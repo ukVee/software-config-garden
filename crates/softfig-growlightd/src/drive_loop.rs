@@ -3350,9 +3350,15 @@ impl DriveLoop {
     ///      path's [`resolve_v2_model`] over a live snapshot.
     ///
     ///    Both fall through to the member default (roster model + variant)
-    ///    when nothing is declared — "we couldn't tell" reads as "no override",
-    ///    so a transient keeperd miss / v2 absent/failed load does NOT
-    ///    spuriously un-park.
+    ///    when nothing is declared or the chain can't be read: a transient
+    ///    keeperd miss, a v2 absent/failed load, or a v2 entry archived since
+    ///    the park all read as "no override" (slice 007, code-review 050 F1).
+    ///    A park whose refusal IS the member default therefore stays parked;
+    ///    one whose refusal came from an item declaration un-parks onto the
+    ///    default. The park already released the member's claim and paused /
+    ///    parked the item (fail-soft), but the member stays registered, so an
+    ///    un-park re-rolls its own baton through step 2 with no fresh claim
+    ///    (growlight report 090, open).
     /// 3. Compares the resolved choice against the supervisor's latched
     ///    [`Supervisor::refused_model`]. On a difference, updates the stored
     ///    spec so the re-roll re-spawns with the fresh model, then
@@ -3379,8 +3385,8 @@ impl DriveLoop {
         // own load the same tick is a per-tick file read on the v2 TOML; the
         // in-source alert-once memory stays quiet on a repeated-same error, so
         // the second load doesn't double-alert. Absent / Failed falls through
-        // as `None` here and keeps every V2-latched park alive (same shape as
-        // an unreadable legacy item doc — fail-closed, don't guess).
+        // as `None` here, and each V2-latched park then resolves its member
+        // default (same shape as an unreadable legacy item doc).
         let any_v2 = parked.iter().any(|agent| {
             matches!(
                 self.model_refused_items.get(agent),
@@ -3438,36 +3444,45 @@ impl DriveLoop {
                     })
                 }
                 ModelRefusedPart::V2 { entry } => {
-                    // No live snapshot (absent / failed load / no seams) →
-                    // keep the park (fail-closed; the next tick's load may
-                    // succeed).
-                    let Some(snapshot) = v2_snapshot.as_ref() else {
-                        eprintln!(
-                            "growlightd: reconcile model-refused: v2 snapshot unavailable \
-                             while reconciling {agent} on entry {entry}; keeping park alive"
-                        );
-                        continue;
-                    };
-                    // The entry's live row. A missing entry (archived / dropped
-                    // between park and now) has no chain to walk — keep the
-                    // park alive; a human edit will reset it.
-                    let Some(entry_view) =
-                        snapshot.entries.iter().find(|e| &e.id == entry)
-                    else {
-                        eprintln!(
-                            "growlightd: reconcile model-refused: v2 entry {entry} absent \
-                             from the live snapshot while reconciling {agent}; keeping park alive"
-                        );
-                        continue;
-                    };
-                    // Walk the entry's next unit; a stopped walk (Blocked /
-                    // NoUnit) has no declared models to compare against, so
-                    // we fall through to the member default like admission's
-                    // undeclared case does.
-                    match next_unit(snapshot, entry_view) {
-                        WalkOutcome::Unit { models, .. } => models
-                            .and_then(|list| list.first_for_backend(backend).cloned()),
-                        WalkOutcome::Blocked { .. } | WalkOutcome::NoUnit => None,
+                    // No live snapshot (absent / failed load / no seams) or
+                    // no live row for the entry (archived / dropped between
+                    // park and now) leaves no chain to walk. Both read as "no
+                    // override" and fall through to the member default, the
+                    // legacy branch's shape on an unreadable item doc (slice
+                    // 007, code-review 050 F1). Slice 005 `continue`d here,
+                    // which stranded the park at `not_before = i64::MAX` even
+                    // after a roster edit moved the default off the refusal.
+                    match v2_snapshot.as_ref() {
+                        None => {
+                            eprintln!(
+                                "growlightd: reconcile model-refused: v2 snapshot unavailable \
+                                 while reconciling {agent} on entry {entry}; falling through \
+                                 to member_default"
+                            );
+                            None
+                        }
+                        Some(snapshot) => {
+                            match snapshot.entries.iter().find(|e| &e.id == entry) {
+                                None => {
+                                    eprintln!(
+                                        "growlightd: reconcile model-refused: v2 entry {entry} \
+                                         absent from the live snapshot while reconciling \
+                                         {agent}; falling through to member_default"
+                                    );
+                                    None
+                                }
+                                // Walk the entry's next unit; a stopped walk
+                                // (Blocked / NoUnit) has no declared models to
+                                // compare against, so we fall through to the
+                                // member default like admission's undeclared
+                                // case does.
+                                Some(entry_view) => match next_unit(snapshot, entry_view) {
+                                    WalkOutcome::Unit { models, .. } => models
+                                        .and_then(|list| list.first_for_backend(backend).cloned()),
+                                    WalkOutcome::Blocked { .. } | WalkOutcome::NoUnit => None,
+                                },
+                            }
+                        }
                     }
                 }
             };
@@ -8448,14 +8463,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     use crate::scheduler_v2::{EntryView, ItemView, ProjectView, TreeView, V2Snapshot};
 
     /// The scripted v2 source (the slice's "fake-v2-source"): returns the stored
-    /// snapshot every `load`, or `Absent` — a `Failed` is the real source's
-    /// alert-once row, already unit-proven in `v2_source`. `Clone` so a test
-    /// keeps a handle to swap the snapshot between ticks (the holder-overlay
-    /// test's committed-state flip).
+    /// snapshot every `load`, `Absent`, or a quiet (`alert: false`) `Failed` —
+    /// the real source's alert-once row is already unit-proven in `v2_source`.
+    /// `Clone` so a test keeps a handle to swap the snapshot between ticks (the
+    /// holder-overlay test's committed-state flip).
     #[derive(Debug, Clone, Default)]
     struct FakeV2Source {
         cell: Arc<Mutex<Option<V2Snapshot>>>,
         absent: Arc<AtomicBool>,
+        failed: Arc<AtomicBool>,
     }
 
     impl FakeV2Source {
@@ -8463,12 +8479,14 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             Self {
                 cell: Arc::new(Mutex::new(Some(snapshot))),
                 absent: Arc::new(AtomicBool::new(false)),
+                failed: Arc::new(AtomicBool::new(false)),
             }
         }
         fn absent() -> Self {
             Self {
                 cell: Arc::new(Mutex::new(None)),
                 absent: Arc::new(AtomicBool::new(true)),
+                failed: Arc::new(AtomicBool::new(false)),
             }
         }
         /// Replace the scripted snapshot (the next `load`s read it) — the test's
@@ -8476,12 +8494,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn set(&self, snapshot: V2Snapshot) {
             *self.cell.lock().unwrap() = Some(snapshot);
             self.absent.store(false, Ordering::SeqCst);
+            self.failed.store(false, Ordering::SeqCst);
         }
     }
 
     impl V2QueueSource for FakeV2Source {
         fn load(&mut self) -> V2Load {
-            if self.absent.load(Ordering::SeqCst) {
+            if self.failed.load(Ordering::SeqCst) {
+                V2Load::Failed {
+                    error: crate::v2_source::V2SourceError::Unreadable {
+                        rel: "growlight/queue.toml".into(),
+                        cause: "scripted".into(),
+                    },
+                    alert: false,
+                }
+            } else if self.absent.load(Ordering::SeqCst) {
                 V2Load::Absent
             } else {
                 V2Load::Snapshot(self.cell.lock().unwrap().clone().expect("scripted"))
@@ -11015,14 +11042,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
-    /// SLICE 006 (code-review 050 F2) — if the per-tick reconcile's v2
-    /// snapshot load returns `Absent` (the v2 TOML vanished between the park
-    /// and this tick), every v2-latched park stays alive. Pins slice-005's
-    /// fail-closed shape so a refactor to the shape-(a) member-default
-    /// fall-through (held for slice 007) cannot land green without updating
-    /// this test.
+    /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape
+    /// a) — if the per-tick reconcile's v2 snapshot load returns `Absent`
+    /// (the v2 TOML vanished between the park and this tick), the park falls
+    /// through to the member default. Here that default IS the refusal (the
+    /// roster's `claude-bogus-9-9`, unedited), so the park stays alive and
+    /// the latch is intact. The un-park twin is
+    /// `v2_model_refused_snapshot_fail_falls_through_to_member_default_and_unparks_when_different`.
     #[test]
-    fn v2_model_refused_snapshot_absent_keeps_the_park() {
+    fn v2_model_refused_snapshot_absent_keeps_the_park_when_member_default_is_the_refusal() {
         let entries_dir = std::env::temp_dir().join(format!(
             "v2-entries-slice006-snapshot-absent-{}",
             std::process::id()
@@ -11058,13 +11086,14 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // disappearing between park and reconcile.
         source.absent.store(true, Ordering::SeqCst);
 
-        // Tick 2: v2_snapshot resolves to None → the v2-latched park hits
-        // the snapshot-absent guard; park stays alive, latch intact.
+        // Tick 2: v2_snapshot resolves to None → the v2-latched park falls
+        // through to member_default = the refused bogus id → park stays
+        // alive, latch intact.
         let r2 = loop_.tick(2);
         assert_eq!(
             loop_.supervisor.agents_in_model_refused_park(),
             vec!["c1".to_string()],
-            "the snapshot-absent guard keeps the park alive",
+            "member_default is the refusal, so the snapshot-absent fall-through keeps the park",
         );
         assert_eq!(
             loop_.model_refused_items.get("c1"),
@@ -11084,12 +11113,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
-    /// SLICE 006 (code-review 050 F2) — if the latched v2 entry is absent
-    /// from the live snapshot (archived / completed between park and tick),
-    /// the per-tick reconcile keeps the park alive. Same pinning rationale
-    /// as the snapshot-absent test.
+    /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape
+    /// a) — if the latched v2 entry is absent from the live snapshot
+    /// (archived / completed between park and tick), the reconcile falls
+    /// through to the member default. That default IS the refusal here, so
+    /// the park stays alive, the latch is intact and nothing re-spawns.
     #[test]
-    fn v2_model_refused_entry_archived_keeps_the_park() {
+    fn v2_model_refused_entry_archived_falls_through_to_member_default_and_keeps_park_when_same() {
         let entries_dir = std::env::temp_dir().join(format!(
             "v2-entries-slice006-entry-archived-{}",
             std::process::id()
@@ -11125,13 +11155,14 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // latched m1 is absent — archive / complete between park and tick.
         source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
 
-        // Tick 2: reconcile walks the entries, finds no m1, hits the
-        // entry-absent guard; park stays alive, latch intact.
+        // Tick 2: reconcile walks the entries, finds no m1, falls through to
+        // member_default = the refused bogus id; park stays alive, latch
+        // intact.
         let r2 = loop_.tick(2);
         assert_eq!(
             loop_.supervisor.agents_in_model_refused_park(),
             vec!["c1".to_string()],
-            "the entry-absent guard keeps the park alive",
+            "member_default is the refusal, so the entry-absent fall-through keeps the park",
         );
         assert_eq!(
             loop_.model_refused_items.get("c1"),
@@ -11148,6 +11179,157 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             backend.spawns(),
             spawns_after_park,
             "no re-spawn while the entry is absent",
+        );
+    }
+
+    /// SLICE 007 (code-review 050 F1, shape a) — when the v2 reconcile's
+    /// snapshot load returns `Failed`, the park falls through to the
+    /// member's roster default (parity with the legacy branch's undeclared
+    /// case) and un-parks iff that default differs from the latched refused
+    /// `ModelChoice`. Slice 005 `continue`d here and kept the park alive
+    /// whatever the roster resolved to. The keep-park twin is
+    /// `v2_model_refused_snapshot_absent_keeps_the_park_when_member_default_is_the_refusal`.
+    #[test]
+    fn v2_model_refused_snapshot_fail_falls_through_to_member_default_and_unparks_when_different()
+    {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice007-snapshot-fail-fallthrough-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Force the next load to return a quiet V2Load::Failed — an
+        // unreadable v2 file between park and reconcile.
+        source.failed.store(true, Ordering::SeqCst);
+
+        // The roster is edited: c1's default model moves to a VALID id that
+        // DIFFERS from the latched refusal (parity with the slice-005
+        // roster-edit test's shape).
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+
+        // Tick 2: the v2 reconcile's snapshot-unavailable branch falls
+        // through to `member_default` from the live roster →
+        // claude:claude-opus-5-5, which differs from the latched refusal
+        // (claude-bogus-9-9), so the park clears and the latch drops.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "shape (a): c1 is un-parked by the roster edit even on snapshot-fail",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "shape (a): the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "shape (a): the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the un-park tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn on the un-park tick itself (the next tick re-rolls on the fresh model)",
+        );
+    }
+
+    /// SLICE 007 (code-review 050 F1, shape a) — the strand F1 named: the
+    /// latched entry is archived between park and reconcile AND the roster
+    /// default moves to a valid id. The entry-absent branch falls through to
+    /// that default, which differs from the refusal, so the park clears.
+    /// Slice 005 `continue`d here and left the member at
+    /// `not_before = i64::MAX` with no entry left to edit. What the freed
+    /// member runs next is the shared un-park → step-2 re-roll path, which
+    /// the slice-005 un-park tests also leave unasserted (growlight report
+    /// filed 2026-10-28).
+    #[test]
+    fn v2_model_refused_entry_archived_falls_through_to_member_default_and_unparks_when_different()
+    {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice007-entry-archived-unpark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+
+        // m1 is archived (the live snapshot carries only m2) and the roster
+        // default moves to a valid id.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+
+        // Tick 2: entry-absent falls through to member_default =
+        // claude-opus-5-5 ≠ the refusal → park clears, latch drops, no alert.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "shape (a): the archived-entry park clears once the default moves",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the un-park tick",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "update_spec_model ran: the next spawn carries the fresh roster default, not the refusal",
         );
     }
 }
