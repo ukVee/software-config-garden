@@ -700,10 +700,12 @@ struct Supervised {
     /// (claude-login-pool-wiring slice 004): latched in
     /// [`Supervisor::on_model_refused_exit`] from the live `spec.model` at park
     /// time, read by the drive loop's per-tick reconcile pass through
-    /// [`Supervisor::refused_model`], and cleared by
-    /// [`Supervisor::clear_model_refused_park`] once the resolved choice has
-    /// moved on. `None` means the member is NOT in a model-refused park (every
-    /// other lifecycle leaves it untouched).
+    /// [`Supervisor::refused_model`], and dropped alongside the park when the
+    /// reconcile releases the member (slice 008 — `supervisor.retire` on a
+    /// resolved difference) or clears the park defensively (the roster-missing
+    /// branch via [`Supervisor::clear_model_refused_park`]). `None` means the
+    /// member is NOT in a model-refused park (every other lifecycle leaves it
+    /// untouched).
     last_refused_model: Option<softfig_ipc::model_choice::ModelChoice>,
 }
 
@@ -856,20 +858,6 @@ impl Supervisor {
         {
             sup.not_before = now;
             sup.last_refused_model = None;
-        }
-    }
-
-    /// Replace `agent`'s stored `spec.model` (slice 004 M-E): the reconcile
-    /// pass calls this before clearing the park so the next re-roll — which
-    /// re-spawns from the stored spec — picks up the fresh resolution rather
-    /// than the model that was just refused. A no-op for an unknown agent.
-    pub fn update_spec_model(
-        &mut self,
-        agent: &str,
-        model: Option<softfig_ipc::model_choice::ModelChoice>,
-    ) {
-        if let Some(sup) = self.agents.get_mut(agent) {
-            sup.spec.model = model;
         }
     }
 

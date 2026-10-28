@@ -3356,14 +3356,18 @@ impl DriveLoop {
     ///    A park whose refusal IS the member default therefore stays parked;
     ///    one whose refusal came from an item declaration un-parks onto the
     ///    default. The park already released the member's claim and paused /
-    ///    parked the item (fail-soft), but the member stays registered, so an
-    ///    un-park re-rolls its own baton through step 2 with no fresh claim
-    ///    (growlight report 090, open).
+    ///    parked the item (fail-soft).
     /// 3. Compares the resolved choice against the supervisor's latched
-    ///    [`Supervisor::refused_model`]. On a difference, updates the stored
-    ///    spec so the re-roll re-spawns with the fresh model, then
-    ///    [`Supervisor::clear_model_refused_park`]s the member (resets
-    ///    `not_before = now`).
+    ///    [`Supervisor::refused_model`]. On a difference, **releases the
+    ///    member** at the supervisor layer — a `supervisor.retire` plus
+    ///    `aggregator.forget` + `reconnecting.remove` + the latch drop
+    ///    (slice 008, growlight report 090). The same tick's step 3 then
+    ///    sees the member unregistered, picks + claims + makes the §3.6
+    ///    baton copy + spawns with the live-resolved model. Before slice
+    ///    008 this branch only reset `not_before = now` and refreshed
+    ///    `spec.model`, which left step 3 skipping (`is_registered` true)
+    ///    and step 2 re-rolling the member off its stale per-member baton
+    ///    with no fresh claim and no assignment.
     ///
     /// A member removed from the roster between park and this tick is
     /// un-parked here — its `Supervised` entry is still alive from the park,
@@ -3496,15 +3500,33 @@ impl DriveLoop {
                 .clone()
             });
             // Did the resolution move off the latched refusal? If not, keep
-            // the park (the slice-003 single alert stands); if yes, update
-            // the stored spec so the re-roll uses the fresh model, then clear.
+            // the park (the slice-003 single alert stands); if yes, release
+            // the member at an item boundary so the SAME tick's step 3 picks
+            // + claims + copies a fresh §3.6 baton + spawns with the live
+            // resolution (slice 008, growlight report 090).
+            //
+            // The release uses `Supervisor::retire` directly, NOT
+            // `DriveLoop::retire`: the latter also inserts into `self.stopped`
+            // (`retired` is permanent for this run), which would stop the
+            // member for good instead of letting step 3 pick for it.
+            // `aggregator.forget` and `reconnecting.remove` mirror
+            // `end_handed_off_session`'s boundary-release pattern; the latch
+            // drops with the park.
+            //
+            // `supervisor.retire` returns the live child, if any. A parked
+            // member has already exited so this reads `None` in practice; a
+            // surprise child is killed outside any daemon lock (the
+            // AgentChild contract).
             let differs = self
                 .supervisor
                 .refused_model(&agent)
                 .is_some_and(|r| r != &resolved);
             if differs {
-                self.supervisor.update_spec_model(&agent, Some(resolved));
-                self.supervisor.clear_model_refused_park(&agent, now);
+                if let Some(child) = self.supervisor.retire(&agent) {
+                    child.kill();
+                }
+                self.aggregator.forget(&agent);
+                self.reconnecting.remove(&agent);
                 self.model_refused_items.remove(&agent);
             }
         }
@@ -4366,6 +4388,22 @@ mod tests {
         /// backend latches off an in-band 429 / errored result line).
         fn set_stream_error(&self, agent: &str, err: StreamError) {
             self.stream_errors.lock().unwrap().insert(agent.to_string(), err);
+        }
+        /// Drop `agent`'s scripted stdout stream error — models a fresh session's
+        /// stream, which the live backend would surface as "no error observed"
+        /// (the per-session reset the real cell does on a new spawn). Slice 008
+        /// uses this before ticking past an un-park, so the newly step-3-spawned
+        /// member does not immediately re-poll the previous session's scripted
+        /// `ModelRefused` and re-park. Paired with [`clear_health`] so the
+        /// member's new instance polls healthy end-to-end.
+        fn clear_stream_error(&self, agent: &str) {
+            self.stream_errors.lock().unwrap().remove(agent);
+        }
+        /// Drop `agent`'s scripted health, so the next observe reads the backend
+        /// default rather than a persisted `Exited`. Slice 008 companion to
+        /// [`clear_stream_error`].
+        fn clear_health(&self, agent: &str) {
+            self.health.lock().unwrap().remove(agent);
         }
         /// Script `agent`'s terminal baton status (read by the loop on its exit).
         fn set_baton(&self, agent: &str, status: &str) {
@@ -10611,7 +10649,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// slice-003 single alert depends on.
     #[test]
     fn item_model_edit_unparks_the_member_on_next_tick() {
-        let (mut loop_, _d, backend, _claimer, _parker, queues, _probe) = make_full(
+        let (mut loop_, _d, backend, claimer, _parker, queues, _probe) = make_full(
             vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
             vec![q("qa", &[("p1", "queued")])],
             Policy::default(),
@@ -10627,20 +10665,30 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
         // Tick 2: no doc change — the park must survive the re-read (same
         // undeclared resolution → same roster default → same latched refusal).
-        let _ = loop_.tick(2);
+        let r2 = loop_.tick(2);
         assert_eq!(
             loop_.supervisor.agents_in_model_refused_park(),
             vec!["c1".to_string()],
             "an idle reconcile does NOT spuriously un-park",
         );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "the still-parked member is not re-rolled either",
+        );
 
         // The human edits the item doc, setting `> Model:` to a valid choice.
         queues.set_item_doc("p1", "# p1\n\n> Model: claude:claude-opus-5-5\n");
+        let spawns_before = backend.spawns();
+        let claims_before = claimer.claims();
 
         // Tick 3: the reconcile reads the new doc, resolves to a different
-        // model, and clears the park. The stored spec is updated so the next
-        // re-roll spawns on the fresh model.
-        let _ = loop_.tick(3);
+        // model, and **releases the member** (slice 008, growlight report
+        // 090). Step 3 in the SAME tick sees c1 unregistered; `p1` is
+        // `blocked` from the park, so no legacy workable part exists and
+        // the member holds with no workable work rather than claiming a
+        // stale baton through step 2. The re-roll (step 2) therefore never
+        // touches c1 either.
+        let r3 = loop_.tick(3);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
             "c1 is un-parked by the item-doc edit",
@@ -10648,6 +10696,24 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             loop_.supervisor.refused_model("c1").is_none(),
             "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member — no stale baton re-roll",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_before,
+            "slice 008: a `blocked` legacy item does NOT spawn a new session",
+        );
+        assert_eq!(
+            claimer.claims(),
+            claims_before,
+            "no new claim: p1 stays blocked, and nothing else is queued",
+        );
+        assert!(
+            !r3.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: the un-park tick's rerolls never contain the released agent",
         );
     }
 
@@ -10659,7 +10725,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// produces); the reconcile reads it fresh each tick.
     #[test]
     fn roster_model_edit_unparks_the_member_on_next_tick() {
-        let (mut loop_, _d, backend, _claimer, _parker, _queues, _probe) = make_full(
+        let (mut loop_, _d, backend, claimer, _parker, _queues, _probe) = make_full(
             vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
             vec![q("qa", &[("p1", "queued")])],
             Policy::default(),
@@ -10672,6 +10738,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec!["c1".to_string()],
             "preamble: c1 is parked on claude-bogus-9-9",
         );
+        let spawns_before = backend.spawns();
+        let claims_before = claimer.claims();
 
         // The human edits config/growlight.toml to flip c1's roster model to
         // a valid id; a daemon rebuild would re-assemble the fleet, which is
@@ -10680,8 +10748,11 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
         // Tick 2: the reconcile re-reads the live roster through
         // `member.backend.roster_model()`, resolves to the new choice, and
-        // clears the park. One tick, no daemon restart.
-        let _ = loop_.tick(2);
+        // **releases the member** (slice 008, growlight report 090). Step 3
+        // in the SAME tick sees c1 unregistered; `p1` is `blocked` from the
+        // park, so no legacy workable part exists and the member holds. No
+        // stale baton re-roll (step 2 never touches an unregistered agent).
+        let r2 = loop_.tick(2);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
             "c1 is un-parked by the roster edit",
@@ -10689,6 +10760,24 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             loop_.supervisor.refused_model("c1").is_none(),
             "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member — no stale baton re-roll",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_before,
+            "slice 008: a `blocked` legacy item does NOT spawn a new session",
+        );
+        assert_eq!(
+            claimer.claims(),
+            claims_before,
+            "no new claim: p1 stays blocked, and nothing else is queued",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: the un-park tick's rerolls never contain the released agent",
         );
     }
 
@@ -10895,12 +10984,16 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             Some("claude:claude-opus-5-5"),
         ));
 
-        // Tick 2: the reconcile walks `next_unit` → the slice's new
-        // declared list → `claude:claude-opus-5-5`, which differs from the
-        // latched refused choice. The park clears, the stored spec is
-        // refreshed, and the next re-roll will spawn on opus-5-5. One
-        // tick, no daemon restart.
-        let _ = loop_.tick(2);
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
+
+        // Tick 2: the reconcile walks `next_unit` → the slice's new declared
+        // list → `claude:claude-opus-5-5`, which differs from the latched
+        // refused choice, so the member is **released** (slice 008). Step 3
+        // in the SAME tick picks the paused entry (c1 is its own pauser,
+        // the overlay carries that preference) through a **real claim** on
+        // `("m1", Some("001"))` and spawns on the fresh model.
+        let r2 = loop_.tick(2);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
             "c1 is un-parked by the slice-doc edit",
@@ -10912,6 +11005,37 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             !loop_.model_refused_items.contains_key("c1"),
             "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 re-claims the paused entry through keeperd on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim names the edited slice unit",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: a fresh v2 assignment carries the resumed entry (not stale from pre-park)",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the un-park tick's spawn carries the live-resolved model",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
         );
     }
 
@@ -10956,12 +11080,16 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // to a valid id; a daemon rebuild simulates as replacing the live
         // fleet view.
         loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
 
-        // Tick 2: the v2 reconcile walks `next_unit` (slice still
-        // undeclared) → member default from the live roster →
-        // claude:claude-opus-5-5, which differs from the latched refusal.
-        // The park clears.
-        let _ = loop_.tick(2);
+        // Tick 2: the v2 reconcile walks `next_unit` (slice still undeclared)
+        // → member default from the live roster → claude:claude-opus-5-5,
+        // which differs from the latched refusal, so the member is
+        // **released** (slice 008). Step 3 in the SAME tick picks the
+        // paused entry (c1's own pauser overlay) through a **real claim**
+        // on `("m1", Some("001"))` and spawns on the fresh roster default.
+        let r2 = loop_.tick(2);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
             "c1 is un-parked by the roster edit",
@@ -10973,6 +11101,37 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             !loop_.model_refused_items.contains_key("c1"),
             "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 re-claims the paused entry through keeperd on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim names the resumed slice unit",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: a fresh v2 assignment carries the resumed entry",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the un-park tick's spawn carries the live-resolved roster default",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
         );
     }
 
@@ -11231,11 +11390,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // DIFFERS from the latched refusal (parity with the slice-005
         // roster-edit test's shape).
         loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
 
         // Tick 2: the v2 reconcile's snapshot-unavailable branch falls
         // through to `member_default` from the live roster →
         // claude:claude-opus-5-5, which differs from the latched refusal
-        // (claude-bogus-9-9), so the park clears and the latch drops.
+        // (claude-bogus-9-9), so the member is **released** (slice 008).
+        // Step 3 does not run while the snapshot is unreadable, so no new
+        // claim and no new spawn — the release stands until the snapshot
+        // comes back.
         let r2 = loop_.tick(2);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
@@ -11253,10 +11416,54 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             r2.crashes.is_empty(),
             "no second ModelRefused alert on the un-park tick",
         );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member while the snapshot is unreadable",
+        );
         assert_eq!(
             backend.spawns(),
             spawns_after_park,
             "no re-spawn on the un-park tick itself (the next tick re-rolls on the fresh model)",
+        );
+        assert_eq!(
+            claimer.claims.lock().unwrap().clone(),
+            claims_before,
+            "slice 008: no new claim while the snapshot is unreadable",
+        );
+
+        // Once the v2 TOML is readable again, step 3 picks m1 (still queued
+        // in the restored snapshot), claims it fresh, and spawns on the
+        // live-resolved roster default. Clear the scripted exit so the
+        // fresh session polls healthy.
+        source.failed.store(false, Ordering::SeqCst);
+        backend.clear_stream_error("c1");
+        backend.clear_health("c1");
+
+        let _r3 = loop_.tick(3);
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(
+            claims_after.len(),
+            claims_before.len() + 1,
+            "slice 008: step 3 claims a fresh unit once the snapshot comes back",
+        );
+        assert_eq!(
+            claims_after.last().unwrap(),
+            &("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim lands on the live-snapshot entry",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: v2_assignments carries the freshly claimed entry",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the fresh spawn carries the live-resolved roster default",
         );
     }
 
@@ -11306,9 +11513,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // default moves to a valid id.
         source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
         loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
 
         // Tick 2: entry-absent falls through to member_default =
-        // claude-opus-5-5 ≠ the refusal → park clears, latch drops, no alert.
+        // claude-opus-5-5 ≠ the refusal → the member is **released** (slice
+        // 008). Step 3 in the SAME tick picks m2 (the only queued entry
+        // left) through a real claim and spawns on the fresh roster default.
         let r2 = loop_.tick(2);
         assert!(
             loop_.supervisor.agents_in_model_refused_park().is_empty(),
@@ -11326,10 +11537,208 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             r2.crashes.is_empty(),
             "no second ModelRefused alert on the un-park tick",
         );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0 on m1");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 claims a fresh entry on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m2".to_string(), Some("001".to_string())),
+            "slice 008: the archived latched entry is NOT re-claimed — the freed member moves to m2",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m2"),
+            "slice 008: v2_assignments carries the member's next entry, not the archived m1",
+        );
         assert_eq!(
             backend.spawned_specs().last().and_then(|s| s.model.clone()),
             Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
-            "update_spec_model ran: the next spawn carries the fresh roster default, not the refusal",
+            "slice 008: the un-park tick's spawn carries the live-resolved roster default",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
+        );
+    }
+
+    /// SLICE 008 (growlight report 090) — the invariant across every un-park
+    /// cause: the reconcile releases the member, so step 2 (re-roll) never
+    /// touches it on the un-park tick and no stale per-member baton re-roll
+    /// hits the keeperd claim-less path the report described. Pins the
+    /// legacy case; the v2 cases pin the same invariant inline (the three
+    /// slice-005/007 v2 un-park tests each carry an `r2.rerolls` assertion).
+    #[test]
+    fn un_park_release_never_lets_step_2_re_roll_the_freed_agent() {
+        let (mut loop_, _d, backend, _claimer, _parker, queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert!(
+            loop_.supervisor.is_registered("c1"),
+            "preamble: c1 is registered + parked at the supervisor",
+        );
+
+        // Edit the item doc so the reconcile's `differs` branch fires.
+        queues.set_item_doc("p1", "# p1\n\n> Model: claude:claude-opus-5-5\n");
+
+        let r2 = loop_.tick(2);
+        // No step-2 outcome of ANY kind for the released agent — a
+        // `Rerolled`, a `HeldForBackoff`, a `HeldNoWork`, a
+        // `HeldForAdmission`, or a `SpawnFailed` on `c1` would all read as
+        // the stale-baton path report 090 named.
+        for outcome in &r2.rerolls {
+            let (RerollOutcome::Rerolled { agent }
+            | RerollOutcome::HeldForBackoff { agent, .. }
+            | RerollOutcome::HeldNoWork { agent }
+            | RerollOutcome::HeldForAdmission { agent, .. }
+            | RerollOutcome::SpawnFailed { agent, .. }) = outcome;
+            assert_ne!(
+                agent, "c1",
+                "slice 008 invariant: the released agent never appears in rerolls",
+            );
+        }
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "the un-park releases the member at the supervisor layer",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is dropped alongside the release",
+        );
+        assert!(
+            !loop_.stopped.contains("c1"),
+            "the release uses `supervisor.retire`, NOT `DriveLoop::retire`: \
+             the agent is NOT permanently stopped (step 3 of a later tick may pick it)",
+        );
+    }
+
+    /// SLICE 008 (growlight report 090) — the slice-007 interaction the
+    /// report named: the latched v2 entry is still PAUSED and the SAME unit
+    /// still declares the refused model, but the snapshot briefly fails →
+    /// member_default moves off the refusal → release. When the snapshot
+    /// comes back, step 3 re-picks the still-paused entry, re-resolves to
+    /// the still-refused model, and the member spawns + re-parks (ONE extra
+    /// spawn + ONE re-alert, inside the slice-003 single-alert cooldown's
+    /// scope since the registration is new). Pins the counts the slice-008
+    /// doc flagged for step 7c follow-up.
+    #[test]
+    fn v2_model_refused_release_then_snapshot_restore_respawns_the_still_refused_model() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice008-interaction-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        // The slice declares `claude:claude-bogus-9-9` directly (the item
+        // declaration is what the member default would also resolve to;
+        // what matters is that after a release, step 3 re-resolves to the
+        // still-refused choice).
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            Some("claude:claude-bogus-9-9"),
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        // Tick 0: c1 spawns on m1/001 with the slice's declared bogus model
+        // (overrides the opus-5-5 roster default).
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.v2_started.len(), 1, "c1 starts on m1/001");
+        assert_eq!(
+            r0.v2_started[0].resolved_model,
+            ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None),
+            "the slice's declared bogus model overrides the opus roster default",
+        );
+
+        drive_v2_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.crashes.len(), 1, "the first ModelRefused alert fires");
+
+        // Transient v2 snapshot failure for the un-park tick. The slice's
+        // `> Model:` is unchanged — the item still declares the refused
+        // choice; only the live snapshot is briefly unreadable.
+        source.failed.store(true, Ordering::SeqCst);
+
+        // Clear the scripted exit so the next spawn polls healthy — we
+        // care about the re-park on the FOLLOWING tick, not the one that
+        // scripted the first exit.
+        backend.clear_stream_error("c1");
+        backend.clear_health("c1");
+
+        let spawns_after_park = backend.spawns();
+
+        // Tick 2: snapshot-fail → member_default (opus-5-5) ≠ refused
+        // (bogus-9-9) → release. Step 3 does not run (snapshot unreadable).
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "the member is released by the snapshot-fail / default-moves branch",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "the release deregisters the member",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no new spawn while the snapshot is unreadable (v2 step 3 does not run)",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the release tick",
+        );
+
+        // Snapshot restored. The item still declares the refused model —
+        // nothing on the device changed to resolve it.
+        source.failed.store(false, Ordering::SeqCst);
+
+        // Tick 3: step 3 picks m1 (still queued since the release never
+        // paused it this run; the overlay's prior v2_paused_by[m1] was
+        // pruned when the snapshot flipped to failed → absent-entry
+        // semantics for the pauser). pick → resolve → claim →
+        // spawn on claude-bogus-9-9. No model refused yet (the new
+        // instance has not polled an exit).
+        let r3 = loop_.tick(3);
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_after_park.len() + 1,
+            "slice 008 interaction: exactly ONE extra spawn once the snapshot comes back",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the fresh spawn still carries the refused model — nothing resolved it",
+        );
+        // No second alert on this tick: the scripted stream error is
+        // cleared, so the new session is healthy from the backend's
+        // perspective. Re-driving `drive_v2_model_refused` would re-park on
+        // tick 4 (not pinned here — the step-7c report tracks whether a
+        // tight re-park would re-alert inside the cooldown).
+        assert!(
+            r3.crashes.is_empty(),
+            "no second ModelRefused alert while the fresh session is healthy",
         );
     }
 }

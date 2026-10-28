@@ -103,11 +103,17 @@ variant = "max"                          # closed set: low | medium | high | xhi
   subsequent tick runs a reconcile pass that re-reads the item's `> Model:`
   chain (slice doc → milestone doc) and the live roster through the §6.4
   resolver, compares the resolved choice to the latched refused one, and —
-  if they differ — updates the stored spec and clears the park
-  (`not_before = now`), so a human edit to the item declaration or the
-  roster model un-parks the member on the next tick with no daemon restart.
-  An unreadable item doc is treated as "undeclared" so a transient keeperd
-  miss cannot spuriously un-park. The single ModelRefused alert is never
+  if they differ — **releases the member at an item boundary**
+  (`supervisor.retire` + `aggregator.forget` + the latch drop; slice 008,
+  2026-10-28). The same tick's step 3 then picks + claims + copies a fresh
+  §3.6 baton + spawns on the live-resolved model, so a human edit to the
+  item declaration or the roster model un-parks the member on the next tick
+  with no daemon restart and no stale baton re-roll. A v2 paused entry is
+  pickable by `pick_v2` so an edited entry resumes through a real claim; a
+  legacy `blocked` item stays blocked by default and the freed member moves
+  to the next workable part (the human re-queues the item to re-run it). An
+  unreadable item doc is treated as "undeclared" so a transient keeperd miss
+  cannot spuriously un-park. The single ModelRefused alert is never
   re-emitted while the park stands.
 - **Known gap (review 048 M-A/M-B/M-C, tracked in `claude-login-pool-wiring`
   milestone):** with `profile_pool` configured, the admission budget rail folds
