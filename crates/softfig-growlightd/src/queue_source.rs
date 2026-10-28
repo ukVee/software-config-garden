@@ -288,7 +288,7 @@ impl QueueSource for KeeperdQueueSource {
         }
     }
 
-    /// The part's item doc content for the model-refused reconcile pass
+    /// The part's item doc content for the `reconcile model-refused` pass
     /// (claude-login-pool-wiring slice 004 M-E) — the same reader `claim_hold`
     /// uses, but swallowing the error back to `None`: the reconcile treats
     /// "unreadable" as "undeclared" so a transient keeperd miss cannot
@@ -299,7 +299,7 @@ impl QueueSource for KeeperdQueueSource {
             Ok(doc) => doc,
             Err(e) => {
                 eprintln!(
-                    "growlightd: model-refused reconcile: item doc for {part} unreadable: {e}"
+                    "growlightd: reconcile model-refused: item doc for {part} unreadable: {e}"
                 );
                 None
             }

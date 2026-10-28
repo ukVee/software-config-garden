@@ -2405,7 +2405,13 @@ impl DriveLoop {
                         // missing the latch and silently un-parking (review
                         // 049 F1) — same tight spawn/park loop and per-tick
                         // credit burn the 30-min alert cooldown masked.
-                        if let Some(assignment) = self.v2_assignments.remove(agent) {
+                        let v2_entry = self.v2_assignments.remove(agent);
+                        let legacy_entry = self.assignments.remove(agent);
+                        debug_assert!(
+                            !(v2_entry.is_some() && legacy_entry.is_some()),
+                            "assignments and v2_assignments must not both hold agent {agent} at one tick"
+                        );
+                        if let Some(assignment) = v2_entry {
                             self.pause_v2_entry(&assignment.entry, agent, &mut report);
                             self.model_refused_items.insert(
                                 agent.clone(),
@@ -2413,8 +2419,7 @@ impl DriveLoop {
                                     entry: assignment.entry,
                                 },
                             );
-                        }
-                        if let Some((queue, part)) = self.assignments.remove(agent) {
+                        } else if let Some((queue, part)) = legacy_entry {
                             if let Err(_e) = self.parker.park_item(&queue, &part) {
                                 // Fail-soft (see the Blocked arm's park_item
                                 // comment): the member is already parked at the
@@ -10941,6 +10946,208 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             !loop_.model_refused_items.contains_key("c1"),
             "the v2 latch is dropped alongside the park clear",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2) — if the per-tick reconcile finds a
+    /// parked agent with no latch in `model_refused_items`, it journals one
+    /// line and leaves the park alive. The slice-004 defensive un-park is
+    /// what review-049 F1 silently rode on; this pins the slice-005 shape so
+    /// a refactor that reverts to a clear-and-release lands red on the gate.
+    #[test]
+    fn model_refused_no_latch_keeps_the_park() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-no-latch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Simulate the "no latch" condition: `model_refused_items` is empty
+        // while the supervisor still reports c1 parked (the exact shape
+        // slice 005 made observable instead of silently clearing).
+        loop_.model_refused_items.remove("c1");
+
+        // Tick 2: reconcile hits the no-latch guard; park stays alive, no
+        // re-spawn, no second alert.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the no-latch guard keeps the park alive",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the latch remains absent — reconcile does not fabricate one",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn — the review-049 F1 loop cannot form",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2) — if the per-tick reconcile's v2
+    /// snapshot load returns `Absent` (the v2 TOML vanished between the park
+    /// and this tick), every v2-latched park stays alive. Pins slice-005's
+    /// fail-closed shape so a refactor to the shape-(a) member-default
+    /// fall-through (held for slice 007) cannot land green without updating
+    /// this test.
+    #[test]
+    fn v2_model_refused_snapshot_absent_keeps_the_park() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-snapshot-absent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Force the next load to return V2Load::Absent — the v2 TOML
+        // disappearing between park and reconcile.
+        source.absent.store(true, Ordering::SeqCst);
+
+        // Tick 2: v2_snapshot resolves to None → the v2-latched park hits
+        // the snapshot-absent guard; park stays alive, latch intact.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the snapshot-absent guard keeps the park alive",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn while the snapshot is absent",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2) — if the latched v2 entry is absent
+    /// from the live snapshot (archived / completed between park and tick),
+    /// the per-tick reconcile keeps the park alive. Same pinning rationale
+    /// as the snapshot-absent test.
+    #[test]
+    fn v2_model_refused_entry_archived_keeps_the_park() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-entry-archived-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Replace the live snapshot with a different entry id so the
+        // latched m1 is absent — archive / complete between park and tick.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+
+        // Tick 2: reconcile walks the entries, finds no m1, hits the
+        // entry-absent guard; park stays alive, latch intact.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the entry-absent guard keeps the park alive",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn while the entry is absent",
         );
     }
 }
