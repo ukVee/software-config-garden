@@ -1274,13 +1274,20 @@ impl ClaudeFlavor {
             }
             Some(PickResult::Stall { until_at }) => {
                 // Quiet stall (slice 002 M-B part 2): surface as `Hold` carrying
-                // the pool slots + earliest reset so the drive loop extends a
-                // `rate_limit_holds` entry for each slot and NEVER pages
-                // `AgentCrashed` on a known-exhausted pool. No preapproval
-                // files are rewritten this tick either — the harness preflight
-                // runs this picker BEFORE `generate_preapproval`.
+                // the slots the picker ran against (`candidates` — the hold
+                // pre-filter's `survivors`, or `pool` on the empty-survivors
+                // fall-through where they are the same set) + earliest reset so
+                // the drive loop extends a `rate_limit_holds` entry for each
+                // slot and NEVER pages `AgentCrashed` on a known-exhausted
+                // pool. Carrying the whole `pool` here was slice 009 F2: a slot
+                // the pre-filter already dropped (held) had its hold
+                // monotonically pushed forward to the surviving slot's longer
+                // `until_at`, masking the dropped slot's natural reset.
+                // No preapproval files are rewritten this tick either — the
+                // harness preflight runs this picker BEFORE
+                // `generate_preapproval`.
                 Err(SpawnKind::Hold {
-                    slots: pool.to_vec(),
+                    slots: candidates.to_vec(),
                     until: until_at,
                 })
             }
@@ -2765,6 +2772,7 @@ mod tests {
         _tmp: tempfile::TempDir,
         store: std::path::PathBuf,
         agents: std::path::PathBuf,
+        by_profile_dir: std::path::PathBuf,
         live: Arc<Mutex<BTreeMap<String, String>>>,
         backend: ClaudeBackend,
     }
@@ -2775,7 +2783,7 @@ mod tests {
         }
 
         fn with_store(pools: &[(&str, &[&str])], has_store: bool) -> Self {
-            Self::assemble(pools, has_store, None)
+            Self::assemble(pools, has_store, None, false)
         }
 
         /// A fixture plus a handle to the backend's shared rate-limit hold map
@@ -2786,7 +2794,20 @@ mod tests {
             pools: &[(&str, &[&str])],
         ) -> (Self, Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>) {
             let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
-            let fx = Self::assemble(pools, true, Some(Arc::clone(&holds)));
+            let fx = Self::assemble(pools, true, Some(Arc::clone(&holds)), false);
+            (fx, holds)
+        }
+
+        /// Like [`with_holds`](Self::with_holds) plus `by_profile_dir` wired
+        /// (slice 009 F2 regression tests). Writing a per-slot
+        /// `usage.by-profile/<slot>.json` through [`write_profile_budget`](Self::write_profile_budget)
+        /// then drives the picker's headroom read, so a mixed scenario
+        /// (one slot held, one slot low-headroom) is reproducible.
+        fn with_holds_and_budgets(
+            pools: &[(&str, &[&str])],
+        ) -> (Self, Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>) {
+            let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+            let fx = Self::assemble(pools, true, Some(Arc::clone(&holds)), true);
             (fx, holds)
         }
 
@@ -2794,11 +2815,16 @@ mod tests {
             pools: &[(&str, &[&str])],
             has_store: bool,
             holds: Option<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
+            with_by_profile_dir: bool,
         ) -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let store = tmp.path().join("claude-profiles");
             let agents = tmp.path().join("agents");
+            let by_profile_dir = tmp.path().join("usage.by-profile");
             std::fs::create_dir_all(&store).unwrap();
+            if with_by_profile_dir {
+                std::fs::create_dir_all(&by_profile_dir).unwrap();
+            }
             let live = Arc::new(Mutex::new(BTreeMap::new()));
             let pre = PreApproval::new(
                 &agents,
@@ -2823,7 +2849,7 @@ mod tests {
                     .iter()
                     .map(|(id, pool)| (id.to_string(), pool.iter().map(|s| s.to_string()).collect()))
                     .collect(),
-                by_profile_dir: None,
+                by_profile_dir: with_by_profile_dir.then(|| by_profile_dir.clone()),
             });
             if let Some(h) = holds {
                 backend = backend.with_holds_view(h);
@@ -2832,9 +2858,34 @@ mod tests {
                 _tmp: tmp,
                 store,
                 agents,
+                by_profile_dir,
                 live,
                 backend,
             }
+        }
+
+        /// Write a per-profile budget snapshot for `slot` with `used_pct`
+        /// 5h headroom at the given `resets_at`. The sample `ts` is `now`
+        /// (fresh — well inside the staleness floor the production picker
+        /// uses, since the picker's `now` is `pin::now_unix()`). The 7d
+        /// window is left default (reads as full), so the 5h binds.
+        fn write_profile_budget(&self, slot: &str, used_pct: u8, resets_at: i64) {
+            use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+            let snap = UsageSnapshot {
+                context_window: None,
+                rate_limits: RateLimits {
+                    five_hour: RateWindow {
+                        used_percentage: Some(used_pct),
+                        resets_at: Some(resets_at),
+                        status: Some("allowed_warning".to_string()),
+                    },
+                    seven_day: RateWindow::default(),
+                },
+                ts: crate::profile_pin::now_unix() as f64,
+                profile: None,
+            };
+            let path = crate::profile_budget::profile_budget_path(&self.by_profile_dir, slot);
+            snap.write_atomic(&path).unwrap();
         }
 
         /// A logged-in store slot: a dir holding a 0600 `.credentials.json`.
@@ -3136,6 +3187,70 @@ mod tests {
             err.0.contains("logged in") && err.0.contains("profile_pool"),
             "{err}",
         );
+    }
+
+    /// Slice 009 F2 — a Stall whose surviving slot is one carries ONLY that
+    /// slot in the `SpawnKind::Hold` payload. Before the fix, the error site
+    /// returned `pool.to_vec()`, so a held slot's hold was pushed forward by
+    /// the drive-loop handler to the surviving slot's longer `until_at` —
+    /// masking the held slot's natural reset. The pre-filter dropped slot1
+    /// (held); the picker ran against `[slot2]` and stalled on it; the Hold
+    /// payload must name only `slot2`.
+    #[test]
+    fn stall_hold_payload_names_only_the_surviving_stalled_slot() {
+        let (fx, holds) = SlotFixture::with_holds_and_budgets(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let now = crate::profile_pin::now_unix();
+        // slot1 held in rate_limit_holds with the earlier reset; slot2 at 1%
+        // headroom with a long future reset — the mixed shape F2 flags. The
+        // reset must be in the FUTURE relative to `now` or `window_reset_by`
+        // folds the reading to full headroom.
+        let slot1_hold_until = now + 10_000;
+        let slot2_reset_at = now + 50_000;
+        holds.lock().unwrap().extend("slot1", slot1_hold_until);
+        fx.write_profile_budget("slot2", 99, slot2_reset_at);
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("stall") {
+            SpawnKind::Hold { slots, until } => {
+                assert_eq!(
+                    slots,
+                    vec!["slot2".to_string()],
+                    "only the stalled survivor rides the Hold payload — not the \
+                     pre-filtered held slot1 (slice 009 F2)",
+                );
+                assert_eq!(
+                    until,
+                    Some(slot2_reset_at),
+                    "the stall's `until_at` is slot2's reset, not slot1's hold",
+                );
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        // Nothing was committed — a stall does not record a pick.
+        assert!(fx.history("a").is_empty());
+    }
+
+    /// Slice 009 F2 — the natural-reset companion to the payload test above.
+    /// With both slots in the pool held in rate_limit_holds (no surviving
+    /// slots at all), the all-held fall-through at claude_backend.rs:1215
+    /// still carries the whole pool with the earliest reset — THAT site was
+    /// correct before and after F2 (the whole pool IS the "slots that stalled"
+    /// in that branch). This test pins the no-change invariant so the F2 fix
+    /// cannot accidentally narrow the all-held branch too.
+    #[test]
+    fn all_held_fallthrough_still_carries_the_whole_pool() {
+        let (fx, holds) = SlotFixture::with_holds_and_budgets(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        holds.lock().unwrap().extend("slot1", 10_000);
+        holds.lock().unwrap().extend("slot2", 20_000);
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("all held") {
+            SpawnKind::Hold { slots, until } => {
+                assert_eq!(slots, vec!["slot1".to_string(), "slot2".to_string()]);
+                assert_eq!(until, Some(10_000), "earliest reset wins");
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
     }
 
     /// M-C finish check 4 — regression guard: with no slot filtered out (both

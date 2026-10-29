@@ -2924,6 +2924,26 @@ impl DriveLoop {
                     self.reassert_claim(agent);
                 }
             }
+            // Re-roll side of `StartOutcome::Hold` (claude-login-pool-wiring
+            // slice 009 F1). The symmetric site of drive_loop.rs:2776 and
+            // :3117: a re-roll into an exhausted pool extends
+            // `rate_limit_holds` per slot so next tick's admission check
+            // short-circuits via `member_fully_held` instead of re-running
+            // the picker. NOT paged `AgentCrashed` (the alert dispatcher at
+            // :3241 only fires on `SpawnFailed`); not crash-backed-off (the
+            // supervisor's Hold arm leaves `consecutive_failures` + `not_before`
+            // untouched). Before this handler the re-roll's Err path collapsed
+            // every `SpawnKind` into `SpawnFailed`, pageing the operator on
+            // every tick a pooled member found its slots exhausted.
+            for outcome in &report.rerolls {
+                if let RerollOutcome::HeldForSlot { slots, until, .. } = outcome {
+                    let fallback = now + crate::profile_budget::STALE_FLOOR_SECS;
+                    let mut holds = self.rate_limit_holds.lock().unwrap();
+                    for slot in slots {
+                        holds.extend(slot.clone(), until.unwrap_or(fallback));
+                    }
+                }
+            }
         }
 
         // 3. Schedule + claim + admit + spawn over the snapshot read above. Each
@@ -4049,6 +4069,12 @@ impl TickLogger {
                 RerollOutcome::HeldForAdmission { agent, .. } => {
                     held_now.insert((agent.clone(), "admission budget/rate"));
                 }
+                // Re-roll picker-stall (claude-login-pool-wiring slice 009 F1).
+                // The per-slot rate-limit hold already narrates "waiting for
+                // rate limit reset" through the status surface, mirroring the
+                // start-side `StartOutcome::Hold` `continue` branch below —
+                // skip the edge-dedup line here to avoid a double-narration.
+                RerollOutcome::HeldForSlot { .. } => {}
             }
         }
         for held in &r.held_starts {
@@ -4348,6 +4374,12 @@ mod tests {
         /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
         /// `SpawnError` before exec).
         fail_spawn: AtomicBool,
+        /// Slice 009 F1 — when `Some`, every `spawn` returns
+        /// `SpawnKind::Hold` with this payload. Models the live ClaudeBackend's
+        /// `pick_pool_slot` Stall path, so a drive-loop test can drive a
+        /// `tick_with` re-roll into an exhausted pool without wiring in the
+        /// real picker.
+        spawn_hold: Mutex<Option<(Vec<String>, Option<i64>)>>,
         /// When set, every `seed` fails (the fail-closed seed path — a member that
         /// can't be given its baton is not spawned).
         fail_seed: AtomicBool,
@@ -4422,6 +4454,11 @@ mod tests {
         /// Force every subsequent `spawn` to fail (the fail-closed path).
         fn set_fail_spawn(&self, fail: bool) {
             self.fail_spawn.store(fail, Ordering::SeqCst);
+        }
+        /// Slice 009 F1 — arm every subsequent `spawn` to return
+        /// `SpawnKind::Hold` with this payload. Clear by passing `None`.
+        fn set_spawn_hold(&self, hold: Option<(Vec<String>, Option<i64>)>) {
+            *self.spawn_hold.lock().unwrap() = hold;
         }
         /// Force every subsequent `seed` to fail (the fail-closed seed path).
         fn set_fail_seed(&self, fail: bool) {
@@ -4510,6 +4547,9 @@ mod tests {
             self.spawns.lock().unwrap().push(spec.agent.clone());
             self.events.lock().unwrap().push(format!("spawn:{}", spec.agent));
             self.spawned_specs.lock().unwrap().push(spec.clone());
+            if let Some((slots, until)) = self.spawn_hold.lock().unwrap().clone() {
+                return Err(SpawnKind::Hold { slots, until });
+            }
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(SpawnError(format!(
                     "pre-approval generation failed for agent {}",
@@ -10107,6 +10147,99 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// Slice 009 F1+F2 — the re-roll side of `StartOutcome::Hold`. A member
+    /// whose pool's picker stalls on the re-roll:
+    /// - surfaces as `HeldForSlot`, not `SpawnFailed`;
+    /// - never pages `AgentCrashed` (the alert dispatcher's `SpawnFailed`
+    ///   check sees no entry to fire on);
+    /// - extends `rate_limit_holds` ONLY for the slots the picker carried in
+    ///   the payload (F2): a pre-filtered held slot keeps its own, earlier
+    ///   `until` instead of being pushed forward to the surviving slot's
+    ///   longer `until_at`.
+    #[test]
+    fn reroll_into_exhausted_pool_holds_quietly_and_extends_only_the_stalled_slot() {
+        let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+        // slot1 held at t=10_000 (the "pre-filtered" slot in the real picker);
+        // slot2 unheld, armed as the Stall payload (the "survivor").
+        holds.lock().unwrap().extend("slot1", 10_000);
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[(
+                "a1",
+                &["slot1", "slot2"],
+            )])))
+            .with_rate_limit_holds(Arc::clone(&holds));
+        backend.set_profile_tag("a1", Some("slot2"));
+
+        // Tick 0: a1 starts cleanly (no hold scripted yet).
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // Clean continue-exit → re-roll candidate on the next tick.
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+
+        // Arm the backend's re-roll spawn to Stall with slots=["slot2"] only,
+        // reset=50_000 (longer than slot1's own 10_000 hold). This is the
+        // F2-corrected shape: before the fix the error site would have
+        // carried the whole pool, so this test would see slot1's hold
+        // monotonically pushed from 10_000 to 50_000.
+        backend.set_spawn_hold(Some((vec!["slot2".to_string()], Some(50_000))));
+
+        let r1 = loop_.tick(1);
+
+        // F1 — the re-roll surfaces as `HeldForSlot`, never `SpawnFailed`.
+        assert!(
+            r1.rerolls
+                .iter()
+                .any(|o| matches!(o, RerollOutcome::HeldForSlot { agent, slots, until }
+                    if agent == "a1"
+                        && slots == &vec!["slot2".to_string()]
+                        && *until == Some(50_000))),
+            "the re-roll's Stall surfaces as HeldForSlot: {:?}",
+            r1.rerolls,
+        );
+        assert!(
+            !r1.rerolls
+                .iter()
+                .any(|o| matches!(o, RerollOutcome::SpawnFailed { .. })),
+            "a Hold does NOT collapse to SpawnFailed: {:?}",
+            r1.rerolls,
+        );
+
+        // F1 — no `AgentCrashed` alert dispatched (the dispatcher's
+        // `SpawnFailed` check has no entry to page on).
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(
+            alerts.iter().all(|a| !format!("{a:?}").contains("AgentCrashed")),
+            "no `AgentCrashed` page for a pool-stall re-roll (slice 009 F1): {alerts:?}",
+        );
+
+        // F1 — slot2's hold was extended by the drive-loop handler.
+        // F2 — slot1's hold stayed at its own 10_000 (the Stall payload
+        // carried only slot2, so the pre-filtered slot was not pushed
+        // forward to slot2's longer reset).
+        let h = holds.lock().unwrap();
+        assert_eq!(
+            h.held_until("slot1"),
+            Some(10_000),
+            "slot1's hold was NOT extended by slot2's longer reset (slice 009 F2)",
+        );
+        assert_eq!(
+            h.held_until("slot2"),
+            Some(50_000),
+            "slot2's hold was extended to the Stall's `until` (slice 009 F1)",
+        );
+    }
+
     /// Finish-check 3 — restart with per-profile holds already active stays
     /// quiet: no page, no crash, no per-tick spawn. This exercises the LIVE
     /// seed path (claude-login-pool-wiring slice 002 M-B part 1): write
@@ -11604,7 +11737,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             | RerollOutcome::HeldForBackoff { agent, .. }
             | RerollOutcome::HeldNoWork { agent }
             | RerollOutcome::HeldForAdmission { agent, .. }
-            | RerollOutcome::SpawnFailed { agent, .. }) = outcome;
+            | RerollOutcome::SpawnFailed { agent, .. }
+            | RerollOutcome::HeldForSlot { agent, .. }) = outcome;
             assert_ne!(
                 agent, "c1",
                 "slice 008 invariant: the released agent never appears in rerolls",

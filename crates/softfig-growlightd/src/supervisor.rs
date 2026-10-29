@@ -664,6 +664,29 @@ pub enum RerollOutcome {
         /// The backend's error text.
         error: String,
     },
+    /// The backend's picker refused every pool slot the admission check could
+    /// try ([`SpawnKind::Hold`] — claude-login-pool-wiring slice 009 F1). The
+    /// hold is on the SLOT, not the agent: unlike [`Self::SpawnFailed`] it is
+    /// NOT an operator alert, does NOT bump the crash backoff, and does NOT
+    /// extend `not_before`. The drive loop extends a
+    /// [`crate::rate_limit_holds::RateLimitHolds`] entry per slot so the next
+    /// tick's admission check short-circuits via `member_fully_held` without
+    /// re-running the picker (the per-tick spin fix mirrors
+    /// [`StartOutcome::Hold`]'s start-side handling).
+    HeldForSlot {
+        /// The held agent's id.
+        agent: String,
+        /// The pool slots the picker found exhausted this tick. Carries only
+        /// the slots the Stall actually ran against — the F2 fix of the
+        /// picker site at [`crate::claude_backend`] narrows the payload here
+        /// too, so a slot the pre-filter dropped (its hold already live) does
+        /// not have that hold pushed forward to the surviving slot's reset.
+        slots: Vec<String>,
+        /// Earliest 5h/7d window reset instant the picker saw across the
+        /// stalled slots, or `None` when no slot carried a boundary (the drive
+        /// loop then extends with a staleness bound).
+        until: Option<i64>,
+    },
 }
 
 /// One supervised agent's live state.
@@ -1554,7 +1577,21 @@ impl Supervisor {
                     sup.child = Some(child);
                     out.push(RerollOutcome::Rerolled { agent });
                 }
-                Err(e) => {
+                // Backend's picker refused every pool slot the admission check
+                // could try (claude-login-pool-wiring slice 009 F1). This is
+                // the re-roll side of `start_claiming`'s `StartOutcome::Hold`
+                // (supervisor.rs:936): the hold is on the slot, not the agent,
+                // so do NOT bump `consecutive_failures`, do NOT extend
+                // `not_before`, do NOT emit `SpawnFailed` (the drive-loop
+                // alert dispatcher pages `AgentCrashed` on every
+                // `SpawnFailed`). The drive-loop handler for `HeldForSlot`
+                // extends `rate_limit_holds` per slot so next tick's
+                // admission check short-circuits via `member_fully_held`
+                // without re-running the picker.
+                Err(SpawnKind::Hold { slots, until }) => {
+                    out.push(RerollOutcome::HeldForSlot { agent, slots, until });
+                }
+                Err(SpawnKind::Failed(e)) => {
                     let backoff = self.backoff;
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");
                     sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
@@ -1594,6 +1631,10 @@ mod tests {
     struct FakeBackend {
         spawns: Mutex<Vec<String>>,
         fail: AtomicBool,
+        /// Claude-login-pool-wiring slice 009 F1 — when set, every spawn
+        /// returns `SpawnKind::Hold` carrying this payload. Models an
+        /// exhausted pool at the backend's picker boundary.
+        hold: Mutex<Option<(Vec<String>, Option<i64>)>>,
         kills: Arc<AtomicUsize>,
     }
 
@@ -1613,11 +1654,19 @@ mod tests {
         fn set_fail(&self, fail: bool) {
             self.fail.store(fail, Ordering::SeqCst);
         }
+        /// Slice 009 F1 — arm the backend to return `SpawnKind::Hold` with
+        /// this payload on every spawn. Clear by passing `None`.
+        fn set_hold(&self, hold: Option<(Vec<String>, Option<i64>)>) {
+            *self.hold.lock().unwrap() = hold;
+        }
     }
 
     impl AgentBackend for Arc<FakeBackend> {
         fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
+            if let Some((slots, until)) = self.hold.lock().unwrap().clone() {
+                return Err(SpawnKind::Hold { slots, until });
+            }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(SpawnError("backend down".into()).into());
             }
@@ -1717,6 +1766,63 @@ mod tests {
             }
         );
         assert_eq!(backend2.spawn_count(), 0, "a refused start never spawns");
+    }
+
+    /// Slice 009 F1 — a re-roll into an exhausted pool surfaces as
+    /// `HeldForSlot` (NOT `SpawnFailed`), does NOT bump `consecutive_failures`,
+    /// does NOT extend `not_before`, and leaves the member re-rollable the
+    /// moment the hold clears — mirroring `start_claiming`'s `StartOutcome::Hold`
+    /// handling.
+    #[test]
+    fn tick_with_hold_err_does_not_page_or_backoff() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        // Admit + cleanly exit so the member becomes a re-roll candidate with
+        // `consecutive_failures = 0` and `not_before = now`.
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        s.poll("a1", AgentHealth::Exited { code: 0 }, None, 10);
+        assert!(!s.is_running("a1"), "the clean exit left the agent down");
+        assert_eq!(s.failures("a1"), 0, "a clean exit cleared the streak");
+
+        // Arm the backend to Hold on the re-roll (the exhausted-pool shape).
+        backend.set_hold(Some((
+            vec!["slot1".to_string(), "slot2".to_string()],
+            Some(42_000),
+        )));
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work);
+        assert_eq!(
+            out,
+            vec![RerollOutcome::HeldForSlot {
+                agent: "a1".into(),
+                slots: vec!["slot1".to_string(), "slot2".to_string()],
+                until: Some(42_000),
+            }],
+            "the Hold shape surfaces, carrying the slots and reset",
+        );
+        assert_eq!(
+            s.failures("a1"),
+            0,
+            "a Hold does NOT bump the crash streak (slot-not-agent invariant)",
+        );
+        // No `SpawnFailed` ⇒ the drive-loop alert dispatcher sees no entry to
+        // page `AgentCrashed` for. (The dispatcher itself is tested at the
+        // drive-loop level, below.)
+        assert!(
+            !matches!(out[0], RerollOutcome::SpawnFailed { .. }),
+            "a Hold never surfaces as SpawnFailed",
+        );
+
+        // Clear the hold and tick again at the SAME instant — a spawn succeeds
+        // (and the agent re-rolls), proving `not_before` was NOT extended by
+        // the Hold branch. Had the Hold path bumped backoff, this tick would
+        // read `HeldForBackoff` instead.
+        backend.set_hold(None);
+        let out2 = s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work);
+        assert_eq!(
+            out2,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "same-instant re-roll proves not_before stayed put through the Hold",
+        );
     }
 
     /// `start` surfaces a backend launch failure as `SpawnFailed` and registers
