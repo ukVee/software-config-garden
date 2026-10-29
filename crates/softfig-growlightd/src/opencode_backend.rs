@@ -108,7 +108,7 @@ use crate::hub::EventHub;
 use crate::opencode_ledger::SessionLedger;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::AgentPaths;
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 
 // Imports for the test-only opencode-shaped `pump` seam below, which wires
 // borrowed cells into the harness's line loop so a fixture drives the real
@@ -750,7 +750,7 @@ impl BackendFlavor for OpencodeFlavor {
         &self,
         _agent: &str,
         paths: &AgentPaths,
-    ) -> Result<Vec<EnvChange>, crate::supervisor::SpawnError> {
+    ) -> Result<Vec<EnvChange>, SpawnKind> {
         Ok(vec![(
             OPENCODE_CONFIG_ENV.into(),
             Some(paths.opencode_config.clone().into_os_string()),
@@ -941,7 +941,7 @@ impl OpencodeBackend {
 }
 
 impl AgentBackend for Arc<OpencodeBackend> {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         self.harness.spawn(spec)
     }
 }
@@ -1743,6 +1743,9 @@ mod tests {
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
         let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
+        let SpawnKind::Failed(err) = err else {
+            panic!("preapproval generation failure must fail hard, never Hold: {err:?}");
+        };
         assert!(
             err.0.contains("opencode pre-approval generation failed"),
             "fail-closed spawn error names its own generator: {err}",

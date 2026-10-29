@@ -55,7 +55,7 @@ use std::thread;
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
 use crate::preapproval::AgentPaths;
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 
 /// Sentinel in [`AgentHealthState::exit_code`] meaning "still running".
 const NOT_EXITED: i64 = i64::MIN;
@@ -390,6 +390,21 @@ pub type EnvChange = (OsString, Option<OsString>);
 /// `Debug + Send + Sync` because the harness holds it behind an `Arc` shared with
 /// every spawn's reader thread.
 pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
+    /// Pre-spawn admission preflight — the hook that lets a backend's own
+    /// picker refuse a spawn BEFORE any pre-approval files are rewritten
+    /// (claude-login-pool-wiring slice 002 M-B part 2). The harness calls this
+    /// FIRST, before [`generate_preapproval`](Self::generate_preapproval), so
+    /// an `Err([`SpawnKind::Hold`])` keeps `inject.sh`/`loop.json`/`mcp.json`
+    /// unchanged on a per-profile exhaustion — the per-tick file churn fix.
+    ///
+    /// The default is `Ok(())`: a backend without a per-spawn picker (opencode,
+    /// a bare claude flavor with no `profile_pool`) runs no preflight and
+    /// cannot stall this way. ClaudeFlavor overrides to run its pool-slot
+    /// picker here and cache the pick for [`child_env`](Self::child_env).
+    fn preflight(&self, _agent: &str) -> Result<(), crate::supervisor::SpawnKind> {
+        Ok(())
+    }
+
     /// Generate THIS agent's pre-approval BEFORE exec, fail-closed (§15): a
     /// headless agent errors out on the first un-approved tool, so an agent whose
     /// pre-approval can't be written must NOT be spawned. The `Err` becomes the
@@ -441,7 +456,11 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
     /// Called before the spawn, which may still fail: anything that must only
     /// be recorded for a session that really started belongs in
     /// [`spawned`](Self::spawned).
-    fn child_env(&self, agent: &str, paths: &AgentPaths) -> Result<Vec<EnvChange>, SpawnError>;
+    fn child_env(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+    ) -> Result<Vec<EnvChange>, crate::supervisor::SpawnKind>;
 
     /// The directory the child runs in, or `None` to inherit growlightd's own.
     /// Constant per backend, so it takes no per-spawn input.
@@ -900,7 +919,13 @@ impl Harness {
     /// detached reader threads (stdout → observer, stderr → ring).
     ///
     /// The [`AgentBackend`] contract — see that trait for the supervisor's side.
-    pub fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    pub fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
+        // Admission preflight (claude-login-pool-wiring slice 002 M-B part 2):
+        // run the backend's own picker BEFORE regenerating the pre-approval, so
+        // a per-profile exhaustion short-circuits as `SpawnKind::Hold` without
+        // rewriting `inject.sh`/`loop.json`/`mcp.json` this tick. Default is
+        // `Ok(())`; ClaudeFlavor runs its pool-slot picker here.
+        self.flavor.preflight(&spec.agent)?;
         // §15 fail-closed pre-approval: generate THIS agent's config BEFORE exec.
         // A headless agent errors out on the first un-approved tool, so an agent
         // whose pre-approval can't be generated must NOT be spawned — the Err
@@ -1102,7 +1127,7 @@ impl Harness {
 /// The harness IS the [`AgentBackend`] once a flavor is bound — a concrete backend
 /// forwards its own `impl` here (see [`crate::claude_backend`]).
 impl AgentBackend for Harness {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         Harness::spawn(self, spec)
     }
 }
@@ -1427,7 +1452,11 @@ mod tests {
             ) -> Vec<OsString> {
                 vec!["true".into()]
             }
-            fn child_env(&self, _agent: &str, _paths: &AgentPaths) -> Result<Vec<EnvChange>, SpawnError> {
+            fn child_env(
+                &self,
+                _agent: &str,
+                _paths: &AgentPaths,
+            ) -> Result<Vec<EnvChange>, SpawnKind> {
                 Ok(vec![("CLAUDE_CONFIG_DIR".into(), None)])
             }
             fn working_dir(&self) -> Option<PathBuf> {
@@ -1455,7 +1484,10 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
         );
         let spec = AgentSpec::new("a1", tmp.path().join("l.json"), tmp.path().join("m.json"));
-        let err = harness.spawn(&spec).expect_err("a missing cwd fails the launch");
+        let err = harness
+            .spawn(&spec)
+            .expect_err("a missing cwd fails the launch")
+            .into_failed();
         assert!(err.0.contains("failed to launch agent a1"), "{err}");
         assert_eq!(flavor.spawned.load(Ordering::Relaxed), 0, "no session, no commit");
         assert!(live.lock().unwrap().is_empty(), "no live scope recorded either");

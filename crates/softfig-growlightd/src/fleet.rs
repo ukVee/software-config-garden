@@ -44,7 +44,7 @@
 //! stays off until `growlight-verify-merge` enables it on-device.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -822,7 +822,21 @@ pub fn assemble_fleet(
     // stderr, budget and spawn all reach the SAME backend for a given member. The
     // shared registries stay fleet-wide inside `build_member_backends`, or the
     // daemon's kill / `set_resources` paths would stop reaching some members.
-    let router = Arc::new(build_member_backends(daemon, fleet, &agents_dir, &garden_root));
+    // Shared rate-limit hold map (claude-login-pool-wiring slice 003 M-C): a
+    // single `Arc<Mutex<RateLimitHolds>>` the DriveLoop extends and the claude
+    // backend's `pick_pool_slot` pre-filter reads. Both sides share one view, so
+    // a stdout-only 429 (no on-disk `rate_limit_event`) immediately deprioritises
+    // the held slot in the next pick — not just once `member_fully_held` short-
+    // circuits the whole member.
+    let rate_limit_holds =
+        Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+    let router = Arc::new(build_member_backends(
+        daemon,
+        fleet,
+        &agents_dir,
+        &garden_root,
+        Arc::clone(&rate_limit_holds),
+    ));
     // Let `status` see the SAME router (slice 006). Registered here rather than in
     // `main` so the observation seam cannot be forgotten or built twice: the view
     // the operator reads is literally the table the loop routes through.
@@ -880,7 +894,19 @@ pub fn assemble_fleet(
     // same keeperd docs the queue source pulls.
     .with_repo_probe(Box::new(KeeperdRepoProbe::new(keeperd_socket.to_path_buf())))
     // Per-member admission profiles (slice 009): see the construction above.
-    .with_profile_resolver(Box::new(profile_resolver)))
+    .with_profile_resolver(Box::new(profile_resolver))
+    // On-disk per-slot rate-limit holds (claude-login-pool-wiring slice 002
+    // M-B part 1): the drive loop seeds the hold map from
+    // `usage.by-profile/<slot>.json` on its first tick and re-scans every N
+    // ticks, so a daemon restart with an exhausted account picks the hold up
+    // instead of spinning the picker's `PickResult::Stall` on every tick.
+    .with_usage_by_profile_dir(Some(runtime_growlight_dir().join(BY_PROFILE_SUBDIR)))
+    // Shared rate-limit hold map (claude-login-pool-wiring slice 003 M-C): the
+    // DriveLoop extends through the SAME `Arc<Mutex<RateLimitHolds>>` the
+    // claude backend's pool-slot picker reads. Without this call the DriveLoop
+    // keeps its own owned map (the pre-slice-003 posture) and the backend's
+    // pre-filter degrades to credential-only.
+    .with_rate_limit_holds(rate_limit_holds))
     .map(|drive| {
         // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
         // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a
@@ -930,13 +956,14 @@ fn build_member_backends(
     fleet: &FleetConfig,
     agents_dir: &Path,
     garden_root: &Path,
+    rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
 ) -> BackendRouter {
     let mut router = BackendRouter::new();
     let mut claude: Option<Arc<ClaudeBackend>> = None;
     for member in &fleet.members {
         let handle = match &member.backend {
             MemberBackend::Claude { .. } => BackendHandle::Claude(Arc::clone(claude.get_or_insert_with(
-                || Arc::new(build_claude_backend(daemon, fleet, agents_dir, garden_root)),
+                || Arc::new(build_claude_backend(daemon, fleet, agents_dir, garden_root, Arc::clone(&rate_limit_holds))),
             ))),
             MemberBackend::Opencode(model) => BackendHandle::Opencode(Arc::new(
                 build_opencode_backend(daemon, fleet, agents_dir, garden_root, model),
@@ -957,6 +984,7 @@ fn build_claude_backend(
     fleet: &FleetConfig,
     agents_dir: &Path,
     garden_root: &Path,
+    rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
 ) -> ClaudeBackend {
     ClaudeBackend::new(
         fleet.bin.clone(),
@@ -1012,6 +1040,11 @@ fn build_claude_backend(
     // member follows the store's `active` slot at each spawn, which is `home`
     // — no env, byte-identical to pre-switcher — until the human migrates.
     .with_profiles(claude_profile_context(fleet, agents_dir))
+    // Shared rate-limit hold map (claude-login-pool-wiring slice 003 M-C): the
+    // pool-slot picker's pre-filter reads the SAME map the drive loop extends
+    // (built once in `assemble_fleet` and cloned here), so a stdout-only 429
+    // (no on-disk `rate_limit_event`) deprioritises its slot immediately.
+    .with_holds_view(rate_limit_holds)
 }
 
 /// Collect the claude members' `profile_pool` roster into a
@@ -1317,6 +1350,13 @@ mod tests {
 
     fn daemon() -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
+    }
+
+    /// A fresh shared hold handle for `build_member_backends` tests
+    /// (claude-login-pool-wiring slice 003 M-C). These tests exercise the
+    /// router shape, not the picker, so an empty handle is fine.
+    fn test_holds() -> Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>> {
+        Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()))
     }
 
     fn member_toml() -> &'static str {
@@ -2013,7 +2053,7 @@ agent = "reviewer"
         let d = daemon();
         let cfg = mixed_roster();
         let agents = Path::new("/cfg/agents");
-        let router = build_member_backends(&d, &cfg, agents, Path::new("/garden"));
+        let router = build_member_backends(&d, &cfg, agents, Path::new("/garden"), test_holds());
 
         // 1. Each member's argv is its OWN backend's — the only honest proof that a
         //    member routes where the operator asked, short of spawning it.
@@ -2101,7 +2141,7 @@ agent = "reviewer"
         // silently, since nothing else observes them. Counting the daemon's Arc is
         // the structural proof: a fresh cell would not bump it.
         let d = daemon();
-        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
         let backends = router.distinct().len();
         // The claude flavor reads `live_scopes` too (claude-login-switcher slice
         // 007: a live member's slot is demoted for the next pick), so each claude
@@ -2136,7 +2176,7 @@ agent = "reviewer"
             "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\nmodel = \"deepseek/deepseek-flash\"\n",
         ))
         .unwrap();
-        let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"));
+        let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
         assert_eq!(router.distinct().len(), 2);
         assert!(
             router
@@ -2166,7 +2206,7 @@ agent = "reviewer"
         // member that is in fact burning the shared reserve: a precise inversion of
         // the bug this slice exists to fix.
         let d = daemon();
-        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
 
         // Both metered members do real work (folded through the same
         // `AgentSpendState` methods a streamed step drives).
@@ -2203,7 +2243,7 @@ agent = "reviewer"
         // actively billing at the time — so what is proven is the mechanism, not a
         // restatement of the posture.
         let d = daemon();
-        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden")));
+        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds()));
         opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.07);
         opencode_backend_for(&router, "c").accrue_spend_for_test("c", 2.5);
         assert!(

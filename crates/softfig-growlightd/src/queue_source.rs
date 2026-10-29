@@ -287,6 +287,24 @@ impl QueueSource for KeeperdQueueSource {
             Err(e) => Some(ClaimHold::Unreadable(e)),
         }
     }
+
+    /// The part's item doc content for the `reconcile model-refused` pass
+    /// (claude-login-pool-wiring slice 004 M-E) — the same reader `claim_hold`
+    /// uses, but swallowing the error back to `None`: the reconcile treats
+    /// "unreadable" as "undeclared" so a transient keeperd miss cannot
+    /// spuriously un-park a member. A journal line records the miss so a
+    /// chronic failure stays visible.
+    fn read_item_doc(&self, part: &str) -> Option<String> {
+        match self.docs.read_item_doc(part) {
+            Ok(doc) => doc,
+            Err(e) => {
+                eprintln!(
+                    "growlightd: reconcile model-refused: item doc for {part} unreadable: {e}"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read

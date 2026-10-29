@@ -95,13 +95,26 @@ variant = "max"                          # closed set: low | medium | high | xhi
 - When Claude Code refuses the requested model (`model_not_found` / 404), the
   REFUSING MEMBER parks (its `not_before` is set to `i64::MAX`) with a single
   alert carrying the refusal reason — there is no crash loop and no backoff
-  retry (`claude-model-select` slice 003, 2026-10-23). **Known gap (review 048
-  M-E, tracked in `claude-login-pool-wiring` milestone):** the parked member
-  does not currently release its claim on the ITEM, so that item stays `active`
-  and no sibling member picks it up until a daemon restart. Editing the item's
-  `> Model:` or the roster's model does NOT yet trigger an in-flight
-  re-admission — recovery today needs a `systemctl --user restart
-  softfig-growlightd.service`.
+  retry (`claude-model-select` slice 003, 2026-10-23). The ITEM is parked at
+  the same time (`park_item` through keeperd + `pause_v2_entry` for a v2
+  assignment), the member's claim is released, and its slot is freed, so a
+  sibling member runs other work; the refusing member stays registered and
+  parked (`claude-login-pool-wiring` slice 004 M-E, 2026-10-24). Every
+  subsequent tick runs a reconcile pass that re-reads the item's `> Model:`
+  chain (slice doc → milestone doc) and the live roster through the §6.4
+  resolver, compares the resolved choice to the latched refused one, and —
+  if they differ — **releases the member at an item boundary**
+  (`supervisor.retire` + `aggregator.forget` + the latch drop; slice 008,
+  2026-10-28). The same tick's step 3 then picks + claims + copies a fresh
+  §3.6 baton + spawns on the live-resolved model, so a human edit to the
+  item declaration or the roster model un-parks the member on the next tick
+  with no daemon restart and no stale baton re-roll. A v2 paused entry is
+  pickable by `pick_v2` so an edited entry resumes through a real claim; a
+  legacy `blocked` item stays blocked by default and the freed member moves
+  to the next workable part (the human re-queues the item to re-run it). An
+  unreadable item doc is treated as "undeclared" so a transient keeperd miss
+  cannot spuriously un-park. The single ModelRefused alert is never
+  re-emitted while the park stands.
 - **Known gap (review 048 M-A/M-B/M-C, tracked in `claude-login-pool-wiring`
   milestone):** with `profile_pool` configured, the admission budget rail folds
   fleet-wide (one slot's `allowed_warning` can halt members pooled on other

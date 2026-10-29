@@ -52,7 +52,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -114,6 +114,21 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
     fn claim_hold(&self, _queue: &str, _part: &str) -> Option<ClaimHold> {
         None
     }
+
+    /// The current content of `part`'s item doc (claude-login-pool-wiring slice
+    /// 004 M-E): the milestone's `CLAUDE.md` or the task's `tasks/<id>-*.md`,
+    /// whichever shape `part` is. Read FRESH each tick by the reconcile pass
+    /// that un-parks a model-refused member when its item's `> Model:` has
+    /// moved off the latched refusal. `None` means the doc could not be read
+    /// (keeperd Locked, two docs sharing one task number, a sealed region
+    /// hiding the metadata, no such id); the reconcile treats "unreadable"
+    /// exactly like "undeclared" — i.e. it falls back to the member default,
+    /// so a transient read miss never spuriously un-parks. Defaults to `None`
+    /// so a test source that never serves an item doc keeps the pre-slice-004
+    /// shape of "no reconcile un-park ever fires".
+    fn read_item_doc(&self, _part: &str) -> Option<String> {
+        None
+    }
 }
 
 /// How long a claim hold found by the claim-time marker read is trusted before
@@ -131,6 +146,19 @@ pub const HOLD_RECHECK_SECS: i64 = 60;
 /// about half a minute, which the refusal text and protocol-fleet step 7c tell
 /// a member to wait out.
 pub const CLAIM_REASSERT_SECS: i64 = 30;
+
+/// Period (in ticks) between re-scans of the on-disk per-slot usage directory
+/// into [`RateLimitHolds`](crate::rate_limit_holds::RateLimitHolds), when the
+/// live assembly points the loop at one via
+/// [`DriveLoop::with_usage_by_profile_dir`] (claude-login-pool-wiring slice 002
+/// M-B part 1). The first tick runs the seed (count ≡ 0), and every N-th tick
+/// thereafter re-scans so a sibling writer — an interactive statusline, slice
+/// 009's per-slot capture — reaches admission within one window on a running
+/// daemon. Not inotify-driven: on a 1-tick/second loop this is roughly every
+/// ten seconds, which is dense enough that a race between the file write and
+/// a member spawn almost never catches the member's picker before the hold
+/// lands, and sparse enough that a quiet fleet is not thrashing the disk.
+pub const RESCAN_USAGE_BY_PROFILE_EVERY_TICKS: u64 = 10;
 
 /// The seam the loop **claims** a picked part through before spawning its agent
 /// — the WRITE counterpart to [`QueueSource`]'s read. Marking the part `active`
@@ -1036,6 +1064,30 @@ pub struct Assignment {
     pub part: String,
 }
 
+/// A `ModelRefused` park's latched identity (claude-login-pool-wiring slice 005
+/// M-F): the park/release arm in each mode (legacy and v2) inserts the matching
+/// variant into [`DriveLoop::model_refused_items`] alongside its own
+/// `assignments.remove` / `v2_assignments.remove`, and
+/// [`DriveLoop::reconcile_model_refused`] dispatches on it to re-walk the
+/// identity's live `> Model:` chain through the right source.
+///
+/// Keyed per parked agent in that map. Slice 004 shipped only the legacy shape
+/// (so v2 members fell through the reconcile's defensive un-park and silently
+/// re-admitted the refused model — code-review 049 F1); slice 005 adds the v2
+/// variant and teaches reconcile to dispatch on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelRefusedPart {
+    /// A legacy queue backlog part, addressed the same way as [`Assignment`]:
+    /// resolved via [`QueueSource::read_item_doc`] against the latched
+    /// `(queue, part)`.
+    Legacy { queue: String, part: String },
+    /// A v2 entry, addressed by its top-level entry id (the `V2Assignment::entry`
+    /// shape, §3.6): resolved via a fresh [`crate::v2_source::V2Source`] load
+    /// walked with [`crate::scheduler_v2::next_unit`], mirroring the admission
+    /// path's [`resolve_v2_model`] over a live snapshot.
+    V2 { entry: String },
+}
+
 /// A queue-v2 scheduler assignment (queue-v2-scheduling slice 006): which agent
 /// was started on which `(entry, unit)` with which resolved model — spec §12's
 /// "assignment carries entry + unit + resolved model". Sits BESIDE the legacy
@@ -1368,6 +1420,17 @@ pub struct DriveLoop {
     /// owns lifecycle (it knows the agent, not its part); the loop owns the
     /// assignment (it did the claim), so the part lookup lives here.
     assignments: std::collections::BTreeMap<String, (String, String)>,
+    /// Members parked on a `ModelRefused` exit, each with the identity they
+    /// were working at refusal time (claude-login-pool-wiring slice 004 M-E,
+    /// extended by slice 005 M-F for v2). Latched by the `ModelRefused` arm
+    /// alongside its removal from `assignments`/`v2_assignments` (both
+    /// removes are mutually exclusive per member — the two maps never carry
+    /// the same agent). [`Self::reconcile_model_refused`] reads it each tick
+    /// to re-resolve the identity's `> Model:` chain through the matching
+    /// source (keeperd's legacy snapshot for `Legacy`, the v2 source's
+    /// assembled snapshot for `V2`), and drops the entry when the park lifts.
+    /// In memory only, so a daemon restart falls back to `reconcile_on_boot`.
+    model_refused_items: std::collections::BTreeMap<String, ModelRefusedPart>,
     /// The v2 scheduling seams (slice 006) — the v2 source, the per-entry baton
     /// store, the member-baton writer, and the v2 claimer/parker. `None` = a
     /// legacy loop (nothing to consult); a loop whose daemon reads
@@ -1442,7 +1505,7 @@ pub struct DriveLoop {
     /// resume, task 037, now per-profile). An opencode member contributes no hold
     /// here — opencode gating is a separate path. See
     /// [`crate::rate_limit_holds::RateLimitHolds`] for the value core.
-    rate_limit_holds: crate::rate_limit_holds::RateLimitHolds,
+    rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     /// Per-member admission profile resolver (slice 008). Admission reads
     /// `profiles_resolver.admission_profiles(agent)` and gates each member on
     /// `rate_limit_holds.member_fully_held(profiles)` — a pooled member whose
@@ -1451,6 +1514,24 @@ pub struct DriveLoop {
     /// [`AssumeHomeProfile`] so every loop built through [`Self::new`] without
     /// a resolver keeps the pre-switcher single-slot key.
     profiles_resolver: Box<dyn ProfileResolver>,
+    /// On-disk per-slot usage directory
+    /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`), set once by
+    /// the live assembly for claude-login-pool-wiring slice 002 M-B part 1.
+    /// `None` keeps the pre-switcher posture: `rate_limit_holds` starts empty
+    /// and only extends from live `rate_limit_event` reports. `Some(dir)`
+    /// seeds the holds on the first tick and re-scans every
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`] ticks thereafter, so a sibling
+    /// writer (an interactive statusline, slice 009's per-slot capture) reaches
+    /// admission within one re-scan window.
+    usage_by_profile_dir: Option<PathBuf>,
+    /// Tick counter for the periodic
+    /// [`RateLimitHolds::rescan_from_disk`](crate::rate_limit_holds::RateLimitHolds::rescan_from_disk)
+    /// pass (slice 002 M-B part 1). Reset only on
+    /// [`DriveLoop::new`]/`with_usage_by_profile_dir`, bumped every tick, and
+    /// gates the re-scan at `tick_count % N == 0` so a busy 1-tick/second loop
+    /// never thrashes the disk on `rejected`-less idle windows. The seed is
+    /// the `== 0` case — the first tick re-scans before admission runs.
+    rescan_tick_count: u64,
     /// The stale-binary guard's on-disk identity probe (task 039). Re-statted each
     /// tick and compared to `exe_baseline`; the live [`SystemExeProbe`] in production
     /// (re-stats growlightd's captured launch path), a scripted fake in tests.
@@ -1542,6 +1623,7 @@ impl DriveLoop {
             stopped: BTreeSet::new(),
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
+            model_refused_items: std::collections::BTreeMap::new(),
             v2: None,
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
@@ -1556,8 +1638,10 @@ impl DriveLoop {
             last_claim_reassert: None,
             offline_since: None,
             offline_alerted: false,
-            rate_limit_holds: crate::rate_limit_holds::RateLimitHolds::new(),
+            rate_limit_holds: Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new())),
             profiles_resolver: Box::new(AssumeHomeProfile),
+            usage_by_profile_dir: None,
+            rescan_tick_count: 0,
             exe_probe,
             exe_baseline: None,
             binary_superseded: false,
@@ -1591,6 +1675,47 @@ impl DriveLoop {
     #[must_use]
     pub fn with_profile_resolver(mut self, resolver: Box<dyn ProfileResolver>) -> Self {
         self.profiles_resolver = resolver;
+        self
+    }
+
+    /// Install a shared rate-limit hold map (claude-login-pool-wiring slice
+    /// 003 M-C) in place of the owned default. The fleet assembly builds the
+    /// `Arc<Mutex<RateLimitHolds>>` and hands a clone to
+    /// [`crate::claude_backend::ClaudeBackend::with_holds_view`] so the
+    /// pool-slot picker's pre-filter reads the SAME map the drive loop
+    /// extends — the only live source for a stdout-only 429 (no on-disk
+    /// `rate_limit_event`) whose seed-from-disk path can't see it. A builder
+    /// like [`with_profile_resolver`](Self::with_profile_resolver), so the
+    /// 15-arg [`new`](Self::new) and every pre-slice-003 test stay unchanged
+    /// (the default owned map keeps the pre-slice-003 posture).
+    #[must_use]
+    pub fn with_rate_limit_holds(
+        mut self,
+        holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
+    ) -> Self {
+        self.rate_limit_holds = holds;
+        self
+    }
+
+    /// Point the loop at the on-disk per-slot usage directory
+    /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`) so a daemon
+    /// restart re-derives per-slot rate-limit holds instead of booting with an
+    /// empty map (claude-login-pool-wiring slice 002 M-B part 1). The first
+    /// tick runs
+    /// [`RateLimitHolds::seed_from_disk`](crate::rate_limit_holds::RateLimitHolds::seed_from_disk)
+    /// against `dir` before admission reads the hold map; every
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`]-th tick thereafter re-scans so a
+    /// sibling writer (slice 009's per-slot capture, an interactive
+    /// statusline) reaches admission without a daemon bounce.
+    ///
+    /// A builder like
+    /// [`with_profile_resolver`](Self::with_profile_resolver): the 15-arg
+    /// [`new`](Self::new) and every pre-slice-002 test stays unchanged (the
+    /// default `None` keeps the empty-map posture).
+    #[must_use]
+    pub fn with_usage_by_profile_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.usage_by_profile_dir = dir;
+        self.rescan_tick_count = 0;
         self
     }
 
@@ -1646,6 +1771,20 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        // Per-slot rate-limit hold re-scan (slice 002 M-B part 1). First tick
+        // seeds from disk BEFORE any admission read; a non-first tick re-scans
+        // every N ticks so a sibling writer reaches admission without a daemon
+        // bounce. Runs before `paused` is read because `paused` does not gate
+        // disk I/O; the admission step itself (step 2/3 below) is paused.
+        if let Some(dir) = self.usage_by_profile_dir.clone() {
+            if self
+                .rescan_tick_count
+                .is_multiple_of(RESCAN_USAGE_BY_PROFILE_EVERY_TICKS)
+            {
+                self.rate_limit_holds.lock().unwrap().rescan_from_disk(&dir, now);
+            }
+            self.rescan_tick_count = self.rescan_tick_count.saturating_add(1);
+        }
         // Which queue each member was draining as this tick began — read by the
         // fallback reservation (task 068) so a member released by step 1 still
         // holds its pinned queue for its own step-3 pick this same tick.
@@ -1764,7 +1903,7 @@ impl DriveLoop {
                 // folds into `home` — the back-compat key that equals the
                 // pre-switcher single global hold.
                 let profile = self.samples.profile_for(agent).unwrap_or_else(|| "home".into());
-                self.rate_limit_holds.extend(profile, reopen);
+                self.rate_limit_holds.lock().unwrap().extend(profile, reopen);
             }
             if self.supervisor.is_running(agent) {
                 if let Some(budget) = self.samples.budget(agent) {
@@ -1796,8 +1935,41 @@ impl DriveLoop {
         // that pass extends the hold from the stdout stream error's `resets_at`, and
         // the elapsed-clear must run against the extended value or a freshly-pinned
         // hold would be wiped the same tick it was set.)
-        self.rate_limit_holds.clear_elapsed(now);
-        let budget = self.aggregator.aggregate_or_fresh_at(now);
+        self.rate_limit_holds.lock().unwrap().clear_elapsed(now);
+        // Admission's budget fold is PER-MEMBER (slice 001 M-A, review 048):
+        // key the 5h/7d max on the admitting member's claude-login profile
+        // (`samples.profile_for(agent).unwrap_or("home")`, the same resolution
+        // the step-0 + health-pass hold-set sites use) so one slot's
+        // `allowed_warning` cannot halt a sibling pooled on a different slot.
+        // Unpooled / untagged fleets collapse to the pre-switcher fleet-wide
+        // fold through the `"home"` back-compat key. The §9 near-exhaustion
+        // alert below stays fleet-wide — it is a shared-pool fact.
+        //
+        // Pre-compute into an owned map now (while nothing else is borrowing
+        // `self.aggregator` / `self.samples`) so the admission call sites —
+        // which take `&mut self.supervisor` and sibling `&mut self.*` paths —
+        // can look up per-agent budgets without holding a live borrow across
+        // the whole tick body. An agent outside `fleet` falls back to the
+        // fleet-wide fold (symmetric with the pre-switcher behaviour).
+        let per_member_budget: std::collections::HashMap<String, BudgetUsage> = fleet
+            .iter()
+            .map(|m| {
+                let agent = m.spec.agent.clone();
+                let profile = self
+                    .samples
+                    .profile_for(&agent)
+                    .unwrap_or_else(|| "home".into());
+                let b = self.aggregator.aggregate_or_fresh_for_profile_at(&profile, now);
+                (agent, b)
+            })
+            .collect();
+        let budget_fleetwide = self.aggregator.aggregate_or_fresh_at(now);
+        let budget_for = |agent: &str| -> BudgetUsage {
+            per_member_budget
+                .get(agent)
+                .copied()
+                .unwrap_or(budget_fleetwide)
+        };
         let rate = self.rate.rate(now);
 
         // Parts item-parked this tick (a member exited on a human-block): collected
@@ -2184,7 +2356,7 @@ impl DriveLoop {
                                 .samples
                                 .profile_for(agent)
                                 .unwrap_or_else(|| "home".into());
-                            self.rate_limit_holds.extend(profile, reopen);
+                            self.rate_limit_holds.lock().unwrap().extend(profile, reopen);
                         }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
@@ -2193,22 +2365,71 @@ impl DriveLoop {
                         }
                     }
                     PollOutcome::ModelRefused { event, reason } => {
-                        // claude-model-select slice 003: the backend refused the
-                        // configured `--model`. The member is parked indefinitely
+                        // claude-model-select slice 003 + claude-login-pool-wiring
+                        // slice 004 (M-E): the backend refused the configured
+                        // `--model`. The member is parked indefinitely
                         // (`not_before = i64::MAX` in the supervisor); a visible
                         // alert naming the reason fires so the human sees it. No
-                        // retry will succeed until the roster/item declaration is
-                        // edited and the daemon re-admits the member. The alert
-                        // is dispatched exactly like a crash alert (same channel,
-                        // same shape), with the stream-error text replacing the
-                        // bare `systemd-run` banner so the message names the
-                        // model and the API's refusal reason.
+                        // retry will succeed until the roster or item declaration
+                        // is edited — and per slice 004 the per-tick reconcile
+                        // pass ([`Self::reconcile_model_refused`]) un-parks the
+                        // member the moment that happens, with NO daemon restart.
+                        //
+                        // Slice 004: park the ITEM too (not just the member) and
+                        // release the slot — mirroring the clean-exit-parks arm
+                        // for `Blocked` above (`park_item` + `pause_v2_entry` +
+                        // the `assignments`/`v2_assignments` removes). Both
+                        // writes are fail-soft: the member is already parked at
+                        // the supervisor and the alert still fires, so a keeperd
+                        // miss means a re-attempt on the next cycle rather than
+                        // a stuck slot.
+                        //
+                        // The alert itself is dispatched exactly like a crash
+                        // alert (same channel, same shape), with the stream-error
+                        // text replacing the bare `systemd-run` banner so the
+                        // message names the model and the API's refusal reason.
+                        // The slice doc is explicit about the alert staying SINGLE
+                        // (not spammy) — the reconcile below MUST NOT re-emit it.
                         let event = event
                             .with_stdout_error(Some(format!("model refused: {reason}")))
                             .with_stderr_tail(filter_systemd_banner(
                                 &self.stderr.stderr_tail(agent),
                             ));
                         report.crashes.push(event);
+                        // Slice 005 M-F: EACH branch inserts its matching
+                        // ModelRefusedPart variant alongside its own `remove`.
+                        // The two branches are mutually exclusive per member
+                        // (one assignments map carries each agent), so only
+                        // one insert fires per park. Slice 004 only populated
+                        // the legacy variant, which left the v2 reconcile
+                        // missing the latch and silently un-parking (review
+                        // 049 F1) — same tight spawn/park loop and per-tick
+                        // credit burn the 30-min alert cooldown masked.
+                        let v2_entry = self.v2_assignments.remove(agent);
+                        let legacy_entry = self.assignments.remove(agent);
+                        debug_assert!(
+                            !(v2_entry.is_some() && legacy_entry.is_some()),
+                            "assignments and v2_assignments must not both hold agent {agent} at one tick"
+                        );
+                        if let Some(assignment) = v2_entry {
+                            self.pause_v2_entry(&assignment.entry, agent, &mut report);
+                            self.model_refused_items.insert(
+                                agent.clone(),
+                                ModelRefusedPart::V2 {
+                                    entry: assignment.entry,
+                                },
+                            );
+                        } else if let Some((queue, part)) = legacy_entry {
+                            if let Err(_e) = self.parker.park_item(&queue, &part) {
+                                // Fail-soft (see the Blocked arm's park_item
+                                // comment): the member is already parked at the
+                                // supervisor, the alert still fires, and the
+                                // keeperd write is re-asserted when the reconcile
+                                // un-parks the member and it re-rolls.
+                            }
+                            self.model_refused_items
+                                .insert(agent.clone(), ModelRefusedPart::Legacy { queue, part });
+                        }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -2237,6 +2458,16 @@ impl DriveLoop {
             }
         }
 
+        // Slice 004 M-E: every tick, walk the model-refused park set and
+        // un-park any member whose live `> Model:` resolution has moved off
+        // the latched refusal (a roster or item-doc edit, both covered by
+        // the §6.4 resolver chain). Runs AFTER the health pass so a member
+        // the ModelRefused arm *just* parked gets its first reconcile pass
+        // on the NEXT tick (not the one that parked it); step 2 below is
+        // where a cleared park actually re-rolls. The slice-003 alert is
+        // not re-emitted here — the reconcile keeps the single alert single.
+        self.reconcile_model_refused(now, &fleet);
+
         // A live hold gates spawns this tick (steps 2 + 3), the pre-spawn HOLD twin
         // of `offline`: no re-roll, no fresh start, no backoff, no crash count — the
         // fleet simply waits out the window instead of crash-looping into it.
@@ -2249,7 +2480,7 @@ impl DriveLoop {
         // profile set is *fully* held wait. A sibling member on a different account
         // (or a different pool) is unaffected. The single `earliest()` boundary is
         // what `report.waiting_for_rate_limit_reset` renders for status.
-        report.waiting_for_rate_limit_reset = self.rate_limit_holds.earliest();
+        report.waiting_for_rate_limit_reset = self.rate_limit_holds.lock().unwrap().earliest();
 
         // ---- queue v2 scheduling (slice 006): steps 2 + 3 on the v2 source ----
         //
@@ -2328,7 +2559,7 @@ impl DriveLoop {
                 // held), as is anything `pick_v2` would hand it.
                 if !paused && !offline && !superseded && !bound_reached {
                     let assignments = &self.v2_assignments;
-                    let holds = &self.rate_limit_holds;
+                    let holds = Arc::clone(&self.rate_limit_holds);
                     let profiles_resolver = self.profiles_resolver.as_ref();
                     let workable = |agent: &str| -> bool {
                         // Per-member rate-limit filter (slice 008): a member
@@ -2336,7 +2567,11 @@ impl DriveLoop {
                         // emitted as `HeldNoWork` — zero `AgentCrashed`, zero
                         // crash-backoff. A sibling with any un-held slot keeps
                         // going.
-                        if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                        if holds
+                            .lock()
+                            .unwrap()
+                            .member_fully_held(&profiles_resolver.admission_profiles(agent))
+                        {
                             return false;
                         }
                         let resumes_own = assignments.get(agent).is_some_and(|a| {
@@ -2349,7 +2584,7 @@ impl DriveLoop {
                                 .get(agent)
                                 .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
                     };
-                    report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+                    report.rerolls = self.supervisor.tick(&budget_for, rate, now, &workable);
                     for outcome in &report.rerolls {
                         if let RerollOutcome::Rerolled { agent } = outcome {
                             self.reconnecting.remove(agent);
@@ -2376,6 +2611,8 @@ impl DriveLoop {
                         // elapses on its own at the window's `resets_at`.
                         if self
                             .rate_limit_holds
+                            .lock()
+                            .unwrap()
                             .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                         {
                             continue;
@@ -2477,9 +2714,12 @@ impl DriveLoop {
                         let entries = &v2_seams.entries;
                         let member_writer = &v2_seams.member_writer;
                         let v2_claimer = &v2_seams.claimer;
+                        // Per-member admission budget (slice 001 M-A): fold on
+                        // this member's claude-login profile only.
+                        let member_budget = budget_for(agent);
                         let outcome = self.supervisor.start_claiming(
                             spec,
-                            budget,
+                            member_budget,
                             rate,
                             now,
                             || {
@@ -2519,6 +2759,36 @@ impl DriveLoop {
                                 report.held_starts.push(HeldStart {
                                     agent: agent.clone(),
                                     outcome,
+                                });
+                            }
+                            // Backend picker stalled on an exhausted claude-login
+                            // pool (slice 002 M-B part 2). The claim + baton
+                            // landed inside the start_claiming closure, so keep
+                            // the entry excluded this tick (same as SpawnFailed);
+                            // extend `rate_limit_holds` for every slot the picker
+                            // called exhausted so next tick's admission check
+                            // short-circuits via `member_fully_held` and the
+                            // picker is NOT re-run every tick until the window
+                            // reopens (no per-tick inject.sh/loop.json/mcp.json
+                            // rewrites — the preflight ran before preapproval).
+                            // No `AgentCrashed` alert fires: the dispatcher only
+                            // pages on `SpawnFailed`.
+                            StartOutcome::Hold { slots, until } => {
+                                spoken_for.insert(pick.entry.clone());
+                                let fallback = now
+                                    + crate::profile_budget::STALE_FLOOR_SECS;
+                                {
+                                    let mut holds = self.rate_limit_holds.lock().unwrap();
+                                    for slot in &slots {
+                                        holds.extend(
+                                            slot.clone(),
+                                            until.unwrap_or(fallback),
+                                        );
+                                    }
+                                }
+                                report.held_starts.push(HeldStart {
+                                    agent: agent.clone(),
+                                    outcome: StartOutcome::Hold { slots, until },
                                 });
                             }
                             // Queued / Refused (no claim attempted) or ClaimFailed
@@ -2590,7 +2860,7 @@ impl DriveLoop {
             let assignments = &self.assignments;
             let draining = draining_queues(&draining_at_start, &self.assignments);
             let (retiring, stopped) = (&self.retiring, &self.stopped);
-            let holds = &self.rate_limit_holds;
+            let holds = Arc::clone(&self.rate_limit_holds);
             let profiles_resolver = self.profiles_resolver.as_ref();
             let workable = |agent: &str| -> bool {
                 // Per-member rate-limit filter (slice 008): a member whose
@@ -2598,7 +2868,11 @@ impl DriveLoop {
                 // `HeldNoWork` by `tick_with` — no re-roll, no backoff, no
                 // crash count. A sibling member on a different account keeps
                 // rolling.
-                if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                if holds
+                    .lock()
+                    .unwrap()
+                    .member_fully_held(&profiles_resolver.admission_profiles(agent))
+                {
                     return false;
                 }
                 // A down member's OWN in-progress part is workable — for itself.
@@ -2636,7 +2910,9 @@ impl DriveLoop {
                     boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
                 }
             };
-            report.rerolls = self.supervisor.tick_with(budget, rate, now, &workable, &pre_spawn);
+            report.rerolls =
+                self.supervisor
+                    .tick_with(&budget_for, rate, now, &workable, &pre_spawn);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
             // 002): the fresh session's next exit is a NEW event to classify anew, so a
             // genuine re-crash after a reconnect is never masked by a stale latch.
@@ -2646,6 +2922,26 @@ impl DriveLoop {
                     // A re-roll is a new session on the same claim: re-record
                     // the holder before it can hand off (review 042 G74-5).
                     self.reassert_claim(agent);
+                }
+            }
+            // Re-roll side of `StartOutcome::Hold` (claude-login-pool-wiring
+            // slice 009 F1). The symmetric site of drive_loop.rs:2776 and
+            // :3117: a re-roll into an exhausted pool extends
+            // `rate_limit_holds` per slot so next tick's admission check
+            // short-circuits via `member_fully_held` instead of re-running
+            // the picker. NOT paged `AgentCrashed` (the alert dispatcher at
+            // :3241 only fires on `SpawnFailed`); not crash-backed-off (the
+            // supervisor's Hold arm leaves `consecutive_failures` + `not_before`
+            // untouched). Before this handler the re-roll's Err path collapsed
+            // every `SpawnKind` into `SpawnFailed`, pageing the operator on
+            // every tick a pooled member found its slots exhausted.
+            for outcome in &report.rerolls {
+                if let RerollOutcome::HeldForSlot { slots, until, .. } = outcome {
+                    let fallback = now + crate::profile_budget::STALE_FLOOR_SECS;
+                    let mut holds = self.rate_limit_holds.lock().unwrap();
+                    for slot in slots {
+                        holds.extend(slot.clone(), until.unwrap_or(fallback));
+                    }
                 }
             }
         }
@@ -2701,6 +2997,8 @@ impl DriveLoop {
                 // on its own at the window's `resets_at`.
                 if self
                     .rate_limit_holds
+                    .lock()
+                    .unwrap()
                     .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                 {
                     continue;
@@ -2779,9 +3077,12 @@ impl DriveLoop {
                 let claimer = &self.claimer;
                 let seeder = self.seeder.as_ref();
                 let repo_probe = self.repo_probe.as_ref();
+                // Per-member admission budget (slice 001 M-A): fold on this
+                // member's claude-login profile only.
+                let member_budget = budget_for(agent);
                 let outcome = self.supervisor.start_claiming(
                     member.spec.clone(),
-                    budget,
+                    member_budget,
                     rate,
                     now,
                     || {
@@ -2823,6 +3124,33 @@ impl DriveLoop {
                         report.held_starts.push(HeldStart {
                             agent: agent.clone(),
                             outcome,
+                        });
+                    }
+                    // Backend picker stalled on an exhausted claude-login pool
+                    // (slice 002 M-B part 2). Claim + baton seed already landed
+                    // inside the start_claiming closure, so mark the part held
+                    // (same as SpawnFailed above) and extend the per-slot
+                    // `rate_limit_holds` so the next tick's admission check
+                    // short-circuits via `member_fully_held` — no per-tick
+                    // preapproval rewrites, no `AgentCrashed` alert, no
+                    // crash-backoff streak.
+                    StartOutcome::Hold { slots, until } => {
+                        snapshot.mark_claimed(&queue, &part);
+                        spoken_for.insert((queue, part));
+                        let fallback = now
+                            + crate::profile_budget::STALE_FLOOR_SECS;
+                        {
+                            let mut holds = self.rate_limit_holds.lock().unwrap();
+                            for slot in &slots {
+                                holds.extend(
+                                    slot.clone(),
+                                    until.unwrap_or(fallback),
+                                );
+                            }
+                        }
+                        report.held_starts.push(HeldStart {
+                            agent: agent.clone(),
+                            outcome: StartOutcome::Hold { slots, until },
                         });
                     }
                     // Queued / Refused (no claim attempted) or ClaimFailed (claim
@@ -3018,6 +3346,212 @@ impl DriveLoop {
         }
     }
 
+    /// Reconcile every member parked on a `ModelRefused` exit against the
+    /// *current* `> Model:` chain (claude-login-pool-wiring slice 004 M-E;
+    /// v2 dispatch added by slice 005 M-F — review 049 F1). Called once per
+    /// tick, right after the health pass, so the un-park takes effect at the
+    /// SAME tick's step-2 re-roll with no daemon restart.
+    ///
+    /// For each parked member it:
+    ///
+    /// 1. Reads the latched identity from [`Self::model_refused_items`]. A
+    ///    missing latch is **noisy** — it is logged and the park is left
+    ///    alive until the next roster rebuild. Slice 004 silently un-parked
+    ///    on a miss, which is what masked the v2-latch gap in review 049 F1
+    ///    (a re-admitted member re-spawned with the refused model and
+    ///    re-latched, in a per-tick credit-burn loop the 30-min alert
+    ///    cooldown hid).
+    /// 2. Resolves the identity's live `> Model:` chain through the matching
+    ///    source:
+    ///    - `Legacy { queue, part }` — [`QueueSource::read_item_doc`] against
+    ///      the latched part, same shape as the semi-auto launcher.
+    ///    - `V2 { entry }` — fresh [`V2QueueSource::load`] + the entry's
+    ///      [`crate::scheduler_v2::next_unit`] walk, mirroring the admission
+    ///      path's [`resolve_v2_model`] over a live snapshot.
+    ///
+    ///    Both fall through to the member default (roster model + variant)
+    ///    when nothing is declared or the chain can't be read: a transient
+    ///    keeperd miss, a v2 absent/failed load, or a v2 entry archived since
+    ///    the park all read as "no override" (slice 007, code-review 050 F1).
+    ///    A park whose refusal IS the member default therefore stays parked;
+    ///    one whose refusal came from an item declaration un-parks onto the
+    ///    default. The park already released the member's claim and paused /
+    ///    parked the item (fail-soft).
+    /// 3. Compares the resolved choice against the supervisor's latched
+    ///    [`Supervisor::refused_model`]. On a difference, **releases the
+    ///    member** at the supervisor layer — a `supervisor.retire` plus
+    ///    `aggregator.forget` + `reconnecting.remove` + the latch drop
+    ///    (slice 008, growlight report 090). The same tick's step 3 then
+    ///    sees the member unregistered, picks + claims + makes the §3.6
+    ///    baton copy + spawns with the live-resolved model. Before slice
+    ///    008 this branch only reset `not_before = now` and refreshed
+    ///    `spec.model`, which left step 3 skipping (`is_registered` true)
+    ///    and step 2 re-rolling the member off its stale per-member baton
+    ///    with no fresh claim and no assignment.
+    ///
+    /// A member removed from the roster between park and this tick is
+    /// un-parked here — its `Supervised` entry is still alive from the park,
+    /// but there is no live member to re-resolve against; letting the retire
+    /// pass clean it up next tick is cheaper than pinning the slot. (Legacy
+    /// behavior, unchanged.)
+    ///
+    /// Keeps the slice-003 single alert exactly single: no event is pushed
+    /// onto `report.crashes` here, so a park whose refused model is still
+    /// refused does NOT re-page.
+    fn reconcile_model_refused(&mut self, now: i64, fleet: &[FleetMember]) {
+        let parked = self.supervisor.agents_in_model_refused_park();
+        if parked.is_empty() {
+            return;
+        }
+        // Load the v2 snapshot once per tick, shared across every V2-latched
+        // member. Skipped when nothing V2 is parked (the common path on a
+        // legacy loop). A separate `source.load()` from the v2-mode branch's
+        // own load the same tick is a per-tick file read on the v2 TOML; the
+        // in-source alert-once memory stays quiet on a repeated-same error, so
+        // the second load doesn't double-alert. Absent / Failed falls through
+        // as `None` here, and each V2-latched park then resolves its member
+        // default (same shape as an unreadable legacy item doc).
+        let any_v2 = parked.iter().any(|agent| {
+            matches!(
+                self.model_refused_items.get(agent),
+                Some(ModelRefusedPart::V2 { .. }),
+            )
+        });
+        let v2_snapshot = if any_v2 {
+            self.v2.as_mut().and_then(|seams| match seams.source.load() {
+                V2Load::Snapshot(snapshot) => Some(snapshot),
+                V2Load::Absent | V2Load::Failed { .. } => None,
+            })
+        } else {
+            None
+        };
+        for agent in parked {
+            // The latched identity. On a miss, keep the park alive (slice
+            // 005): the silent defensive un-park is what masked review 049
+            // F1. One journal line per occurrence so an actual stuck park
+            // is visible without re-alerting.
+            let Some(part) = self.model_refused_items.get(&agent).cloned() else {
+                eprintln!(
+                    "growlightd: reconcile model-refused: no latch for {agent}; \
+                     keeping park alive (next roster rebuild clears it)"
+                );
+                continue;
+            };
+            // The member in the current roster. A member removed from the
+            // fleet config between the park and this tick (operator edit
+            // + daemon rebuild) has no roster to re-resolve against — un-park
+            // defensively; the retiring/stopped pass will clean up next tick.
+            let Some(member) = fleet.iter().find(|m| m.spec.agent == agent) else {
+                self.model_refused_items.remove(&agent);
+                self.supervisor.clear_model_refused_park(&agent, now);
+                continue;
+            };
+            let backend = member.backend.ipc_backend();
+            // §6.4 resolve on live state. `Legacy` walks keeperd's snapshot
+            // for the latched part; `V2` walks the v2 snapshot for the
+            // latched entry's current next unit (`next_unit` yields the
+            // chain-resolved `models` for a slice / close-out / entry).
+            // Both read the SAME helpers as admission (`item_model_field` +
+            // `parse_declaration` + `first_for_backend` for legacy;
+            // `resolve_v2_model`'s structure for v2) so the two sides can't
+            // disagree about what the chain resolves to.
+            let declared: Option<ModelChoice> = match &part {
+                ModelRefusedPart::Legacy { part, .. } => {
+                    self.queues.read_item_doc(part).and_then(|doc| {
+                        let field = softfig_ipc::model_choice::item_model_field(&doc)?;
+                        match softfig_ipc::model_choice::parse_declaration(field).ok()? {
+                            softfig_ipc::model_choice::Declaration::List(list) => {
+                                list.first_for_backend(backend).cloned()
+                            }
+                            softfig_ipc::model_choice::Declaration::Auto => None,
+                        }
+                    })
+                }
+                ModelRefusedPart::V2 { entry } => {
+                    // No live snapshot (absent / failed load / no seams) or
+                    // no live row for the entry (archived / dropped between
+                    // park and now) leaves no chain to walk. Both read as "no
+                    // override" and fall through to the member default, the
+                    // legacy branch's shape on an unreadable item doc (slice
+                    // 007, code-review 050 F1). Slice 005 `continue`d here,
+                    // which stranded the park at `not_before = i64::MAX` even
+                    // after a roster edit moved the default off the refusal.
+                    match v2_snapshot.as_ref() {
+                        None => {
+                            eprintln!(
+                                "growlightd: reconcile model-refused: v2 snapshot unavailable \
+                                 while reconciling {agent} on entry {entry}; falling through \
+                                 to member_default"
+                            );
+                            None
+                        }
+                        Some(snapshot) => {
+                            match snapshot.entries.iter().find(|e| &e.id == entry) {
+                                None => {
+                                    eprintln!(
+                                        "growlightd: reconcile model-refused: v2 entry {entry} \
+                                         absent from the live snapshot while reconciling \
+                                         {agent}; falling through to member_default"
+                                    );
+                                    None
+                                }
+                                // Walk the entry's next unit; a stopped walk
+                                // (Blocked / NoUnit) has no declared models to
+                                // compare against, so we fall through to the
+                                // member default like admission's undeclared
+                                // case does.
+                                Some(entry_view) => match next_unit(snapshot, entry_view) {
+                                    WalkOutcome::Unit { models, .. } => models
+                                        .and_then(|list| list.first_for_backend(backend).cloned()),
+                                    WalkOutcome::Blocked { .. } | WalkOutcome::NoUnit => None,
+                                },
+                            }
+                        }
+                    }
+                }
+            };
+            let resolved = declared.unwrap_or_else(|| {
+                softfig_ipc::model_choice::member_default(
+                    backend,
+                    member.backend.roster_model(),
+                    member.backend.roster_variant(),
+                )
+                .first()
+                .clone()
+            });
+            // Did the resolution move off the latched refusal? If not, keep
+            // the park (the slice-003 single alert stands); if yes, release
+            // the member at an item boundary so the SAME tick's step 3 picks
+            // + claims + copies a fresh §3.6 baton + spawns with the live
+            // resolution (slice 008, growlight report 090).
+            //
+            // The release uses `Supervisor::retire` directly, NOT
+            // `DriveLoop::retire`: the latter also inserts into `self.stopped`
+            // (`retired` is permanent for this run), which would stop the
+            // member for good instead of letting step 3 pick for it.
+            // `aggregator.forget` and `reconnecting.remove` mirror
+            // `end_handed_off_session`'s boundary-release pattern; the latch
+            // drops with the park.
+            //
+            // `supervisor.retire` returns the live child, if any. A parked
+            // member has already exited so this reads `None` in practice; a
+            // surprise child is killed outside any daemon lock (the
+            // AgentChild contract).
+            let differs = self
+                .supervisor
+                .refused_model(&agent)
+                .is_some_and(|r| r != &resolved);
+            if differs {
+                if let Some(child) = self.supervisor.retire(&agent) {
+                    child.kill();
+                }
+                self.aggregator.forget(&agent);
+                self.reconnecting.remove(&agent);
+                self.model_refused_items.remove(&agent);
+            }
+        }
+    }
+
     /// Retire `agent` from the supervisor on a boundary stop, killing any live
     /// child OUTSIDE any daemon lock (the [`crate::control::AgentChild`] contract).
     /// Records the retire and marks the agent permanently stopped for this run.
@@ -3031,6 +3565,11 @@ impl DriveLoop {
         self.assignments.remove(agent);
         // The v2 twin (slice 006) — a no-op on a legacy loop's always-empty map.
         self.v2_assignments.remove(agent);
+        // Slice 004 (M-E): a retired member is no longer parked at the
+        // supervisor (its `Supervised` entry is gone), so its reconcile latch
+        // must go with it — otherwise the reconcile would read a stale map
+        // forever.
+        self.model_refused_items.remove(agent);
         self.stopped.insert(agent.to_string());
         report.retired.push(agent.to_string());
     }
@@ -3530,6 +4069,12 @@ impl TickLogger {
                 RerollOutcome::HeldForAdmission { agent, .. } => {
                     held_now.insert((agent.clone(), "admission budget/rate"));
                 }
+                // Re-roll picker-stall (claude-login-pool-wiring slice 009 F1).
+                // The per-slot rate-limit hold already narrates "waiting for
+                // rate limit reset" through the status surface, mirroring the
+                // start-side `StartOutcome::Hold` `continue` branch below —
+                // skip the edge-dedup line here to avoid a double-narration.
+                RerollOutcome::HeldForSlot { .. } => {}
             }
         }
         for held in &r.held_starts {
@@ -3540,6 +4085,11 @@ impl TickLogger {
                 // `Started` never lands in `held_starts`; a spawn failure is
                 // alerted through the dispatcher — no duplicate.
                 StartOutcome::Started | StartOutcome::SpawnFailed { .. } => continue,
+                // Picker stall (claude-login-pool-wiring slice 002 M-B part 2):
+                // the per-slot rate-limit hold already narrates "waiting for
+                // rate limit reset" through the status surface, so skip the
+                // edge-dedup line here to avoid a double-narration.
+                StartOutcome::Hold { .. } => continue,
             };
             held_now.insert((held.agent.clone(), kind));
         }
@@ -3747,7 +4297,7 @@ mod tests {
     use crate::notifications::NotifyPolicy;
     use crate::notify_dispatch::{GuiNotifier, LogNotifier, LogSink};
     use crate::scheduler::{classify_queue, PartView, QueueState, QueueView};
-    use crate::supervisor::{AgentBackend, Backoff, MemberLifecycle, SpawnError};
+    use crate::supervisor::{AgentBackend, Backoff, MemberLifecycle, SpawnError, SpawnKind};
     use softfig_ipc::growlightd::StopLevel;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3824,6 +4374,12 @@ mod tests {
         /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
         /// `SpawnError` before exec).
         fail_spawn: AtomicBool,
+        /// Slice 009 F1 — when `Some`, every `spawn` returns
+        /// `SpawnKind::Hold` with this payload. Models the live ClaudeBackend's
+        /// `pick_pool_slot` Stall path, so a drive-loop test can drive a
+        /// `tick_with` re-roll into an exhausted pool without wiring in the
+        /// real picker.
+        spawn_hold: Mutex<Option<(Vec<String>, Option<i64>)>>,
         /// When set, every `seed` fails (the fail-closed seed path — a member that
         /// can't be given its baton is not spawned).
         fail_seed: AtomicBool,
@@ -3865,6 +4421,22 @@ mod tests {
         fn set_stream_error(&self, agent: &str, err: StreamError) {
             self.stream_errors.lock().unwrap().insert(agent.to_string(), err);
         }
+        /// Drop `agent`'s scripted stdout stream error — models a fresh session's
+        /// stream, which the live backend would surface as "no error observed"
+        /// (the per-session reset the real cell does on a new spawn). Slice 008
+        /// uses this before ticking past an un-park, so the newly step-3-spawned
+        /// member does not immediately re-poll the previous session's scripted
+        /// `ModelRefused` and re-park. Paired with [`clear_health`] so the
+        /// member's new instance polls healthy end-to-end.
+        fn clear_stream_error(&self, agent: &str) {
+            self.stream_errors.lock().unwrap().remove(agent);
+        }
+        /// Drop `agent`'s scripted health, so the next observe reads the backend
+        /// default rather than a persisted `Exited`. Slice 008 companion to
+        /// [`clear_stream_error`].
+        fn clear_health(&self, agent: &str) {
+            self.health.lock().unwrap().remove(agent);
+        }
         /// Script `agent`'s terminal baton status (read by the loop on its exit).
         fn set_baton(&self, agent: &str, status: &str) {
             self.baton
@@ -3882,6 +4454,11 @@ mod tests {
         /// Force every subsequent `spawn` to fail (the fail-closed path).
         fn set_fail_spawn(&self, fail: bool) {
             self.fail_spawn.store(fail, Ordering::SeqCst);
+        }
+        /// Slice 009 F1 — arm every subsequent `spawn` to return
+        /// `SpawnKind::Hold` with this payload. Clear by passing `None`.
+        fn set_spawn_hold(&self, hold: Option<(Vec<String>, Option<i64>)>) {
+            *self.spawn_hold.lock().unwrap() = hold;
         }
         /// Force every subsequent `seed` to fail (the fail-closed seed path).
         fn set_fail_seed(&self, fail: bool) {
@@ -3966,15 +4543,19 @@ mod tests {
         }
     }
     impl AgentBackend for Arc<FakeFleet> {
-        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
             self.events.lock().unwrap().push(format!("spawn:{}", spec.agent));
             self.spawned_specs.lock().unwrap().push(spec.clone());
+            if let Some((slots, until)) = self.spawn_hold.lock().unwrap().clone() {
+                return Err(SpawnKind::Hold { slots, until });
+            }
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(SpawnError(format!(
                     "pre-approval generation failed for agent {}",
                     spec.agent
-                )));
+                ))
+                .into());
             }
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),
@@ -4110,49 +4691,73 @@ mod tests {
 
     /// A fixed (mutable) queue snapshot source.
     #[derive(Debug)]
-    struct FixedQueues(Mutex<Snapshot>, Mutex<BTreeMap<String, ClaimHold>>, Mutex<usize>);
+    struct FixedQueues {
+        snapshot: Mutex<Snapshot>,
+        /// `> Fleet:` claim-hold table, keyed by part id (task 068).
+        holds: Mutex<BTreeMap<String, ClaimHold>>,
+        /// Count of `claim_hold` reads (task 068 — proves the marker is read
+        /// afresh at claim time).
+        marker_reads: Mutex<usize>,
+        /// Per-part item-doc text (claude-login-pool-wiring slice 004 M-E): the
+        /// reconcile pass reads this to re-resolve `> Model:`. A part not in
+        /// the map returns `None` — undeclared.
+        item_docs: Mutex<BTreeMap<String, String>>,
+    }
     impl FixedQueues {
         fn new(qs: Vec<QueueView>) -> Arc<Self> {
-            Arc::new(Self(Mutex::new(Snapshot::new(qs)), Mutex::default(), Mutex::default()))
+            Arc::new(Self {
+                snapshot: Mutex::new(Snapshot::new(qs)),
+                holds: Mutex::default(),
+                marker_reads: Mutex::default(),
+                item_docs: Mutex::default(),
+            })
         }
         /// Give a part's item doc a `> Fleet: no` line (task 068).
         fn mark_human_only(&self, part: &str) {
-            self.1.lock().unwrap().insert(part.into(), ClaimHold::HumanOnly("no".into()));
+            self.holds.lock().unwrap().insert(part.into(), ClaimHold::HumanOnly("no".into()));
         }
         /// Remove a part's `> Fleet:` line — the owner authorizes the fleet on it.
         fn clear_marker(&self, part: &str) {
-            self.1.lock().unwrap().remove(part);
+            self.holds.lock().unwrap().remove(part);
         }
         /// How many claim-time marker reads the loop has made.
         fn marker_reads(&self) -> usize {
-            *self.2.lock().unwrap()
+            *self.marker_reads.lock().unwrap()
+        }
+        /// Script `part`'s item doc text (claude-login-pool-wiring slice 004
+        /// M-E) — what the reconcile pass reads to walk the `> Model:` chain.
+        fn set_item_doc(&self, part: &str, doc: &str) {
+            self.item_docs.lock().unwrap().insert(part.into(), doc.into());
         }
         /// Mark a part `blocked` in the shared snapshot — models keeperd's
         /// committed item-park write, so the NEXT `snapshot()` shows it blocked (the
         /// cross-tick half of pivot-on-block).
         fn mark_blocked(&self, queue: &str, part: &str) {
-            self.0.lock().unwrap().mark_blocked(queue, part);
+            self.snapshot.lock().unwrap().mark_blocked(queue, part);
         }
         /// Mark a part `active` in the shared snapshot — models keeperd's
         /// committed claim write, so the NEXT `snapshot()` shows it claimed (the
         /// cross-tick half of the double-assignment fix).
         fn mark_active(&self, queue: &str, part: &str) {
-            self.0.lock().unwrap().mark_claimed(queue, part);
+            self.snapshot.lock().unwrap().mark_claimed(queue, part);
         }
         /// Replace the whole snapshot — models the queue tables moving on between
         /// ticks (e.g. an agent marked its item `done` before reporting
         /// QUEUE_EMPTY, so the next tick sees a drained queue).
         fn set(&self, qs: Vec<QueueView>) {
-            *self.0.lock().unwrap() = Snapshot::new(qs);
+            *self.snapshot.lock().unwrap() = Snapshot::new(qs);
         }
     }
     impl QueueSource for Arc<FixedQueues> {
         fn snapshot(&self) -> Snapshot {
-            self.0.lock().unwrap().clone()
+            self.snapshot.lock().unwrap().clone()
         }
         fn claim_hold(&self, _queue: &str, part: &str) -> Option<ClaimHold> {
-            *self.2.lock().unwrap() += 1;
-            self.1.lock().unwrap().get(part).cloned()
+            *self.marker_reads.lock().unwrap() += 1;
+            self.holds.lock().unwrap().get(part).cloned()
+        }
+        fn read_item_doc(&self, part: &str) -> Option<String> {
+            self.item_docs.lock().unwrap().get(part).cloned()
         }
     }
 
@@ -5595,7 +6200,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // keeperd now holds p1 `blocked` (committed by the parker) — so a later
         // snapshot keeps pivoting past it until a human clears it (slice 004).
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),
         );
     }
@@ -5659,7 +6264,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
         // keeperd now holds p1 `blocked` — later snapshots keep pivoting past it.
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),
         );
     }
@@ -5971,7 +6576,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             assert!(parker.parks().is_empty(), "nothing is written `blocked` in keeperd (tick {t})");
             assert_eq!(probe.gui_alerts(), 0, "no blocked-on-human alert while merely held (tick {t})");
             assert_eq!(
-                classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+                classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
                 QueueState::Active("p1".into()),
                 "a1's part stays active/workable while held (tick {t})",
             );
@@ -6025,7 +6630,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // keeperd's qa/p1 was NOT committed blocked (the write failed) — it lingers
         // `active`, to be re-blocked when the member next resolves to it. No sticky slot.
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Active("p1".into()),
             "the uncommitted block left the part active in keeperd (fail-soft)",
         );
@@ -7936,14 +8541,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     use crate::scheduler_v2::{EntryView, ItemView, ProjectView, TreeView, V2Snapshot};
 
     /// The scripted v2 source (the slice's "fake-v2-source"): returns the stored
-    /// snapshot every `load`, or `Absent` — a `Failed` is the real source's
-    /// alert-once row, already unit-proven in `v2_source`. `Clone` so a test
-    /// keeps a handle to swap the snapshot between ticks (the holder-overlay
-    /// test's committed-state flip).
+    /// snapshot every `load`, `Absent`, or a quiet (`alert: false`) `Failed` —
+    /// the real source's alert-once row is already unit-proven in `v2_source`.
+    /// `Clone` so a test keeps a handle to swap the snapshot between ticks (the
+    /// holder-overlay test's committed-state flip).
     #[derive(Debug, Clone, Default)]
     struct FakeV2Source {
         cell: Arc<Mutex<Option<V2Snapshot>>>,
         absent: Arc<AtomicBool>,
+        failed: Arc<AtomicBool>,
     }
 
     impl FakeV2Source {
@@ -7951,12 +8557,14 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             Self {
                 cell: Arc::new(Mutex::new(Some(snapshot))),
                 absent: Arc::new(AtomicBool::new(false)),
+                failed: Arc::new(AtomicBool::new(false)),
             }
         }
         fn absent() -> Self {
             Self {
                 cell: Arc::new(Mutex::new(None)),
                 absent: Arc::new(AtomicBool::new(true)),
+                failed: Arc::new(AtomicBool::new(false)),
             }
         }
         /// Replace the scripted snapshot (the next `load`s read it) — the test's
@@ -7964,12 +8572,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn set(&self, snapshot: V2Snapshot) {
             *self.cell.lock().unwrap() = Some(snapshot);
             self.absent.store(false, Ordering::SeqCst);
+            self.failed.store(false, Ordering::SeqCst);
         }
     }
 
     impl V2QueueSource for FakeV2Source {
         fn load(&mut self) -> V2Load {
-            if self.absent.load(Ordering::SeqCst) {
+            if self.failed.load(Ordering::SeqCst) {
+                V2Load::Failed {
+                    error: crate::v2_source::V2SourceError::Unreadable {
+                        rel: "growlight/queue.toml".into(),
+                        cause: "scripted".into(),
+                    },
+                    alert: false,
+                }
+            } else if self.absent.load(Ordering::SeqCst) {
                 V2Load::Absent
             } else {
                 V2Load::Snapshot(self.cell.lock().unwrap().clone().expect("scripted"))
@@ -9530,29 +10147,141 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
-    /// Finish-check 3 — restart with per-profile holds already active
-    /// (modelled here by seeding the DriveLoop with a hold BEFORE the first
-    /// tick) stays quiet: no page, no crash, no per-tick spawn. In production
-    /// a daemon restart re-derives these from `usage.by-profile/<slot>.json`
-    /// (slice 009's per-slot capture); here we inject the end state directly
-    /// since the finish-check is the drive-loop level invariant.
+    /// Slice 009 F1+F2 — the re-roll side of `StartOutcome::Hold`. A member
+    /// whose pool's picker stalls on the re-roll:
+    /// - surfaces as `HeldForSlot`, not `SpawnFailed`;
+    /// - never pages `AgentCrashed` (the alert dispatcher's `SpawnFailed`
+    ///   check sees no entry to fire on);
+    /// - extends `rate_limit_holds` ONLY for the slots the picker carried in
+    ///   the payload (F2): a pre-filtered held slot keeps its own, earlier
+    ///   `until` instead of being pushed forward to the surviving slot's
+    ///   longer `until_at`.
+    #[test]
+    fn reroll_into_exhausted_pool_holds_quietly_and_extends_only_the_stalled_slot() {
+        let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+        // slot1 held at t=10_000 (the "pre-filtered" slot in the real picker);
+        // slot2 unheld, armed as the Stall payload (the "survivor").
+        holds.lock().unwrap().extend("slot1", 10_000);
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[(
+                "a1",
+                &["slot1", "slot2"],
+            )])))
+            .with_rate_limit_holds(Arc::clone(&holds));
+        backend.set_profile_tag("a1", Some("slot2"));
+
+        // Tick 0: a1 starts cleanly (no hold scripted yet).
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // Clean continue-exit → re-roll candidate on the next tick.
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+
+        // Arm the backend's re-roll spawn to Stall with slots=["slot2"] only,
+        // reset=50_000 (longer than slot1's own 10_000 hold). This is the
+        // F2-corrected shape: before the fix the error site would have
+        // carried the whole pool, so this test would see slot1's hold
+        // monotonically pushed from 10_000 to 50_000.
+        backend.set_spawn_hold(Some((vec!["slot2".to_string()], Some(50_000))));
+
+        let r1 = loop_.tick(1);
+
+        // F1 — the re-roll surfaces as `HeldForSlot`, never `SpawnFailed`.
+        assert!(
+            r1.rerolls
+                .iter()
+                .any(|o| matches!(o, RerollOutcome::HeldForSlot { agent, slots, until }
+                    if agent == "a1"
+                        && slots == &vec!["slot2".to_string()]
+                        && *until == Some(50_000))),
+            "the re-roll's Stall surfaces as HeldForSlot: {:?}",
+            r1.rerolls,
+        );
+        assert!(
+            !r1.rerolls
+                .iter()
+                .any(|o| matches!(o, RerollOutcome::SpawnFailed { .. })),
+            "a Hold does NOT collapse to SpawnFailed: {:?}",
+            r1.rerolls,
+        );
+
+        // F1 — no `AgentCrashed` alert dispatched (the dispatcher's
+        // `SpawnFailed` check has no entry to page on).
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(
+            alerts.iter().all(|a| !format!("{a:?}").contains("AgentCrashed")),
+            "no `AgentCrashed` page for a pool-stall re-roll (slice 009 F1): {alerts:?}",
+        );
+
+        // F1 — slot2's hold was extended by the drive-loop handler.
+        // F2 — slot1's hold stayed at its own 10_000 (the Stall payload
+        // carried only slot2, so the pre-filtered slot was not pushed
+        // forward to slot2's longer reset).
+        let h = holds.lock().unwrap();
+        assert_eq!(
+            h.held_until("slot1"),
+            Some(10_000),
+            "slot1's hold was NOT extended by slot2's longer reset (slice 009 F2)",
+        );
+        assert_eq!(
+            h.held_until("slot2"),
+            Some(50_000),
+            "slot2's hold was extended to the Stall's `until` (slice 009 F1)",
+        );
+    }
+
+    /// Finish-check 3 — restart with per-profile holds already active stays
+    /// quiet: no page, no crash, no per-tick spawn. This exercises the LIVE
+    /// seed path (claude-login-pool-wiring slice 002 M-B part 1): write
+    /// `usage.by-profile/slot1.json` with a `rejected` + future `resets_at`,
+    /// point the loop at the dir via
+    /// [`with_usage_by_profile_dir`](DriveLoop::with_usage_by_profile_dir),
+    /// and verify the first tick's admission already short-circuits via the
+    /// seeded hold without a hand-extend.
     #[test]
     fn restart_with_exhausted_per_profile_files_holds_quietly() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        // Write slot1's on-disk reading: `rejected` 5h window with
+        // `resets_at = 500` (ahead of the first few ticks, which run at t=0..3).
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(500),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
         let (mut loop_, _d, backend, probe) = make(
             vec![member("a1", "qa")],
             vec![q("qa", &[("pa", "queued")])],
             Policy::default(),
         );
-        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[(
-            "a1",
-            &["slot1"],
-        )])));
-        // Simulate the restart's re-derivation: the hold is already present
-        // before any tick runs (the live loop reads it from
-        // `usage.by-profile/slot1.json` at construction / first tick).
-        loop_.rate_limit_holds.extend("slot1".to_string(), 500);
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
 
-        // Three consecutive ticks under the hold.
+        // Three consecutive ticks under the hold — the first tick's
+        // seed_from_disk pulls slot1.json into the hold map BEFORE admission
+        // reads it, so admission skips a1 immediately.
         for t in 0..3 {
             let r = loop_.tick(t);
             assert_eq!(r.waiting_for_rate_limit_reset, Some(500));
@@ -9565,6 +10294,194 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             }
             assert!(alerts.is_empty(), "quiet hold emits no alerts: {alerts:?}");
         }
+    }
+
+    /// Slice 002 M-B part 1 — a cold restart with `rejected` on disk seeds
+    /// the hold BEFORE admission runs, so the first tick's admission check
+    /// is already a quiet hold. The headline symptom the slice removes: zero
+    /// `AgentCrashed` pages, zero `SpawnFailed` outcomes, zero spawns.
+    #[test]
+    fn seed_from_disk_quiets_the_first_tick_after_a_restart() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(2_000),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
+
+        let r = loop_.tick(0);
+        // Admission's hold-sum surface shows slot1's `resets_at`, so the
+        // seed landed before step 3 ran.
+        assert_eq!(
+            r.waiting_for_rate_limit_reset,
+            Some(2_000),
+            "first-tick seed from disk extends the hold BEFORE admission",
+        );
+        // No spawn ever started on the exhausted slot — admission's
+        // `member_fully_held` short-circuit held a1 without reaching the
+        // picker. No `held_starts` from the picker's quiet-stall path either:
+        // the hold check lands first.
+        assert!(backend.spawns().is_empty(), "no spawn on a held slot");
+        assert!(
+            !r.held_starts.iter().any(|h| matches!(h.outcome, StartOutcome::Hold { .. })
+                || matches!(h.outcome, StartOutcome::SpawnFailed { .. })),
+            "no Hold/SpawnFailed in held_starts — the hold short-circuit ran first: {:?}",
+            r.held_starts,
+        );
+        // No alerts page.
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(alerts.is_empty(), "quiet seeded hold emits no alerts: {alerts:?}");
+    }
+
+    /// Slice 002 M-B part 1 — a live-updated per-slot file reaches admission
+    /// within one re-scan window. Start with an empty dir, write
+    /// `slot1.json` with `rejected`, drive
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`] ticks, and verify the hold
+    /// landed quietly before admission tried to spawn on slot1.
+    #[test]
+    fn live_write_reaches_the_hold_within_a_rescan_window() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
+
+        // Tick 0 — the dir is empty: no hold, a1 is admitted and spawns.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // Mid-run: an external writer (slice 009's per-slot capture, or the
+        // interactive statusline) lands a `rejected` reading on slot1 with
+        // `resets_at` way out ahead of the test's horizon.
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(1_000_000),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        // Mark a1 Down so step 3 would try to re-roll it (the fresh-start
+        // path, where admission would hit the picker). We've already ticked
+        // once (counter is 1), so to land on the next multiple of N (10) we
+        // tick through to `rescan_tick_count % N == 0` again — i.e. up to
+        // tick 10.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "ITEM_COMPLETE");
+        let mut saw_rescan = false;
+        for t in 1..=RESCAN_USAGE_BY_PROFILE_EVERY_TICKS as i64 {
+            let r = loop_.tick(t);
+            if r.waiting_for_rate_limit_reset == Some(1_000_000) {
+                saw_rescan = true;
+                break;
+            }
+        }
+        assert!(
+            saw_rescan,
+            "the periodic re-scan picked up the live-written slot1.json \
+             within one N-tick window",
+        );
+        // No `AgentCrashed` alerts fired through the whole run.
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(
+            alerts.iter().all(|a| !format!("{a:?}").contains("AgentCrashed")),
+            "live-write hold is quiet, no AgentCrashed: {alerts:?}",
+        );
+    }
+
+    /// Slice 002 M-B part 1 — a `rejected` on disk with `resets_at = null`
+    /// is NOT seeded as a time-pinned hold (there is no concrete instant to
+    /// pin against). The admission picker still sees the same stale file via
+    /// `pool_headroom` → `headroom_from`, where the §9 staleness bound
+    /// ([`STALE_FLOOR_SECS`]) folds the fossil to full after six hours. This
+    /// test exercises the pure headroom contract — the hold map stays empty.
+    #[test]
+    fn seed_from_disk_leaves_null_resets_at_to_the_staleness_bound() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: None,
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        // Seed the hold map directly through the public verb (also exercised
+        // by the drive loop's first tick). A null `resets_at` MUST NOT
+        // populate a hold entry: the drive-loop Hold path owns the staleness
+        // bound (part 2), not the seed.
+        let holds = crate::rate_limit_holds::RateLimitHolds::seed_from_disk(tmp.path(), 0);
+        assert!(
+            !holds.any_held(),
+            "null resets_at leaves the seed empty — the staleness bound is \
+             the picker's job via §9's `STALE_FLOOR_SECS`",
+        );
+        // And the §9 staleness bound still folds the fossil to full once the
+        // sample's own age crosses it: `headroom_from` on the saved sample at
+        // `now = STALE_FLOOR_SECS + 1` reads as full (unused), not as 0.
+        let snap = softfig_ipc::usage::UsageSnapshot::load(
+            &crate::profile_budget::profile_budget_path(tmp.path(), "slot1"),
+        )
+        .unwrap()
+        .unwrap();
+        let hr = crate::profile_budget::headroom_from(
+            Some(&snap),
+            crate::profile_budget::STALE_FLOOR_SECS + 1,
+        );
+        assert_eq!(
+            hr,
+            crate::profile_budget::Headroom::full(),
+            "post-6h fossil folds to full — the admission picker reopens on its own",
+        );
     }
 
     /// Finish-check 4 — no pools anywhere ≡ the pre-slice-008 fleet-wide
@@ -9631,6 +10548,1331 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             backend.spawns(),
             vec!["a1", "b1"],
             "no re-spawn into the exhausted window",
+        );
+    }
+
+    /// Slice 001 M-A finish-check 1 (review 048) — an `allowed_warning` on
+    /// slot1 must NOT halt a sibling pooled on slot2. a1 is unpooled on
+    /// slot1 and reports a 90% 5h reading WITHOUT `rejected` (so the
+    /// per-slot HOLD layer plays no part — only the budget fold does); d1
+    /// is pooled on [slot1, slot2] with its session reading from slot2.
+    /// On tick 1 d1 exits clean on `IN_PROGRESS` → re-roll candidate; the
+    /// per-profile fold at the admission call keys on d1's slot2 profile
+    /// (fresh) and admits the roll. The pre-M-A fleet-wide fold would see
+    /// slot1's 90% and refuse `Intent::Roll` with `Budget5h`.
+    #[test]
+    fn a_warning_on_slot1_admits_d_pool_rolling_on_slot2() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("d1", "qd")],
+            vec![
+                q("qa", &[("pa", "queued")]),
+                q("qd", &[("pd", "queued")]),
+            ],
+            Policy::default(),
+        );
+        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[
+            ("a1", &["slot1"]),
+            ("d1", &["slot1", "slot2"]),
+        ])));
+        backend.set_profile_tag("a1", Some("slot1"));
+        backend.set_profile_tag("d1", Some("slot2"));
+
+        // Tick 0: both start — no readings yet, every profile folds fresh.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1", "d1"]);
+
+        // a1 reports a hot 5h reading (90%) tagged slot1 and keeps running.
+        // Deliberately NO `set_budget_reset`: a `allowed_warning` carries no
+        // `rejected` boundary, so step-0 extends no hold on slot1 — the
+        // budget fold is the only rail that could refuse d1 here.
+        backend.set_budget("a1", hot_budget());
+        backend.set_health("a1", AgentHealth::Alive { last_active: 1 });
+        // d1 clean-exits on a continue status → the supervisor queues a
+        // re-roll, which admission must gate per-profile for d1 (slot2 is
+        // fresh), not fleet-wide (slot1 is 90%).
+        backend.set_baton("d1", "IN_PROGRESS");
+        backend.set_health("d1", AgentHealth::Exited { code: 0 });
+
+        let r = loop_.tick(1);
+
+        let rerolled: Vec<&str> = r
+            .rerolls
+            .iter()
+            .filter_map(|o| match o {
+                RerollOutcome::Rerolled { agent } => Some(agent.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rerolled,
+            vec!["d1"],
+            "d1 (slot2) is admitted — a1's slot1 90% must not fold into slot2's view",
+        );
+        // No `HeldForAdmission { Budget5h }` on this tick — that is the
+        // fleet-wide-fold symptom the slice retires.
+        for o in &r.rerolls {
+            if let RerollOutcome::HeldForAdmission { agent, decision } = o {
+                let d = format!("{decision:?}");
+                assert!(
+                    !d.contains("Budget5h"),
+                    "{agent}: unexpected Budget5h refuse — fleet-wide fold leaked ({d})",
+                );
+            }
+        }
+        let spawns = backend.spawns();
+        assert_eq!(
+            spawns.iter().filter(|s| **s == *"d1").count(),
+            2,
+            "d1 spawned at tick 0 (fresh) and again at tick 1 (re-roll): {spawns:?}",
+        );
+    }
+
+    /// Slice 001 M-A finish-check 2 — regression. With no `profile_pool`
+    /// anywhere, every reading is untagged and every member resolves to
+    /// `"home"`, so the per-profile fold is byte-identical to the
+    /// fleet-wide fold for the same sample set. The back-compat key is
+    /// what lets admission read exactly as it did pre-switcher when no
+    /// slot is configured. Pure unit shape over `UsageAggregator`.
+    #[test]
+    fn no_pools_per_profile_fold_equals_fleet_wide() {
+        let mut agg = UsageAggregator::new();
+        // Two untagged readings (the pre-switcher sample shape — `profile`
+        // is `None`), with non-equal pcts so the per-field max is
+        // observable from either column.
+        agg.observe(UsageSample::new(
+            "a".to_string(),
+            BudgetUsage::new(40, 10),
+            0,
+        ));
+        agg.observe(UsageSample::new(
+            "b".to_string(),
+            BudgetUsage::new(20, 50),
+            0,
+        ));
+
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("home", 0),
+            agg.aggregate_or_fresh_at(0),
+            "untagged readings fold identically on `home` and fleet-wide",
+        );
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("home", 0),
+            BudgetUsage::new(40, 50),
+            "per-field max over the two readings — the admission governor's input",
+        );
+        // An unused profile key sees the SAME untagged readings (they fold
+        // into every profile's view by the `is_none_or` include rule), so
+        // a slot with no reading of its own still inherits the fleet-wide
+        // view — the `home` back-compat invariant generalises.
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("unused-slot", 0),
+            agg.aggregate_or_fresh_at(0),
+            "an unseen profile inherits the untagged (pre-switcher) readings",
+        );
+    }
+
+    // ---- claude-login-pool-wiring slice 004 (M-E): park ITEM on ModelRefused +
+    //      per-tick reconcile on roster/item edit ----------------------------
+
+    /// A claude member whose spec also lifts the roster model/effort — matches
+    /// what [`crate::fleet::FleetMemberConfig::to_member`] builds in production,
+    /// so slice-004's latch at park time sees the same `spec.model` the real
+    /// loop would. Different from `claude_member_with`, which only sets the
+    /// roster side (useful for v2 picks that resolve freshly each tick).
+    fn claude_member_prod(id: &str, model: Option<&str>, effort: Option<&str>) -> FleetMember {
+        let base = AgentSpec::new(id, format!("/cfg/{id}/loop.json"), format!("/cfg/{id}/mcp.json"));
+        let spec = if model.is_some() || effort.is_some() {
+            base.with_model(ModelChoice::claude_on(
+                model.map(str::to_string),
+                effort.map(str::to_string),
+            ))
+        } else {
+            base
+        };
+        FleetMember::unpinned(spec).with_backend(crate::fleet::MemberBackend::Claude {
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+        })
+    }
+
+    /// Drive the member to a `ModelRefused` exit on `agent`'s current session —
+    /// latch a stdout `StreamError::ModelRefused`, flip health to a non-zero
+    /// `Exited`, and leave no baton (so the clean-exit path is not reached).
+    fn drive_model_refused(backend: &Arc<FakeFleet>, agent: &str) {
+        backend.set_stream_error(
+            agent,
+            crate::agent_harness::StreamError {
+                kind: crate::agent_harness::StreamErrorKind::ModelRefused,
+                text: "model refused: model_not_found (claude:claude-bogus-9-9)".into(),
+                resets_at: None,
+            },
+        );
+        backend.set_health(agent, AgentHealth::Exited { code: 1 });
+    }
+
+    /// SLICE 004 M-E — the ModelRefused arm now PARKS THE ITEM (not just the
+    /// member) and RELEASES the slot. The member is dropped from
+    /// [`DriveLoop::assignments`], the parker gets the (queue, part) write,
+    /// the supervisor stays registered with `last_refused_model` latched, and
+    /// the single alert fires exactly once. Replaces the pre-slice-004 shape
+    /// where the item lingered `active` behind a parked member.
+    #[test]
+    fn model_refused_parks_the_item_and_frees_the_member_slot() {
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        // Tick 0: c1 starts on qa/p1 (declared bogus roster model).
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.started.len(), 1, "c1 starts on p1");
+        assert_eq!(backend.spawns(), vec!["c1"]);
+        // Drain any `started` subscribe events so the slice-003 "single alert"
+        // assertion below reads only what the ModelRefused tick fired.
+        let _ = probe.gui_alerts();
+
+        // Session dies on a `model_not_found` result → ModelRefused.
+        drive_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+
+        // The slot is freed: the member is no longer in `assignments`, and
+        // the item is `blocked`/`parked` in the shared snapshot (what keeperd
+        // would commit via `park_item`).
+        assert_eq!(parker.parks(), vec![("qa".into(), "p1".into())]);
+        assert_eq!(
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
+            QueueState::Blocked("p1".into()),
+            "the parker's write marks the part blocked for the next snapshot",
+        );
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "c1 is parked on a model refusal",
+        );
+        assert_eq!(
+            loop_.supervisor.refused_model("c1"),
+            Some(&ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the latch records the exact choice the backend refused",
+        );
+        assert_eq!(
+            r1.crashes.len(),
+            1,
+            "exactly one ModelRefused alert fires on park (slice-003 single-alert shape)",
+        );
+        // Two GUI alerts for this tick: the ModelRefused crash + the
+        // BlockedOnHuman the item park raised. Both describe DIFFERENT things,
+        // so the "not spammy" constraint is on the SAME alert not re-firing —
+        // asserted on the reconcile tick below.
+        let _ = probe.gui_alerts();
+
+        // A later tick stays silent on the member alert: the reconcile does
+        // NOT re-emit a ModelRefused crash, and the parker is not re-written.
+        let r2 = loop_.tick(2);
+        assert!(r2.crashes.is_empty(), "reconcile does NOT re-alert");
+        assert_eq!(parker.parks().len(), 1, "no re-park");
+    }
+
+    /// SLICE 004 M-E — editing the item's `> Model:` to a value the member
+    /// CAN run un-parks the member on the next tick (no daemon restart). The
+    /// reconcile reads the item doc fresh through [`QueueSource::read_item_doc`]
+    /// and compares the resolved choice to the latched refused one; a
+    /// difference clears the park (resets `not_before = now`) and updates the
+    /// stored spec so the next re-roll spawns with the fresh model. A single
+    /// re-read with no doc change does NOT un-park — the invariant the
+    /// slice-003 single alert depends on.
+    #[test]
+    fn item_model_edit_unparks_the_member_on_next_tick() {
+        let (mut loop_, _d, backend, claimer, _parker, queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+
+        // Tick 2: no doc change — the park must survive the re-read (same
+        // undeclared resolution → same roster default → same latched refusal).
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "an idle reconcile does NOT spuriously un-park",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "the still-parked member is not re-rolled either",
+        );
+
+        // The human edits the item doc, setting `> Model:` to a valid choice.
+        queues.set_item_doc("p1", "# p1\n\n> Model: claude:claude-opus-5-5\n");
+        let spawns_before = backend.spawns();
+        let claims_before = claimer.claims();
+
+        // Tick 3: the reconcile reads the new doc, resolves to a different
+        // model, and **releases the member** (slice 008, growlight report
+        // 090). Step 3 in the SAME tick sees c1 unregistered; `p1` is
+        // `blocked` from the park, so no legacy workable part exists and
+        // the member holds with no workable work rather than claiming a
+        // stale baton through step 2. The re-roll (step 2) therefore never
+        // touches c1 either.
+        let r3 = loop_.tick(3);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the item-doc edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member — no stale baton re-roll",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_before,
+            "slice 008: a `blocked` legacy item does NOT spawn a new session",
+        );
+        assert_eq!(
+            claimer.claims(),
+            claims_before,
+            "no new claim: p1 stays blocked, and nothing else is queued",
+        );
+        assert!(
+            !r3.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: the un-park tick's rerolls never contain the released agent",
+        );
+    }
+
+    /// SLICE 004 M-E — editing the ROSTER's model to a valid value un-parks
+    /// the member the same way an item-doc edit does: the §6.4 resolver's
+    /// member-default branch reads the roster, so any change there reaches
+    /// the reconcile through the live fleet. Simulated here by replacing
+    /// [`DriveLoop::fleet`] (what a daemon rebuild on a config change
+    /// produces); the reconcile reads it fresh each tick.
+    #[test]
+    fn roster_model_edit_unparks_the_member_on_next_tick() {
+        let (mut loop_, _d, backend, claimer, _parker, _queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+        let spawns_before = backend.spawns();
+        let claims_before = claimer.claims();
+
+        // The human edits config/growlight.toml to flip c1's roster model to
+        // a valid id; a daemon rebuild would re-assemble the fleet, which is
+        // simulated here by replacing the loop's live fleet view.
+        loop_.fleet = vec![claude_member_prod("c1", Some("claude-opus-5-5"), None)];
+
+        // Tick 2: the reconcile re-reads the live roster through
+        // `member.backend.roster_model()`, resolves to the new choice, and
+        // **releases the member** (slice 008, growlight report 090). Step 3
+        // in the SAME tick sees c1 unregistered; `p1` is `blocked` from the
+        // park, so no legacy workable part exists and the member holds. No
+        // stale baton re-roll (step 2 never touches an unregistered agent).
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the roster edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member — no stale baton re-roll",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_before,
+            "slice 008: a `blocked` legacy item does NOT spawn a new session",
+        );
+        assert_eq!(
+            claimer.claims(),
+            claims_before,
+            "no new claim: p1 stays blocked, and nothing else is queued",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: the un-park tick's rerolls never contain the released agent",
+        );
+    }
+
+    // ---- claude-login-pool-wiring slice 005 (M-F): fix slice-004's reconcile
+    //      for v2-mode members (code-review 049 F1) ----------------------------
+    //
+    // The slice-004 ModelRefused arm populated `model_refused_items` only in
+    // the legacy branch; the v2 branch's park/pause ran but never latched the
+    // entry id, so reconcile hit the defensive un-park and silently cleared
+    // the park while leaving the stored (refused) `spec.model` intact —
+    // admission re-admitted, re-spawned on the refused model, re-latched, re-
+    // parked. A tight spawn/park loop every N ticks, masked by the 30-min
+    // alert cooldown; token/credit burn is per tick.
+    //
+    // Slice 005 carries a v2 variant in the latch map and dispatches reconcile
+    // on it, walking the entry's live `next_unit` chain the same way admission
+    // does (`resolve_v2_model`). The defensive un-park is also removed — a
+    // missing latch now leaves the park alive until the next roster rebuild.
+
+    /// A claude member for v2 tests — identical to [`claude_member_prod`] in
+    /// shape (the member spec/backend does not vary by queue mode), named
+    /// explicitly per the slice-005 spec so the v2 test's claude helper is
+    /// mnemonic alongside the legacy one.
+    fn claude_member_v2_prod(id: &str, model: Option<&str>, effort: Option<&str>) -> FleetMember {
+        claude_member_prod(id, model, effort)
+    }
+
+    /// The v2 twin of `drive_model_refused` — same scripted exit on the
+    /// FakeFleet health/stream state, included for symmetry (the arm's v2
+    /// branch reads the same health classifier as the legacy branch).
+    fn drive_v2_model_refused(backend: &Arc<FakeFleet>, agent: &str) {
+        drive_model_refused(backend, agent);
+    }
+
+    /// SLICE 005 M-F — the v2 branch of the `ModelRefused` arm pauses the
+    /// entry, drops the v2 assignment AND latches a `V2 { entry }` sibling
+    /// in `model_refused_items` so the per-tick reconcile knows which chain
+    /// to re-walk. On a stable tick with the entry's `> Model:` unchanged,
+    /// the reconcile finds the same chain-resolved choice as the latched
+    /// refusal, so the park stays alive, no second alert fires, and the
+    /// member does NOT re-spawn — the regression slice 004 lost.
+    #[test]
+    fn v2_model_refused_parks_entry_latches_v2_and_stable_tick_keeps_the_park() {
+        // A unique entries dir per test — a sibling slice-006 pattern.
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-stable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            // No slice `> Model:` → resolve_v2_model falls to the member
+            // default (claude roster "claude-bogus-9-9"), which is what the
+            // backend will refuse.
+            None,
+        ));
+        let (mut loop_, _d, backend, probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        // Tick 0: c1 spawns on m1/001 with the resolved bogus model.
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.v2_started.len(), 1, "c1 starts on m1/001");
+        assert_eq!(backend.spawns(), vec!["c1"]);
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "c1 holds the entry in v2_assignments",
+        );
+        let _ = probe.gui_alerts();
+
+        // Session dies on model_not_found → ModelRefused arm fires.
+        drive_v2_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+
+        // The v2 half ran: the entry is paused through keeperd, and c1 is
+        // dropped from v2_assignments. The LEGACY park (parker.parks / the
+        // legacy snapshot) was NOT written — this is a v2 flow.
+        assert_eq!(
+            *parker.paused.lock().unwrap(),
+            vec!["m1".to_string()],
+            "pause_v2_entry ran on the v2 branch of ModelRefused",
+        );
+        assert!(
+            !loop_.v2_assignments.contains_key("c1"),
+            "v2_assignments.remove ran — the slot is freed",
+        );
+        // The new v2 latch — review 049 F1's fix. Was absent in slice 004.
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the park latches the entry id as a V2 variant (slice 005)",
+        );
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "c1 is parked at the supervisor",
+        );
+        assert_eq!(
+            loop_.supervisor.refused_model("c1"),
+            Some(&ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the latch records the exact choice the backend refused",
+        );
+        assert_eq!(
+            r1.crashes.len(),
+            1,
+            "exactly one ModelRefused alert fires on park (slice-003 single-alert shape)",
+        );
+        let _ = probe.gui_alerts();
+        let spawns_after_park = backend.spawns();
+
+        // Tick 2: a stable reconcile tick with the entry unchanged. The v2
+        // reconcile walks `next_unit` on the live snapshot (slice `001`'s
+        // models=None) → member default → same bogus choice → park stays
+        // alive. The regression slice 004 lost: with slice 004's silent
+        // defensive un-park on a missed latch, the park would have cleared
+        // here, admission would have re-rolled c1 on the refused model, and
+        // the park would have re-fired next tick — a per-tick re-spawn loop.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the park survives a stable reconcile tick (no silent un-park)",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the stable tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn — the loop that review 049 F1 named cannot form",
+        );
+        assert_eq!(
+            parker.paused.lock().unwrap().len(),
+            1,
+            "no re-pause of the entry on the stable tick",
+        );
+    }
+
+    /// SLICE 005 M-F — editing the slice's `> Model:` to a value the member
+    /// CAN run un-parks the v2 member on the next tick (no daemon restart).
+    /// The reconcile re-loads the v2 snapshot, walks the entry's current
+    /// next unit, and compares the chain-resolved choice to the latched
+    /// refusal — a difference clears the park and refreshes the stored spec
+    /// so the re-roll spawns on the fresh model.
+    #[test]
+    fn v2_item_model_edit_unparks_the_member_on_next_tick() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-item-edit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+
+        // The human edits the slice doc, setting `> Model:` to a valid
+        // claude choice. In production the v2 source re-reads it on the
+        // next load; here the test flips the scripted snapshot.
+        source.set(v2_milestone(
+            "m1",
+            EntryStatus::Paused,
+            "001",
+            Some("claude:claude-opus-5-5"),
+        ));
+
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
+
+        // Tick 2: the reconcile walks `next_unit` → the slice's new declared
+        // list → `claude:claude-opus-5-5`, which differs from the latched
+        // refused choice, so the member is **released** (slice 008). Step 3
+        // in the SAME tick picks the paused entry (c1 is its own pauser,
+        // the overlay carries that preference) through a **real claim** on
+        // `("m1", Some("001"))` and spawns on the fresh model.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the slice-doc edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 re-claims the paused entry through keeperd on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim names the edited slice unit",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: a fresh v2 assignment carries the resumed entry (not stale from pre-park)",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the un-park tick's spawn carries the live-resolved model",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
+        );
+    }
+
+    /// SLICE 005 M-F — editing the ROSTER's model to a valid value un-parks
+    /// the v2 member on the next tick (the same shape as the slice-004
+    /// legacy roster-edit case, routed through the v2 reconcile branch).
+    /// Simulated by replacing [`DriveLoop::fleet`] (what a daemon rebuild on
+    /// a config change produces); the reconcile reads it fresh each tick.
+    #[test]
+    fn v2_roster_model_edit_unparks_the_member_on_next_tick() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-roster-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+
+        // The human edits config/growlight.toml to flip c1's roster model
+        // to a valid id; a daemon rebuild simulates as replacing the live
+        // fleet view.
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
+
+        // Tick 2: the v2 reconcile walks `next_unit` (slice still undeclared)
+        // → member default from the live roster → claude:claude-opus-5-5,
+        // which differs from the latched refusal, so the member is
+        // **released** (slice 008). Step 3 in the SAME tick picks the
+        // paused entry (c1's own pauser overlay) through a **real claim**
+        // on `("m1", Some("001"))` and spawns on the fresh roster default.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the roster edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 re-claims the paused entry through keeperd on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim names the resumed slice unit",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: a fresh v2 assignment carries the resumed entry",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the un-park tick's spawn carries the live-resolved roster default",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2) — if the per-tick reconcile finds a
+    /// parked agent with no latch in `model_refused_items`, it journals one
+    /// line and leaves the park alive. The slice-004 defensive un-park is
+    /// what review-049 F1 silently rode on; this pins the slice-005 shape so
+    /// a refactor that reverts to a clear-and-release lands red on the gate.
+    #[test]
+    fn model_refused_no_latch_keeps_the_park() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-no-latch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Simulate the "no latch" condition: `model_refused_items` is empty
+        // while the supervisor still reports c1 parked (the exact shape
+        // slice 005 made observable instead of silently clearing).
+        loop_.model_refused_items.remove("c1");
+
+        // Tick 2: reconcile hits the no-latch guard; park stays alive, no
+        // re-spawn, no second alert.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the no-latch guard keeps the park alive",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the latch remains absent — reconcile does not fabricate one",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn — the review-049 F1 loop cannot form",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape
+    /// a) — if the per-tick reconcile's v2 snapshot load returns `Absent`
+    /// (the v2 TOML vanished between the park and this tick), the park falls
+    /// through to the member default. Here that default IS the refusal (the
+    /// roster's `claude-bogus-9-9`, unedited), so the park stays alive and
+    /// the latch is intact. The un-park twin is
+    /// `v2_model_refused_snapshot_fail_falls_through_to_member_default_and_unparks_when_different`.
+    #[test]
+    fn v2_model_refused_snapshot_absent_keeps_the_park_when_member_default_is_the_refusal() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-snapshot-absent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Force the next load to return V2Load::Absent — the v2 TOML
+        // disappearing between park and reconcile.
+        source.absent.store(true, Ordering::SeqCst);
+
+        // Tick 2: v2_snapshot resolves to None → the v2-latched park falls
+        // through to member_default = the refused bogus id → park stays
+        // alive, latch intact.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "member_default is the refusal, so the snapshot-absent fall-through keeps the park",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn while the snapshot is absent",
+        );
+    }
+
+    /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape
+    /// a) — if the latched v2 entry is absent from the live snapshot
+    /// (archived / completed between park and tick), the reconcile falls
+    /// through to the member default. That default IS the refusal here, so
+    /// the park stays alive, the latch is intact and nothing re-spawns.
+    #[test]
+    fn v2_model_refused_entry_archived_falls_through_to_member_default_and_keeps_park_when_same() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice006-entry-archived-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Replace the live snapshot with a different entry id so the
+        // latched m1 is absent — archive / complete between park and tick.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+
+        // Tick 2: reconcile walks the entries, finds no m1, falls through to
+        // member_default = the refused bogus id; park stays alive, latch
+        // intact.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "member_default is the refusal, so the entry-absent fall-through keeps the park",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the guarded tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn while the entry is absent",
+        );
+    }
+
+    /// SLICE 007 (code-review 050 F1, shape a) — when the v2 reconcile's
+    /// snapshot load returns `Failed`, the park falls through to the
+    /// member's roster default (parity with the legacy branch's undeclared
+    /// case) and un-parks iff that default differs from the latched refused
+    /// `ModelChoice`. Slice 005 `continue`d here and kept the park alive
+    /// whatever the roster resolved to. The keep-park twin is
+    /// `v2_model_refused_snapshot_absent_keeps_the_park_when_member_default_is_the_refusal`.
+    #[test]
+    fn v2_model_refused_snapshot_fail_falls_through_to_member_default_and_unparks_when_different()
+    {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice007-snapshot-fail-fallthrough-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+        let spawns_after_park = backend.spawns();
+
+        // Force the next load to return a quiet V2Load::Failed — an
+        // unreadable v2 file between park and reconcile.
+        source.failed.store(true, Ordering::SeqCst);
+
+        // The roster is edited: c1's default model moves to a VALID id that
+        // DIFFERS from the latched refusal (parity with the slice-005
+        // roster-edit test's shape).
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
+
+        // Tick 2: the v2 reconcile's snapshot-unavailable branch falls
+        // through to `member_default` from the live roster →
+        // claude:claude-opus-5-5, which differs from the latched refusal
+        // (claude-bogus-9-9), so the member is **released** (slice 008).
+        // Step 3 does not run while the snapshot is unreadable, so no new
+        // claim and no new spawn — the release stands until the snapshot
+        // comes back.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "shape (a): c1 is un-parked by the roster edit even on snapshot-fail",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "shape (a): the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "shape (a): the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the un-park tick",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "slice 008: the un-park releases the member while the snapshot is unreadable",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn on the un-park tick itself (the next tick re-rolls on the fresh model)",
+        );
+        assert_eq!(
+            claimer.claims.lock().unwrap().clone(),
+            claims_before,
+            "slice 008: no new claim while the snapshot is unreadable",
+        );
+
+        // Once the v2 TOML is readable again, step 3 picks m1 (still queued
+        // in the restored snapshot), claims it fresh, and spawns on the
+        // live-resolved roster default. Clear the scripted exit so the
+        // fresh session polls healthy.
+        source.failed.store(false, Ordering::SeqCst);
+        backend.clear_stream_error("c1");
+        backend.clear_health("c1");
+
+        let _r3 = loop_.tick(3);
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(
+            claims_after.len(),
+            claims_before.len() + 1,
+            "slice 008: step 3 claims a fresh unit once the snapshot comes back",
+        );
+        assert_eq!(
+            claims_after.last().unwrap(),
+            &("m1".to_string(), Some("001".to_string())),
+            "slice 008: the fresh claim lands on the live-snapshot entry",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "slice 008: v2_assignments carries the freshly claimed entry",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the fresh spawn carries the live-resolved roster default",
+        );
+    }
+
+    /// SLICE 007 (code-review 050 F1, shape a) — the strand F1 named: the
+    /// latched entry is archived between park and reconcile AND the roster
+    /// default moves to a valid id. The entry-absent branch falls through to
+    /// that default, which differs from the refusal, so the park clears.
+    /// Slice 005 `continue`d here and left the member at
+    /// `not_before = i64::MAX` with no entry left to edit. What the freed
+    /// member runs next is the shared un-park → step-2 re-roll path, which
+    /// the slice-005 un-park tests also leave unasserted (growlight report
+    /// filed 2026-10-28).
+    #[test]
+    fn v2_model_refused_entry_archived_falls_through_to_member_default_and_unparks_when_different()
+    {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice007-entry-archived-unpark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+
+        // m1 is archived (the live snapshot carries only m2) and the roster
+        // default moves to a valid id.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+        let spawns_before = backend.spawns();
+        let claims_before: Vec<_> = claimer.claims.lock().unwrap().clone();
+
+        // Tick 2: entry-absent falls through to member_default =
+        // claude-opus-5-5 ≠ the refusal → the member is **released** (slice
+        // 008). Step 3 in the SAME tick picks m2 (the only queued entry
+        // left) through a real claim and spawns on the fresh roster default.
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "shape (a): the archived-entry park clears once the default moves",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the un-park tick",
+        );
+        assert!(
+            !r2.rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "c1")),
+            "slice 008 invariant: no stale-baton re-roll on the un-park tick",
+        );
+        let claims_after: Vec<_> = claimer.claims.lock().unwrap().clone();
+        assert_eq!(claims_before.len(), 1, "preamble: one claim recorded at tick 0 on m1");
+        assert_eq!(
+            claims_after.len(),
+            2,
+            "slice 008: step 3 claims a fresh entry on the un-park tick",
+        );
+        assert_eq!(
+            claims_after[1],
+            ("m2".to_string(), Some("001".to_string())),
+            "slice 008: the archived latched entry is NOT re-claimed — the freed member moves to m2",
+        );
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m2"),
+            "slice 008: v2_assignments carries the member's next entry, not the archived m1",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-opus-5-5".into()), None)),
+            "slice 008: the un-park tick's spawn carries the live-resolved roster default",
+        );
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_before.len() + 1,
+            "slice 008: exactly one new spawn on the un-park tick",
+        );
+    }
+
+    /// SLICE 008 (growlight report 090) — the invariant across every un-park
+    /// cause: the reconcile releases the member, so step 2 (re-roll) never
+    /// touches it on the un-park tick and no stale per-member baton re-roll
+    /// hits the keeperd claim-less path the report described. Pins the
+    /// legacy case; the v2 cases pin the same invariant inline (the three
+    /// slice-005/007 v2 un-park tests each carry an `r2.rerolls` assertion).
+    #[test]
+    fn un_park_release_never_lets_step_2_re_roll_the_freed_agent() {
+        let (mut loop_, _d, backend, _claimer, _parker, queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert!(
+            loop_.supervisor.is_registered("c1"),
+            "preamble: c1 is registered + parked at the supervisor",
+        );
+
+        // Edit the item doc so the reconcile's `differs` branch fires.
+        queues.set_item_doc("p1", "# p1\n\n> Model: claude:claude-opus-5-5\n");
+
+        let r2 = loop_.tick(2);
+        // No step-2 outcome of ANY kind for the released agent — a
+        // `Rerolled`, a `HeldForBackoff`, a `HeldNoWork`, a
+        // `HeldForAdmission`, or a `SpawnFailed` on `c1` would all read as
+        // the stale-baton path report 090 named.
+        for outcome in &r2.rerolls {
+            let (RerollOutcome::Rerolled { agent }
+            | RerollOutcome::HeldForBackoff { agent, .. }
+            | RerollOutcome::HeldNoWork { agent }
+            | RerollOutcome::HeldForAdmission { agent, .. }
+            | RerollOutcome::SpawnFailed { agent, .. }
+            | RerollOutcome::HeldForSlot { agent, .. }) = outcome;
+            assert_ne!(
+                agent, "c1",
+                "slice 008 invariant: the released agent never appears in rerolls",
+            );
+        }
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "the un-park releases the member at the supervisor layer",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is dropped alongside the release",
+        );
+        assert!(
+            !loop_.stopped.contains("c1"),
+            "the release uses `supervisor.retire`, NOT `DriveLoop::retire`: \
+             the agent is NOT permanently stopped (step 3 of a later tick may pick it)",
+        );
+    }
+
+    /// SLICE 008 (growlight report 090) — the slice-007 interaction the
+    /// report named: the latched v2 entry is still PAUSED and the SAME unit
+    /// still declares the refused model, but the snapshot briefly fails →
+    /// member_default moves off the refusal → release. When the snapshot
+    /// comes back, step 3 re-picks the still-paused entry, re-resolves to
+    /// the still-refused model, and the member spawns + re-parks (ONE extra
+    /// spawn + ONE re-alert, inside the slice-003 single-alert cooldown's
+    /// scope since the registration is new). Pins the counts the slice-008
+    /// doc flagged for step 7c follow-up.
+    #[test]
+    fn v2_model_refused_release_then_snapshot_restore_respawns_the_still_refused_model() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice008-interaction-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        // The slice declares `claude:claude-bogus-9-9` directly (the item
+        // declaration is what the member default would also resolve to;
+        // what matters is that after a release, step 3 re-resolves to the
+        // still-refused choice).
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            Some("claude:claude-bogus-9-9"),
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        // Tick 0: c1 spawns on m1/001 with the slice's declared bogus model
+        // (overrides the opus-5-5 roster default).
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.v2_started.len(), 1, "c1 starts on m1/001");
+        assert_eq!(
+            r0.v2_started[0].resolved_model,
+            ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None),
+            "the slice's declared bogus model overrides the opus roster default",
+        );
+
+        drive_v2_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.crashes.len(), 1, "the first ModelRefused alert fires");
+
+        // Transient v2 snapshot failure for the un-park tick. The slice's
+        // `> Model:` is unchanged — the item still declares the refused
+        // choice; only the live snapshot is briefly unreadable.
+        source.failed.store(true, Ordering::SeqCst);
+
+        // Clear the scripted exit so the next spawn polls healthy — we
+        // care about the re-park on the FOLLOWING tick, not the one that
+        // scripted the first exit.
+        backend.clear_stream_error("c1");
+        backend.clear_health("c1");
+
+        let spawns_after_park = backend.spawns();
+
+        // Tick 2: snapshot-fail → member_default (opus-5-5) ≠ refused
+        // (bogus-9-9) → release. Step 3 does not run (snapshot unreadable).
+        let r2 = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "the member is released by the snapshot-fail / default-moves branch",
+        );
+        assert!(
+            !loop_.supervisor.is_registered("c1"),
+            "the release deregisters the member",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no new spawn while the snapshot is unreadable (v2 step 3 does not run)",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the release tick",
+        );
+
+        // Snapshot restored. The item still declares the refused model —
+        // nothing on the device changed to resolve it.
+        source.failed.store(false, Ordering::SeqCst);
+
+        // Tick 3: step 3 picks m1 (still queued since the release never
+        // paused it this run; the overlay's prior v2_paused_by[m1] was
+        // pruned when the snapshot flipped to failed → absent-entry
+        // semantics for the pauser). pick → resolve → claim →
+        // spawn on claude-bogus-9-9. No model refused yet (the new
+        // instance has not polled an exit).
+        let r3 = loop_.tick(3);
+        assert_eq!(
+            backend.spawns().len(),
+            spawns_after_park.len() + 1,
+            "slice 008 interaction: exactly ONE extra spawn once the snapshot comes back",
+        );
+        assert_eq!(
+            backend.spawned_specs().last().and_then(|s| s.model.clone()),
+            Some(ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the fresh spawn still carries the refused model — nothing resolved it",
+        );
+        // No second alert on this tick: the scripted stream error is
+        // cleared, so the new session is healthy from the backend's
+        // perspective. Re-driving `drive_v2_model_refused` would re-park on
+        // tick 4 (not pinned here — the step-7c report tracks whether a
+        // tight re-park would re-alert inside the cooldown).
+        assert!(
+            r3.crashes.is_empty(),
+            "no second ModelRefused alert while the fresh session is healthy",
         );
     }
 }

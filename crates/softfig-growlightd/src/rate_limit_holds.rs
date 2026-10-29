@@ -20,6 +20,10 @@
 //! provider gating is a separate path).
 
 use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::profile_budget::slot_headroom;
+use crate::profile_pin::HEADROOM_STALL_PCT;
 
 /// A profile the hold is keyed on — the claude-login slot name (or `home`) a
 /// member's reading was taken against. Opencode members never contribute a hold;
@@ -117,6 +121,75 @@ impl RateLimitHolds {
     pub fn iter(&self) -> impl Iterator<Item = (&str, i64)> {
         self.holds.iter().map(|(k, v)| (k.as_str(), *v))
     }
+
+    /// Seed the hold map from the on-disk per-slot usage files under
+    /// `by_profile_dir` (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/<slot>.json`),
+    /// so a daemon restart re-derives the holds slot-by-slot instead of booting
+    /// with an empty map (claude-login-pool-wiring slice 002 M-B part 1). A
+    /// restart whose on-disk files already carry a `rejected` 5h/7d window
+    /// (headroom at or below the stall floor, resets_at in the future) extends
+    /// the hold for that slot — so the first tick's admission skips the member
+    /// via [`member_fully_held`] and never spins the picker into
+    /// `PickResult::Stall` on every tick.
+    ///
+    /// `resets_at = null` is **not seeded**: a stall without a known boundary
+    /// has nothing to pin against here. The admission-time picker still trips
+    /// `PickResult::Stall { until_at: None }` and the drive-loop Hold path
+    /// (part 2) extends the hold with its own staleness bound — the shape slice
+    /// 002's §9 test case tracks. A past boundary is also a no-op (the window
+    /// has reopened). A missing directory, missing file, or torn JSON reads as
+    /// no hold for that slot, fail-closed per [`slot_headroom`].
+    pub fn seed_from_disk(by_profile_dir: &Path, now: i64) -> Self {
+        let mut out = Self::default();
+        out.rescan_from_disk(by_profile_dir, now);
+        out
+    }
+
+    /// Re-scan `by_profile_dir` and MERGE any discovered holds into this map
+    /// (claude-login-pool-wiring slice 002 M-B part 1). Merge semantics are
+    /// `extend`: a strictly later boundary wins, so a periodic re-scan never
+    /// shortens a hold the step-0 `rate_limit_event` path or a prior scan
+    /// already extended. Returns the number of hold entries that were added or
+    /// moved forward (zero when the on-disk state is empty / unchanged / all
+    /// slots have reopened).
+    ///
+    /// Called from the drive loop on daemon start (via [`seed_from_disk`]) and
+    /// again every N ticks under a running fleet so that a sibling writer —
+    /// an interactive statusline, slice 009's per-slot capture — reaches
+    /// admission within one re-scan window instead of waiting for a member's
+    /// own `rate_limit_event` to report it.
+    pub fn rescan_from_disk(&mut self, by_profile_dir: &Path, now: i64) -> usize {
+        let Ok(entries) = std::fs::read_dir(by_profile_dir) else {
+            // No directory yet (fresh daemon on an uninitialised deployment),
+            // or a transient read error (permissions, mount): nothing to merge.
+            return 0;
+        };
+        let mut extended = 0_usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(slot) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let hr = slot_headroom(by_profile_dir, slot, now);
+            if hr.pct > HEADROOM_STALL_PCT {
+                continue;
+            }
+            // Stalled on disk — extend the hold only when a concrete boundary
+            // is known and still ahead. A `None` or past boundary is the §9
+            // staleness-bound case; the live picker + drive-loop Hold path
+            // own it (part 2).
+            if let Some(resets_at) = hr.resets_at
+                && resets_at > now
+                && self.extend(slot.to_string(), resets_at)
+            {
+                extended += 1;
+            }
+        }
+        extended
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +280,143 @@ mod tests {
         assert!(h.member_fully_held(&pool));
         h.clear_elapsed(1_000);
         assert!(!h.any_held());
+    }
+
+    // ---- Slice 002 M-B part 1: seed_from_disk / rescan_from_disk --------
+
+    use crate::profile_budget::profile_budget_path;
+    use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+
+    fn snap(five_status: &str, five_reset: Option<i64>, ts: i64) -> UsageSnapshot {
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: five_reset,
+                    status: Some(five_status.to_string()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: ts as f64,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn seed_from_disk_on_missing_dir_is_empty() {
+        let h = RateLimitHolds::seed_from_disk(Path::new("/does/not/exist"), 500);
+        assert!(!h.any_held(), "a missing dir seeds no holds");
+    }
+
+    #[test]
+    fn seed_from_disk_on_an_empty_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 500);
+        assert!(!h.any_held());
+    }
+
+    #[test]
+    fn seed_from_disk_picks_up_a_future_rejected_window() {
+        // Headline cold-restart case: `slot1.json` on disk carries a 5h
+        // `rejected` with a future `resets_at`. The seed extends the hold
+        // for slot1 so the first admission check skips the member via
+        // `member_fully_held`.
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", Some(2_000), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 500);
+        assert_eq!(h.held_until("slot1"), Some(2_000));
+        assert_eq!(h.earliest(), Some(2_000));
+    }
+
+    #[test]
+    fn seed_from_disk_skips_a_past_resets_at() {
+        // A `rejected` whose boundary has already passed: the window has
+        // reopened, so nothing to hold against.
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", Some(100), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 1_000);
+        assert!(!h.any_held(), "a past boundary is a no-op (window reopened)");
+    }
+
+    #[test]
+    fn seed_from_disk_skips_a_null_resets_at() {
+        // §9 shape: a `rejected` without a known boundary carries no concrete
+        // instant to pin against here. The admission picker returns
+        // `PickResult::Stall { until_at: None }` and the Hold path (part 2)
+        // owns the staleness bound; the seed stays silent.
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", None, 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 1_000);
+        assert!(!h.any_held(), "null resets_at ⇒ no seeded hold");
+    }
+
+    #[test]
+    fn seed_from_disk_skips_an_allowed_slot() {
+        // A slot whose window is `allowed` (full headroom) must not be held
+        // just because its file exists.
+        let dir = tempfile::tempdir().unwrap();
+        snap("allowed", Some(9_000), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 1_000);
+        assert!(!h.any_held());
+    }
+
+    #[test]
+    fn seed_from_disk_reads_multiple_slots_independently() {
+        // slot1 rejected (future), slot2 allowed, slot3 rejected (past).
+        // Only slot1 ends up held.
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", Some(2_000), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        snap("allowed", Some(9_000), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot2"))
+            .unwrap();
+        snap("rejected", Some(100), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot3"))
+            .unwrap();
+        let h = RateLimitHolds::seed_from_disk(dir.path(), 1_000);
+        assert_eq!(h.held_until("slot1"), Some(2_000));
+        assert!(!h.is_held("slot2"));
+        assert!(!h.is_held("slot3"));
+    }
+
+    #[test]
+    fn rescan_from_disk_merges_without_shortening() {
+        // A hold already extended to 2_000 is NEVER shortened by a smaller
+        // disk boundary (the slice-008 monotonic rule, now covered on the
+        // re-scan path too).
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", Some(1_200), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let mut h = RateLimitHolds::new();
+        h.extend("slot1", 2_000);
+        let moved = h.rescan_from_disk(dir.path(), 500);
+        assert_eq!(moved, 0, "the smaller disk boundary did not advance the hold");
+        assert_eq!(h.held_until("slot1"), Some(2_000));
+    }
+
+    #[test]
+    fn rescan_from_disk_advances_to_a_later_boundary() {
+        // The reverse of the monotonic test: a later disk boundary advances
+        // the hold.
+        let dir = tempfile::tempdir().unwrap();
+        snap("rejected", Some(5_000), 500)
+            .write_atomic(&profile_budget_path(dir.path(), "slot1"))
+            .unwrap();
+        let mut h = RateLimitHolds::new();
+        h.extend("slot1", 2_000);
+        let moved = h.rescan_from_disk(dir.path(), 500);
+        assert_eq!(moved, 1);
+        assert_eq!(h.held_until("slot1"), Some(5_000));
     }
 }
