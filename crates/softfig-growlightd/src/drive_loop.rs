@@ -1218,6 +1218,11 @@ pub struct TickReport {
     /// (task 068) — journaled once per hold, never alerted: the part stays
     /// `queued`, and a member moves on to the next part instead.
     pub skipped_for_human: Vec<HeldPart>,
+    /// `(queue, part)` heads a pinned pick found `active` with no live member of
+    /// this fleet holding them (task 086): work in flight OUTSIDE the fleet — a
+    /// semi-auto session's self-pull or a human's `set_item_status active`. Never
+    /// claimed; journaled once while the part stays `active`.
+    pub foreign_active: Vec<(String, String)>,
     /// Re-roll outcomes from [`Supervisor::tick`] (rerolled / held / failed).
     pub rerolls: Vec<RerollOutcome>,
     /// Crash alerts surfaced by [`Supervisor::poll`] (slice 003 dispatches these).
@@ -1485,6 +1490,10 @@ pub struct DriveLoop {
     /// shows. A part leaves it when a read finds it claimable again or the queue
     /// stops showing it `queued`.
     announced_holds: std::collections::BTreeMap<(String, String), ClaimHold>,
+    /// `active` parts already journaled as in flight outside the fleet (task 086),
+    /// so each is narrated once. A part leaves it when the snapshot stops showing
+    /// it `active`.
+    announced_foreign: BTreeSet<(String, String)>,
     /// When the loop last re-asserted its live legacy claims (review 042 G74-5,
     /// [`CLAIM_REASSERT_SECS`]); `None` until the first beat.
     last_claim_reassert: Option<i64>,
@@ -1635,6 +1644,7 @@ impl DriveLoop {
             holds: std::collections::BTreeMap::new(),
             spin_parks: std::collections::BTreeMap::new(),
             announced_holds: std::collections::BTreeMap::new(),
+            announced_foreign: BTreeSet::new(),
             last_claim_reassert: None,
             offline_since: None,
             offline_alerted: false,
@@ -2976,9 +2986,10 @@ impl DriveLoop {
             // since keeperd's claim of an already-`active` part is idempotent-`Ok`.
             // Each this-tick claim is then inserted as before — the same-tick
             // belt-and-suspenders for two members mis-pinned to one queue, where
-            // marking the head `active` would otherwise read as a *resume*. A fresh
-            // loop after a daemon restart has an empty `assignments`, so the rightful
-            // resumer still claims (resume-after-restart preserved).
+            // marking the head `active` would otherwise read as a *resume*. Resume
+            // after a daemon restart needs no `active` path: boot reconcile resets
+            // every orphaned `active` item to `queued` before the first pick, and the
+            // same-item seed keeps the member's baton (task 086).
             let mut spoken_for: BTreeSet<(String, String)> =
                 self.assignments.values().cloned().collect();
             for member in &fleet {
@@ -3012,20 +3023,33 @@ impl DriveLoop {
                 // the part's own doc. A held part is marked on the working snapshot
                 // (so no later member re-reads it this tick) and the member picks
                 // again, past it — each pass holds one more part, so this ends.
-                // A resume of an `active` part is not a fresh claim and is never
-                // held: the marker does not park work already in flight.
+                //
+                // An `active` head no live member holds is never this fleet's work
+                // (task 086): boot reconcile resets every `active` item at startup, and
+                // a live member's part is in `spoken_for`. It is a semi-auto session's
+                // self-pull, a human's claim, or a part whose member just exited
+                // without marking it — claiming it re-runs someone else's or finished
+                // work, and skips the `> Fleet:` marker read besides. The pin is
+                // occupied, so the member pivots to fallback, which never picks an
+                // `active` head: at most one extra pass.
+                let mut pin = member.pin.as_deref();
                 let picked = loop {
-                    let Some((queue, part)) =
-                        pick_for(&snapshot, member.pin.as_deref(), &reserved)
-                    else {
+                    let Some((queue, part)) = pick_for(&snapshot, pin, &reserved) else {
                         break None;
                     };
                     let key = (queue.clone(), part.clone());
+                    if spoken_for.contains(&key) {
+                        break Some((queue, part));
+                    }
                     let fresh = snapshot.queue(&queue).is_some_and(|q| {
                         q.parts.iter().any(|p| p.id == part && p.status == PartStatus::Queued)
                     });
-                    if !fresh || spoken_for.contains(&key) {
-                        break Some((queue, part));
+                    if !fresh {
+                        if self.announced_foreign.insert(key) {
+                            report.foreign_active.push((queue, part));
+                        }
+                        pin = None;
+                        continue;
                     }
                     let Some(hold) = self.queues.claim_hold(&queue, &part) else {
                         self.announced_holds.remove(&key);
@@ -3171,6 +3195,12 @@ impl DriveLoop {
             self.announced_holds.retain(|(queue, part), _| {
                 snapshot.queue(queue).is_some_and(|q| {
                     q.parts.iter().any(|p| p.id == *part && p.status == PartStatus::Queued)
+                })
+            });
+            // Task 086: a part is narrated again only after it stops being `active`.
+            self.announced_foreign.retain(|(queue, part)| {
+                snapshot.queue(queue).is_some_and(|q| {
+                    q.parts.iter().any(|p| p.id == *part && p.status == PartStatus::Active)
                 })
             });
         }
@@ -4104,6 +4134,14 @@ impl TickLogger {
             out.push(format!(
                 "fleet: skipping {}/{} — {}; left queued for the human",
                 h.queue, h.part, h.reason
+            ));
+        }
+        // Task 086: an `active` head no member holds is someone else's in-flight work.
+        for (queue, part) in &r.foreign_active {
+            out.push(format!(
+                "fleet: leaving {queue}/{part} alone — active, but no fleet member holds it \
+                 (a semi-auto session, a human claim, or a member that exited without \
+                 marking it)"
             ));
         }
         for (agent, kind) in held_now.difference(&self.held) {
@@ -7003,6 +7041,24 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     }
 
     #[test]
+    fn tick_logger_narrates_an_active_part_left_alone() {
+        let mut logger = TickLogger::default();
+        let foreign = TickReport {
+            foreign_active: vec![("default".into(), "067".into())],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&foreign),
+            vec![
+                "fleet: leaving default/067 alone — active, but no fleet member holds it \
+                 (a semi-auto session, a human claim, or a member that exited without \
+                 marking it)"
+                    .to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn tick_logger_narrates_held_fresh_and_exit_dispositions() {
         let mut logger = TickLogger::default();
 
@@ -8007,23 +8063,83 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(claimer.claims(), vec![("default".into(), "h1".into())]);
     }
 
-    /// TASK 068 — the marker never parks work in flight: resuming an `active` part
-    /// is not a fresh claim, so its doc is not read for a marker at all.
+    /// TASK 086 — an `active` head no live member holds is never taken. Boot
+    /// reconcile resets every `active` item before the first pick, so such a part
+    /// is someone else's in-flight work. This test used to assert the opposite
+    /// ("the marker never parks work in flight"), which is how member `a` took
+    /// `default/067` from a semi-auto session on 2026-10-21.
     #[test]
-    fn the_marker_never_holds_a_part_already_active() {
-        let (mut loop_, _d, _backend, _claimer, queues, _probe) = make_claiming(
+    fn an_active_part_no_member_holds_is_never_taken() {
+        let (mut loop_, _d, _backend, claimer, queues, _probe) = make_claiming(
             vec![member("c", "default")],
             vec![q("default", &[("x", "active")])],
             Policy::default(),
         );
         queues.mark_human_only("x");
         let r = loop_.tick(0);
+        assert!(r.started.is_empty(), "an active part with no fleet holder is not ours: {:?}", r.started);
+        assert_eq!(r.foreign_active, vec![("default".to_string(), "x".to_string())]);
+        assert!(r.skipped_for_human.is_empty());
+        assert_eq!(queues.marker_reads(), 0, "not a claim candidate, so its doc isn't read");
+        assert!(claimer.claims().is_empty());
+
+        let r1 = loop_.tick(1);
+        assert!(r1.started.is_empty());
+        assert!(r1.foreign_active.is_empty(), "narrated once while it stays active");
+    }
+
+    /// TASK 086, the 2026-10-21 shape: a semi-auto session finished `066` and its
+    /// self-pull set `067` `active`. The member pinned to `default` must leave it to
+    /// the session and pivot to its fallback, as it would for a blocked queue.
+    #[test]
+    fn a_semi_auto_self_pull_pivots_the_pinned_member_to_fallback() {
+        let (mut loop_, _d, _backend, claimer, _queues, _probe) = make_claiming(
+            vec![member("a", "default")],
+            vec![
+                q("default", &[("066", "done"), ("067", "active")]),
+                q("qb", &[("p", "queued")]),
+            ],
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
         assert_eq!(
             r.started,
-            vec![Assignment { agent: "c".into(), queue: "default".into(), part: "x".into() }],
+            vec![Assignment { agent: "a".into(), queue: "qb".into(), part: "p".into() }],
         );
-        assert!(r.skipped_for_human.is_empty());
-        assert_eq!(queues.marker_reads(), 0);
+        assert_eq!(r.foreign_active, vec![("default".to_string(), "067".to_string())]);
+        assert_eq!(claimer.claims(), vec![("qb".into(), "p".into())], "067 is never claimed");
+    }
+
+    /// TASK 086, the same hole from the member's side (report 084's failure mode):
+    /// a member exits `ITEM_COMPLETE` but its `set_item_status` never landed, so
+    /// the part still reads `active`. The completion drops its assignment, and the
+    /// re-claim in the same tick must not relaunch it onto the finished part.
+    #[test]
+    fn a_completed_part_left_active_is_not_relaunched() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0); // claims p1 — the claim leaves it `active`
+        assert_eq!(backend.spawn_count(), 1);
+
+        queues.set(vec![q("qa", &[("p1", "active")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "ITEM_COMPLETE");
+        let r1 = loop_.tick(1);
+        assert!(r1.started.is_empty(), "no relaunch onto the finished part: {:?}", r1.started);
+        assert_eq!(backend.spawn_count(), 1);
+        assert_eq!(r1.foreign_active, vec![("qa".to_string(), "p1".to_string())]);
+
+        // Once the status write shows up, the member moves on to the next part.
+        queues.set(vec![q("qa", &[("p1", "done"), ("p2", "queued")])]);
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p2".into() }],
+        );
+        assert_eq!(claimer.claims().last(), Some(&("qa".to_string(), "p2".to_string())));
     }
 
     /// TASK 068 — `growlight status` lists what the fleet left for the human. The
