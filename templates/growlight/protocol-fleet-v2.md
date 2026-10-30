@@ -106,10 +106,12 @@ protocol is fixed; the baton changes each iteration.
 
 7b. DEFERRED VERIFICATION. If the ONLY unmet criteria are manual smoketests you
    physically can't run, do NOT block. Finish and verify everything you can, then
-   record each pending test in the item doc under a `## Deferred verification`
-   section (what to run, expected result) AND in FOR THE HUMAN; end with
+   record each pending test in FOR THE HUMAN; end with
    `growlight_complete_entry`, `outcome = deferred`, with `deferred_tests` (each
-   pending test, what to run, the expected result) and a short terminal baton
+   pending test: `what` to run and the `expected` result). That verb is the only
+   writer of the item doc's `## Deferred verification` section — never write or
+   edit that section by hand, it replaces whatever is there. Put the whole
+   runbook for a test in its `what`. End with a short terminal baton
    (status ITEM_DEFERRED). Do NOT pull or reseed — the orchestrator claims and
    seeds your next part. A `deferred` item waits for the human and never
    re-enters the loop. Reserve `growlight_block` `kind = human` strictly for when

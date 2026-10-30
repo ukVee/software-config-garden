@@ -362,6 +362,32 @@ mod template_tests {
     }
 
     #[test]
+    fn v2_protocol_leaves_deferred_verification_to_the_verb() {
+        // V10: `queue_v2_deferred` replaces the whole `## Deferred verification`
+        // section (down to the next same-or-higher heading), so a runbook the
+        // member hand-wrote there is lost. The verb is the only writer; step 7b
+        // must not tell the member to write the section itself.
+        let step = PROTOCOL_FLEET_V2_MD
+            .split_once("\n7b. DEFERRED VERIFICATION.")
+            .expect("v2 protocol has a step 7b")
+            .1
+            .split_once("\n8. THE CAP.")
+            .expect("step 7b is followed by step 8")
+            .0;
+        let step = step.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !step.contains("in the item doc under"),
+            "v2 step 7b must not tell the member to hand-write the section"
+        );
+        assert!(
+            step.contains("only writer of the item doc's `## Deferred verification` section"),
+            "v2 step 7b must name the verb as the only writer"
+        );
+        // The legacy fleet protocol (no such verb) still hand-writes it.
+        assert!(PROTOCOL_FLEET_MD.contains("under a `## Deferred verification`"));
+    }
+
+    #[test]
     fn v2_protocol_keeps_step_3c_byte_identical() {
         // Step 3c (REPORT) sits between the changed 3b and 4, so it is outside the
         // shared-prefix guard — assert it stays byte-identical on its own.
