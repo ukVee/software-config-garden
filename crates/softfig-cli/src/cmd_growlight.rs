@@ -2207,6 +2207,10 @@ pub enum QueueSub {
     /// release it to the fleet (`yes`) — the row's `fleet` field.
     Fleet(QueueFleetArgs),
 
+    /// Set an entry's start time (the row's `not_before`): a `queued` entry
+    /// is held until then. `""` clears it.
+    NotBefore(QueueNotBeforeArgs),
+
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
     Drop(QueueDropArgs),
 }
@@ -2281,6 +2285,10 @@ pub struct QueueAddArgs {
     /// Make the entry human-only (`fleet = false`): the fleet never claims it.
     #[arg(long)]
     pub no_fleet: bool,
+    /// Hold the entry until this time (`not_before`): `YYYY-MM-DD HH:MM
+    /// ±HH:MM`, offset required.
+    #[arg(long, value_name = "TIME")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2377,6 +2385,18 @@ pub struct QueueFleetArgs {
     /// yes releases the entry to the fleet; no holds it for the human. A
     /// live-held active entry keeps running.
     pub fleet: FleetArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueNotBeforeArgs {
+    /// The live entry id.
+    pub id: String,
+    /// `YYYY-MM-DD HH:MM ±HH:MM` (offset required; `T` and `Z` allowed), or
+    /// `""` to clear the start time. An entry that has started ignores it.
+    pub time: String,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2488,6 +2508,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::After(a) => queue_after(&socket, a),
         QueueSub::Status(a) => queue_status(&socket, a),
         QueueSub::Fleet(a) => queue_fleet(&socket, a),
+        QueueSub::NotBefore(a) => queue_not_before(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
     }
 }
@@ -2780,6 +2801,7 @@ fn queue_add(socket: &Path, args: QueueAddArgs) -> Result<()> {
         ref_id,
         slices: Vec::new(),
         fleet: args.no_fleet.then_some(false),
+        not_before: args.not_before,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_ADD_ENTRY, serde_json::to_value(wire)?)?;
@@ -2797,6 +2819,7 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
         after: None,
         status: None,
         fleet: None,
+        not_before: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2816,6 +2839,7 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
         after: None,
         status: None,
         fleet: None,
+        not_before: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2832,6 +2856,7 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
         after: Some(args.ids),
         status: None,
         fleet: None,
+        not_before: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2853,6 +2878,7 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
             HumanStatus::Done => QueueStatusArg::Done,
         }),
         fleet: None,
+        not_before: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2869,6 +2895,24 @@ fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
         after: None,
         status: None,
         fleet: Some(args.fleet == FleetArg::Yes),
+        not_before: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: Some(args.time),
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -4426,6 +4470,31 @@ mod tests {
             },
             other => panic!("expected Queue, got {other:?}"),
         }
+        match TestCli::try_parse_from(["g", "queue", "not-before", "m1", ""]).unwrap().cmd {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::NotBefore(n) => {
+                    assert_eq!(n.id, "m1");
+                    assert_eq!(n.time, "", "an empty time clears it");
+                }
+                other => panic!("expected not-before, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "add", "task", "t1", "--project", "softfig", "--not-before",
+            "2026-11-01 02:00 -04:00",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => {
+                    assert_eq!(q.not_before.as_deref(), Some("2026-11-01 02:00 -04:00"))
+                }
+                other => panic!("expected add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
         match TestCli::try_parse_from(["g", "queue", "drop", "m1", "--reason", "@why.md"])
             .unwrap()
             .cmd
@@ -4786,6 +4855,7 @@ mod tests {
             before: None,
             behind: None,
             no_fleet: false,
+            not_before: None,
             dry_run,
         }
     }
@@ -4857,6 +4927,7 @@ mod tests {
             before: None,
             behind: None,
             no_fleet: false,
+            not_before: None,
             dry_run: true,
         };
         queue_add(&socket, task).unwrap();
@@ -4878,6 +4949,7 @@ mod tests {
                 before: None,
                 behind: None,
                 no_fleet: false,
+                not_before: None,
                 dry_run: false,
             },
         )
@@ -4933,6 +5005,20 @@ mod tests {
         queue_fleet(&socket, QueueFleetArgs { id: "m1".into(), fleet: FleetArg::Yes, dry_run: false })
             .unwrap();
         assert!(fleet_of(&socket), "queue fleet m1 yes releases it");
+
+        // not-before: schedule, refuse a bad time, then clear.
+        let nb_of = |socket: &Path| {
+            e2e_queue(socket).entries.iter().find(|e| e.id == "m1").unwrap().not_before.clone()
+        };
+        let at = "2026-11-01 02:00 -04:00";
+        let nb = |time: &str| QueueNotBeforeArgs { id: "m1".into(), time: time.into(), dry_run: false };
+        queue_not_before(&socket, nb(at)).unwrap();
+        assert_eq!(nb_of(&socket).as_deref(), Some(at), "queue not-before m1 <time> schedules it");
+        let err = queue_not_before(&socket, nb("tomorrow")).unwrap_err();
+        assert!(format!("{err:#}").contains("bad_start_time"), "{err:#}");
+        assert_eq!(nb_of(&socket).as_deref(), Some(at), "a refused time changes nothing");
+        queue_not_before(&socket, nb("")).unwrap();
+        assert_eq!(nb_of(&socket), None, "queue not-before m1 \"\" clears it");
 
         // A dry-run status edit leaves the state untouched.
         queue_status(

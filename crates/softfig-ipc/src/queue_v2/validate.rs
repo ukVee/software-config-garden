@@ -40,7 +40,7 @@ use super::{
 };
 
 /// A refused write, or a file that fails invariant validation. The first
-/// eleven variants are the §6.8 state-level refusal codes, one per named code,
+/// twelve variants are the §6.8 state-level refusal codes, one per named code,
 /// so keeperd verbs map them 1:1 onto replies. The last two are
 /// validation-only (file corruption) and never cross a verb reply:
 ///
@@ -126,6 +126,15 @@ pub enum QueueRefusal {
         /// The verb the member may not call.
         verb: String,
     },
+    /// Verb-only: a `not_before` that does not parse as
+    /// `YYYY-MM-DD HH:MM ±HH:MM` (§6.8 **Holds**). The pick holds such an
+    /// entry fail-closed, so the verb refuses it rather than write one.
+    BadStartTime {
+        /// The value as given.
+        value: String,
+        /// Why it does not parse.
+        reason: String,
+    },
     /// **Validation-only** (finding 9): a `slices.toml` whose `milestone`
     /// field names a different folder than the file was read from — the file
     /// belongs somewhere else, or was hand-moved. No §6.8 code describes it.
@@ -161,6 +170,7 @@ impl QueueRefusal {
             QueueRefusal::Running { .. } => "running",
             QueueRefusal::DaemonOwned { .. } => "daemon_owned",
             QueueRefusal::MemberNotAllowed { .. } => "member_not_allowed",
+            QueueRefusal::BadStartTime { .. } => "bad_start_time",
             QueueRefusal::MilestoneMismatch { .. } => "milestone_mismatch",
             QueueRefusal::InvalidItemShape { .. } => "invalid_item_shape",
         }
@@ -202,6 +212,9 @@ impl fmt::Display for QueueRefusal {
             }
             QueueRefusal::MemberNotAllowed { verb } => {
                 write!(f, "member_not_allowed: '{verb}' is not allowed to members")
+            }
+            QueueRefusal::BadStartTime { value, reason } => {
+                write!(f, "bad_start_time: not_before '{value}' does not parse ({reason})")
             }
             QueueRefusal::MilestoneMismatch { found, expected } => write!(
                 f,
@@ -921,6 +934,13 @@ mod tests {
     }
 
     #[test]
+    fn refusal_bad_start_time() {
+        let r = QueueRefusal::BadStartTime { value: "soon".into(), reason: "why".into() };
+        assert_eq!(r.code(), "bad_start_time");
+        assert!(r.to_string().starts_with("bad_start_time:") && r.to_string().contains("soon"));
+    }
+
+    #[test]
     fn refusal_invalid_item_shape() {
         let r = QueueRefusal::InvalidItemShape { id: "x".into() };
         assert_eq!(r.code(), "invalid_item_shape");
@@ -943,6 +963,7 @@ mod tests {
             QueueRefusal::Running { id: "x".into() },
             QueueRefusal::DaemonOwned { id: "x".into() },
             QueueRefusal::MemberNotAllowed { verb: "queue_drop".into() },
+            QueueRefusal::BadStartTime { value: "x".into(), reason: "y".into() },
             QueueRefusal::MilestoneMismatch {
                 found: "x".into(),
                 expected: "y".into(),

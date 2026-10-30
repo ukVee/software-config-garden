@@ -2226,7 +2226,7 @@ pub struct QueueSliceSpec {
 
 /// `queue_add_entry({kind, slug?, title?, mission?, finish_criteria?,
 /// project, lane = "normal", after = [], position = "back", ref?,
-/// slices = [], fleet?, dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
+/// slices = [], fleet?, not_before?, dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
 /// the docs as the legacy `add_backlog_item` does and places the lane row in
 /// `queue.toml` — one commit:
 ///
@@ -2283,6 +2283,12 @@ pub struct QueueAddEntryArgs {
     /// found work is the fleet's by definition, and a hold is the human's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<bool>,
+    /// The row's `not_before` start time (§3.1), in the
+    /// [`crate::fleet::parse_not_before`] grammar, kept as written. A value
+    /// that does not parse is refused `bad_start_time`. Refused for `restack`
+    /// and for a fleet member, like `fleet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,
@@ -2332,8 +2338,8 @@ pub struct QueueMoveSpec {
 }
 
 /// `queue_update_entry({id, lane?, move = {to, ref?}?, after?, status?,
-/// fleet?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
-/// applied in the order lane → move → after → fleet → status, committed once with the queue view
+/// fleet?, not_before?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
+/// applied in the order lane → move → after → fleet → not_before → status, committed once with the queue view
 /// re-rendered. A no-op edit mints no commit (the legacy reorder verb's
 /// idempotence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2362,6 +2368,11 @@ pub struct QueueUpdateEntryArgs {
     /// `active` entry keeps running (§2 **Holds**).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<bool>,
+    /// Sets the row's `not_before` start time (§3.1); `""` clears it. A value
+    /// that does not parse is refused `bad_start_time`. Holds a `queued`
+    /// entry only: one that has started ignores it (§2 **Holds**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,

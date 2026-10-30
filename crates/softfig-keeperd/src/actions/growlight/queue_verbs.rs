@@ -144,11 +144,11 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     let args: QueueAddEntryArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
     if let Some(member) = crate::caller::member()
-        && args.fleet.is_some() {
+        && let Some(field) = member_hold_field(&args) {
             return Err((
                 ErrorKind::BadArgs,
                 format!(
-                    "member_not_allowed: fleet member {member} may not set `fleet` on \
+                    "member_not_allowed: fleet member {member} may not set `{field}` on \
                      queue_add_entry — a member's found work is the fleet's, and holding an \
                      entry for the human is the human's call (spec-growlight-queue §6.7). \
                      Drop the field, or post_message @human if the work needs a person"
@@ -173,6 +173,33 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
         EntryKind::Milestone => add_milestone(daemon, args),
         EntryKind::Task => add_task(daemon, args),
         EntryKind::Restack => add_restack(daemon, args),
+    }
+}
+
+/// §6.7 for a member's `queue_add_entry`: the first hold field (`fleet`,
+/// `not_before`) it carries. Either value of either is refused — the fields are
+/// the human's to set, so their presence is the refusal.
+fn member_hold_field(args: &QueueAddEntryArgs) -> Option<&'static str> {
+    if args.fleet.is_some() {
+        Some("fleet")
+    } else if args.not_before.is_some() {
+        Some("not_before")
+    } else {
+        None
+    }
+}
+
+/// A verb's `not_before` (§6.8 **Holds**), checked with the one parser the
+/// pick uses: `""` is no start time (it clears one on update), anything else
+/// must parse or is refused `bad_start_time`. Kept as written.
+fn checked_not_before(value: Option<String>) -> Result<Option<String>, (ErrorKind, String)> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => match softfig_ipc::fleet::parse_not_before(&v) {
+            Ok(_) => Ok(Some(v)),
+            Err(reason) => Err(refuse(QueueRefusal::BadStartTime { value: v, reason })),
+        },
     }
 }
 
@@ -264,6 +291,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     if conventions::validate_slug(&slug).is_err() {
         return Err(refuse(QueueRefusal::BadName { name: slug.clone() }));
     }
+    let not_before = checked_not_before(args.not_before)?;
     let lane = args.lane.unwrap_or(Lane::Normal);
     let position = parse_position(args.position.as_deref(), args.ref_id.as_deref())?;
     for spec in &args.slices {
@@ -349,7 +377,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         follow_ups: 0,
         pending_status: None,
         fleet: args.fleet.unwrap_or(true),
-        not_before: None,
+        not_before,
     };
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
     queue.entries.insert(idx, entry);
@@ -466,6 +494,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     if conventions::validate_slug(&slug).is_err() {
         return Err(refuse(QueueRefusal::BadName { name: slug.clone() }));
     }
+    let not_before = checked_not_before(args.not_before)?;
     if !args.slices.is_empty() {
         return Err((
             ErrorKind::BadArgs,
@@ -515,7 +544,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         follow_ups: 0,
         pending_status: None,
         fleet: args.fleet.unwrap_or(true),
-        not_before: None,
+        not_before,
     };
     let doc_content = task_doc_v2(&id, &title, &mission, &finish);
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
@@ -674,6 +703,7 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         ("after", !args.after.is_empty()),
         ("slices", !args.slices.is_empty()),
         ("fleet", args.fleet.is_some()),
+        ("not_before", args.not_before.is_some()),
     ] {
         if given {
             return Err((
@@ -786,6 +816,11 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         Some(m) => Some(parse_position(Some(&m.to), m.ref_id.as_deref())?),
         None => None,
     };
+    // So does `not_before`: `Some(None)` clears the start time.
+    let not_before = match args.not_before {
+        Some(v) => Some(checked_not_before(Some(v))?),
+        None => None,
+    };
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -876,7 +911,13 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         queue.entries[idx].fleet = fleet;
     }
 
-    // 5. status. `done` is the human's override — no open-items check — and
+    // 5. not_before: the start-time hold (§3.1), also before status.
+    if let Some(not_before) = not_before {
+        let idx = idx_of(&queue, &args.id);
+        queue.entries[idx].not_before = not_before;
+    }
+
+    // 6. status. `done` is the human's override — no open-items check — and
     // moves the row to the archive (appended, `finished` stamped,
     // `final_status = done`, which still satisfies `after` links).
     let mut archived = false;
@@ -927,7 +968,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
 
     // No-op guard: an edit that changed nothing (same lane, same position,
-    // same links, same fleet, same status) mints no commit — the legacy reorder verb's
+    // same links, same holds, same status) mints no commit — the legacy reorder verb's
     // idempotence. Return the untouched tip without touching apply.
     if queue == loaded_queue && archive == loaded_archive {
         let hash = current_tip(&inner)?;
@@ -2057,6 +2098,100 @@ mod tests {
         assert_eq!(commit_count(&daemon), before + 2);
     }
 
+    /// §6.7: a member's found work may not carry `not_before` either — any
+    /// value, even an empty one. Nothing commits. A human's start time lands
+    /// on the row as written, for both kinds that take it.
+    #[test]
+    fn a_members_add_entry_may_not_carry_not_before() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        let before = commit_count(&daemon);
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for value in ["2026-11-01 02:00 -04:00", ""] {
+                let nb = serde_json::json!({ "not_before": value });
+                for args in [
+                    milestone_args("m1", "softfig", nb.clone()),
+                    task_args("t1", "softfig", nb.clone()),
+                ] {
+                    let err = add_entry(&daemon, args).unwrap_err();
+                    assert_eq!(err.0, ErrorKind::BadArgs);
+                    assert!(err.1.starts_with("member_not_allowed:"), "{err:?}");
+                    assert!(err.1.contains("`not_before`"), "{err:?}");
+                }
+            }
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+        }
+        let at = "2026-11-01T02:00-04:00";
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({ "not_before": at })))
+            .expect("a human may schedule a milestone");
+        add_entry(&daemon, task_args("t1", "softfig", serde_json::json!({ "not_before": at })))
+            .expect("a human may schedule a task");
+        add_entry(&daemon, milestone_args("m2", "softfig", serde_json::json!({})))
+            .expect("absent not_before");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let nb: Vec<Option<&str>> =
+            qs.queue.model.entries.iter().map(|e| e.not_before.as_deref()).collect();
+        assert_eq!(nb, [Some(at), Some(at), None], "kept as written");
+    }
+
+    /// A start time that doesn't parse is refused `bad_start_time` by both
+    /// verbs, before anything commits — the pick would hold it fail-closed, so
+    /// the verb never writes one.
+    #[test]
+    fn a_bad_start_time_is_refused_at_the_verb() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("a", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+        for bad in ["tomorrow", "2026-11-01 02:00", "2026-13-01 02:00 -04:00", " "] {
+            let nb = serde_json::json!({ "not_before": bad });
+            for err in [
+                add_entry(&daemon, milestone_args("m1", "softfig", nb.clone())).unwrap_err(),
+                add_entry(&daemon, task_args("t1", "softfig", nb.clone())).unwrap_err(),
+                update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": bad }))
+                    .unwrap_err(),
+            ] {
+                assert_eq!(err.0, ErrorKind::BadArgs, "{bad:?}");
+                assert!(err.1.starts_with("bad_start_time:"), "{bad:?}: {err:?}");
+            }
+        }
+        assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+    }
+
+    /// `not_before` on `queue_update_entry` sets the start time and `""`
+    /// clears it; re-setting the value it already has, or clearing an absent
+    /// one, is a no-op that mints no commit.
+    #[test]
+    fn update_entry_sets_and_clears_not_before() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("a", "softfig", serde_json::json!({}))).unwrap();
+        let nb_of = |daemon: &Daemon| {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(daemon, &inner);
+            let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+            qs.queue.model.entries[0].not_before.clone()
+        };
+        let at = "2026-11-01 02:00 -04:00";
+        let before = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": "" })).unwrap();
+        assert_eq!(commit_count(&daemon), before, "clearing an absent time is a no-op");
+        update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": at })).unwrap();
+        assert_eq!(nb_of(&daemon).as_deref(), Some(at), "scheduled");
+        assert_eq!(commit_count(&daemon), before + 1);
+        update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": at })).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1, "the same time again is a no-op");
+        update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": "" })).unwrap();
+        assert_eq!(nb_of(&daemon), None, "cleared");
+        assert_eq!(commit_count(&daemon), before + 2);
+    }
+
     #[test]
     fn add_entry_planned_milestone_writes_the_given_slices() {
         let garden = tempfile::tempdir().unwrap();
@@ -2565,6 +2700,7 @@ mod tests {
             ("after", serde_json::json!({ "after": ["001"] })),
             ("slices", serde_json::json!({ "slices": [{ "slug": "x", "body": "y" }] })),
             ("fleet", serde_json::json!({ "fleet": false })),
+            ("not_before", serde_json::json!({ "not_before": "2026-11-01 02:00 -04:00" })),
         ] {
             let err = add_entry(&daemon, restack_args("softfig", extra)).unwrap_err();
             assert_eq!(err.0, ErrorKind::BadArgs, "{name}: {err:?}");
