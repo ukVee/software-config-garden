@@ -172,6 +172,9 @@ impl<'a> WorkTree<'a> {
                 .expect("a doc carrying a managed region");
             return Err((ErrorKind::BadArgs, why));
         }
+        if let Some(file) = self.first_queue_state_file(&scope) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, &file, "removes")));
+        }
         Ok(())
     }
 
@@ -196,6 +199,9 @@ impl<'a> WorkTree<'a> {
             }
         if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_item_doc_path(l)) {
             return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, &landing, "rename lands on")));
+        }
+        if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_queue_state_path(l)) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, &landing, "rename lands on")));
         }
         self.guard_member_removal(to)
     }
@@ -248,6 +254,14 @@ impl<'a> WorkTree<'a> {
     /// its text.
     fn first_fleet_doc(&self, rel: &str) -> Option<(String, String)> {
         self.first_doc_with(rel, softfig_ipc::fleet::held)
+    }
+
+    /// The first queue v2 state file ([`is_queue_state_path`]) present at or
+    /// under `rel`.
+    fn first_queue_state_file(&self, rel: &str) -> Option<String> {
+        self.landings(rel, rel)
+            .into_iter()
+            .find(|f| is_queue_state_path(f) && self.exists(f))
     }
 
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
@@ -467,6 +481,9 @@ fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes:
     let Some(member) = crate::caller::member() else {
         return Ok(());
     };
+    if old != new && is_queue_state_path(rel) {
+        return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, "write changes")));
+    }
     let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
     let (old, new) = (text(old), text(new));
     if bytes == Bytes::Caller
@@ -687,6 +704,35 @@ pub(crate) fn member_region_refusal(
          @human. (spec-growlight-queue §6.7)",
         changed.join("`, `")
     ))
+}
+
+/// Whether canonical `rel` is one of queue v2's state files: the live
+/// `queue.toml`, `queue-archive.toml`, or a milestone's or sub-milestone's
+/// `slices.toml` (`milestones/**/slices.toml`).
+fn is_queue_state_path(rel: &str) -> bool {
+    use softfig_ipc::queue_v2::{MILESTONES_DIR, QUEUE_ARCHIVE_FILE, QUEUE_FILE};
+    rel == QUEUE_FILE
+        || rel == QUEUE_ARCHIVE_FILE
+        || rel
+            .strip_prefix(MILESTONES_DIR)
+            .is_some_and(|rest| rest.starts_with('/') && rest.ends_with("/slices.toml"))
+}
+
+/// queue-v2-parity row 5 (the v2 counterpart of the legacy queue-table
+/// region guard): a member may not write, remove or rename onto a queue v2
+/// state file ([`is_queue_state_path`]). growlightd schedules from them, and
+/// they move only through the queue verbs — keeperd's typed writer
+/// (`write_structured`), which validates the whole file and which a member
+/// reaches with `queue_add_entry` / `slice_insert` or through growlightd's
+/// handshake. The refusal text leads with the wire code, `member_not_allowed`.
+fn member_queue_file_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {rel}, and fleet member {member} may not edit queue v2's \
+         state files by hand — `queue.toml`, `queue-archive.toml` and a milestone's \
+         `slices.toml` move only through the queue verbs, which validate them, and growlightd \
+         schedules from them. Use slice_insert / slice_update or the growlight_* member verbs; \
+         if a row is wrong, file_report it or post_message @human. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// [`member_fleet_refusal`] as the worktree's error, for a change the caller
@@ -1231,6 +1277,104 @@ Example:
             .expect("the prose around the region is the member's");
         wt.write_derived(host, table("done").replace("prose", "edited prose").as_bytes())
             .expect("the daemon's re-derivation of the region");
+    }
+
+    const QUEUE: &str = "growlight/backlog/queue.toml";
+    const ARCHIVE: &str = "growlight/backlog/queue-archive.toml";
+    const SLICES: &str = "growlight/backlog/milestones/m/slices.toml";
+
+    #[test]
+    fn the_queue_state_paths_are_the_three_v2_files() {
+        assert!(is_queue_state_path(QUEUE));
+        assert!(is_queue_state_path(ARCHIVE));
+        assert!(is_queue_state_path(SLICES));
+        assert!(is_queue_state_path("growlight/backlog/milestones/m/subs/s/slices.toml"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones/m/slices/001-a.md"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones-old/m/slices.toml"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones/m/slices.toml.bak"));
+        assert!(!is_queue_state_path("projects/p/queue.toml"));
+    }
+
+    /// queue-v2-parity row 5: a member's write to `queue.toml` is refused
+    /// whatever road it takes — any spelling of the path, the batch pre-check,
+    /// a derived write — and so is creating a `slices.toml`. Re-sending the
+    /// bytes unchanged, and keeperd's typed writer, still land.
+    #[test]
+    fn a_member_may_not_patch_queue_toml() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(QUEUE, b"schema = 1\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for path in [QUEUE, "growlight/./backlog//queue.toml"] {
+            let err = wt.write(path, b"schema = 1\n# moved\n").unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs);
+            assert!(
+                err.1.starts_with("member_not_allowed: this write changes growlight/backlog/queue.toml"),
+                "{err:?}"
+            );
+        }
+        assert!(wt.check_write_bytes(QUEUE, b"x").is_err(), "the pre-check agrees");
+        assert!(wt.check_write_bytes_over(QUEUE, Some(b"schema = 1\n"), b"x").is_err(), "a batch op");
+        assert!(wt.write_derived(QUEUE, b"x").is_err(), "no derived bypass");
+        assert!(wt.write(SLICES, b"schema = 1\n").is_err(), "creating a slices.toml");
+        assert_eq!(wt.read(QUEUE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        assert!(!wt.exists(SLICES));
+        wt.write(QUEUE, b"schema = 1\n").expect("the same bytes change nothing");
+        wt.write_structured(QUEUE, b"schema = 1\n# keeperd\n").expect("keeperd's typed writer");
+    }
+
+    /// queue-v2-parity row 5: a member may not replace the archive, unlink it,
+    /// rename it away, or remove a directory holding a `slices.toml`.
+    #[test]
+    fn a_member_may_not_replace_or_unlink_the_archive() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(ARCHIVE, b"schema = 1\n").unwrap();
+        wt.write(SLICES, b"schema = 1\n").unwrap();
+        wt.write("growlight/backlog/milestones/m/notes/001-x.md", b"# n\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(ARCHIVE, b"schema = 1\n[[entry]]\n").unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed: this write changes"), "{err:?}");
+        let err = wt.remove(ARCHIVE).unwrap_err();
+        assert!(err.1.starts_with(&format!("member_not_allowed: this removes {ARCHIVE}")), "{err:?}");
+        assert!(wt.rename(ARCHIVE, "projects/p/archive.toml").is_err(), "renaming it away");
+        let err = wt.remove("growlight/backlog/milestones/m").unwrap_err();
+        assert!(err.1.contains(&format!("removes {SLICES}")), "{err:?}");
+        assert_eq!(wt.read(ARCHIVE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        assert!(wt.exists(SLICES) && !wt.exists("projects/p/archive.toml"));
+        wt.remove("growlight/backlog/milestones/m/notes/001-x.md")
+            .expect("a backlog file that is not queue state");
+    }
+
+    /// queue-v2-parity row 5: a member may not rename a file — or a directory
+    /// whose files land there — onto a milestone's or sub-milestone's
+    /// `slices.toml`.
+    #[test]
+    fn a_member_may_not_rename_onto_a_slices_toml() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write("projects/p/drafts/slices.toml", b"schema = 1\n").unwrap();
+        wt.write("projects/p/drafts/n/slices.toml", b"schema = 1\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.rename("projects/p/drafts/slices.toml", SLICES).unwrap_err();
+        assert!(
+            err.1.starts_with(&format!("member_not_allowed: this rename lands on {SLICES}")),
+            "{err:?}"
+        );
+        let sub = "growlight/backlog/milestones/m/subs/s/slices.toml";
+        assert!(wt.rename("projects/p/drafts/slices.toml", sub).is_err(), "a sub-milestone's");
+        let err = wt.rename("projects/p/drafts/n", "growlight/backlog/milestones/n").unwrap_err();
+        assert!(err.1.contains("lands on growlight/backlog/milestones/n/slices.toml"), "{err:?}");
+        assert!(!wt.exists(SLICES) && !wt.exists(sub));
+        assert!(!wt.exists("growlight/backlog/milestones/n/slices.toml"));
+        wt.rename("projects/p/drafts/slices.toml", "projects/p/drafts/old.toml")
+            .expect("a rename outside the queue");
     }
 
     /// Review 042 G74-3: every spelling of a garden path canonicalises to one,

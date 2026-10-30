@@ -2003,6 +2003,35 @@ mod tests {
         );
     }
 
+    /// queue-v2-parity row 5: the member raw-file guard leaves the queue verbs
+    /// writing — a human's `queue_update_entry`, and a member's own found work
+    /// (`queue_add_entry`, keeperd's typed writer under the member's scope) —
+    /// while the member's raw write of the same file is refused.
+    #[test]
+    fn the_raw_file_guard_leaves_the_queue_verbs_writing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("a", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": false }))
+            .expect("a human verb writes queue.toml");
+        assert_eq!(commit_count(&daemon), before + 1);
+        let _member = crate::caller::enter(Some("c".into()));
+        add_entry(&daemon, milestone_args("b", "softfig", serde_json::json!({})))
+            .expect("a member's found work writes queue.toml and a slices.toml");
+        assert_eq!(commit_count(&daemon), before + 2);
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert!(wt.exists(&slices_file("b")), "the member's milestone has its slices.toml");
+        let queue = wt.read_to_string(QUEUE_FILE).unwrap();
+        let err = wt.write(QUEUE_FILE, format!("{queue}\n# hand edit\n").as_bytes()).unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:"), "{err:?}");
+    }
+
     /// `fleet` on `queue_update_entry` sets the row's hold and releases it;
     /// re-setting the value it already has is a no-op that mints no commit.
     #[test]
