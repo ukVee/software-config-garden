@@ -397,8 +397,11 @@ pub struct RestackEntry {
 /// merged, or a lower branch amended in review). Walks the stack candidates in
 /// claim order (read-only, via [`stack_candidates`]) and returns the ordered
 /// stack — each branch with its recorded `parent`/`base` and the resolved
-/// `--onto` target — when any branch's recorded `base` is no longer an
-/// ancestor of its parent's tip (or `main`). `None` when the stack is healthy
+/// `--onto` target — when any branch no longer contains its parent's tip (or
+/// `main`'s), i.e. `!is_ancestor(onto, branch)`. The recorded `base` is carried
+/// through for the restack doc but never judged: ff-only merges only move
+/// `main` forward, so the old base stays an ancestor of it. `None` when the
+/// stack is healthy
 /// (no false positive), empty, or remote (a remote repo never auto-enqueues,
 /// §8 — growlightd can't see `main` move there). `git` is never written to.
 pub fn detect_restack(
@@ -450,9 +453,11 @@ pub fn detect_restack(
         } else {
             branch_of.get(parent).copied().unwrap_or(main).to_string()
         };
-        // Stale when the recorded base is no longer an ancestor of the parent's
-        // tip (or `main`). An empty base (never recorded) can't be judged.
-        if !base.is_empty() && !git.is_ancestor(base, &onto)? {
+        // Stale when the branch no longer contains its parent's tip (or
+        // `main`'s). Judged on the branch itself, not on the recorded base: under
+        // §8's ff-only merges `main` only moves forward, so the old base stays an
+        // ancestor of it and a base-vs-onto test never sees an urgent fix land.
+        if !git.is_ancestor(&onto, &c.branch)? {
             stale = true;
         }
         out.push(RestackBranch {
@@ -866,13 +871,13 @@ mod tests {
         rev_parse_sh(repo, name)
     }
 
-    /// Rewrite `main`'s tip so the recorded base commit is abandoned (an
-    /// amend — the new tip is no longer a descendant of the old one).
-    fn amend_main(repo: &Path) -> String {
-        sh_git(repo, &["checkout", "-q", "main"]);
-        fs::write(repo.join("a.txt"), "amended\n").unwrap();
-        sh_git(repo, &["add", "."]);
-        sh_git(repo, &["commit", "-q", "--amend", "-m", "main rewritten"]);
+    /// Move `main` forward the way §8's ff-only merges do: an urgent fix cut
+    /// from `main` and fast-forwarded in. The old tip stays an ancestor of the
+    /// new one (`main` is never rewritten), so every branch cut before this is
+    /// now missing the new tip.
+    fn ff_main(repo: &Path) -> String {
+        open_branch_from(repo, "urgent/fix", "main");
+        sh_git(repo, &["merge", "--ff-only", "-q", "urgent/fix"]);
         rev_parse_sh(repo, "main")
     }
 
@@ -888,14 +893,21 @@ mod tests {
     }
 
     #[test]
-    fn detect_restack_fires_when_main_moves_under_a_two_branch_stack() {
+    fn detect_restack_fires_when_an_urgent_fix_ff_merges_under_a_two_branch_stack() {
         let (dir, main_commit) = seeded_repo();
         let repo = dir.path();
         let one_tip = open_branch_from(repo, "feat/one", "main");
         let two_tip = open_branch_from(repo, "feat/two", "feat/one");
-        // main is rewritten AFTER the stack was cut: feat/one's recorded base
-        // (the old main tip) is no longer an ancestor of main.
-        let _new_main = amend_main(repo);
+        // An urgent fix is ff-merged AFTER the stack was cut: main moves
+        // forward, so feat/one's recorded base (the old main tip) is STILL an
+        // ancestor of main, but feat/one no longer contains main's tip.
+        let new_main = ff_main(repo);
+        assert!(
+            Git::new(repo.to_path_buf())
+                .is_ancestor(&main_commit, &new_main)
+                .unwrap(),
+            "ff-only: the old base stays an ancestor of main",
+        );
 
         let entries = vec![
             restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
@@ -919,6 +931,29 @@ mod tests {
         // The two tips are untouched by the read-only detection.
         assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip);
         assert_eq!(rev_parse_sh(repo, "feat/two"), two_tip);
+    }
+
+    #[test]
+    fn detect_restack_is_silent_once_the_stack_is_restacked_onto_the_new_main() {
+        // Containment is the truth, not the recorded base: after the restack the
+        // bases are still the pre-restack ones (not yet re-recorded), yet no
+        // follow-up restack fires.
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        open_branch_from(repo, "feat/two", "feat/one");
+        ff_main(repo);
+        sh_git(repo, &["rebase", "-q", "main", "feat/one"]);
+        sh_git(repo, &["rebase", "-q", "--onto", "feat/one", &one_tip, "feat/two"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+        let git = Git::new(repo.to_path_buf());
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+        assert!(need.is_none(), "a restacked stack is healthy: {need:?}");
     }
 
     #[test]
@@ -1086,7 +1121,7 @@ mod tests {
         let repo = dir.path();
         let one_tip = open_branch_from(repo, "feat/one", "main");
         open_branch_from(repo, "feat/two", "feat/one");
-        amend_main(repo);
+        ff_main(repo);
         let entries = vec![
             restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
             restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
