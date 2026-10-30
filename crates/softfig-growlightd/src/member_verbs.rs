@@ -836,6 +836,7 @@ mod tests {
             claimed: "2026-10-14T00:00Z".into(),
             follow_ups: 0,
             pending: None,
+            fleet: true,
             holder: None,
             models: None,
         }

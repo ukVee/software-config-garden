@@ -787,6 +787,7 @@ pub(crate) mod tests {
                 claimed: "2026-10-14T00:00Z".into(),
                 follow_ups: 2,
                 pending: None,
+                fleet: true,
                 holder: None,
                 models: None,
             }],

@@ -8827,6 +8827,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 claimed: "2026-10-14T00:00Z".into(),
                 follow_ups: 0,
                 pending: None,
+                fleet: true,
                 holder: None,
                 models: None,
             }],

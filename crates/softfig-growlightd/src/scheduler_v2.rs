@@ -87,6 +87,10 @@ pub struct EntryView {
     /// applied (finding 8, §6.8): the handshake applies it at the boundary.
     /// The pick ignores it — the entry is `active` until then.
     pub pending: Option<EntryStatus>,
+    /// `false` marks a human-only entry (§2 **Holds**, §3.1 `fleet`): the
+    /// fleet never claims it and never resumes it while no live member holds
+    /// it. Default `true`.
+    pub fleet: bool,
     /// Who holds the entry. An `active` entry → the running member, or `None`
     /// when no running member holds it (an orphan any member resumes); a
     /// `paused` entry → the member that paused it (the step-2 resume
@@ -190,6 +194,9 @@ pub enum SkipReason {
     BackendMismatch,
     /// The entry's project is not the member's pinned project (steps 1/3).
     NotPinned,
+    /// A human-only entry (`fleet = false`, §2 **Holds**) that no live member
+    /// holds: `queued`, `paused`, or an orphaned `active` entry.
+    HumanOnly,
 }
 
 impl SkipReason {
@@ -205,6 +212,7 @@ impl SkipReason {
             SkipReason::BlockedWalk => "blocked_walk",
             SkipReason::BackendMismatch => "backend_mismatch",
             SkipReason::NotPinned => "not_pinned",
+            SkipReason::HumanOnly => "human_only",
         }
     }
 
@@ -224,6 +232,9 @@ impl SkipReason {
                 "its next unit declares no model this member's backend runs (§6.4)"
             }
             SkipReason::NotPinned => "outside the member's pinned project (§2 steps 1 and 3)",
+            SkipReason::HumanOnly => {
+                "a human-only entry (`fleet = false`) that no live member holds (§2 Holds)"
+            }
         }
     }
 }
@@ -372,6 +383,15 @@ pub fn eligible(
         EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
     ) {
         return Err(SkipReason::NotEligible);
+    }
+    // Holds (§2), right after the status clause. A human-only entry is never
+    // claimed, and never resumed while no live member holds it — so `queued`,
+    // `paused` and an orphaned `active` entry are all held (report 086). Only
+    // an `active` entry a live member still holds runs on, to its next
+    // handshake; whether *this* member is that holder is clause 4's call.
+    let live_held = entry.status == EntryStatus::Active && entry.holder.is_some();
+    if !entry.fleet && !live_held {
+        return Err(SkipReason::HumanOnly);
     }
     // 2. `after` links: every listed id is archived `done`. A `dropped` id is
     // simply absent from `done_ids`, so it never satisfies (§2).
@@ -607,6 +627,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending: None,
+            fleet: true,
             holder: None,
             models: None,
         }
@@ -958,6 +979,153 @@ mod tests {
         snapshot.trees.insert("e".into(), tree(declared(None)));
         assert!(eligible(&snapshot, &member("bob"), &e).is_ok());
         assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
+    }
+
+    // ---- holds: human-only (`fleet = false`) -----------------------------
+
+    /// §2 **Holds**: a queued human-only entry is rolled past like a deferred
+    /// one — it is not claimed, it holds no repo, and the entry behind it on
+    /// the same repo is picked.
+    #[test]
+    fn a_human_only_entry_is_rolled_past_and_the_next_one_is_picked() {
+        let mut held = entry("held");
+        held.fleet = false;
+        let next = entry("next");
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![held.clone(), next.clone()],
+        );
+        snapshot.trees.insert("held".into(), tree(declared(None)));
+        snapshot.trees.insert("next".into(), tree(declared(None)));
+        let outcome = pick_v2(&snapshot, &member("m"));
+        assert_eq!(outcome.picked.map(|p| p.entry), Some("next".to_string()));
+        assert_eq!(
+            outcome.skips,
+            vec![Skip {
+                entry: "held".into(),
+                reason: SkipReason::HumanOnly,
+            }],
+        );
+    }
+
+    /// Task 068's parity: a pinned member whose project has nothing workable
+    /// falls back across projects (step 4), and that fallback never lands on a
+    /// human-only entry — the reason it records is the hold, not `NotPinned`.
+    #[test]
+    fn a_fallback_member_never_lands_on_a_human_only_entry() {
+        let mut pinned = entry("pinned");
+        pinned.status = EntryStatus::Blocked; // nothing in-pin is eligible
+        let mut held = entry("held");
+        held.project = "other".into();
+        held.fleet = false;
+        let mut snapshot = snap(
+            vec![
+                project("softfig", "~/projects/softfig"),
+                project("other", "~/projects/other"),
+            ],
+            vec![pinned.clone(), held.clone()],
+        );
+        snapshot.trees.insert("pinned".into(), tree(declared(None)));
+        snapshot.trees.insert("held".into(), tree(declared(None)));
+
+        let mut m = member("m");
+        m.pin = Some("softfig".into());
+        let outcome = pick_v2(&snapshot, &m);
+        assert_eq!(outcome.picked, None);
+        assert_eq!(
+            outcome.skips,
+            vec![
+                Skip {
+                    entry: "pinned".into(),
+                    reason: SkipReason::NotEligible,
+                },
+                Skip {
+                    entry: "held".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+            ]
+        );
+    }
+
+    /// Report 086's parity: a human-only entry no live member holds is never
+    /// resumed — neither an orphaned `active` one (holder `None`) nor a
+    /// `paused` one, not even by the member that paused it. Both still hold
+    /// their repo, which they held already.
+    #[test]
+    fn a_human_only_orphaned_active_or_paused_entry_is_not_resumed() {
+        let mut orphan = entry("orphan");
+        orphan.status = EntryStatus::Active;
+        orphan.fleet = false;
+        let mut paused = entry("paused");
+        paused.project = "other".into();
+        paused.status = EntryStatus::Paused;
+        paused.holder = Some("alice".into());
+        paused.fleet = false;
+        let next = entry("next");
+        let mut snapshot = snap(
+            vec![
+                project("softfig", "~/projects/softfig"),
+                project("other", "~/projects/other"),
+            ],
+            vec![orphan.clone(), paused.clone(), next.clone()],
+        );
+        for id in ["orphan", "paused", "next"] {
+            snapshot.trees.insert(id.into(), tree(declared(None)));
+        }
+        for who in ["alice", "bob"] {
+            assert_eq!(
+                eligible(&snapshot, &member(who), &orphan),
+                Err(SkipReason::HumanOnly)
+            );
+            assert_eq!(
+                eligible(&snapshot, &member(who), &paused),
+                Err(SkipReason::HumanOnly)
+            );
+        }
+        // Through the pick: alice's step-2 resume of her own paused entry is
+        // held too, and the orphan still holds `next`'s repo.
+        let outcome = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(outcome.picked, None);
+        assert_eq!(
+            outcome.skips,
+            vec![
+                Skip {
+                    entry: "orphan".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+                Skip {
+                    entry: "paused".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+                Skip {
+                    entry: "next".into(),
+                    reason: SkipReason::RepoHeld,
+                },
+            ]
+        );
+    }
+
+    /// The hold's one exception: an `active` human-only entry a live member
+    /// still holds runs on, to its next handshake. Its holder keeps it; any
+    /// other member is refused by the holder rule, as for any active entry.
+    #[test]
+    fn a_live_held_human_only_active_entry_keeps_its_holder() {
+        let mut e = entry("e");
+        e.status = EntryStatus::Active;
+        e.holder = Some("alice".into());
+        e.fleet = false;
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![e.clone()],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &e),
+            Err(SkipReason::Held)
+        );
+        let outcome = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(outcome.picked.map(|p| p.entry), Some("e".to_string()));
     }
 
     #[test]
