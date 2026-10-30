@@ -9401,6 +9401,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     claimed: "2026-10-14T00:01:00Z".into(),
                     follow_ups: 0,
                     pending_status: None,
+                    fleet: true,
+                    not_before: None,
                 }],
             )
             .to_toml()
@@ -9586,6 +9588,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             },
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 

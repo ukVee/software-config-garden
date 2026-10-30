@@ -263,6 +263,8 @@ pub(crate) mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 

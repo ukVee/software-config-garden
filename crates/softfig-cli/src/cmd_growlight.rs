@@ -4536,6 +4536,8 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         };
         let mut linked = e("normal-a", Lane::Normal, "feat/normal-a", "");
         linked.after = vec!["u1".into()];

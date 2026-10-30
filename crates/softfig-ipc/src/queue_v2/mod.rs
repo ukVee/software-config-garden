@@ -19,7 +19,9 @@
 //!   is refused, not half-read;
 //! - every field is required (no `#[serde(default)]` on the file shapes):
 //!   keeperd writes every field on every write, so a missing one means the
-//!   file was hand-edited or corrupted — refuse it;
+//!   file was hand-edited or corrupted — refuse it. The exceptions are
+//!   [`Entry`]'s three optional fields (`pending_status`, `fleet`,
+//!   `not_before`), omitted at their default so older files still parse;
 //! - the closed vocabularies (kind, lane, status, …) are enums, so a stray
 //!   string fails to parse instead of being carried as data;
 //! - unknown fields are refused ([`serde(deny_unknown_fields)`]) — one
@@ -161,7 +163,9 @@ pub enum EntryStatus {
 }
 
 /// A `[[entry]]` row (§3.1) — exactly the spec's field set, every field
-/// required and written on every write.
+/// required and written on every write, except the three optional ones
+/// (`pending_status`, `fleet`, `not_before`) that are omitted at their
+/// default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -205,6 +209,30 @@ pub struct Entry {
     /// `active → …` transition).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_status: Option<EntryStatus>,
+    /// `false` marks a human-only entry (§2, §3.1): the fleet never claims
+    /// it, and never resumes it while no live member holds it — `queued`,
+    /// an orphaned `active` and `paused` are all held (legacy `> Fleet:`,
+    /// task 068; report 086's parity). Written only by the human verbs
+    /// (§6.8) and the migration; member writes are refused (§6.7). Omitted
+    /// when `true`, so a pre-parity file round-trips byte-identical.
+    #[serde(default = "fleet_default", skip_serializing_if = "is_fleet_default")]
+    pub fleet: bool,
+    /// The earliest time the fleet may start this entry (§2, §3.1), as
+    /// written; parsed by [`crate::fleet::parse_not_before`] (legacy
+    /// `> Not before:`). Holds `queued` only — an entry that has started has
+    /// started — and a value that does not parse holds fail-closed. Written
+    /// only by the human verbs (§6.8) and the migration. Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+}
+
+/// [`Entry::fleet`]'s default: an entry the fleet may claim.
+fn fleet_default() -> bool {
+    true
+}
+
+fn is_fleet_default(fleet: &bool) -> bool {
+    *fleet
 }
 
 /// The archive's outcome (§3.2): `done` satisfies `after` links, `dropped`
@@ -503,6 +531,8 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 
@@ -628,6 +658,43 @@ follow_ups = 0
         let dropped_block = text.split("[[entry]]").nth(2).expect("second row");
         assert!(dropped_block.contains("reason = \"superseded\""));
         assert!(dropped_block.contains("final_status = \"dropped\""));
+    }
+
+    // A row written before `fleet` / `not_before` existed (the §3.1 example
+    // has neither) reads as a fleet entry with no start time, and writing it
+    // back adds neither key — so a pre-parity queue file and archive
+    // re-serialize byte-identical. A held entry carries both through.
+    #[test]
+    fn fleet_and_not_before_default_when_absent_and_round_trip_when_set() {
+        let q = QueueToml::parse(SPEC_QUEUE).expect("the §3.1 example must parse");
+        assert!(q.entries[0].fleet);
+        assert_eq!(q.entries[0].not_before, None);
+        let text = q.to_toml().expect("serialize");
+        assert!(!text.contains("\nfleet ="), "default fleet is omitted:\n{text}");
+        assert!(!text.contains("\nnot_before ="), "no start time is omitted:\n{text}");
+        let again = QueueToml::parse(&text).expect("re-parse");
+        assert_eq!(again.to_toml().expect("re-serialize"), text);
+
+        let arch = QueueArchiveToml::new(vec![ArchivedEntry {
+            row: entry("done-one"),
+            finished: "2026-10-11T15:40:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+        }]);
+        let arch_text = arch.to_toml().expect("serialize archive");
+        assert!(!arch_text.contains("\nfleet =") && !arch_text.contains("\nnot_before ="));
+        let back = QueueArchiveToml::parse(&arch_text).expect("re-parse archive");
+        assert!(back.entries[0].row.fleet);
+        assert_eq!(back.to_toml().expect("re-serialize archive"), arch_text);
+
+        let mut held = entry("held");
+        held.fleet = false;
+        held.not_before = Some("2026-11-01 09:00".into());
+        let q = QueueToml::new(vec![], vec![held.clone()]);
+        let text = q.to_toml().expect("serialize held");
+        assert!(text.contains("fleet = false"), "{text}");
+        assert!(text.contains("not_before = \"2026-11-01 09:00\""), "{text}");
+        assert_eq!(QueueToml::parse(&text).expect("re-parse held").entries, vec![held]);
     }
 
     #[test]
@@ -853,6 +920,8 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         };
         let text = toml::to_string(&entry).expect("serialize");
         assert!(text.contains("kind = \"task\""), "{text}");

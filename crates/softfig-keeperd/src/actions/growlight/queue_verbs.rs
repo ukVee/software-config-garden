@@ -336,6 +336,8 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        fleet: true,
+        not_before: None,
     };
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
     queue.entries.insert(idx, entry);
@@ -500,6 +502,8 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        fleet: true,
+        not_before: None,
     };
     let doc_content = task_doc_v2(&id, &title, &mission, &finish);
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
@@ -626,6 +630,8 @@ fn restack_core(
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        fleet: true,
+        not_before: None,
     };
     // §6.8/§8: urgent lane, appended at the urgent lane's back.
     let idx = place_entry(&queue.entries, Lane::Urgent, &V2Position::Back).map_err(refuse)?;
@@ -1702,6 +1708,8 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 
