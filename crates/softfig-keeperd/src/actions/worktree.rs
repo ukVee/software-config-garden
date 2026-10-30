@@ -500,33 +500,24 @@ fn is_backlog_rel(rel: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// The inline `<vault …>…</vault>` regions in `text`, as `(open tag, body)`
-/// pairs in order. A plain scan, deliberately wider than the vault's own
-/// markdown-masked parser (a tag inside a code span counts here too), because
-/// the member guard that reads it fails closed.
-fn vault_regions(text: &str) -> Vec<(&str, &str)> {
-    const CLOSE: &str = "</vault>";
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(i) = rest.find("<vault") {
-        let tag = &rest[i..];
-        let Some(open_end) = tag.find('>') else {
-            out.push((tag, ""));
-            break;
-        };
-        let body = &tag[open_end + 1..];
-        match body.find(CLOSE) {
-            Some(j) => {
-                out.push((&tag[..=open_end], &body[..j]));
-                rest = &body[j + CLOSE.len()..];
-            }
-            None => {
-                out.push((&tag[..=open_end], body));
-                break;
-            }
-        }
-    }
-    out
+/// The inline `<vault id="…">…</vault>` regions in `text` at repo-relative
+/// `rel`, as `(open tag, body)` pairs in order. One scanner for the member
+/// guard and for Layer B's own parser (`layer_b::regions::parse`), so a
+/// prose mention of `<vault>` — id-less, inside an inline backtick span,
+/// or inside a fenced code block — is **not** a region in either view
+/// (report 084). The scanner dispatches on `rel`'s extension (`.md` →
+/// markdown mask, `.toml` → TOML mask, else plain), matching Layer B's
+/// per-format exemptions. An unterminated real `<vault id="…">` yields a
+/// region with an empty body: any change to the open tag is still visible
+/// to the caller (so a member cannot smuggle a seal by omitting
+/// `</vault>`), but a prose edit after it never looks like the region's
+/// body changed.
+fn vault_regions<'a>(text: &'a str, rel: &str) -> Vec<(&'a str, &'a str)> {
+    let parser = crate::layer_b::regions::parser_for(rel);
+    crate::layer_b::regions::scan_region_bounds(parser, text.as_bytes())
+        .into_iter()
+        .map(|(tag_range, body_range)| (&text[tag_range], &text[body_range]))
+        .collect()
 }
 
 /// The member vault-region guard, pure: `Some(refusal)` when replacing `old`
@@ -548,8 +539,8 @@ pub(crate) fn member_vault_refusal(
     old: Option<&str>,
     new: Option<&str>,
 ) -> Option<String> {
-    let before = old.map(vault_regions).unwrap_or_default();
-    let after = new.map(vault_regions).unwrap_or_default();
+    let before = old.map(|t| vault_regions(t, rel)).unwrap_or_default();
+    let after = new.map(|t| vault_regions(t, rel)).unwrap_or_default();
     let unchanged = before.len() == after.len()
         && before
             .iter()
@@ -1033,6 +1024,103 @@ mod tests {
         assert!(
             member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
             "removing a fenced model line is still refused",
+        );
+    }
+
+    /// Report 084: a prose mention of `<vault>` above a queue table (in an
+    /// inline backtick span, or an id-less tag, or `<vault id="…">` inside a
+    /// fenced block) is **not** a region — a member's unrelated edit below it
+    /// stays allowed. One scanner for the member guard and for Layer B.
+    #[test]
+    fn a_prose_vault_mention_does_not_hide_an_unrelated_edit() {
+        let rel = "growlight/backlog/CLAUDE.md";
+        // The real doc shape: a prose mention `<vault>` with no id, then a
+        // queue table far below it. A member's cell flip in the table must
+        // not be read as changing a vault region's body (there isn't one).
+        let before = "\
+# backlog
+
+- a `<vault>` region, under `growlight/backlog/`: no adding or changing one.
+
+| # | id | type | title | status |
+|---|----|------|-------|--------|
+| 1 | 066 | task | T | queued |
+";
+        let after = before.replace("queued", "done");
+        assert_eq!(
+            member_vault_refusal("c", rel, Some(before), Some(&after)),
+            None,
+            "a backticked id-less `<vault>` is prose, not a region — the cell flip must be allowed",
+        );
+
+        // Also a `<vault id="…">` inside an inline backtick span is prose.
+        let before = "\
+# backlog
+
+The syntax is `<vault id=\"h\">…</vault>`.
+
+| # | id | type | title | status |
+|---|----|------|-------|--------|
+| 1 | 066 | task | T | queued |
+";
+        let after = before.replace("queued", "done");
+        assert_eq!(
+            member_vault_refusal("c", rel, Some(before), Some(&after)),
+            None,
+            "an inline-code `<vault id=\"h\">` is prose, not a region",
+        );
+
+        // And `<vault id="…">` inside a fenced code block is prose.
+        let before = "\
+# backlog
+
+Example:
+```
+<vault id=\"h\">
+> Fleet: no
+</vault>
+```
+
+| # | id | type | title | status |
+|---|----|------|-------|--------|
+| 1 | 066 | task | T | queued |
+";
+        let after = before.replace("queued", "done");
+        assert_eq!(
+            member_vault_refusal("c", rel, Some(before), Some(&after)),
+            None,
+            "a fenced `<vault id=\"h\">` is prose, not a region",
+        );
+    }
+
+    /// Report 084: an id-less or inline-code `<vault>` mention is text, not a
+    /// region — but a real **unterminated** `<vault id="x">` outside a fence
+    /// still has to be refused when a write adds, removes or changes its open
+    /// tag (so a member cannot smuggle a seal by omitting `</vault>`). Its
+    /// "body" is never "the rest of the file", so an unrelated edit after it
+    /// is allowed.
+    #[test]
+    fn an_unterminated_real_region_is_still_guarded_but_doesnt_eat_prose() {
+        let rel = "growlight/backlog/milestones/m/slices/001-a.md";
+        let bare = "# slice\n\nbody\n";
+        let unterm = "# slice\n\n<vault id=\"h\">\n> Fleet: no\n\nbody\n";
+        // Adding an unterminated real region → refused (smuggle guard).
+        assert!(
+            member_vault_refusal("c", rel, Some(bare), Some(unterm)).is_some(),
+            "adding an unterminated real region is refused",
+        );
+        // Removing it → also refused (any change to the open tag).
+        assert!(
+            member_vault_refusal("c", rel, Some(unterm), Some(bare)).is_some(),
+            "removing an unterminated real region is refused",
+        );
+        // But its body is empty, not "rest of file" — a prose edit below the
+        // unterminated tag doesn't look like a region change.
+        let after = unterm.replace("body\n", "edited body\n");
+        assert_eq!(
+            member_vault_refusal("c", rel, Some(unterm), Some(&after)),
+            None,
+            "an unrelated edit after an unterminated region must not refuse",
         );
     }
 
