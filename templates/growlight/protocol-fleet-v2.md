@@ -34,10 +34,9 @@ protocol is fixed; the baton changes each iteration.
    the remaining 5h window; don't leave a started window idle.
 
 3. WORK. Execute NEXT ACTION as one coherent chunk. Obey all standing feedback
-   (garden edits only via softfig-mcp; commit code on the active item's branch
-   per its `## Branch policy` when it declares one — a stacked feature branch,
-   never main, and the loop NEVER merges it (the human reviews + merges the
-   stack); commit on main only when the item declares no branch policy;
+   (garden edits only via softfig-mcp; commit code on the entry's `branch`
+   (queue.toml / your baton's FIRST STEP) — a stacked feature branch, never
+   main, and the loop NEVER merges it (the human reviews + merges the stack);
    root-cause fixes, no patchwork; refresh garden+project docs when a milestone
    verifies). When a milestone verifies, also keep your own claude-memory
    pointers under `~/.claude/projects/<garden>/memory/` in sync — you may
@@ -79,8 +78,8 @@ protocol is fixed; the baton changes each iteration.
    decision you must not default) ends with `growlight_block`, `kind = human`.
 
 5. HANDOFF. Persist durable outcomes first: garden via softfig-mcp, code via git
-   commit on the item's branch (per its `## Branch policy`; main only if it
-   declares none). Then end the session with the roll verb as your LAST call —
+   commit on the entry's `branch` (queue.toml / your baton's FIRST STEP), never
+   main. Then end the session with the roll verb as your LAST call —
    do not write the baton file yourself; the verb carries it, and growlightd
    stores it as the entry's baton (copied into your `agents/<id>/baton.md` at
    the next spawn). An unfinished unit ends with `growlight_add_follow_up_session`

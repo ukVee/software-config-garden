@@ -303,26 +303,62 @@ mod template_tests {
         assert_eq!(s, f, "the shared protocol prefix must stay byte-identical");
     }
 
-    /// The boundary between the shared steps (1–3) and the v2-specific
-    /// continuation (3b) for the fleet/v2 pair (queue-v2-git slice 005). The v2
-    /// protocol is the fleet protocol plus §10's changes, so everything before
-    /// step 3b is the SAME text; only the v2 continuation differs.
-    const STEP_3B: &str = "3b. DAEMON RESTART";
+    /// The boundary between the shared steps (intro–2b) and the v2-specific
+    /// continuation (step 3, WORK) for the fleet/v2 pair (queue-v2-git slice
+    /// 005). The v2 protocol is the fleet protocol plus §10's changes, so
+    /// everything before step 3 is the SAME text. Step 3 itself differs on
+    /// purpose (V9: a v2 entry's branch lives in queue.toml, not a `## Branch
+    /// policy`), so the guard stops before it.
+    const STEP_3: &str = "\n3. WORK.";
 
     #[test]
-    fn fleet_and_v2_protocols_share_steps_1_through_3() {
+    fn fleet_and_v2_protocols_share_the_intro_through_step_2b() {
         let f = PROTOCOL_FLEET_MD
-            .split_once(STEP_3B)
-            .expect("fleet protocol has a step 3b")
+            .split_once(STEP_3)
+            .expect("fleet protocol has a step 3")
             .0;
         let v = PROTOCOL_FLEET_V2_MD
-            .split_once(STEP_3B)
-            .expect("v2 protocol has a step 3b")
+            .split_once(STEP_3)
+            .expect("v2 protocol has a step 3")
             .0;
-        // Intro + steps 1–3 are the SAME text — the v2 file is the legacy fleet
-        // protocol plus §10's changes, so a shared step edited in one file fails
-        // this until both are synced.
+        // The intro + steps 1–2b are the SAME text — the v2 file is the legacy
+        // fleet protocol plus §10's changes, so a shared step edited in one file
+        // fails this until both are synced.
         assert_eq!(f, v, "the shared fleet/v2 prefix must stay byte-identical");
+    }
+
+    #[test]
+    fn v2_protocol_commits_on_the_entry_branch_never_main() {
+        // V9: v2 entry docs never declare a `## Branch policy` (the branch lives
+        // in queue.toml), so the legacy "per its `## Branch policy` … main only
+        // if it declares none" wording read as permission to commit on main.
+        fn between<'a>(doc: &'a str, from: &str, to: &str) -> &'a str {
+            doc.split_once(from)
+                .unwrap_or_else(|| panic!("v2 protocol has {from:?}"))
+                .1
+                .split_once(to)
+                .unwrap_or_else(|| panic!("{from:?} is followed by {to:?}"))
+                .0
+        }
+        let v = PROTOCOL_FLEET_V2_MD;
+        let work = between(v, "\n3. WORK.", "\n3b. DAEMON RESTART");
+        let handoff = between(v, "\n5. HANDOFF.", "\n6. STUCK.");
+        for (name, step) in [("step 3", work), ("step 5", handoff)] {
+            // Rewrapped prose: compare on single-spaced text.
+            let step = step.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                step.contains("entry's `branch`") && step.contains("FIRST STEP"),
+                "v2 {name} must say to commit on the entry's `branch` (queue.toml / baton FIRST STEP)"
+            );
+            assert!(step.contains("never main"), "v2 {name} must say never main");
+            assert!(
+                !step.contains("Branch policy") && !step.contains("main only"),
+                "v2 {name} must not keep the legacy branch-policy / main-only wording"
+            );
+        }
+        // The legacy fleet protocol keeps the `## Branch policy` wording.
+        let legacy = PROTOCOL_FLEET_MD.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(legacy.contains("commit on main only when the item declares no branch policy"));
     }
 
     #[test]
