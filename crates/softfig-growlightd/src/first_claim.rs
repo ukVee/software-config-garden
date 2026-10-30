@@ -44,8 +44,9 @@ pub struct FirstClaim {
 ///
 /// The stack candidates are the snapshot's live entries in the same project,
 /// in claim order. An **urgent** entry skips the stack entirely — it branches
-/// from `main`, and skipping keeps a sibling branch that a member has not yet
-/// created from failing the read-only `merge-base` probe.
+/// from `main`, so its base never depends on it and the probes are saved. A
+/// sibling whose branch is not cut yet is not a candidate (see
+/// [`git_stack::stack_candidates`]), so it never blocks a normal claim either.
 pub fn first_claim(
     snapshot: &V2Snapshot,
     entry: &EntryView,
@@ -228,11 +229,33 @@ mod tests {
     }
 
     #[test]
+    fn a_started_entry_with_no_branch_does_not_block_a_normal_first_claim() {
+        // V3: `ghost` was claimed (then blocked/deferred) before its branch was
+        // cut. It must not fail the repo's other first claims; the stack just
+        // skips it and the new entry stacks on the real branch below it.
+        let (dir, _main) = seeded_repo();
+        let one_tip = rev_parse(dir.path(), "feat/one");
+        let entries = vec![
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z"),
+            entry("ghost", "feat/ghost", Lane::Normal, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None)
+            .expect("an uncut sibling branch must not fail the claim")
+            .unwrap();
+        assert_eq!(fc.parent, "one", "the uncut ghost is skipped");
+        assert_eq!(fc.base, one_tip);
+    }
+
+    #[test]
     fn urgent_branches_from_main_and_skips_the_stack() {
         let (dir, main_tip) = seeded_repo();
         // A sibling branch that does not exist yet (a member claimed it but has
-        // not cut the branch) must not fail the urgent claim: urgent skips the
-        // stack entirely, so the missing `feat/ghost` is never probed.
+        // not cut the branch): urgent skips the stack entirely, so the missing
+        // `feat/ghost` is never probed.
         let entries = vec![
             entry("one", "feat/ghost", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z"),
             entry("hotfix", "feat/hotfix", Lane::Urgent, EntryStatus::Queued, ""),

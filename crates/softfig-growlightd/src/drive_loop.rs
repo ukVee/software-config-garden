@@ -1174,6 +1174,36 @@ pub struct HeldStart {
     pub outcome: StartOutcome,
 }
 
+/// A v2 claim that failed closed this tick (V3). Carries the reason so a
+/// persistent failure is diagnosable from the journal and the alert instead of
+/// a bare "part claim failed" hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2ClaimFailure {
+    /// The member whose start failed.
+    pub agent: String,
+    /// The top-level entry it tried to claim.
+    pub entry: String,
+    /// Why the claim could not be made (the first-claim git error, or keeperd's).
+    pub reason: String,
+    /// Consecutive failures for this entry, this one included.
+    pub streak: u32,
+    /// Seconds before the entry is picked again.
+    pub retry_secs: i64,
+}
+
+/// Consecutive claim failures after which the human is alerted (V3).
+const V2_CLAIM_ALERT_STREAK: u32 = 3;
+/// First retry delay after a v2 claim failure; doubles per consecutive failure.
+const V2_CLAIM_BACKOFF_BASE_SECS: i64 = 5;
+/// The longest a failing v2 claim waits between retries.
+const V2_CLAIM_BACKOFF_MAX_SECS: i64 = 300;
+
+/// The retry delay after the `streak`-th consecutive v2 claim failure.
+fn v2_claim_backoff_secs(streak: u32) -> i64 {
+    let doublings = streak.saturating_sub(1).min(16);
+    (V2_CLAIM_BACKOFF_BASE_SECS << doublings).min(V2_CLAIM_BACKOFF_MAX_SECS)
+}
+
 /// A member whose FRESH start was skipped in step 3 BEFORE admission — no workable
 /// part to pick, or the part it picked was already spoken for. Distinct from a
 /// [`HeldStart`] (which reached admission and was refused/queued): a `HeldFresh`
@@ -1247,6 +1277,9 @@ pub struct TickReport {
     pub v2_walk_blocked: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
+    /// v2 first-claim/claim failures this tick (V3): the reason, so the journal
+    /// and the alert can name why an entry cannot be claimed, plus the streak.
+    pub v2_claim_failures: Vec<V2ClaimFailure>,
     /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
     /// part was already spoken for (task 042's diagnosability half). Narrated as a
     /// hold so a held fleet member names itself in the journal instead of stalling
@@ -1521,6 +1554,11 @@ pub struct DriveLoop {
     /// Paused entries → the member that paused them, the §2 step-2 resume
     /// preference overlaid as the entry's `holder`.
     v2_paused_by: std::collections::BTreeMap<String, String>,
+    /// Entries whose claim failed closed, with the consecutive-failure streak and
+    /// the time before which the entry is not picked again (V3). Cleared when the
+    /// entry claims. Without it one entry whose claim keeps failing is re-picked
+    /// and re-failed every ~1 s tick, head-of-line blocking its member.
+    v2_claim_backoff: std::collections::BTreeMap<String, (u32, i64)>,
     /// Entries whose §4 walk stops at a `blocked` item, already alerted (§2
     /// "growlightd alerts once"): entry → the blocked item's address. In memory
     /// like the v2 source's alert memory. An entry leaves when its walk moves
@@ -1704,6 +1742,7 @@ impl DriveLoop {
             v2_handoff_seen: std::collections::BTreeMap::new(),
             v2_rolled: std::collections::BTreeMap::new(),
             v2_paused_by: std::collections::BTreeMap::new(),
+            v2_claim_backoff: std::collections::BTreeMap::new(),
             v2_to_pause: std::collections::BTreeMap::new(),
             v2_model_overrides: Vec::new(),
             holds: std::collections::BTreeMap::new(),
@@ -2768,6 +2807,17 @@ impl DriveLoop {
                             });
                             continue;
                         }
+                        // A claim that failed closed recently is not retried until
+                        // its backoff elapses (V3) — no per-tick re-fail.
+                        if let Some(&(_, until)) = self.v2_claim_backoff.get(&pick.entry)
+                            && now < until
+                        {
+                            report.held_fresh.push(HeldFresh {
+                                agent: agent.clone(),
+                                reason: "claim backing off",
+                            });
+                            continue;
+                        }
                         // Resolve the concrete model (§6.4): the unit's declared
                         // list's first entry this member's backend runs, or the
                         // member default when nothing was declared. `pick_v2` only
@@ -2871,6 +2921,7 @@ impl DriveLoop {
                         match outcome {
                             StartOutcome::Started => {
                                 spoken_for.insert(pick.entry.clone());
+                                self.v2_claim_backoff.remove(&pick.entry);
                                 // The handshake's bookkeeping for this entry is
                                 // spent: it is held by a running member again,
                                 // and a model change reached its session.
@@ -2942,9 +2993,32 @@ impl DriveLoop {
                                     outcome: StartOutcome::Hold { slots, until },
                                 });
                             }
-                            // Queued / Refused (no claim attempted) or ClaimFailed
-                            // (claim refused, fail-closed): nothing claimed, nothing
-                            // excluded.
+                            // The claim failed closed (V3): nothing claimed, nothing
+                            // excluded, but the entry backs off and the reason
+                            // surfaces instead of the member re-failing it each tick.
+                            StartOutcome::ClaimFailed { reason } => {
+                                let streak = self
+                                    .v2_claim_backoff
+                                    .get(&pick.entry)
+                                    .map_or(0, |&(n, _)| n)
+                                    .saturating_add(1);
+                                let retry_secs = v2_claim_backoff_secs(streak);
+                                self.v2_claim_backoff
+                                    .insert(pick.entry.clone(), (streak, now + retry_secs));
+                                report.v2_claim_failures.push(V2ClaimFailure {
+                                    agent: agent.clone(),
+                                    entry: pick.entry.clone(),
+                                    reason: reason.clone(),
+                                    streak,
+                                    retry_secs,
+                                });
+                                report.held_starts.push(HeldStart {
+                                    agent: agent.clone(),
+                                    outcome: StartOutcome::ClaimFailed { reason },
+                                });
+                            }
+                            // Queued / Refused (no claim attempted): nothing
+                            // claimed, nothing excluded.
                             outcome => report.held_starts.push(HeldStart {
                                 agent: agent.clone(),
                                 outcome,
@@ -3428,6 +3502,17 @@ impl DriveLoop {
                 // the bare `agent_crashed` shape (crash-diagnostics slice 001).
                 self.dispatcher
                     .notify(&NotifyEvent::agent_crashed(held.agent.clone()), now);
+            }
+        }
+        // A v2 claim that keeps failing is the same class: the member cannot start
+        // and needs a human. The reason rides the alert; the dispatcher's
+        // per-agent cooldown dedups a still-failing claim.
+        for f in &report.v2_claim_failures {
+            if f.streak >= V2_CLAIM_ALERT_STREAK {
+                let event = NotifyEvent::agent_crashed(f.agent.clone()).with_stdout_error(Some(
+                    format!("claim of {} failed: {}", f.entry, f.reason),
+                ));
+                self.dispatcher.notify(&event, now);
             }
         }
         for reroll in &report.rerolls {
@@ -4342,6 +4427,14 @@ impl TickLogger {
                 a.entry,
                 v2_unit_label(&a.unit),
                 model_ref_label(&a.resolved_model),
+            ));
+        }
+        // Not edge-deduped: the claim backoff already spaces these out, and each
+        // carries a new streak and reason (V3).
+        for f in &r.v2_claim_failures {
+            out.push(format!(
+                "fleet: claim of v2 {} by {} failed ({}); failure {}, retrying in {}s",
+                f.entry, f.agent, f.reason, f.streak, f.retry_secs
             ));
         }
         let mut held_now: BTreeSet<(String, &'static str)> = BTreeSet::new();
@@ -9459,6 +9552,57 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "held as a claim failure: {:?}",
             r.held_starts[0].outcome,
         );
+    }
+
+    /// V3 — a persistent claim error surfaces with its reason and backs off: the
+    /// failing entry is not re-picked (and re-failed) every tick, the journal line
+    /// names why, and past the alert streak the human is paged. A claim that then
+    /// succeeds clears the backoff.
+    #[test]
+    fn v2_mode_a_persistent_claim_failure_backs_off_and_surfaces_its_reason() {
+        let claimer = Arc::new(FakeV2Claimer::default());
+        claimer.fail.store(true, Ordering::SeqCst);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            std::env::temp_dir().join(format!("v2-entries-backoff-{}", std::process::id())),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let f = &r.v2_claim_failures[0];
+        assert_eq!((f.entry.as_str(), f.streak), ("m1", 1));
+        assert_eq!(f.reason, "claim refused", "the reason rides the report");
+        assert_eq!(f.retry_secs, v2_claim_backoff_secs(1));
+        let mut logger = TickLogger::default();
+        let lines = logger.lines(&r);
+        assert!(
+            lines.iter().any(|l| l.contains("m1") && l.contains("claim refused")),
+            "the journal line names the reason: {lines:?}",
+        );
+
+        // The next tick, inside the backoff: no claim is attempted.
+        let r = loop_.tick(1);
+        assert_eq!(claimer.claims.lock().unwrap().len(), 1, "no re-claim while backing off");
+        assert!(r.v2_claim_failures.is_empty());
+        assert_eq!(r.held_fresh.len(), 1);
+        assert_eq!(r.held_fresh[0].reason, "claim backing off");
+
+        // Past the backoff the claim is retried, and the delay grows.
+        let r = loop_.tick(v2_claim_backoff_secs(1) + 1);
+        assert_eq!(claimer.claims.lock().unwrap().len(), 2, "retried after the backoff");
+        assert_eq!(r.v2_claim_failures[0].streak, 2);
+        assert!(r.v2_claim_failures[0].retry_secs > v2_claim_backoff_secs(1));
+        assert_eq!(backend.spawn_count(), 0);
+
+        // A claim that lands clears the backoff.
+        claimer.fail.store(false, Ordering::SeqCst);
+        let r = loop_.tick(1_000);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert!(loop_.v2_claim_backoff.is_empty(), "success clears the backoff");
     }
 
     /// SLICE 006 — an `Absent` v2 source (no `queue.toml`) schedules nothing,

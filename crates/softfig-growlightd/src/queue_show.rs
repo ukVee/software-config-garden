@@ -76,8 +76,9 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
                 claimed: e.claimed.clone(),
             })
             .collect();
-        // A git error (not-a-repo, a not-yet-cut branch, a hung mount) collapses
-        // to an empty stack: the surface shows what it can, never fails.
+        // A real git error (not-a-repo, a hung mount) collapses to an empty
+        // stack: the surface shows what it can, never fails. (A not-yet-cut
+        // branch is not an error — `stack_candidates` just skips it.)
         let stack = git_stack::stack_candidates(&repo_kind, &project.main, &stack_entries, &git)
             .unwrap_or_default();
 
@@ -427,27 +428,33 @@ mod tests {
     }
 
     #[test]
-    fn a_not_yet_cut_branch_collapses_to_no_open_not_a_failure() {
-        // A claimed entry whose branch does not exist yet in the repo: the
-        // read-only git probe fails, and the surface shows an empty stack
-        // rather than erroring.
+    fn a_not_yet_cut_branch_is_not_open_and_does_not_hide_its_siblings() {
+        // A claimed entry whose branch does not exist yet in the repo is simply
+        // not a candidate. It is not open, and it no longer blanks the whole
+        // project's stack (V3).
         let repo = tempfile::tempdir().unwrap();
         sh_git(repo.path(), &["init", "-q", "-b", "main"]);
         fs::write(repo.path().join("a.txt"), "base\n").unwrap();
         sh_git(repo.path(), &["add", "."]);
         sh_git(repo.path(), &["commit", "-q", "-m", "base"]);
 
-        let entries = vec![entry(
-            "ghost",
-            "feat/ghost",
-            Lane::Normal,
-            EntryStatus::Active,
-            "2026-10-01T00:00:00Z",
-        )];
+        sh_git(repo.path(), &["checkout", "-q", "-b", "feat/real"]);
+        fs::write(repo.path().join("b.txt"), "real\n").unwrap();
+        sh_git(repo.path(), &["add", "."]);
+        sh_git(repo.path(), &["commit", "-q", "-m", "real"]);
+        sh_git(repo.path(), &["checkout", "-q", "main"]);
+
+        let entries = vec![
+            entry("ghost", "feat/ghost", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z"),
+            entry("real", "feat/real", Lane::Normal, EntryStatus::Active, "2026-10-02T00:00:00Z"),
+        ];
         let snapshot = snap(repo.path(), entries, BTreeMap::new());
         let reply = build(&snapshot, repo.path(), None);
-        assert!(reply.projects[0].stack.is_empty());
-        assert!(!reply.entries[0].open);
+        assert_eq!(reply.projects[0].stack.len(), 1, "only the cut branch is in the stack");
+        assert_eq!(reply.projects[0].stack[0].entry, "real");
+        let open = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap().open;
+        assert!(!open("ghost"));
+        assert!(open("real"));
     }
 
     #[test]

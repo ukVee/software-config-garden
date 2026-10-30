@@ -8,7 +8,10 @@
 //! - **Stack candidates** ([`stack_candidates`]) are the branches of *live*
 //!   entries in one repo that are *started* (first-claimed, `claimed` set) and
 //!   whose tip is **not** an ancestor of `main` (`git merge-base
-//!   --is-ancestor`, read-only). Archived entries never reach this module, so
+//!   --is-ancestor`, read-only). A branch that does not exist (claimed before
+//!   it was cut, or deleted after a merge) is not a candidate and not an error
+//!   (`git rev-parse --verify --quiet refs/heads/<b>`); only a real git failure
+//!   fails the stack. Archived entries never reach this module, so
 //!   they never pin the stack. A restack entry has no branch (`branch = ""`)
 //!   and contributes nothing.
 //! - **Stack top** ([`stack_top`]) is the newest-claimed candidate; with none,
@@ -88,6 +91,25 @@ impl Git {
             Some(1) => Ok(false),
             _ => Err(GitError::Run {
                 cmd: "merge-base --is-ancestor".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            }),
+        }
+    }
+
+    /// `git rev-parse --verify --quiet refs/heads/<branch>`: does the local
+    /// branch exist? Exit 0 = yes, exit 1 = no (git's `--quiet` "not found"),
+    /// anything else is an error (a bad repo, a timeout). An absent branch is
+    /// an ordinary state — an entry claimed before its branch was cut, or a
+    /// branch deleted after the human merged it — not a git failure.
+    pub fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
+        let full = format!("refs/heads/{branch}");
+        let (status, _) = self.run(&["rev-parse", "--verify", "--quiet", &full])?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Run {
+                cmd: "rev-parse --verify --quiet refs/heads/<branch>".into(),
                 repo: self.repo.clone(),
                 cause: status.to_string(),
             }),
@@ -287,8 +309,10 @@ pub struct ClaimBase {
 /// Compute the stack candidates for `repo` from the live entries: every
 /// started (`claimed` set) entry with a branch, in claim order, plus — for a
 /// local repo — the read-only exclusion of any branch whose tip is an ancestor
-/// of `main` (§8). A remote repo runs no git, so every claimed entry is a
-/// candidate and `git` is never called.
+/// of `main` (§8). A branch that does not exist yet (claimed before it was
+/// cut) or no longer exists (deleted after a merge) is not a candidate — that
+/// is not an error; only a real git failure is. A remote repo runs no git, so
+/// every claimed entry is a candidate and `git` is never called.
 pub fn stack_candidates(
     repo: &Repo,
     main: &str,
@@ -300,10 +324,13 @@ pub fn stack_candidates(
         if entry.claimed.is_empty() || entry.branch.is_empty() {
             continue; // never claimed, or a restack with no branch
         }
-        if let Repo::Local(_) = repo
-            && git.is_ancestor(&entry.branch, main)?
-        {
-            continue; // already merged — not a candidate
+        if let Repo::Local(_) = repo {
+            if !git.branch_exists(&entry.branch)? {
+                continue; // not cut yet, or deleted after a merge — no tip to stack on
+            }
+            if git.is_ancestor(&entry.branch, main)? {
+                continue; // already merged — not a candidate
+            }
         }
         candidates.push(entry.clone());
     }
@@ -636,6 +663,43 @@ mod tests {
             .unwrap();
         let ids: Vec<&str> = stack.candidates.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["one"]);
+    }
+
+    #[test]
+    fn an_absent_branch_is_not_a_candidate_and_does_not_fail_the_stack() {
+        // V3: an entry claimed before its branch was cut (or whose branch was
+        // deleted after the human merged it) is "no candidate", not a git error
+        // that fails every other entry's stack in the repo.
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        open_branch(repo, "feat/real");
+
+        let entries = vec![
+            entry("ghost", "feat/ghost", Lane::Normal, "2026-10-01T00:00:00Z"),
+            entry("real", "feat/real", Lane::Normal, "2026-10-02T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let stack = stack_candidates(&Repo::Local(repo.to_path_buf()), "main", &entries, &git)
+            .expect("an absent branch must not fail the stack");
+        let ids: Vec<&str> = stack.candidates.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["real"]);
+    }
+
+    #[test]
+    fn a_real_git_failure_still_fails_the_stack() {
+        // Only an absent branch is benign: a repo that is not a repo at all is
+        // a real error and must still surface.
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let entries = vec![entry("one", "feat/one", Lane::Normal, "2026-10-01T00:00:00Z")];
+        let git = Git::new(not_a_repo.path().to_path_buf());
+        let res = stack_candidates(
+            &Repo::Local(not_a_repo.path().to_path_buf()),
+            "main",
+            &entries,
+            &git,
+        );
+        assert!(res.is_err(), "a non-repo is a git error, not an absent branch");
     }
 
     #[test]
