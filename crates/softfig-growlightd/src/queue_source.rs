@@ -276,14 +276,13 @@ impl QueueSource for KeeperdQueueSource {
         }
     }
 
-    /// Read the part's item doc fresh and parse its `> Fleet:` marker (task 068).
-    /// A doc keeperd could not serve holds the part fail-closed
-    /// ([`ClaimHold::Unreadable`]); a part with no doc has no marker.
+    /// Read the part's item doc fresh and parse its `> Fleet:` marker (task 068)
+    /// and its `> Not before:` start time ([`doc_hold`]). A doc keeperd could not
+    /// serve holds the part fail-closed ([`ClaimHold::Unreadable`]); a part with no
+    /// doc has no marker.
     fn claim_hold(&self, _queue: &str, part: &str) -> Option<ClaimHold> {
         match self.docs.read_item_doc(part) {
-            Ok(doc) => doc
-                .as_deref()
-                .and_then(|d| fleet_marker(d).map(|v| ClaimHold::HumanOnly(v.to_string()))),
+            Ok(doc) => doc.as_deref().and_then(|d| doc_hold(d, crate::agent_harness::unix_now())),
             Err(e) => Some(ClaimHold::Unreadable(e)),
         }
     }
@@ -304,6 +303,21 @@ impl QueueSource for KeeperdQueueSource {
                 None
             }
         }
+    }
+}
+
+/// The claim hold `doc` declares at `now`: its `> Fleet:` marker first (task
+/// 068), then its `> Not before:` start time (the interim scheduler,
+/// 2026-10-30). An unparseable start time holds — a typo never starts an item
+/// early.
+pub(crate) fn doc_hold(doc: &str, now: i64) -> Option<ClaimHold> {
+    if let Some(value) = fleet_marker(doc) {
+        return Some(ClaimHold::HumanOnly(value.to_string()));
+    }
+    match softfig_ipc::fleet::not_before(doc)? {
+        (raw, Ok(at)) if now < at => Some(ClaimHold::NotYet(raw.to_string())),
+        (_, Ok(_)) => None,
+        (_, Err(e)) => Some(ClaimHold::BadStartTime(e)),
     }
 }
 
@@ -598,6 +612,35 @@ mod tests {
         assert_eq!(unmarked.claim_hold("default", "x"), None);
         let no_doc = with_docs(Ok(None));
         assert_eq!(no_doc.claim_hold("default", "x"), None, "no doc, no marker: as before");
+    }
+
+    #[test]
+    fn a_start_time_holds_the_item_until_it_arrives() {
+        let doc = "# x\n\n> Not before: 2026-10-31 02:00 -04:00\n";
+        let at = 1_793_426_400; // `date -d '2026-10-31 02:00 -04:00' +%s`
+        assert_eq!(
+            doc_hold(doc, at - 1),
+            Some(ClaimHold::NotYet("2026-10-31 02:00 -04:00".into())),
+        );
+        assert_eq!(doc_hold(doc, at), None, "claimable from that second on");
+        assert_eq!(
+            ClaimHold::NotYet("2026-10-31 02:00 -04:00".into()).reason(),
+            "scheduled (> Not before: 2026-10-31 02:00 -04:00)",
+        );
+    }
+
+    #[test]
+    fn a_bad_start_time_holds_and_the_fleet_marker_wins() {
+        let typo = doc_hold("> Not before: tomorrow 2am\n", 0);
+        assert!(matches!(typo, Some(ClaimHold::BadStartTime(_))), "fail-closed: {typo:?}");
+        // No offset is a parse error too, never a guess at local time.
+        let no_offset = doc_hold("> Not before: 2026-10-31 02:00\n", i64::MAX);
+        assert!(matches!(no_offset, Some(ClaimHold::BadStartTime(_))), "{no_offset:?}");
+        // `> Fleet: no` holds whatever the time says.
+        assert_eq!(
+            doc_hold("> Fleet: no\n> Not before: 2000-01-01 00:00Z\n", i64::MAX),
+            Some(ClaimHold::HumanOnly("no".into())),
+        );
     }
 
     #[test]

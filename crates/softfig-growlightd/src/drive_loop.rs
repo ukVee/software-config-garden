@@ -1173,13 +1173,15 @@ pub struct ExitDisposition {
     pub misrouted: Option<(String, String)>,
 }
 
-/// A part the fleet left for the human (task 068): which, and why — the
-/// [`ClaimHold::reason`] the claim-time marker read found.
+/// A part the fleet left queued (task 068): which, why — the
+/// [`ClaimHold::reason`] the claim-time marker read found — and what it waits
+/// for ([`ClaimHold::waits_for`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldPart {
     pub queue: String,
     pub part: String,
     pub reason: String,
+    pub waits_for: &'static str,
 }
 
 /// Everything one [`DriveLoop::tick`] did, for the caller (the live thread, or a
@@ -3060,6 +3062,7 @@ impl DriveLoop {
                             queue: queue.clone(),
                             part: part.clone(),
                             reason: hold.reason(),
+                            waits_for: hold.waits_for(),
                         });
                     }
                     snapshot.mark_held(&queue, &part, hold.clone());
@@ -4132,8 +4135,8 @@ impl TickLogger {
         // Human-only skips (task 068): the loop already narrates each hold once.
         for h in &r.skipped_for_human {
             out.push(format!(
-                "fleet: skipping {}/{} — {}; left queued for the human",
-                h.queue, h.part, h.reason
+                "fleet: skipping {}/{} — {}; left queued for {}",
+                h.queue, h.part, h.reason, h.waits_for
             ));
         }
         // Task 086: an `active` head no member holds is someone else's in-flight work.
@@ -7027,6 +7030,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 queue: "hoverview".into(),
                 part: "hover-view-sticky".into(),
                 reason: "human-only (> Fleet: no)".into(),
+                waits_for: "the human",
             }],
             ..TickReport::default()
         };
@@ -7035,6 +7039,29 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec![
                 "fleet: skipping hoverview/hover-view-sticky — human-only (> Fleet: no); \
                  left queued for the human"
+                    .to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn tick_logger_narrates_a_scheduled_skip_as_waiting_for_its_time() {
+        let mut logger = TickLogger::default();
+        let hold = ClaimHold::NotYet("2026-10-31 02:00 -04:00".into());
+        let skipped = TickReport {
+            skipped_for_human: vec![HeldPart {
+                queue: "remote-runner".into(),
+                part: "084".into(),
+                reason: hold.reason(),
+                waits_for: hold.waits_for(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&skipped),
+            vec![
+                "fleet: skipping remote-runner/084 — scheduled (> Not before: 2026-10-31 02:00 \
+                 -04:00); left queued for its start time"
                     .to_string(),
             ],
         );
@@ -7996,6 +8023,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 queue: "default".into(),
                 part: "queue-v2-scheduling".into(),
                 reason: "human-only (> Fleet: no)".into(),
+                waits_for: "the human",
             }],
         );
         assert_eq!(claimer.claims(), vec![("default".into(), "068".into())]);
