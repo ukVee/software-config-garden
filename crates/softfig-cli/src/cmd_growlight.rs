@@ -1637,17 +1637,51 @@ fn client_status(args: ClientArgs) -> Result<()> {
     print_fleet_status(&reply);
     // The v2 queue view (§6.9): both lanes, the stack per repo, and the
     // session log — the same annotations `queue show` layers onto its TOML.
-    let view: QueueShowReply =
-        growlight_call(&socket, growlightd::op::QUEUE_SHOW, serde_json::Value::Null)?;
-    println!();
-    if view.list {
-        println!("queue v2");
-        print!("{}", render_queue_lanes(&view));
-        print!("{}", render_annotations(&view));
-    } else {
-        println!("{}", queue_empty_line());
+    // Best-effort: the fleet status above is the core render.
+    if let Some(view) = fetch_queue_view(&socket)? {
+        let rendered = render_status_queue(&view);
+        if !rendered.is_empty() {
+            println!();
+            print!("{rendered}");
+        }
     }
     Ok(())
+}
+
+/// The queue block `status` appends to the fleet status: nothing at all when
+/// there is no v2 list (`status` is not the place to explain an absent
+/// `queue.toml` — `queue show` is).
+fn render_status_queue(view: &QueueShowReply) -> String {
+    if !view.list {
+        return String::new();
+    }
+    format!(
+        "queue v2\n{}{}",
+        render_queue_lanes(view),
+        render_annotations(view)
+    )
+}
+
+/// `QUEUE_SHOW` against growlightd, best-effort: it is an annotation layered
+/// onto a verb that already has its own answer, so a daemon that cannot serve
+/// it must not fail the verb. `None` when growlightd is absent, or when it
+/// rejects the call with `BadArgs` — what a daemon older than the verb says,
+/// whether for the unknown op or a protocol-version mismatch (growlightd
+/// reports both as `BadArgs`); that case also leaves one line on stderr. Any
+/// other daemon error is still surfaced.
+fn fetch_queue_view(socket: &Path) -> Result<Option<QueueShowReply>> {
+    match try_daemon_call(socket, growlightd::op::QUEUE_SHOW, serde_json::Value::Null) {
+        Ok(Some(value)) => Ok(Some(serde_json::from_value(value)?)),
+        Ok(None) => Ok(None),
+        Err(ClientError::Daemon { kind: ErrorKind::BadArgs, message }) => {
+            eprintln!("queue annotations unavailable — growlightd rejected queue show ({message})");
+            Ok(None)
+        }
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("growlightd error ({kind:?}): {message}"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
 }
 
 /// Render a [`FleetStatusReply`] for the terminal.
@@ -2568,25 +2602,13 @@ fn queue_show(socket: &Path, growlightd_socket: &Path) -> Result<()> {
             print!("{}", render_queue_show(&queue));
             // The live git-stack + session annotations (queue-v2-git slice
             // 006) — growlightd runs the read-only git, keeperd can't (§8).
-            // Best-effort: a stopped growlightd just skips the annotations (the
-            // TOML table above is the core render); a growlightd that rejects
-            // the call is surfaced.
-            match try_daemon_call(
-                growlightd_socket,
-                growlightd::op::QUEUE_SHOW,
-                serde_json::Value::Null,
-            ) {
-                Ok(Some(value)) => {
-                    let view: QueueShowReply = serde_json::from_value(value)?;
-                    if view.list {
-                        print!("{}", render_annotations(&view));
-                    }
-                }
-                Ok(None) => {}
-                Err(ClientError::Daemon { kind, message }) => {
-                    return Err(anyhow!("growlightd error ({kind:?}): {message}"))
-                }
-                Err(e) => return Err(anyhow!("{e}")),
+            // Best-effort: a stopped growlightd, or one too old to know the
+            // verb, just skips the annotations (the TOML table above is the
+            // core render).
+            if let Some(view) = fetch_queue_view(growlightd_socket)?
+                && view.list
+            {
+                print!("{}", render_annotations(&view));
             }
             Ok(())
         }
@@ -4641,6 +4663,19 @@ mod tests {
         };
         assert_eq!(render_queue_pick(&reply), format!("{}\n", queue_empty_line()));
         assert!(queue_empty_line().contains("the v2 queue is empty (§3.4"));
+    }
+
+    #[test]
+    fn status_prints_no_queue_block_when_there_is_no_v2_list() {
+        let none = QueueShowReply {
+            list: false,
+            projects: vec![],
+            entries: vec![],
+            archived: vec![],
+            sessions: vec![],
+            trees: vec![],
+        };
+        assert_eq!(render_status_queue(&none), "");
     }
 
     #[test]
