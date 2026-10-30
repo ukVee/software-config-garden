@@ -1026,6 +1026,8 @@ pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
     // The runtime holders and accepted model changes, as of the loop's last tick
     // — the same overlay the loop's own pick sees (slice 012).
     crate::drive_loop::apply_v2_overlay(&mut snapshot, &daemon.v2_overlay());
+    // The `not_before` hold reads the clock as of now, not the loop's last tick.
+    snapshot.now_unix = crate::drive_loop::unix_now();
     let outcome = scheduler_v2::pick_v2(&snapshot, &member);
     let reply = QueuePickReply {
         list: true,

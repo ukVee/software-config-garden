@@ -262,6 +262,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             follow_ups: entry.follow_ups,
             pending: entry.pending_status,
             fleet: entry.fleet,
+            not_before: entry.not_before.clone(),
             // Runtime state, not TOML — the drive loop overlays it (slice
             // 006; slice 002's contract).
             holder: None,
@@ -283,6 +284,8 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         entries,
         trees,
         done_ids,
+        // The source reads no clock; the picker stamps its own.
+        now_unix: 0,
     }))
 }
 

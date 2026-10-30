@@ -2529,6 +2529,8 @@ impl DriveLoop {
                 }
             };
             if let Some(snapshot) = snapshot.as_mut() {
+                // The `not_before` hold reads the loop's own clock (§2 Holds).
+                snapshot.now_unix = now;
                 // §2's blocked walk: alert once per stopped entry, whatever the
                 // gates below decide about spawning.
                 self.note_v2_blocked_walks(snapshot, &mut report);
@@ -4337,7 +4339,7 @@ pub fn spawn_drive_loop(
 /// Wall-clock Unix seconds for the live thread's `now`. The pure policy stays
 /// time-injected; only this live driver reads the clock (mirrors
 /// [`crate::claude_backend`]'s local clock).
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -8845,6 +8847,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 follow_ups: 0,
                 pending: None,
                 fleet: true,
+                not_before: None,
                 holder: None,
                 models: None,
             }],
@@ -8864,6 +8867,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             .into_iter()
             .collect(),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
         }
     }
 

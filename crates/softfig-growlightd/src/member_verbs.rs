@@ -837,6 +837,7 @@ mod tests {
             follow_ups: 0,
             pending: None,
             fleet: true,
+            not_before: None,
             holder: None,
             models: None,
         }
@@ -883,6 +884,7 @@ mod tests {
                 },
             )]),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
         }
     }
 

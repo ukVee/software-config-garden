@@ -91,6 +91,10 @@ pub struct EntryView {
     /// fleet never claims it and never resumes it while no live member holds
     /// it. Default `true`.
     pub fleet: bool,
+    /// The entry's start time as written (§2 **Holds**, §3.1 `not_before`):
+    /// a `queued` entry is not claimed before it. Kept raw, so a malformed
+    /// value reaches the pick and holds (fail closed) rather than vanishing.
+    pub not_before: Option<String>,
     /// Who holds the entry. An `active` entry → the running member, or `None`
     /// when no running member holds it (an orphan any member resumes); a
     /// `paused` entry → the member that paused it (the step-2 resume
@@ -148,6 +152,12 @@ pub struct V2Snapshot {
     /// these (§3.2). A `dropped` row is deliberately absent, so it never
     /// satisfies a link (§2).
     pub done_ids: BTreeSet<String>,
+    /// The clock the `not_before` hold reads, UNIX seconds. The v2 source
+    /// leaves it 0; whoever picks stamps it from its own clock — the drive
+    /// loop's injected `now`, `queue pick`'s wall clock. Unstamped, every
+    /// start time is still ahead, so a forgotten stamp holds, never starts
+    /// early.
+    pub now_unix: i64,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -197,6 +207,12 @@ pub enum SkipReason {
     /// A human-only entry (`fleet = false`, §2 **Holds**) that no live member
     /// holds: `queued`, `paused`, or an orphaned `active` entry.
     HumanOnly,
+    /// A `queued` entry whose `not_before` start time is still ahead (§2
+    /// **Holds**).
+    NotYet,
+    /// A `queued` entry whose `not_before` doesn't parse: held, so a typo
+    /// never starts work early (§2 **Holds**, fail closed).
+    BadStartTime,
 }
 
 impl SkipReason {
@@ -213,6 +229,8 @@ impl SkipReason {
             SkipReason::BackendMismatch => "backend_mismatch",
             SkipReason::NotPinned => "not_pinned",
             SkipReason::HumanOnly => "human_only",
+            SkipReason::NotYet => "not_yet",
+            SkipReason::BadStartTime => "bad_start_time",
         }
     }
 
@@ -222,6 +240,8 @@ impl SkipReason {
     pub fn hold_label(self) -> Option<&'static str> {
         match self {
             SkipReason::HumanOnly => Some("human-only (fleet = false)"),
+            SkipReason::NotYet => Some("not yet (not_before)"),
+            SkipReason::BadStartTime => Some("bad start time (not_before)"),
             _ => None,
         }
     }
@@ -244,6 +264,12 @@ impl SkipReason {
             SkipReason::NotPinned => "outside the member's pinned project (§2 steps 1 and 3)",
             SkipReason::HumanOnly => {
                 "a human-only entry (`fleet = false`) that no live member holds (§2 Holds)"
+            }
+            SkipReason::NotYet => {
+                "a queued entry whose `not_before` start time is still ahead (§2 Holds)"
+            }
+            SkipReason::BadStartTime => {
+                "a queued entry whose `not_before` doesn't parse, held until fixed (§2 Holds)"
             }
         }
     }
@@ -391,9 +417,23 @@ fn status_eligible(entry: &EntryView) -> bool {
 /// holds it — so `queued`, `paused` and an orphaned `active` entry are all held
 /// (report 086). Only an `active` entry a live member still holds runs on, to
 /// its next handshake; whether *this* member is that holder is clause 4's call.
-fn hold(entry: &EntryView) -> Option<SkipReason> {
+/// Then the start time, which only gates a claim: a `queued` entry is held
+/// before its `not_before` (`now` is UNIX seconds), and one whose value doesn't
+/// parse is held outright. An `active` or `paused` entry is past its claim, so
+/// the time no longer applies. Human-only wins when both hold.
+fn hold(entry: &EntryView, now: i64) -> Option<SkipReason> {
     let live_held = entry.status == EntryStatus::Active && entry.holder.is_some();
-    (!entry.fleet && !live_held).then_some(SkipReason::HumanOnly)
+    if !entry.fleet && !live_held {
+        return Some(SkipReason::HumanOnly);
+    }
+    if entry.status != EntryStatus::Queued {
+        return None;
+    }
+    match softfig_ipc::fleet::parse_not_before(entry.not_before.as_deref()?) {
+        Ok(at) if now < at => Some(SkipReason::NotYet),
+        Ok(_) => None,
+        Err(_) => Some(SkipReason::BadStartTime),
+    }
 }
 
 /// Every status-eligible entry a §2 hold keeps from every member, in file
@@ -404,7 +444,7 @@ pub fn held_entries(snapshot: &V2Snapshot) -> Vec<(&EntryView, SkipReason)> {
         .entries
         .iter()
         .filter(|entry| status_eligible(entry))
-        .filter_map(|entry| hold(entry).map(|reason| (entry, reason)))
+        .filter_map(|entry| hold(entry, snapshot.now_unix).map(|reason| (entry, reason)))
         .collect()
 }
 
@@ -422,7 +462,7 @@ pub fn eligible(
         return Err(SkipReason::NotEligible);
     }
     // Holds (§2), right after the status clause.
-    if let Some(reason) = hold(entry) {
+    if let Some(reason) = hold(entry, snapshot.now_unix) {
         return Err(reason);
     }
     // 2. `after` links: every listed id is archived `done`. A `dropped` id is
@@ -660,6 +700,7 @@ mod tests {
             follow_ups: 0,
             pending: None,
             fleet: true,
+            not_before: None,
             holder: None,
             models: None,
         }
@@ -688,6 +729,7 @@ mod tests {
             entries,
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
         }
     }
 
@@ -1190,6 +1232,132 @@ mod tests {
         let label = Some("human-only (fleet = false)");
         assert_eq!(held, vec![("paused", label), ("queued", label)]);
         assert_eq!(SkipReason::Held.hold_label(), None, "not every skip is a hold");
+    }
+
+    /// The slice 003 start time, and its UNIX seconds through the one parser.
+    const START: &str = "2026-10-31 02:00 -04:00";
+
+    fn start_unix() -> i64 {
+        softfig_ipc::fleet::parse_not_before(START).expect("valid start time")
+    }
+
+    fn starting(id: &str, at: &str) -> EntryView {
+        let mut e = entry(id);
+        e.not_before = Some(at.into());
+        e
+    }
+
+    /// Two queued entries on one repo, the first not due yet: the pick rolls
+    /// past it to the second, and `growlight status` lists it as held. An
+    /// unstamped snapshot (`now_unix` 0) holds it too: a forgotten clock never
+    /// starts work early.
+    #[test]
+    fn a_queued_entry_before_its_start_time_is_rolled_past() {
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![starting("later", START), entry("now")],
+        );
+        snapshot.trees.insert("later".into(), tree(declared(None)));
+        snapshot.trees.insert("now".into(), tree(declared(None)));
+        for now in [0, start_unix() - 1] {
+            snapshot.now_unix = now;
+            let outcome = pick_v2(&snapshot, &member("m"));
+            assert_eq!(outcome.picked.map(|p| p.entry), Some("now".to_string()));
+            assert_eq!(
+                outcome.skips,
+                vec![Skip {
+                    entry: "later".into(),
+                    reason: SkipReason::NotYet,
+                }]
+            );
+            let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+                .into_iter()
+                .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+                .collect();
+            assert_eq!(held, vec![("later", Some("not yet (not_before)"))]);
+        }
+    }
+
+    /// The start time is inclusive: at it, and after it, the entry is picked
+    /// and nothing is held.
+    #[test]
+    fn at_and_after_the_start_time_it_is_picked() {
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![starting("e", START)],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        for now in [start_unix(), start_unix() + 1] {
+            snapshot.now_unix = now;
+            let outcome = pick_v2(&snapshot, &member("m"));
+            assert_eq!(outcome.picked.map(|p| p.entry), Some("e".to_string()));
+            assert!(outcome.skips.is_empty());
+            assert!(held_entries(&snapshot).is_empty());
+        }
+    }
+
+    /// A start time that doesn't parse (here, no offset) holds at any clock,
+    /// so a typo never starts an entry early.
+    #[test]
+    fn a_bad_start_time_holds_fail_closed() {
+        let bad = starting("e", "2026-10-31 02:00");
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![bad.clone()],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        snapshot.now_unix = i64::MAX;
+        assert_eq!(
+            eligible(&snapshot, &member("m"), &bad),
+            Err(SkipReason::BadStartTime)
+        );
+        let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+            .into_iter()
+            .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+            .collect();
+        assert_eq!(held, vec![("e", Some("bad start time (not_before)"))]);
+    }
+
+    /// A human-only entry with a start time reads human-only, whether the time
+    /// is ahead or doesn't parse: lifting the time alone would not free it.
+    #[test]
+    fn human_only_wins_over_not_before() {
+        for at in [START, "not a time"] {
+            let mut e = starting("e", at);
+            e.fleet = false;
+            let mut snapshot = snap(
+                vec![project("softfig", "~/projects/softfig")],
+                vec![e.clone()],
+            );
+            snapshot.trees.insert("e".into(), tree(declared(None)));
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &e),
+                Err(SkipReason::HumanOnly)
+            );
+        }
+    }
+
+    /// The start time gates only a claim. An orphaned `active` entry and a
+    /// `paused` one are past theirs, so neither a time still ahead nor one
+    /// that doesn't parse holds them.
+    #[test]
+    fn an_active_or_paused_entry_ignores_not_before() {
+        for status in [EntryStatus::Active, EntryStatus::Paused] {
+            for at in [START, "not a time"] {
+                let mut e = starting("e", at);
+                e.status = status;
+                let mut snapshot = snap(
+                    vec![project("softfig", "~/projects/softfig")],
+                    vec![e.clone()],
+                );
+                snapshot.trees.insert("e".into(), tree(declared(None)));
+                assert!(
+                    eligible(&snapshot, &member("m"), &e).is_ok(),
+                    "{status:?} with not_before {at:?}"
+                );
+                assert!(held_entries(&snapshot).is_empty());
+            }
+        }
     }
 
     #[test]

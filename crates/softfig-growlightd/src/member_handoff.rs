@@ -788,6 +788,7 @@ pub(crate) mod tests {
                 follow_ups: 2,
                 pending: None,
                 fleet: true,
+                not_before: None,
                 holder: None,
                 models: None,
             }],
@@ -801,6 +802,7 @@ pub(crate) mod tests {
             .into_iter()
             .collect(),
             done_ids: Default::default(),
+            now_unix: 0,
         }
     }
 
