@@ -1198,6 +1198,12 @@ fn restack_blocked_alert(project: &str, branch: &str) -> String {
     format!("restack {project}: {branch} tracks an upstream")
 }
 
+/// The alert for a restack whose worktree was left mid-rebase (V4): the bases
+/// are not re-recorded, and the human is told which worktree to look at.
+fn restack_rebasing_alert(project: &str, worktree: &str) -> String {
+    format!("restack {project}: worktree {worktree} is mid-rebase; bases not re-recorded")
+}
+
 /// Consecutive claim failures after which the human is alerted (V3).
 const V2_CLAIM_ALERT_STREAK: u32 = 3;
 /// First retry delay after a v2 claim failure; doubles per consecutive failure.
@@ -3978,6 +3984,12 @@ impl DriveLoop {
             // bases stay as recorded and the human is told.
             Ok(git_stack::ReRecord::Upstream { branch }) => {
                 blocked.push(restack_blocked_alert(project, &branch));
+                return;
+            }
+            // A stack worktree is mid-rebase (a killed restack session): the
+            // branch has not moved yet, so record nothing and tell the human.
+            Ok(git_stack::ReRecord::Rebasing { worktree }) => {
+                blocked.push(restack_rebasing_alert(project, &worktree));
                 return;
             }
             Err(_) => return, // fail-soft: re-detected on the next scan
@@ -9752,6 +9764,40 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         loop_.re_record_restack(&restack_snapshot(dir.path(), &base), "softfig", &mut blocked);
 
         assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+    }
+
+    /// V4: a restack session killed mid-rebase leaves a stack worktree in
+    /// `rebase-merge`; the re-record records nothing and tells the human which
+    /// worktree it is.
+    #[test]
+    fn v2_mode_re_record_mid_rebase_alerts_and_records_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        std::fs::write(repo.join("one.txt"), "main\n").unwrap();
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "main moved"]).status.success());
+        assert!(!git(&["rebase", "main", "feat/one"]).status.success(), "stops on the conflict");
+
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+        let mut blocked = Vec::new();
+        loop_.re_record_restack(&restack_snapshot(repo, &base), "softfig", &mut blocked);
+
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert!(
+            blocked[0].starts_with("restack softfig: worktree ")
+                && blocked[0].ends_with(" is mid-rebase; bases not re-recorded"),
+            "{blocked:?}",
+        );
     }
 
     #[test]

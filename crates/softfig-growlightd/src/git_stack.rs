@@ -167,6 +167,62 @@ impl Git {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// Every worktree of the repo that is mid-rebase (V4): `git worktree list
+    /// --porcelain`, then per worktree whether its `rebase-merge` or
+    /// `rebase-apply` directory exists (resolved with `rev-parse --git-path`, so
+    /// a linked worktree's private gitdir is honoured). A session killed in the
+    /// middle of a restack (crash, rate limit, provider balance) leaves exactly
+    /// this behind. The branch being rebased is read from the rebase's
+    /// `head-name`; a rebase that does not name one (a `git am`) is `None`.
+    /// Bare and prunable entries have no checkout and are skipped.
+    pub fn rebasing_worktrees(&self) -> Result<Vec<Rebasing>, GitError> {
+        let (status, out) = self.run(&["worktree", "list", "--porcelain"])?;
+        if !status.success() {
+            return Err(GitError::Run {
+                cmd: "worktree list --porcelain".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            });
+        }
+        let listing = String::from_utf8_lossy(&out);
+        let mut found = Vec::new();
+        for block in listing.split("\n\n") {
+            let mut path = None;
+            let mut skip = false;
+            for line in block.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    path = Some(PathBuf::from(p));
+                } else if line == "bare" || line.starts_with("prunable") {
+                    skip = true;
+                }
+            }
+            let Some(path) = path.filter(|_| !skip) else {
+                continue;
+            };
+            let wt = Git::new(path.clone());
+            for dir in ["rebase-merge", "rebase-apply"] {
+                let (status, out) = wt.run(&["rev-parse", "--git-path", dir])?;
+                if !status.success() {
+                    return Err(GitError::Run {
+                        cmd: "rev-parse --git-path".into(),
+                        repo: path.clone(),
+                        cause: status.to_string(),
+                    });
+                }
+                let state = path.join(String::from_utf8_lossy(&out).trim());
+                if !state.is_dir() {
+                    continue;
+                }
+                let branch = std::fs::read_to_string(state.join("head-name"))
+                    .ok()
+                    .and_then(|s| s.trim().strip_prefix("refs/heads/").map(str::to_string));
+                found.push(Rebasing { worktree: path.clone(), branch });
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     fn run(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
         let mut child = Command::new("git")
             .arg("--no-optional-locks")
@@ -224,6 +280,14 @@ impl Git {
             })?;
         Ok((status, out))
     }
+}
+
+/// A worktree caught mid-rebase (V4): where it is and, when the rebase says so,
+/// the branch it is rewriting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebasing {
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
 }
 
 /// Where a repo's `main` lives and whether growlightd can run git against it.
@@ -538,6 +602,10 @@ pub enum ReRecord {
     Bases(Vec<ReRecordedBase>),
     /// A branch tracks an upstream: the loop must not rewrite it; block.
     Upstream { branch: String },
+    /// A stack worktree is mid-rebase (a restack session died part-way): its
+    /// branch tip has not moved yet, so a merge-base now would record a base
+    /// the finished rebase will invalidate. Re-record nothing; tell the human.
+    Rebasing { worktree: String },
 }
 
 /// Re-record the restacked branches' bases after a restack completes (§8):
@@ -545,7 +613,9 @@ pub enum ReRecord {
 /// tip or main>`. Only a branch that already contains that tip counts as
 /// restacked; a partially restacked stack re-records just those, and the rest
 /// stay as recorded until they are restacked too. A branch that has an upstream is never rewritten — the pass returns
-/// [`ReRecord::Upstream`] and the loop blocks for the human. A remote repo runs
+/// [`ReRecord::Upstream`] and the loop blocks for the human. While any stack
+/// worktree is mid-rebase the pass returns [`ReRecord::Rebasing`] and records
+/// nothing (V4). A remote repo runs
 /// no git and has no commit to resolve, so its pass is empty (the human
 /// re-records by hand, §8). `git` is never written to.
 pub fn re_record_bases(
@@ -570,6 +640,17 @@ pub fn re_record_bases(
     let stack = stack_candidates(repo, main, &stack_input, git)?;
     if stack.candidates.is_empty() {
         return Ok(ReRecord::Bases(Vec::new()));
+    }
+    // A worktree caught mid-rebase on a stack branch (or on one that names no
+    // branch, which fails closed) means the restack is not finished: refuse.
+    if let Some(r) = git.rebasing_worktrees()?.into_iter().find(|r| {
+        r.branch
+            .as_ref()
+            .is_none_or(|b| stack.candidates.iter().any(|c| &c.branch == b))
+    }) {
+        return Ok(ReRecord::Rebasing {
+            worktree: r.worktree.display().to_string(),
+        });
     }
     // branch → its recorded entry (for the parent), and id → branch (to
     // resolve a parent entry's branch), mirroring [`detect_restack`].
@@ -1250,6 +1331,127 @@ mod tests {
             "an upstream branch is never rewritten: block for the human",
         );
         assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip, "the tip is untouched");
+    }
+
+    /// Leave `repo` mid-rebase (V4): `branch` adds `c.txt` one way, `main`
+    /// another, and `git rebase main <branch>` stops on the conflict. This is
+    /// the state a restack session killed part-way leaves behind.
+    fn stop_mid_rebase(repo: &Path, branch: &str) {
+        sh_git(repo, &["checkout", "-q", "-b", branch]);
+        fs::write(repo.join("c.txt"), "branch\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "-m", branch]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+        fs::write(repo.join("c.txt"), "main\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "-m", "main moved"]);
+        let stopped = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(repo)
+            .args(["rebase", "main", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run git rebase");
+        assert!(!stopped.success(), "the rebase must stop on a conflict");
+    }
+
+    #[test]
+    fn rebasing_worktrees_names_the_worktree_and_branch_caught_mid_rebase() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let git = Git::new(repo.to_path_buf());
+        assert_eq!(git.rebasing_worktrees().unwrap(), vec![], "a quiet repo");
+
+        stop_mid_rebase(repo, "feat/one");
+        let found = git.rebasing_worktrees().unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].worktree.canonicalize().unwrap(), repo.canonicalize().unwrap());
+        assert_eq!(found[0].branch.as_deref(), Some("feat/one"));
+    }
+
+    #[test]
+    fn rebasing_worktrees_sees_a_linked_worktree_mid_rebase() {
+        // The bare-repo layout keeps every branch in its own linked worktree,
+        // whose rebase state lives in a private gitdir.
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        sh_git(repo, &["branch", "feat/one"]);
+        let linked = tempfile::tempdir().unwrap();
+        let wt = linked.path().join("one");
+        sh_git(repo, &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/one"]);
+        fs::write(wt.join("c.txt"), "branch\n").unwrap();
+        sh_git(&wt, &["add", "."]);
+        sh_git(&wt, &["commit", "-q", "-m", "one"]);
+        fs::write(repo.join("c.txt"), "main\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "-m", "main moved"]);
+        let stopped = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(&wt)
+            .args(["rebase", "main"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run git rebase");
+        assert!(!stopped.success());
+
+        let found = Git::new(repo.to_path_buf()).rebasing_worktrees().unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].worktree.canonicalize().unwrap(), wt.canonicalize().unwrap());
+        assert_eq!(found[0].branch.as_deref(), Some("feat/one"));
+    }
+
+    #[test]
+    fn re_record_refuses_while_a_stack_worktree_is_mid_rebase() {
+        // V4: the restack session died mid-rebase. feat/one has not moved, so
+        // recording now would bless a base the finished rebase will replace.
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        stop_mid_rebase(repo, "feat/one");
+        let entries =
+            vec![restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z")];
+
+        let git = Git::new(repo.to_path_buf());
+        let outcome = re_record_bases(
+            &Repo::Local(repo.to_path_buf()),
+            "main",
+            &entries,
+            &Default::default(),
+            &git,
+        )
+        .unwrap();
+        let ReRecord::Rebasing { worktree } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(
+            Path::new(&worktree).canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn re_record_ignores_a_rebase_of_a_branch_outside_the_stack() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let two_tip = open_branch(repo, "feat/two");
+        stop_mid_rebase(repo, "scratch/other");
+        let entries =
+            vec![restack_entry("two", "feat/two", "", &main_commit, "2026-10-01T00:00:00Z")];
+
+        let git = Git::new(repo.to_path_buf());
+        let outcome = re_record_bases(
+            &Repo::Local(repo.to_path_buf()),
+            "main",
+            &entries,
+            &Default::default(),
+            &git,
+        )
+        .unwrap();
+        assert!(matches!(outcome, ReRecord::Bases(_)), "{outcome:?}");
+        assert_eq!(rev_parse_sh(repo, "feat/two"), two_tip);
     }
 
     #[test]
