@@ -2203,6 +2203,10 @@ pub enum QueueSub {
     /// Set an entry's status (`queued | blocked | deferred | done`).
     Status(QueueStatusArgs),
 
+    /// Hold an entry for the human (`no`: the fleet never claims it) or
+    /// release it to the fleet (`yes`) — the row's `fleet` field.
+    Fleet(QueueFleetArgs),
+
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
     Drop(QueueDropArgs),
 }
@@ -2274,6 +2278,9 @@ pub struct QueueAddArgs {
     /// `after` position, §6.9).
     #[arg(long, conflicts_with_all = ["front", "before"])]
     pub behind: Option<String>,
+    /// Make the entry human-only (`fleet = false`): the fleet never claims it.
+    #[arg(long)]
+    pub no_fleet: bool,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2351,6 +2358,25 @@ pub struct QueueStatusArgs {
     /// queued (also unblocks/un-defers) | blocked | deferred | done (archives
     /// the row).
     pub status: HumanStatus,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The `queue fleet` words: yes (the fleet may claim it) | no (human-only).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetArg {
+    Yes,
+    No,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueFleetArgs {
+    /// The live entry id.
+    pub id: String,
+    /// yes releases the entry to the fleet; no holds it for the human. A
+    /// live-held active entry keeps running.
+    pub fleet: FleetArg,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2461,6 +2487,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Lane(a) => queue_lane(&socket, a),
         QueueSub::After(a) => queue_after(&socket, a),
         QueueSub::Status(a) => queue_status(&socket, a),
+        QueueSub::Fleet(a) => queue_fleet(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
     }
 }
@@ -2749,6 +2776,7 @@ fn queue_add(socket: &Path, args: QueueAddArgs) -> Result<()> {
         position,
         ref_id,
         slices: Vec::new(),
+        fleet: args.no_fleet.then_some(false),
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_ADD_ENTRY, serde_json::to_value(wire)?)?;
@@ -2765,6 +2793,7 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
         move_spec: Some(QueueMoveSpec { to, ref_id }),
         after: None,
         status: None,
+        fleet: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2783,6 +2812,7 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
         move_spec: None,
         after: None,
         status: None,
+        fleet: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2798,6 +2828,7 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
         move_spec: None,
         after: Some(args.ids),
         status: None,
+        fleet: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -2818,6 +2849,23 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
             HumanStatus::Deferred => QueueStatusArg::Deferred,
             HumanStatus::Done => QueueStatusArg::Done,
         }),
+        fleet: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: Some(args.fleet == FleetArg::Yes),
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -4353,6 +4401,28 @@ mod tests {
             },
             other => panic!("expected Queue, got {other:?}"),
         }
+        match TestCli::try_parse_from(["g", "queue", "fleet", "m1", "no"]).unwrap().cmd {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Fleet(f) => {
+                    assert_eq!(f.id, "m1");
+                    assert_eq!(f.fleet, FleetArg::No);
+                }
+                other => panic!("expected fleet, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "add", "task", "t1", "--project", "softfig", "--no-fleet",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => assert!(q.no_fleet),
+                other => panic!("expected add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
         match TestCli::try_parse_from(["g", "queue", "drop", "m1", "--reason", "@why.md"])
             .unwrap()
             .cmd
@@ -4686,6 +4756,7 @@ mod tests {
             front: false,
             before: None,
             behind: None,
+            no_fleet: false,
             dry_run,
         }
     }
@@ -4756,6 +4827,7 @@ mod tests {
             front: false,
             before: None,
             behind: None,
+            no_fleet: false,
             dry_run: true,
         };
         queue_add(&socket, task).unwrap();
@@ -4776,6 +4848,7 @@ mod tests {
                 front: false,
                 before: None,
                 behind: None,
+                no_fleet: false,
                 dry_run: false,
             },
         )
@@ -4820,6 +4893,17 @@ mod tests {
             },
         )
         .unwrap();
+
+        // fleet: hold for the human, then release.
+        let fleet_of = |socket: &Path| {
+            e2e_queue(socket).entries.iter().find(|e| e.id == "m1").unwrap().fleet
+        };
+        queue_fleet(&socket, QueueFleetArgs { id: "m1".into(), fleet: FleetArg::No, dry_run: false })
+            .unwrap();
+        assert!(!fleet_of(&socket), "queue fleet m1 no holds it");
+        queue_fleet(&socket, QueueFleetArgs { id: "m1".into(), fleet: FleetArg::Yes, dry_run: false })
+            .unwrap();
+        assert!(fleet_of(&socket), "queue fleet m1 yes releases it");
 
         // A dry-run status edit leaves the state untouched.
         queue_status(

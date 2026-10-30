@@ -144,6 +144,18 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     let args: QueueAddEntryArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
     if let Some(member) = crate::caller::member()
+        && args.fleet.is_some() {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "member_not_allowed: fleet member {member} may not set `fleet` on \
+                     queue_add_entry — a member's found work is the fleet's, and holding an \
+                     entry for the human is the human's call (spec-growlight-queue §6.7). \
+                     Drop the field, or post_message @human if the work needs a person"
+                ),
+            ));
+        }
+    if let Some(member) = crate::caller::member()
         && let Some((field, key)) = member_reserved_field(&args) {
             let key = softfig_ipc::item_meta::display_key(key);
             return Err((
@@ -336,7 +348,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
-        fleet: true,
+        fleet: args.fleet.unwrap_or(true),
         not_before: None,
     };
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
@@ -502,7 +514,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
-        fleet: true,
+        fleet: args.fleet.unwrap_or(true),
         not_before: None,
     };
     let doc_content = task_doc_v2(&id, &title, &mission, &finish);
@@ -661,6 +673,7 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         ("ref", args.ref_id.is_some()),
         ("after", !args.after.is_empty()),
         ("slices", !args.slices.is_empty()),
+        ("fleet", args.fleet.is_some()),
     ] {
         if given {
             return Err((
@@ -856,7 +869,14 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         queue.entries[idx].after = links;
     }
 
-    // 4. status. `done` is the human's override — no open-items check — and
+    // 4. fleet: the human-only hold (§3.1). Set before status, so a `done`
+    // in the same edit archives the row as edited.
+    if let Some(fleet) = args.fleet {
+        let idx = idx_of(&queue, &args.id);
+        queue.entries[idx].fleet = fleet;
+    }
+
+    // 5. status. `done` is the human's override — no open-items check — and
     // moves the row to the archive (appended, `finished` stamped,
     // `final_status = done`, which still satisfies `after` links).
     let mut archived = false;
@@ -907,7 +927,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
 
     // No-op guard: an edit that changed nothing (same lane, same position,
-    // same links, same status) mints no commit — the legacy reorder verb's
+    // same links, same fleet, same status) mints no commit — the legacy reorder verb's
     // idempotence. Return the untouched tip without touching apply.
     if queue == loaded_queue && archive == loaded_archive {
         let hash = current_tip(&inner)?;
@@ -1940,6 +1960,74 @@ mod tests {
         add_entry(&daemon, human).expect("a human may declare a slice model");
     }
 
+    /// §6.7: a member's found work may not carry `fleet` at all — not `false`
+    /// (a hold is the human's call) and not `true` either (the field is the
+    /// human's to set, so its presence is the refusal). Nothing commits. A
+    /// human's `fleet = false` lands as a human-only row, for both kinds that
+    /// take it.
+    #[test]
+    fn a_members_add_entry_may_not_carry_fleet() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        let before = commit_count(&daemon);
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for fleet in [false, true] {
+                let fleet = serde_json::json!({ "fleet": fleet });
+                for args in [
+                    milestone_args("m1", "softfig", fleet.clone()),
+                    task_args("t1", "softfig", fleet.clone()),
+                ] {
+                    let err = add_entry(&daemon, args).unwrap_err();
+                    assert_eq!(err.0, ErrorKind::BadArgs);
+                    assert!(err.1.starts_with("member_not_allowed:"), "{err:?}");
+                }
+            }
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+        }
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({ "fleet": false })))
+            .expect("a human may hold a milestone");
+        add_entry(&daemon, task_args("t1", "softfig", serde_json::json!({ "fleet": false })))
+            .expect("a human may hold a task");
+        add_entry(&daemon, milestone_args("m2", "softfig", serde_json::json!({})))
+            .expect("absent fleet");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let fleet: Vec<(EntryKind, bool)> =
+            qs.queue.model.entries.iter().map(|e| (e.kind, e.fleet)).collect();
+        assert_eq!(
+            fleet,
+            [(EntryKind::Milestone, false), (EntryKind::Task, false), (EntryKind::Milestone, true)]
+        );
+    }
+
+    /// `fleet` on `queue_update_entry` sets the row's hold and releases it;
+    /// re-setting the value it already has is a no-op that mints no commit.
+    #[test]
+    fn update_entry_sets_and_clears_fleet() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("a", "softfig", serde_json::json!({}))).unwrap();
+        let fleet_of = |daemon: &Daemon| {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(daemon, &inner);
+            let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+            qs.queue.model.entries[0].fleet
+        };
+        let before = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": false })).unwrap();
+        assert!(!fleet_of(&daemon), "held for the human");
+        assert_eq!(commit_count(&daemon), before + 1);
+        update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": false })).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1, "the same hold again is a no-op");
+        update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": true })).unwrap();
+        assert!(fleet_of(&daemon), "released to the fleet");
+        assert_eq!(commit_count(&daemon), before + 2);
+    }
+
     #[test]
     fn add_entry_planned_milestone_writes_the_given_slices() {
         let garden = tempfile::tempdir().unwrap();
@@ -2447,6 +2535,7 @@ mod tests {
             ("ref", serde_json::json!({ "ref": "001" })),
             ("after", serde_json::json!({ "after": ["001"] })),
             ("slices", serde_json::json!({ "slices": [{ "slug": "x", "body": "y" }] })),
+            ("fleet", serde_json::json!({ "fleet": false })),
         ] {
             let err = add_entry(&daemon, restack_args("softfig", extra)).unwrap_err();
             assert_eq!(err.0, ErrorKind::BadArgs, "{name}: {err:?}");

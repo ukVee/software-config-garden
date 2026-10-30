@@ -2226,7 +2226,7 @@ pub struct QueueSliceSpec {
 
 /// `queue_add_entry({kind, slug?, title?, mission?, finish_criteria?,
 /// project, lane = "normal", after = [], position = "back", ref?,
-/// slices = [], dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
+/// slices = [], fleet?, dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
 /// the docs as the legacy `add_backlog_item` does and places the lane row in
 /// `queue.toml` — one commit:
 ///
@@ -2277,6 +2277,12 @@ pub struct QueueAddEntryArgs {
     /// generates the `001-plan` slice (§4).
     #[serde(default)]
     pub slices: Vec<QueueSliceSpec>,
+    /// The row's `fleet` field (§3.1): `false` makes the entry human-only, so
+    /// the fleet never claims it. Absent writes the default, `true`. Refused
+    /// for `restack` (finding 5) and for a fleet member (§6.7: a member's
+    /// found work is the fleet's by definition, and a hold is the human's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<bool>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,
@@ -2326,8 +2332,8 @@ pub struct QueueMoveSpec {
 }
 
 /// `queue_update_entry({id, lane?, move = {to, ref?}?, after?, status?,
-/// dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit applied in
-/// the order lane → move → after → status, committed once with the queue view
+/// fleet?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
+/// applied in the order lane → move → after → fleet → status, committed once with the queue view
 /// re-rendered. A no-op edit mints no commit (the legacy reorder verb's
 /// idempotence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2351,6 +2357,11 @@ pub struct QueueUpdateEntryArgs {
     /// `daemon_owned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<QueueStatusArg>,
+    /// Sets the row's `fleet` field (§3.1): `false` holds the entry for the
+    /// human, `true` releases it. Takes effect at the next pick; a live-held
+    /// `active` entry keeps running (§2 **Holds**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<bool>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,

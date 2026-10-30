@@ -449,8 +449,8 @@ fn tool_defs() -> Vec<Value> {
                             generated doc into the urgent lane (project only — every other arg is \
                             refused BadArgs). A fleet member may call it for found work only \
                             (§6.7): a milestone or task in the normal lane, appended at the back, \
-                            `after` allowed, and no `> Model:` line in any text (field_not_allowed); \
-                            urgent work goes to @human. Anything else is member_not_allowed. Refusal \
+                            `after` allowed, no `fleet`, and no `> Model:` line in any text \
+                            (field_not_allowed); urgent work goes to @human. Anything else is member_not_allowed. Refusal \
                             codes surface as-is from keeperd.",
             "inputSchema": {
                 "type": "object",
@@ -467,6 +467,7 @@ fn tool_defs() -> Vec<Value> {
                     "position": { "type": "string", "description": "front | back | before | after (with ref for the last two), inside the entry's lane; defaults to back" },
                     "ref": { "type": "string", "description": "the reference entry id for before/after placement" },
                     "slices": { "type": "array", "items": { "type": "object" }, "description": "slices to seed slices.toml with, each {slug, title?, body}; empty generates the 001-plan slice. Refused for the task kind" },
+                    "fleet": { "type": "boolean", "description": "false makes the entry human-only: the fleet never claims it. Defaults to true. Refused for the restack kind, and for a fleet member (member_not_allowed)" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -474,7 +475,7 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "queue_update_entry",
             "description": "growlight queue v2: one atomic edit of a live entry, applied in the order \
-                            lane → move → after → status — patch-style, pass only the fields you \
+                            lane → move → after → fleet → status — patch-style, pass only the fields you \
                             change. status takes the human statuses queued | blocked | deferred | \
                             done (done archives the row; refused running on an active entry); \
                             active/paused/split are daemon-owned and refused. A HUMAN verb: a fleet \
@@ -489,6 +490,7 @@ fn tool_defs() -> Vec<Value> {
                     "move": { "type": "object", "description": "{to: front|back|before|after, ref?: id} — a within-lane move; refused started once the entry is claimed" },
                     "after": { "type": "array", "items": { "type": "string" }, "description": "replaces the whole link list ([] clears it); every id must resolve and the links stay acyclic" },
                     "status": { "type": "string", "description": "queued | blocked | deferred | done. queued also unblocks and un-defers" },
+                    "fleet": { "type": "boolean", "description": "false holds the entry for the human (the fleet never claims it), true releases it. A live-held active entry keeps running" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -1154,6 +1156,12 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
                 Some(refused(
                     "queue_add_entry lane=urgent",
                     &format!("a member's found work joins the normal lane, and {urgent}"),
+                ))
+            } else if a.fleet.is_some() {
+                Some(refused(
+                    "queue_add_entry fleet",
+                    "a member's found work is the fleet's, and holding an entry for the human is \
+                     the human's call",
                 ))
             } else if a.position.as_deref().is_some_and(|p| p != "back") || a.ref_id.is_some() {
                 Some(refused(
@@ -1828,6 +1836,9 @@ mod tests {
             ("queue_add_entry", entry(json!({ "position": "front" }))),
             ("queue_add_entry", entry(json!({ "position": "after", "ref": "x" }))),
             ("queue_add_entry", json!({ "kind": "restack", "project": "softfig" })),
+            ("queue_add_entry", entry(json!({ "fleet": false }))),
+            ("queue_add_entry", entry(json!({ "fleet": true }))),
+            ("queue_update_entry", json!({ "id": "m", "fleet": true })),
             ("slice_update", json!({ "milestone": "m", "id": "002", "status": "done" })),
         ];
         for (verb, args) in &refused {
