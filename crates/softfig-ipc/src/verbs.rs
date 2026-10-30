@@ -341,7 +341,7 @@ pub mod op {
     /// (§8, `queue-v2-git` slice 004). growlightd recomputed each branch's base
     /// read-only with `git merge-base` and passes `entries: [{entry, base}]`;
     /// keeperd replaces each named live entry's `base`. One commit,
-    /// `queue_v2_bases_rererecorded`.
+    /// `queue_v2_bases_rerecorded`.
     pub const QUEUE_V2_RE_RECORD_BASES: &str = "queue_v2_re_record_bases";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log

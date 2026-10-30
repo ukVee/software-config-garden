@@ -1213,7 +1213,7 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
 /// growlightd recomputed each restacked branch's base read-only after the
 /// restack completed (§8, `git merge-base`) and writes them back: each named
 /// live entry's `base` is replaced. An all-no-op write (every `base` already
-/// the given value) mints no commit. One commit, `queue_v2_bases_rererecorded`;
+/// the given value) mints no commit. One commit, `queue_v2_bases_rerecorded`;
 /// the derived view re-renders.
 pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueV2ReRecordBasesArgs = serde_json::from_value(args)
@@ -1267,7 +1267,7 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
     let hash = apply(
         daemon,
         &mut inner,
-        "queue_v2_bases_rererecorded",
+        "queue_v2_bases_rerecorded",
         serde_json::json!({ "entries": args.entries.len() }),
         &files,
         &[ViewWrite {
