@@ -130,6 +130,63 @@ pub struct Project {
     pub main: String,
 }
 
+impl Project {
+    /// Where [`Project::repo`] lives, for the current user.
+    pub fn locality(&self) -> RepoLocality {
+        RepoLocality::for_current_user(&self.repo)
+    }
+}
+
+/// Where a project's `repo` lives (§3.1 `repo`; report 062). The one
+/// classifier every reader of `repo` goes through — the pick's remote rule,
+/// the add verb's refusal, the git stack's repo resolver — so they cannot
+/// disagree on a spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoLocality {
+    /// On this machine: an absolute path, `~`, `~/…`, or `~<user>/…` for the
+    /// current user.
+    Local,
+    /// `host:path` on another machine (§8 remote proxy).
+    Remote,
+    /// Neither provably: `~<other user>/…`, a relative path, or `:path` with
+    /// no host. Refused, never guessed (`queue_add_project` replies
+    /// `ambiguous_repo`).
+    Ambiguous,
+}
+
+impl RepoLocality {
+    /// Classify `repo` as written. `user` is the current user's name; with
+    /// none, every `~<user>/…` is [`RepoLocality::Ambiguous`].
+    ///
+    /// A tilde or a leading `/` decides first, so a `:` later in a local path
+    /// is just a character. Otherwise `host:path` is remote when the host is
+    /// non-empty and holds no `/` (the scp rule: a `/` before the `:` makes
+    /// it a path).
+    pub fn of(repo: &str, user: Option<&str>) -> Self {
+        let repo = repo.trim();
+        if let Some(rest) = repo.strip_prefix('~') {
+            let name = rest.split('/').next().unwrap_or_default();
+            return if name.is_empty() || Some(name) == user {
+                RepoLocality::Local
+            } else {
+                RepoLocality::Ambiguous
+            };
+        }
+        if repo.starts_with('/') {
+            return RepoLocality::Local;
+        }
+        match repo.split_once(':') {
+            Some((host, _)) if !host.is_empty() && !host.contains('/') => RepoLocality::Remote,
+            _ => RepoLocality::Ambiguous,
+        }
+    }
+
+    /// [`RepoLocality::of`] against the current user, read from `$USER`.
+    pub fn for_current_user(repo: &str) -> Self {
+        RepoLocality::of(repo, std::env::var("USER").ok().as_deref())
+    }
+}
+
 /// An entry's `kind` (§1, §3.1): one milestone, task or restack in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -927,5 +984,59 @@ follow_ups = 0
         assert!(text.contains("kind = \"task\""), "{text}");
         assert!(text.contains("status = \"queued\""), "{text}");
         assert!(text.contains("lane = \"normal\""), "{text}");
+    }
+
+    // ---- RepoLocality (report 062) -------------------------------------
+
+    fn loc(repo: &str) -> RepoLocality {
+        RepoLocality::of(repo, Some("ukv"))
+    }
+
+    #[test]
+    fn home_tilde_forms_are_local() {
+        // §3.1's own example spelling, which report 062 found misread.
+        assert_eq!(loc("~/projects/software-config_garden/codebase/main"), RepoLocality::Local);
+        assert_eq!(loc("~"), RepoLocality::Local);
+        assert_eq!(loc("~/"), RepoLocality::Local);
+        assert_eq!(loc(" ~/p "), RepoLocality::Local, "trimmed like the add verb's check");
+    }
+
+    #[test]
+    fn the_current_users_named_home_is_local() {
+        assert_eq!(loc("~ukv/p"), RepoLocality::Local);
+        assert_eq!(loc("~ukv"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn another_users_home_is_ambiguous() {
+        assert_eq!(loc("~bob/p"), RepoLocality::Ambiguous);
+        assert_eq!(loc("~bob"), RepoLocality::Ambiguous);
+        // With no current user known, no named home can be proved ours.
+        assert_eq!(RepoLocality::of("~ukv/p", None), RepoLocality::Ambiguous);
+        // A colon inside a tilde path never makes it remote.
+        assert_eq!(loc("~bob/a:b"), RepoLocality::Ambiguous);
+        assert_eq!(loc("~/a:b"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn an_absolute_path_is_local_even_with_a_colon() {
+        assert_eq!(loc("/tmp/queue-v2-smoke"), RepoLocality::Local);
+        assert_eq!(loc("/srv/a:b"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn host_path_is_remote() {
+        assert_eq!(loc("phone:roadeye"), RepoLocality::Remote);
+        assert_eq!(loc("otg-travel:/home/sshukv/projects/roadeye"), RepoLocality::Remote);
+        assert_eq!(loc("user@host:~/p"), RepoLocality::Remote);
+    }
+
+    #[test]
+    fn relative_and_hostless_forms_are_ambiguous() {
+        assert_eq!(loc("projects/x"), RepoLocality::Ambiguous);
+        assert_eq!(loc("./x"), RepoLocality::Ambiguous);
+        assert_eq!(loc(":/p"), RepoLocality::Ambiguous, "no host");
+        assert_eq!(loc("a/b:c"), RepoLocality::Ambiguous, "a `/` before the `:` is a path");
+        assert_eq!(loc(""), RepoLocality::Ambiguous);
     }
 }

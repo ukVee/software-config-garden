@@ -867,6 +867,7 @@ mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/r".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
             }],
             entries: vec![
                 entry("m", EntryKind::Milestone, EntryStatus::Active),

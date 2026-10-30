@@ -135,6 +135,15 @@ pub enum QueueRefusal {
         /// Why it does not parse.
         reason: String,
     },
+    /// Verb-only: a project `repo` that is neither provably local nor
+    /// `host:path` — `~<other user>/…`, a relative path, `:path`
+    /// ([`super::RepoLocality::Ambiguous`], report 062). Refused rather than
+    /// guessed, since a wrong guess silently drops the git stack or the
+    /// opencode remote rule.
+    AmbiguousRepo {
+        /// The repo as given.
+        repo: String,
+    },
     /// **Validation-only** (finding 9): a `slices.toml` whose `milestone`
     /// field names a different folder than the file was read from — the file
     /// belongs somewhere else, or was hand-moved. No §6.8 code describes it.
@@ -171,6 +180,7 @@ impl QueueRefusal {
             QueueRefusal::DaemonOwned { .. } => "daemon_owned",
             QueueRefusal::MemberNotAllowed { .. } => "member_not_allowed",
             QueueRefusal::BadStartTime { .. } => "bad_start_time",
+            QueueRefusal::AmbiguousRepo { .. } => "ambiguous_repo",
             QueueRefusal::MilestoneMismatch { .. } => "milestone_mismatch",
             QueueRefusal::InvalidItemShape { .. } => "invalid_item_shape",
         }
@@ -216,6 +226,11 @@ impl fmt::Display for QueueRefusal {
             QueueRefusal::BadStartTime { value, reason } => {
                 write!(f, "bad_start_time: not_before '{value}' does not parse ({reason})")
             }
+            QueueRefusal::AmbiguousRepo { repo } => write!(
+                f,
+                "ambiguous_repo: '{repo}' is neither a local path (absolute, `~`, `~/…`, \
+                 `~<you>/…`) nor `host:path`"
+            ),
             QueueRefusal::MilestoneMismatch { found, expected } => write!(
                 f,
                 "milestone_mismatch: the file claims '{found}', the folder is '{expected}'"
@@ -941,6 +956,13 @@ mod tests {
     }
 
     #[test]
+    fn refusal_ambiguous_repo() {
+        let r = QueueRefusal::AmbiguousRepo { repo: "~bob/p".into() };
+        assert_eq!(r.code(), "ambiguous_repo");
+        assert!(r.to_string().starts_with("ambiguous_repo:") && r.to_string().contains("~bob/p"));
+    }
+
+    #[test]
     fn refusal_invalid_item_shape() {
         let r = QueueRefusal::InvalidItemShape { id: "x".into() };
         assert_eq!(r.code(), "invalid_item_shape");
@@ -964,6 +986,7 @@ mod tests {
             QueueRefusal::DaemonOwned { id: "x".into() },
             QueueRefusal::MemberNotAllowed { verb: "queue_drop".into() },
             QueueRefusal::BadStartTime { value: "x".into(), reason: "y".into() },
+            QueueRefusal::AmbiguousRepo { repo: "x".into() },
             QueueRefusal::MilestoneMismatch {
                 found: "x".into(),
                 expected: "y".into(),

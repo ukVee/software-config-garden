@@ -776,6 +776,7 @@ pub(crate) mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/garden".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
             }],
             entries: vec![EntryView {
                 id: "m1".into(),

@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use softfig_ipc::model_choice::{Backend, ModelList};
-use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, SliceKind, SliceStatus};
+use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, RepoLocality, SliceKind, SliceStatus};
 
 /// A member asking the scheduler what to run next — the `pick_v2(member)`
 /// input (§2). Pure data; the caller fills it from the roster and runtime
@@ -59,9 +59,12 @@ pub struct Member {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectView {
     pub name: String,
-    /// The repo path or `host:path`. The repo rule keys on this; a value
-    /// containing `:` is a remote project (grants §9).
+    /// The repo path or `host:path`, as written. The repo rule keys on this.
     pub repo: String,
+    /// Where `repo` lives, classified once by the v2 source
+    /// ([`Project::locality`](softfig_ipc::queue_v2::Project::locality),
+    /// report 062) — the remote rule reads this, never the string.
+    pub locality: RepoLocality,
 }
 
 /// One `[[entry]]` row plus the runtime fields the pick needs (§3.1). The v2
@@ -192,6 +195,9 @@ pub enum SkipReason {
     /// The entry's project is remote and the member runs opencode (grants §9,
     /// queue-v2-state finding 1).
     Remote,
+    /// The entry's project repo is neither provably local nor `host:path`
+    /// (report 062) and the member runs opencode — never guessed local.
+    AmbiguousRepo,
     /// No next unit: the walk found neither a slice nor a close-out — e.g. the
     /// milestone's tree is missing from the snapshot. Fail closed, never
     /// guessed.
@@ -224,6 +230,7 @@ impl SkipReason {
             SkipReason::RepoHeld => "repo_held",
             SkipReason::Held => "held",
             SkipReason::Remote => "remote",
+            SkipReason::AmbiguousRepo => "ambiguous_repo",
             SkipReason::NoUnit => "no_unit",
             SkipReason::BlockedWalk => "blocked_walk",
             SkipReason::BackendMismatch => "backend_mismatch",
@@ -266,6 +273,10 @@ impl SkipReason {
             }
             SkipReason::Held => "it is active and another running member holds it (§2)",
             SkipReason::Remote => "a remote project, which an opencode member never takes",
+            SkipReason::AmbiguousRepo => {
+                "its repo is neither provably local nor host:path, so an opencode member \
+                 never takes it (report 062)"
+            }
             SkipReason::NoUnit => "no next unit: its slice list is missing (§4, fail closed)",
             SkipReason::BlockedWalk => "its walk stops at a blocked item, which needs a human (§2)",
             SkipReason::BackendMismatch => {
@@ -342,6 +353,15 @@ fn repo_of<'a>(snapshot: &'a V2Snapshot, entry: &EntryView) -> Option<&'a str> {
         .iter()
         .find(|p| p.name == entry.project)
         .map(|p| p.repo.as_str())
+}
+
+/// [`repo_of`]'s locality: where the entry's project repo lives.
+fn locality_of(snapshot: &V2Snapshot, entry: &EntryView) -> Option<RepoLocality> {
+    snapshot
+        .projects
+        .iter()
+        .find(|p| p.name == entry.project)
+        .map(|p| p.locality)
 }
 
 /// The §4 unit walk for a picked entry: a milestone walks its slice tree (in
@@ -512,11 +532,16 @@ pub fn eligible(
     {
         return Err(SkipReason::Held);
     }
-    // 5. The remote rule: an opencode member never takes a remote project's
-    // entries (grants §9; queue-v2-state finding 1 — the repo is `host:path`).
-    // A claude member is unaffected.
-    if member.backend == Backend::Opencode && repo.contains(':') {
-        return Err(SkipReason::Remote);
+    // 5. The remote rule: an opencode member takes only a project provably on
+    // this machine (grants §9; queue-v2-state finding 1). A `host:path` repo
+    // is remote; one neither local nor remote (report 062) is never guessed
+    // local. A claude member is unaffected.
+    if member.backend == Backend::Opencode {
+        match locality_of(snapshot, entry) {
+            Some(RepoLocality::Local) => {}
+            Some(RepoLocality::Remote) => return Err(SkipReason::Remote),
+            Some(RepoLocality::Ambiguous) | None => return Err(SkipReason::AmbiguousRepo),
+        }
     }
     // 6 + 7. The next unit, then the §6.4 backend match on its declared list
     // (`None` = the member default, which always runs on the member's own
@@ -695,6 +720,7 @@ mod tests {
         ProjectView {
             name: name.into(),
             repo: repo.into(),
+            locality: RepoLocality::of(repo, Some("u")),
         }
     }
 
@@ -1386,6 +1412,29 @@ mod tests {
         );
         // A claude member is unaffected.
         assert!(eligible(&snapshot, &claude("m"), &remote).is_ok());
+    }
+
+    #[test]
+    fn the_remote_rule_reads_the_classified_locality() {
+        // Report 062: the clause goes through `RepoLocality`, not a `:` test.
+        // Home-tilde, the current user's named home and an absolute path with
+        // a colon are local; another user's home and a relative path are
+        // ambiguous, which an opencode member never takes either.
+        let cases = [
+            ("~/projects/softfig", Ok(())),
+            ("~u/projects/softfig", Ok(())),
+            ("/srv/a:b", Ok(())),
+            ("host:/srv/p", Err(SkipReason::Remote)),
+            ("~bob/projects/softfig", Err(SkipReason::AmbiguousRepo)),
+            ("projects/softfig", Err(SkipReason::AmbiguousRepo)),
+        ];
+        for (repo, want) in cases {
+            let e = entry("e");
+            let mut snapshot = snap(vec![project("softfig", repo)], vec![e.clone()]);
+            snapshot.trees.insert("e".into(), tree(declared(None)));
+            assert_eq!(eligible(&snapshot, &member("m"), &e).map(|_| ()), want, "{repo}");
+            assert!(eligible(&snapshot, &claude("m"), &e).is_ok(), "{repo}: claude unaffected");
+        }
     }
 
     // ---- eligibility: backend match (§6.4) -------------------------------

@@ -25,8 +25,8 @@ use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
     sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
-    QueueArchiveToml, QueueRefusal, QueueToml, SliceItem, SliceKind, SliceStatus, SlicesToml,
-    QUEUE_ARCHIVE_FILE,
+    QueueArchiveToml, QueueRefusal, QueueToml, RepoLocality, SliceItem, SliceKind, SliceStatus,
+    SlicesToml, QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
     QueueAddEntryArgs, QueueAddEntryReply, QueueAddProjectArgs, QueueAddProjectReply,
@@ -57,6 +57,11 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     }
     if args.repo.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "repo must be non-empty".to_string()));
+    }
+    // Report 062: a repo neither provably local nor `host:path` is refused,
+    // never guessed — the pick's remote rule and the git stack both read it.
+    if RepoLocality::for_current_user(&args.repo) == RepoLocality::Ambiguous {
+        return Err(refuse(QueueRefusal::AmbiguousRepo { repo: args.repo.clone() }));
     }
     let main = args.main.as_deref().unwrap_or("main");
     if main.trim().is_empty() {
@@ -1864,6 +1869,14 @@ mod tests {
         let err = queue_add_project(&daemon, serde_json::json!({ "name": "ok", "repo": "  " }))
             .unwrap_err();
         assert_eq!(err.0, ErrorKind::BadArgs);
+        // A repo neither provably local nor `host:path` → `ambiguous_repo`
+        // (report 062): another user's home, a relative path, no host.
+        for repo in ["~nobody-else-062/p", "projects/x", ":/p"] {
+            let err = queue_add_project(&daemon, serde_json::json!({ "name": "ok", "repo": repo }))
+                .unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs, "{repo}");
+            assert!(err.1.starts_with("ambiguous_repo:"), "{repo}: {:?}", err.1);
+        }
         assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
     }
 

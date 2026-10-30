@@ -2225,7 +2225,8 @@ pub enum QueueProjectSub {
 pub struct QueueProjectAddArgs {
     /// `[a-z0-9-]+` — the project name entries reference.
     pub name: String,
-    /// A local path (`~` allowed) or `host:path`.
+    /// A local path (absolute, `~`, `~/…` or `~<you>/…`) or `host:path`.
+    /// Another user's `~<name>/…` or a relative path is refused.
     pub repo: String,
     /// The branch merges land on; defaults to `main`.
     #[arg(long)]

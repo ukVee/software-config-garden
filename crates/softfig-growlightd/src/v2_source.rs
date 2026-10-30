@@ -232,6 +232,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         .map(|p| ProjectView {
             name: p.name.clone(),
             repo: p.repo.clone(),
+            locality: p.locality(),
         })
         .collect();
 
