@@ -642,12 +642,66 @@ fn restack_core(
     })
 }
 
-/// `queue_add_entry`, restack kind (§8): keeperd's half of the auto-restack
-/// enqueue — `project` only, every other arg refused as `BadArgs` (finding 5:
-/// the §6.8 state-refusal list has no code for a shape mismatch). The doc is
-/// the minimal placeholder `tasks/NNN-restack-<project>.md` (the full
-/// generated template — stack in order, steps, gate — is `queue-v2-git`'s);
-/// the row is urgent-lane, no branch, appended to the urgent lane's back.
+/// The stack of `project` as the list records it (§8's remote proxy): every
+/// live entry with a branch that has been claimed, in claim order, each with
+/// its recorded `parent` and `base`. `onto` is the parent's branch while the
+/// parent is live, else the branch of a `done` archive row (an archived but
+/// unmerged parent still holds the child's prerequisite commits, V7), else the
+/// project's `main`. Empty when nothing of the project has been claimed.
+fn stack_from_list(
+    queue: &QueueToml,
+    archive: &QueueArchiveToml,
+    project: &str,
+) -> Vec<RestackBranch> {
+    let main = queue
+        .projects
+        .iter()
+        .find(|p| p.name == project)
+        .map(|p| p.main.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let mut started: Vec<&Entry> = queue
+        .entries
+        .iter()
+        .filter(|e| e.project == project && !e.branch.is_empty() && !e.claimed.is_empty())
+        .collect();
+    started.sort_by(|a, b| a.claimed.cmp(&b.claimed));
+    started
+        .into_iter()
+        .map(|e| {
+            let parent_branch = queue
+                .entries
+                .iter()
+                .find(|p| !e.parent.is_empty() && p.id == e.parent)
+                .map(|p| p.branch.clone())
+                .or_else(|| {
+                    archive
+                        .entries
+                        .iter()
+                        .find(|a| {
+                            !e.parent.is_empty()
+                                && a.row.id == e.parent
+                                && a.final_status == FinalStatus::Done
+                        })
+                        .map(|a| a.row.branch.clone())
+                })
+                .filter(|b| !b.is_empty());
+            RestackBranch {
+                branch: e.branch.clone(),
+                parent: e.parent.clone(),
+                base: e.base.clone(),
+                onto: parent_branch.unwrap_or_else(|| main.clone()),
+            }
+        })
+        .collect()
+}
+
+/// `queue_add_entry`, restack kind (§8): `project` only, every other arg
+/// refused as `BadArgs` (finding 5: the §6.8 state-refusal list has no code
+/// for a shape mismatch). This is the human-enqueued restack — the only kind a
+/// remote project gets. keeperd runs no git, so the doc's stack is rendered
+/// from list state ([`stack_from_list`]); the placeholder form is left for a
+/// project with nothing claimed. The row is urgent-lane, no branch, appended
+/// to the urgent lane's back.
 fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     for (name, given) in [
         ("slug", args.slug.is_some()),
@@ -679,10 +733,14 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         load_for_add(&wt, &inner, &args.project, &[])?
     };
 
+    // keeperd runs no git, but it holds the list: render the stack from it, the
+    // same way for a remote project (which growlightd never resolves) and a
+    // local one a human enqueues by hand (V4).
+    let stack = stack_from_list(&queue, &archive, &args.project);
     let restack = {
         let wt = WorkTree::new(daemon, &inner);
         let number = numbering::next_number(&wt, &paths::tasks_dir());
-        restack_core(&wt, &mut queue, &args.project, number, &[])?
+        restack_core(&wt, &mut queue, &args.project, number, &stack)?
     };
     queue.validate(&archive).map_err(refuse)?;
 
@@ -1824,13 +1882,54 @@ const RESTACK_UPSTREAM_RULE: &str = "## Before you rebase\n\n\
      `growlight_block`, `kind = human`, naming the branch. A command that fails \
      is not an answer — treat it as tracked and block.\n";
 
-/// The §8 restack doc (queue-v2-git slice 003): with a resolved `stack`, the
-/// full template — the stack in order (each branch's `parent` and `base`), the
-/// steps (rebase each unmerged branch in stack order with `git rebase --onto`),
-/// and the gate command. With an empty `stack` (a human/drop-enqueued restack
-/// carries no git resolution) the doc is a placeholder naming `queue show` as
-/// the way to re-derive it. Both forms carry [`RESTACK_UPSTREAM_RULE`]: the loop
-/// never rewrites a branch that tracks an upstream (§8, V1).
+/// What a restack session must do before it touches a branch (§8, V4). The
+/// steps are bare `git rebase --onto` lines, so everything that keeps the work
+/// they rewrite safe lives here: which worktree runs them (a branch checked out
+/// in one worktree cannot be rebased from another), a clean tree, a backup ref,
+/// and what a session killed mid-rebase leaves for the next one.
+const RESTACK_SAFETY_RULE: &str = "## Protect the work\n\n\
+     1. **Resume first.** A previous session may have died mid-rebase. In every \
+     worktree (`git worktree list --porcelain`), if \
+     `git -C <worktree> rev-parse --git-path rebase-merge` or `… rebase-apply` \
+     names a directory that exists, run `git -C <worktree> rebase --abort`; the \
+     branch goes back to its pre-rebase tip, so nothing is lost. A branch that \
+     already contains its `--onto` tip \
+     (`git merge-base --is-ancestor <onto> <branch>`) is done: skip its step.\n\
+     2. **Use the branch's worktree.** Run each step from the worktree that has \
+     the branch checked out (the `worktree` block of `git worktree list \
+     --porcelain` whose `branch` is `refs/heads/<branch>`). If none has it, run \
+     it from the repo's main worktree.\n\
+     3. **Clean tree.** `git -C <worktree> status --porcelain` must print \
+     nothing. If it prints anything, rebase nothing: `growlight_block`, \
+     `kind = human`, naming the worktree. Never stash, reset or discard.\n\
+     4. **Back up.** Before a branch's rebase run \
+     `git branch restack-backup/<branch> <branch>`. If that ref already exists \
+     an earlier attempt made it: keep it, it holds the original tip. Never \
+     delete a backup ref; the human does, after review.\n\
+     5. **On a conflict, abort and block.** Run `git -C <worktree> rebase \
+     --abort`, then end with `growlight_block`, `kind = human`, naming the \
+     branch and its backup ref. Do not resolve the conflict and do not rebase \
+     any later branch.\n";
+
+/// The gate every restack doc names (§8, V4): the project's own, never a
+/// hard-coded command — `cargo test --workspace` is wrong for a project that is
+/// not a Cargo workspace.
+const RESTACK_GATE_RULE: &str = "## Gate\n\n\
+     After each rebase, run the project's own gate before the next branch and \
+     before `growlight_complete_entry`: the build/test/lint command the \
+     project's own `CLAUDE.md` names. Do not assume one. If the project names \
+     no gate, or the gate fails, end with `growlight_block`, `kind = human`, \
+     naming the branch and its `restack-backup/<branch>` ref.\n";
+
+/// The §8 restack doc (queue-v2-git slice 003, V4): with a `stack` (growlightd's
+/// git-resolved one, or keeperd's list-state one for a human-enqueued restack),
+/// the full template — the stack in order (each branch's `parent` and `base`),
+/// the safety rules, the steps (one `git rebase --onto` per unmerged branch in
+/// stack order) and the gate. With an empty `stack` (nothing of the project is
+/// claimed) the doc is a placeholder naming `queue show` as the way to re-derive
+/// it. Both forms carry [`RESTACK_UPSTREAM_RULE`] and [`RESTACK_SAFETY_RULE`]:
+/// the loop never rewrites a branch that tracks an upstream (§8, V1), and never
+/// rebases without a worktree, a clean tree and a backup (V4).
 fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> String {
     if stack.is_empty() {
         return format!(
@@ -1839,7 +1938,8 @@ fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> Str
              > Generated restack entry for project `{project}` (queue v2 §8). Lane, \
              status and branch live in `queue.toml` (the derived `softfig:queue-v2` \
              table in `../CLAUDE.md`). No stack was recorded at enqueue — re-derive \
-             it from `softfig growlight queue show` before rebasing.\n\n{RESTACK_UPSTREAM_RULE}"
+             it from `softfig growlight queue show` before rebasing.\n\n\
+             {RESTACK_UPSTREAM_RULE}\n{RESTACK_SAFETY_RULE}\n{RESTACK_GATE_RULE}"
         );
     }
     let mut doc = format!(
@@ -1860,24 +1960,32 @@ fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> Str
     }
     doc.push('\n');
     doc.push_str(RESTACK_UPSTREAM_RULE);
+    doc.push('\n');
+    doc.push_str(RESTACK_SAFETY_RULE);
     doc.push_str(
         "\n## Steps\n\n\
-         Rebase each branch in stack order (bottom first), resolving conflicts and \
-         re-running the gate per branch:\n\n",
+         Rebase each branch in stack order (bottom first), each from its own \
+         worktree and after its backup ref exists. If an `--onto` branch no longer \
+         exists it was merged: use `main` instead.\n\n",
     );
     for b in stack {
+        if b.base.is_empty() {
+            // No recorded base: the step cannot be written, and a guessed one
+            // could drop or duplicate commits.
+            doc.push_str(&format!(
+                "- `{}`: no base is recorded for it, so do not guess one — \
+                 `growlight_block`, `kind = human`, naming the branch\n",
+                b.branch
+            ));
+            continue;
+        }
         doc.push_str(&format!(
             "- `git rebase --onto {} {} {}`\n",
             b.onto, b.base, b.branch
         ));
     }
-    doc.push_str(
-        "\n## Gate\n\n\
-         After each rebase, re-run the repo's gate before `growlight_complete_entry`:\n\n\
-         ```\n\
-         cargo test --workspace\n\
-         ```\n",
-    );
+    doc.push('\n');
+    doc.push_str(RESTACK_GATE_RULE);
     doc
 }
 
@@ -2736,7 +2844,9 @@ mod tests {
         assert!(doc.contains("- `git rebase --onto main abc123 feat/one`"), "{doc}");
         assert!(doc.contains("- `git rebase --onto feat/one def456 feat/two`"), "{doc}");
         assert!(doc.contains("## Gate"), "{doc}");
-        assert!(doc.contains("cargo test --workspace"), "{doc}");
+        // V4: the gate comes from the project, not a hard-coded cargo command.
+        assert!(doc.contains("the project's own `CLAUDE.md`"), "{doc}");
+        assert!(!doc.contains("cargo test --workspace"), "{doc}");
         // V1: the upstream rule comes before the first rebase step.
         let rule = doc.find("## Before you rebase").expect("the upstream rule");
         assert!(rule < doc.find("## Steps").unwrap(), "{doc}");
@@ -2745,6 +2855,108 @@ mod tests {
         assert_eq!(wt.read_to_string("growlight/backlog/tasks/.seq").unwrap(), "1
 ");
         drop(inner);
+    }
+
+    /// The V4 safety rules every restack doc carries, in the order a session
+    /// meets them: before the first `git rebase --onto` step.
+    fn assert_carries_the_safety_rules(doc: &str) {
+        let protect = doc.find("## Protect the work").unwrap_or_else(|| panic!("{doc}"));
+        for needle in [
+            "git worktree list --porcelain",
+            "rev-parse --git-path rebase-merge",
+            "rebase --abort",
+            "git -C <worktree> status --porcelain",
+            "git branch restack-backup/<branch> <branch>",
+            "`growlight_block`, `kind = human`",
+        ] {
+            assert!(doc[protect..].contains(needle), "missing {needle}\n{doc}");
+        }
+        if let Some(steps) = doc.find("## Steps") {
+            assert!(protect < steps, "the safety rules precede the steps\n{doc}");
+        }
+    }
+
+    #[test]
+    fn the_restack_doc_protects_the_work_it_rewrites() {
+        let doc = restack_doc("softfig", "2026-10-30", &[rb("feat/one", "", "abc123", "main")]);
+        assert_carries_the_safety_rules(&doc);
+        assert!(doc.contains("- `git rebase --onto main abc123 feat/one`"), "{doc}");
+        // The placeholder form carries them too.
+        assert_carries_the_safety_rules(&restack_doc("softfig", "2026-10-30", &[]));
+    }
+
+    #[test]
+    fn a_stack_branch_without_a_recorded_base_renders_no_broken_step() {
+        let doc = restack_doc(
+            "softfig",
+            "2026-10-30",
+            &[rb("feat/one", "", "", "main"), rb("feat/two", "one", "def456", "feat/one")],
+        );
+        assert!(!doc.contains("--onto main  feat/one"), "{doc}");
+        assert!(!doc.contains("git rebase --onto main"), "{doc}");
+        assert!(
+            doc.contains("- `feat/one`: no base is recorded for it, so do not guess one"),
+            "{doc}"
+        );
+        assert!(doc.contains("- `git rebase --onto feat/one def456 feat/two`"), "{doc}");
+    }
+
+    #[test]
+    fn a_human_enqueued_restack_renders_the_stack_from_list_state() {
+        // No git here: keeperd holds the list, so a hand-enqueued restack (the
+        // only kind a remote project gets) carries the full template, not a
+        // stackless placeholder (V4).
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut one = entry("one");
+        one.claimed = "2026-10-11T12:00:00Z".to_string();
+        one.base = "main-tip".to_string();
+        let mut two = entry("two");
+        two.parent = "one".to_string();
+        two.claimed = "2026-10-12T12:00:00Z".to_string();
+        two.base = "feat/one".to_string(); // a remote base is the parent's branch name
+        let unstarted = entry("three"); // never claimed: not in the stack
+        seed_queue(&daemon, vec![project()], vec![two, one, unstarted], None);
+
+        add_entry(&daemon, restack_args("softfig", serde_json::json!({}))).expect("restack");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(!doc.contains("No stack was recorded"), "{doc}");
+        let steps = [
+            "- `git rebase --onto main main-tip feat/one`",
+            "- `git rebase --onto feat/one feat/one feat/two`",
+        ]
+        .map(|s| doc.find(s).unwrap_or_else(|| panic!("missing {s}\n{doc}")));
+        assert!(steps[0] < steps[1], "claim order, bottom first\n{doc}");
+        assert!(doc.contains("- `feat/one` — parent: `main`, base: `main-tip`"), "{doc}");
+        assert!(doc.contains("- `feat/two` — parent: `one`"), "{doc}");
+        assert!(!doc.contains("feat/three"), "an unstarted entry is not in the stack\n{doc}");
+        assert_carries_the_safety_rules(&doc);
+    }
+
+    #[test]
+    fn list_state_stack_targets_an_archived_unmerged_parent_not_main() {
+        // V7 on the list-state path: `done` archives the parent but the loop
+        // never merges it, so the child must stay on the parent's branch.
+        let mut parent = entry("a");
+        parent.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut child = entry("b");
+        child.parent = "a".to_string();
+        child.claimed = "2026-10-12T12:00:00Z".to_string();
+        child.base = "a-tip".to_string();
+        let archive = QueueArchiveToml::new(vec![ArchivedEntry {
+            row: parent,
+            finished: "2026-10-13T12:00:00Z".to_string(),
+            final_status: FinalStatus::Done,
+            reason: None,
+        }]);
+        let queue = QueueToml::new(vec![project()], vec![child]);
+        let stack = stack_from_list(&queue, &archive, "softfig");
+        assert_eq!(stack, vec![rb("feat/b", "a", "a-tip", "feat/a")]);
     }
 
     #[test]
