@@ -1374,8 +1374,11 @@ pub fn slice_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 /// nothing), and `running` for an `active` entry (the running session is
 /// never killed; a paused/blocked/deferred/queued entry has none). If a live
 /// entry's `parent` is the dropped id — a stacked branch was cut from it,
-/// §8 — one restack is enqueued per distinct child project (the restack
-/// covers a repo's stack; its doc names `queue-v2-git` for the rebase steps).
+/// §8 — the children are re-parented in the same write (`parent` := the
+/// dropped entry's parent, `base` := the dropped base) and one restack is
+/// enqueued per distinct project of the whole descendant subtree, not just
+/// the direct children (the restack covers a repo's stack; its doc names
+/// `queue-v2-git` for the rebase steps).
 pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueDropArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_drop args: {e}")))?;
@@ -1413,22 +1416,59 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
     }
 
-    // The drop→restack path (§8, queue-v2-git slice 004): live children cut
-    // from the dropped entry, one restack per distinct child project, each
-    // carrying the `--onto` rebase that moves the child off the abandoned
-    // commits (`git rebase --onto <dropped base> <dropped branch> <child>`).
-    // Collected before the row leaves the list.
-    let children: Vec<(String, String)> = queue
-        .entries
-        .iter()
-        .filter(|e| e.parent == args.id)
-        .map(|e| (e.project.clone(), e.branch.clone()))
-        .collect();
+    // The drop→restack path (§8, queue-v2-git slices 004 + 006): the live
+    // subtree cut from the dropped entry, one restack per distinct project.
+    // The direct children move off the abandoned commits (`git rebase --onto
+    // <dropped base> <dropped branch> <child>`) and are re-parented in this
+    // same write — `parent` := the dropped entry's parent, `base` := the
+    // dropped base — so later rewrites of the real parent are still detected
+    // (V5). Their descendants keep their parents and recorded bases and follow
+    // their parent's new tip (`--onto <parent branch> <own base>`). Collected
+    // before the row leaves the list; bottom first, so a parent is always
+    // rebased before the branches cut from it.
+    let dropped_parent = queue.entries[idx].parent.clone();
+    let dropped_branch = queue.entries[idx].branch.clone();
+    let dropped_base = queue.entries[idx].base.clone();
+    let mut subtree: Vec<(String, RestackBranch)> = Vec::new();
+    let mut seen: Vec<String> = vec![args.id.clone()];
+    let mut cursor = 0;
+    while cursor < seen.len() {
+        let at = seen[cursor].clone();
+        cursor += 1;
+        for e in queue.entries.iter().filter(|e| e.parent == at) {
+            if seen.contains(&e.id) {
+                continue;
+            }
+            seen.push(e.id.clone());
+            let rb = if at == args.id {
+                RestackBranch {
+                    branch: e.branch.clone(),
+                    parent: dropped_parent.clone(),
+                    base: dropped_branch.clone(),
+                    onto: dropped_base.clone(),
+                }
+            } else {
+                RestackBranch {
+                    branch: e.branch.clone(),
+                    parent: at.clone(),
+                    base: e.base.clone(),
+                    onto: queue
+                        .entries
+                        .iter()
+                        .find(|p| p.id == at)
+                        .map(|p| p.branch.clone())
+                        .unwrap_or_default(),
+                }
+            };
+            subtree.push((e.project.clone(), rb));
+        }
+    }
+    for e in queue.entries.iter_mut().filter(|e| e.parent == args.id) {
+        e.parent = dropped_parent.clone();
+        e.base = dropped_base.clone();
+    }
 
     let row = queue.entries.remove(idx);
-    // Capture the dropped entry's stack fields before the row is archived.
-    let dropped_branch = row.branch.clone();
-    let dropped_base = row.base.clone();
     archive.entries.push(ArchivedEntry {
         row,
         finished: conventions::now_rfc3339(),
@@ -1442,20 +1482,15 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // numbers even before any `.seq` write lands.
     let restacks: Vec<RestackStaged> = {
         let wt = WorkTree::new(daemon, &inner);
-        // Group the children per project (project order = first-child order,
-        // child order = the list order, which is the claim order §8).
+        // Group the stack per project (project order = first-branch order,
+        // branch order = bottom first, siblings in list order — the claim
+        // order §8).
         let mut by_project: Vec<(String, Vec<RestackBranch>)> = Vec::new();
-        for (project, branch) in &children {
-            let rb = RestackBranch {
-                branch: branch.clone(),
-                parent: args.id.clone(),
-                base: dropped_branch.clone(),
-                onto: dropped_base.clone(),
-            };
-            if let Some((_, stack)) = by_project.iter_mut().find(|(p, _)| p == project) {
+        for (project, rb) in subtree {
+            if let Some((_, stack)) = by_project.iter_mut().find(|(p, _)| *p == project) {
                 stack.push(rb);
             } else {
-                by_project.push((project.clone(), vec![rb]));
+                by_project.push((project, vec![rb]));
             }
         }
         (numbering::next_number(&wt, &paths::tasks_dir())..)
@@ -3560,10 +3595,11 @@ mod tests {
         assert_eq!(r.lane, Lane::Urgent);
         assert_eq!(r.branch, "", "a restack has no branch of its own");
         assert_eq!(r.project, "softfig");
-        // The child keeps its recorded parent as history (the restack itself
-        // computes the rebase in queue-v2-git).
+        // The child is re-parented in the same write (V5): a had no parent,
+        // so b is main-rooted now, cut from a's base.
         let b = qs.queue.model.entries.iter().find(|e| e.id == "b").unwrap();
-        assert_eq!(b.parent, "a");
+        assert_eq!(b.parent, "");
+        assert_eq!(b.base, "parent-commit");
 
         // The archive row: dropped, stamped, with the reason.
         assert_eq!(qs.archive.model.entries.len(), 1);
@@ -3609,6 +3645,60 @@ mod tests {
             .map(|a| a.row.id.as_str())
             .collect();
         assert_eq!(archived, ["a", "c"], "archive rows keep arrival order");
+    }
+
+    #[test]
+    fn queue_drop_of_a_middle_entry_reparents_and_restacks_the_whole_subtree() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // A 4-deep stack r → m → g → h; m (the middle) is dropped. Hand-seeded
+        // like the other stack tests: claims are not file state.
+        let stamp = "2026-10-11T12:00:00Z".to_string();
+        let mut r = entry("r");
+        r.claimed = stamp.clone();
+        r.base = "r-base".to_string();
+        let mut m = entry("m");
+        m.parent = "r".to_string();
+        m.base = "m-base".to_string();
+        m.claimed = stamp.clone();
+        let mut g = entry("g");
+        g.parent = "m".to_string();
+        g.base = "g-base".to_string();
+        g.claimed = stamp.clone();
+        let mut h = entry("h");
+        h.parent = "g".to_string();
+        h.base = "h-base".to_string();
+        h.claimed = stamp;
+        seed_queue(&daemon, vec![project()], vec![r, m, g, h], None);
+
+        drop_entry(&daemon, serde_json::json!({ "id": "m", "reason": "abandoned" }))
+            .expect("drop");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let row = |id: &str| qs.queue.model.entries.iter().find(|e| e.id == id).unwrap();
+        // The direct child takes the dropped entry's parent and base, in the
+        // same write that archives the row ...
+        assert_eq!(row("g").parent, "r");
+        assert_eq!(row("g").base, "m-base");
+        // ... and the grandchild keeps its own parent and recorded base.
+        assert_eq!(row("h").parent, "g");
+        assert_eq!(row("h").base, "h-base");
+
+        // One restack covers the whole subtree, bottom first: g leaves the
+        // abandoned commits, then h follows g's rebased tip (not main).
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        let steps = [
+            "- `git rebase --onto m-base feat/m feat/g`",
+            "- `git rebase --onto feat/g h-base feat/h`",
+        ]
+        .map(|s| doc.find(s).unwrap_or_else(|| panic!("missing {s}\n{doc}")));
+        assert!(steps[0] < steps[1], "parents rebase before their children\n{doc}");
+        assert!(doc.contains("- `feat/g` — parent: `r`"), "{doc}");
+        assert!(doc.contains("- `feat/h` — parent: `g`"), "{doc}");
     }
 
     #[test]
