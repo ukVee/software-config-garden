@@ -105,6 +105,23 @@ fn non_empty(field: &str, value: &str) -> Result<(), (ErrorKind, String)> {
     }
 }
 
+/// Report 036: a fleet member's reach over the legacy growlight verbs. A
+/// member may `log_baton` and `set_item_status` on its OWN held item to
+/// `done` | `deferred` | `blocked` (protocol-fleet.md's handoff steps); every
+/// other legacy queue-table write is the human's or growlightd's. Refused
+/// here `member_not_allowed`, before any tree change.
+fn refuse_member_legacy(member: &str, verb: &str, why: &str) -> (ErrorKind, String) {
+    (
+        ErrorKind::BadArgs,
+        format!(
+            "member_not_allowed: '{verb}' is not a member's call — {why}. Fleet member \
+             {member} may only log_baton and set its own held item to done/deferred/blocked \
+             (protocol-fleet.md); file_report it or post_message to @human instead. \
+             (spec-growlight-queue §6.7)"
+        ),
+    )
+}
+
 // ---- log_baton ---------------------------------------------------------
 
 pub fn log_baton(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -297,6 +314,14 @@ pub fn add_backlog_item(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     non_empty("mission", &args.mission)?;
     non_empty("finish_criteria", &args.finish_criteria)?;
 
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_backlog_item",
+            "shaping the backlog is the human's",
+        ));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let date = conventions::today_hyphen();
@@ -391,6 +416,14 @@ pub fn add_slice(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     conventions::validate_slug(&args.slug)?;
     non_empty("body", &args.body)?;
 
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_slice",
+            "adding a slice is the human's",
+        ));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
@@ -443,6 +476,15 @@ pub fn add_slice(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 pub fn add_queue(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: AddQueueArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("add_queue args: {e}")))?;
+    // Review 042 G74-7: registering a queue writes the registry growlightd
+    // schedules from (and, under folder-grants, a repo's default grant).
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_queue",
+            "registering a work-stream queue (and the repo it binds) is the human's",
+        ));
+    }
     queues::validate_queue_name(&args.name)?;
     non_empty("repo", &args.repo)?;
 
@@ -483,7 +525,7 @@ pub fn add_queue(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         let item_tag = queues::item_region_tag(&args.name);
         let heading = format!("Queue: {}", args.name);
         let content = upsert_section_region(&content, &heading, &item_tag, &queue::render(&[]));
-        wt.write(&rel, content.as_bytes())?;
+        wt.write_derived(&rel, content.as_bytes())?;
     }
 
     let payload = serde_json::json!({ "name": args.name, "repo": args.repo });
@@ -508,6 +550,24 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     non_empty("id", &args.id)?;
     paths::validate_status(&args.status)?;
 
+    // Report 036: a member may only move its OWN item to a handoff status —
+    // never claim (`active`) or resume (`queued`), which are growlightd's and
+    // the human's. The own-item check below runs once the queue region resolves.
+    let member = crate::caller::member();
+    if let Some(member) = member.as_deref()
+        && !matches!(args.status.as_str(), "done" | "deferred" | "blocked")
+    {
+        return Err(refuse_member_legacy(
+            member,
+            "set_item_status",
+            &format!(
+                "a status change to {:?} is growlightd's (an `active` claim) or the human's \
+                 (a `queued` resume); a member may only set done, deferred or blocked",
+                args.status
+            ),
+        ));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
@@ -526,9 +586,10 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
         Leave,
     }
 
-    // (wrote?, part key, holder-map update). `wrote == false` is the idempotent
-    // no-op (return the current tip, no commit); `true` means the tree changed.
-    let (wrote, key, holder_op): (bool, holders::PartKey, HolderOp) = {
+    // (wrote?, part key, holder-map update, the status to report). `wrote ==
+    // false` is the idempotent no-op (return the current tip, no commit); `true`
+    // means the tree changed.
+    let (wrote, key, holder_op, status): (bool, holders::PartKey, HolderOp, String) = {
         let wt = WorkTree::new(daemon, &inner);
         if !wt.exists(&rel) {
             return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
@@ -548,65 +609,112 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
 
         let key: holders::PartKey = (tag.clone(), args.id.clone());
 
-        // Holder-identity CAS (milestone #40): only the write TO `active` is
-        // gated. A claim of a part already `active` under a *different* holder is
-        // refused here — fail-closed, before any tree change — so a fleet member
-        // never double-claims a part a live peer holds. A granted claim records
-        // the holder after the block (covers a fresh claim, the same holder's
-        // idempotent re-claim, and the unknown-holder post-`daemon cycle` resume
-        // where first-claim-wins). A non-active write drops any holder, so a
-        // later re-activation is a fresh first-claim.
-        let holder_op = if args.status == "active" {
-            match inner.holders.gate(&key, args.holder.as_deref()) {
-                ClaimGate::Deny(h) => {
+        // Report 036: a member's `set_item_status` reaches only the item it
+        // holds. The holder map is rebuilt empty on every daemon start, so an
+        // unrecorded holder (a post-`daemon cycle` window) fails closed — the
+        // member cannot set the status, and the human runs the change.
+        if let Some(member) = member.as_deref() {
+            match inner.holders.holder_of(&key) {
+                Some(h) if h == member => {}
+                Some(other) => {
                     return Err((
                         ErrorKind::BadArgs,
                         format!(
-                            "item {:?} is already claimed by agent {h:?}; \
-                             a different agent cannot claim it while it is active",
+                            "member_not_allowed: item {:?} is held by agent {other:?}, not \
+                             member {member:?} — a member sets only its own held item's status \
+                             (protocol-fleet.md). If you are working this item, file_report or \
+                             post_message @human; never set another member's item. \
+                             (spec-growlight-queue §6.7)",
                             args.id
                         ),
-                    ));
+                    ))
                 }
-                ClaimGate::Grant => {
-                    HolderOp::Record(args.holder.clone().expect("Grant implies a claimant id"))
-                }
-                ClaimGate::Untracked => HolderOp::Leave,
-            }
-        } else {
-            HolderOp::Clear
-        };
-
-        // Idempotent re-set: no tree change. Return the current tip rather than
-        // minting an empty commit — but the holder op still applies (a post-cycle
-        // first claim of an already-`active` part records its holder with no
-        // commit).
-        if rows[idx].status == args.status {
-            (false, key, holder_op)
-        } else {
-            // Single-active invariant, now *per queue*: only one item may be
-            // `active` within a given queue at a time. Scoping it to the resolved
-            // region is exactly what lets the fleet run one active part per queue
-            // concurrently; a default-only garden keeps the old global behaviour.
-            if args.status == "active"
-                && let Some(other) = rows
-                    .iter()
-                    .enumerate()
-                    .find(|(i, r)| *i != idx && r.status == "active")
-                {
+                None => {
                     return Err((
                         ErrorKind::BadArgs,
                         format!(
-                            "item {:?} is already active; set it done/blocked first",
-                            other.1.id
+                            "member_not_allowed: no holder is recorded for item {:?} (a daemon \
+                             cycle rebuilds the holder map empty), so member {member:?} cannot \
+                             set its status yet. growlightd re-records its members' holders \
+                             within about 30 seconds of a cycle: retry this call once in a \
+                             minute. If it is still refused, post_message @human with the \
+                             status you meant to set, then finish your handoff (baton + \
+                             log_baton) and exit. (spec-growlight-queue §6.7)",
+                            args.id
                         ),
-                    ));
+                    ))
                 }
-            rows[idx].status = args.status.clone();
+            }
+        }
 
-            let new = managed::upsert(&content, &tag, &queue::render(&rows));
-            wt.write(&rel, new.as_bytes())?;
-            (true, key, holder_op)
+        // The conditional form (review 042 G74-5): apply only while the item is
+        // still in `if_status`. A mismatch is a no-op — no write, no holder
+        // change — reporting the status the item actually has.
+        if let Some(want) = args.if_status.as_deref()
+            && rows[idx].status != want
+        {
+            (false, key, HolderOp::Leave, rows[idx].status.clone())
+        } else {
+            // Holder-identity CAS (milestone #40): only the write TO `active` is
+            // gated. A claim of a part already `active` under a *different* holder is
+            // refused here — fail-closed, before any tree change — so a fleet member
+            // never double-claims a part a live peer holds. A granted claim records
+            // the holder after the block (covers a fresh claim, the same holder's
+            // idempotent re-claim, and the unknown-holder post-`daemon cycle` resume
+            // where first-claim-wins). A non-active write drops any holder, so a
+            // later re-activation is a fresh first-claim.
+            let holder_op = if args.status == "active" {
+                match inner.holders.gate(&key, args.holder.as_deref()) {
+                    ClaimGate::Deny(h) => {
+                        return Err((
+                            ErrorKind::BadArgs,
+                            format!(
+                                "item {:?} is already claimed by agent {h:?}; \
+                                 a different agent cannot claim it while it is active",
+                                args.id
+                            ),
+                        ));
+                    }
+                    ClaimGate::Grant => {
+                        HolderOp::Record(args.holder.clone().expect("Grant implies a claimant id"))
+                    }
+                    ClaimGate::Untracked => HolderOp::Leave,
+                }
+            } else {
+                HolderOp::Clear
+            };
+
+            // Idempotent re-set: no tree change. Return the current tip rather than
+            // minting an empty commit — but the holder op still applies (a post-cycle
+            // first claim of an already-`active` part records its holder with no
+            // commit).
+            if rows[idx].status == args.status {
+                (false, key, holder_op, args.status.clone())
+            } else {
+                // Single-active invariant, now *per queue*: only one item may be
+                // `active` within a given queue at a time. Scoping it to the resolved
+                // region is exactly what lets the fleet run one active part per queue
+                // concurrently; a default-only garden keeps the old global behaviour.
+                if args.status == "active"
+                    && let Some(other) = rows
+                        .iter()
+                        .enumerate()
+                        .find(|(i, r)| *i != idx && r.status == "active")
+                    {
+                        return Err((
+                            ErrorKind::BadArgs,
+                            format!(
+                                "item {:?} is already active; set it done/blocked first",
+                                other.1.id
+                            ),
+                        ));
+                    }
+                rows[idx].status = args.status.clone();
+
+                let new = managed::upsert(&content, &tag, &queue::render(&rows));
+                wt.write_derived(&rel, new.as_bytes())?;
+                (true, key, holder_op, args.status.clone())
+            }
         }
     };
 
@@ -629,7 +737,7 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             .unwrap_or_default();
         return Ok(serde_json::to_value(SetItemStatusReply {
             id: args.id,
-            status: args.status,
+            status,
             path: rel,
             hash: tip,
         })
@@ -657,6 +765,14 @@ pub fn reorder_backlog_item(daemon: &Daemon, args: serde_json::Value) -> Handler
         .map_err(|e| (ErrorKind::BadArgs, format!("reorder_backlog_item args: {e}")))?;
     non_empty("id", &args.id)?;
     let position = paths::parse_position(&args.position, args.ref_id.as_deref())?;
+
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "reorder_backlog_item",
+            "reordering the queue is the human's",
+        ));
+    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -712,7 +828,7 @@ pub fn reorder_backlog_item(daemon: &Daemon, args: serde_json::Value) -> Handler
         // status cell (and which single item is `active`) is preserved. Scoped
         // to the resolved queue's region, so order is reprioritized per queue.
         let new = managed::upsert(&content, &tag, &queue::render(&moved));
-        wt.write(&rel, new.as_bytes())?;
+        wt.write_derived(&rel, new.as_bytes())?;
         new_index
     };
 
@@ -774,7 +890,7 @@ fn enqueue(
     }
     rows.push(row);
     let new = managed::upsert(&content, tag, &queue::render(&rows));
-    wt.write(&rel, new.as_bytes())?;
+    wt.write_derived(&rel, new.as_bytes())?;
     Ok(())
 }
 

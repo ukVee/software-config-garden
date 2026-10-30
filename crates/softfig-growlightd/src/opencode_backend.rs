@@ -99,7 +99,8 @@ use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
 use crate::admission::BudgetUsage;
 use crate::agent_harness::{
-    AgentRateState, BackendFlavor, Harness, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars,
+    AgentRateState, BackendFlavor, EnvChange, Harness, LineObserver, TOOL_RENDER_MAX_CHARS,
+    truncate_chars,
 };
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
@@ -107,7 +108,7 @@ use crate::hub::EventHub;
 use crate::opencode_ledger::SessionLedger;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::AgentPaths;
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 
 // Imports for the test-only opencode-shaped `pump` seam below, which wires
 // borrowed cells into the harness's line loop so a fixture drives the real
@@ -725,31 +726,43 @@ impl BackendFlavor for OpencodeFlavor {
         &self,
         agent: &str,
         _paths: &AgentPaths,
-        model: Option<&ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
         // The member id IS the opencode agent name the generated config keys its
         // `agent.<name>` block on — one id names the runtime dir, the baton, and
         // the agent block, so `--agent` can never point at a block that was not
-        // just written. `model` overrides the roster default for THIS spawn
+        // just written. `choice` overrides the roster default for THIS spawn
         // (queue-v2-scheduling slice 006 — the assignment's resolved `> Model:`
         // choice rides argv `--model`, the one path `run` honors fail-closed).
-        opencode_command_argv(
-            &self.launch.bin,
-            &self.launch.prompt,
-            agent,
-            model.unwrap_or(&self.launch.model),
-        )
+        // A claude-shaped choice is ignored defensively; the drive loop never
+        // routes one to this flavor.
+        let override_sel = choice
+            .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Opencode)
+            .map(|c| ModelSelection {
+                model: c.opencode_model().to_string(),
+                variant: c.variant.clone(),
+            });
+        let sel = override_sel.as_ref().unwrap_or(&self.launch.model);
+        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, sel)
     }
 
-    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)> {
-        vec![(
+    fn child_env(
+        &self,
+        _agent: &str,
+        paths: &AgentPaths,
+    ) -> Result<Vec<EnvChange>, SpawnKind> {
+        Ok(vec![(
             OPENCODE_CONFIG_ENV.into(),
-            paths.opencode_config.clone().into_os_string(),
-        )]
+            Some(paths.opencode_config.clone().into_os_string()),
+        )])
     }
 
     fn working_dir(&self) -> Option<PathBuf> {
         Some(self.launch.garden_root.clone())
+    }
+
+    fn spawned(&self, _agent: &str) {
+        // Nothing to commit: opencode picks no account per spawn.
     }
 
     fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
@@ -894,15 +907,16 @@ impl OpencodeBackend {
     /// separator, given the paths a spawn's pre-approval writes — `opencode run
     /// --standalone --format json --agent <id> --model <m> <prompt>`, wrapper
     /// excluded. The routing seam
-    /// (slice 005) asserts an opencode-backed member through it. `model` is the
-    /// per-spawn override (slice 006), `None` = the roster default.
+    /// (slice 005) asserts an opencode-backed member through it. `choice` is the
+    /// per-spawn override (slice 006 + claude-model-select slice 003), `None` =
+    /// the roster default.
     pub fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
-        self.harness.command_argv(agent, paths, model)
+        self.harness.command_argv(agent, paths, choice)
     }
 }
 
@@ -927,7 +941,7 @@ impl OpencodeBackend {
 }
 
 impl AgentBackend for Arc<OpencodeBackend> {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         self.harness.spawn(spec)
     }
 }
@@ -1656,7 +1670,7 @@ mod tests {
             .command_argv(
                 "a1",
                 &paths,
-                Some(&ModelSelection::model("deepseek/deepseek-v4-pro")),
+                Some(&softfig_ipc::model_choice::ModelChoice::opencode("deepseek/deepseek-v4-pro")),
             )
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1679,10 +1693,10 @@ mod tests {
         // OPENCODE_CONFIG names THIS member's generated file — opencode's analog of
         // claude's `--settings`, and an env var rather than a flag, which is why
         // the harness seam carries an env at all.
-        let env = f.child_env(&paths);
+        let env = f.child_env("a1", &paths).expect("opencode child_env never fails");
         assert_eq!(env.len(), 1, "one variable, nothing incidental: {env:?}");
         assert_eq!(env[0].0, OsString::from("OPENCODE_CONFIG"));
-        assert_eq!(env[0].1, paths.opencode_config.clone().into_os_string());
+        assert_eq!(env[0].1, Some(paths.opencode_config.clone().into_os_string()));
         assert!(
             paths.opencode_config.ends_with("agents/a1/opencode.json"),
             "the per-member config, not a shared one: {}",
@@ -1729,6 +1743,9 @@ mod tests {
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
         let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
+        let SpawnKind::Failed(err) = err else {
+            panic!("preapproval generation failure must fail hard, never Hold: {err:?}");
+        };
         assert!(
             err.0.contains("opencode pre-approval generation failed"),
             "fail-closed spawn error names its own generator: {err}",

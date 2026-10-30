@@ -55,7 +55,7 @@ use std::thread;
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
 use crate::preapproval::AgentPaths;
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 
 /// Sentinel in [`AgentHealthState::exit_code`] meaning "still running".
 const NOT_EXITED: i64 = i64::MIN;
@@ -270,6 +270,14 @@ pub enum StreamErrorKind {
     /// An API rate-limit rejection — a 429 / `usage_limit_reached` / `rate_limit`
     /// error. A member dying on one is a rate-limit death, not a crash (task 070).
     RateLimit,
+    /// The configured `--model` was refused by the backend (claude-model-select
+    /// slice 003 — the probe found a 404 `model_not_found` on the terminal
+    /// `result` line, plus `[claude-code:unrecognized_model]` on stderr). A
+    /// member dying on this is a configuration refusal, not a crash: the
+    /// supervisor parks the member (no backoff, no spin re-roll) and surfaces
+    /// a visible alert naming the bad model, since no retry will succeed until
+    /// the roster or item declaration is edited.
+    ModelRefused,
     /// Any other in-band stream error (a permission failure, a provider error) —
     /// still the crash *reason*, but not a rate-limit signal.
     Other,
@@ -297,6 +305,12 @@ impl StreamError {
     /// Whether this is a rate-limit signal (task 070's classifier).
     pub fn is_rate_limit(&self) -> bool {
         self.kind == StreamErrorKind::RateLimit
+    }
+
+    /// Whether this is a model-refused signal (claude-model-select slice 003).
+    /// A member dying on this is parked by the supervisor rather than crashed.
+    pub fn is_model_refused(&self) -> bool {
+        self.kind == StreamErrorKind::ModelRefused
     }
 }
 
@@ -355,10 +369,17 @@ pub trait LineObserver: Send {
     fn finish(&self, at: i64);
 }
 
+/// One environment change a flavor asks of a spawn: `Some(value)` sets the
+/// variable on the child, `None` removes it from what the child would inherit
+/// from growlightd (claude-login-switcher slice 007: a pooled member on the
+/// `home` slot must run with `CLAUDE_CONFIG_DIR` unset even if growlightd has it).
+pub type EnvChange = (OsString, Option<OsString>);
+
 /// What a specific agent CLI supplies to the shared [`Harness`] — the whole
-/// backend seam (spec-agents §10 phase 2). Five methods: the fail-closed
+/// backend seam (spec-agents §10 phase 2). Six methods: the fail-closed
 /// pre-approval, the command after the scope wrapper's `--`, the child's extra
-/// environment and working directory, and the per-line fold.
+/// environment and working directory, the post-spawn commit, and the per-line
+/// fold.
 ///
 /// Every method is REQUIRED, none defaulted, deliberately: the seam's whole
 /// hazard is that a backend which silently omits something a headless agent needs
@@ -369,6 +390,21 @@ pub trait LineObserver: Send {
 /// `Debug + Send + Sync` because the harness holds it behind an `Arc` shared with
 /// every spawn's reader thread.
 pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
+    /// Pre-spawn admission preflight — the hook that lets a backend's own
+    /// picker refuse a spawn BEFORE any pre-approval files are rewritten
+    /// (claude-login-pool-wiring slice 002 M-B part 2). The harness calls this
+    /// FIRST, before [`generate_preapproval`](Self::generate_preapproval), so
+    /// an `Err([`SpawnKind::Hold`])` keeps `inject.sh`/`loop.json`/`mcp.json`
+    /// unchanged on a per-profile exhaustion — the per-tick file churn fix.
+    ///
+    /// The default is `Ok(())`: a backend without a per-spawn picker (opencode,
+    /// a bare claude flavor with no `profile_pool`) runs no preflight and
+    /// cannot stall this way. ClaudeFlavor overrides to run its pool-slot
+    /// picker here and cache the pick for [`child_env`](Self::child_env).
+    fn preflight(&self, _agent: &str) -> Result<(), crate::supervisor::SpawnKind> {
+        Ok(())
+    }
+
     /// Generate THIS agent's pre-approval BEFORE exec, fail-closed (§15): a
     /// headless agent errors out on the first un-approved tool, so an agent whose
     /// pre-approval can't be written must NOT be spawned. The `Err` becomes the
@@ -381,35 +417,60 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
     /// wrote. The scope wrapper half is the harness's ([`scope_wrapper_argv`]) —
     /// this is only the backend's own invocation. `agent` is passed because a
     /// backend may need to name the member on its own command line (opencode's
-    /// `--agent`), which the paths alone do not carry. `model` is the per-spawn
-    /// override the [`crate::supervisor::AgentSpec`] carries (queue-v2-scheduling
-    /// slice 006): `Some` pins an opencode member's `--model` argv for THIS
-    /// spawn; `None` runs the backend's roster default (claude ignores it — its
-    /// model is the harness's own).
+    /// `--agent`), which the paths alone do not carry. `choice` is the resolved
+    /// per-spawn model (queue-v2-scheduling slice 006 + claude-model-select
+    /// slice 003): `Some(ModelChoice{backend: Opencode, …})` pins an opencode
+    /// member's `--model` argv for THIS spawn; `Some(ModelChoice{backend:
+    /// Claude, …})` pins a claude member's `--model`/`--effort` argv for THIS
+    /// spawn; `None` runs the backend's roster default. Each flavor matches on
+    /// the backend of the choice and ignores a mismatch (defensive — the drive
+    /// loop never routes a claude choice to opencode or vice versa).
     fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString>;
 
-    /// Extra environment variables this spawn's child needs, given the paths its
-    /// pre-approval just wrote. Applied on top of growlightd's own environment,
-    /// which the child inherits.
+    /// Extra environment variables this spawn's child needs, given the agent
+    /// being launched and the paths its pre-approval just wrote. Applied on
+    /// top of growlightd's own environment, which the child inherits.
     ///
     /// `systemd-run --scope` runs the command as its **own child** in the new
     /// scope (unlike `--service`, which goes through PID 1), so the environment
     /// and working directory set here reach the real process.
     ///
-    /// claude returns none — it carries its whole config on argv
-    /// (`--settings`/`--mcp-config`). opencode has no such flags: its single
-    /// generated config is named by `OPENCODE_CONFIG`, so for it this is as
-    /// load-bearing as the pre-approval it points at.
-    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)>;
+    /// claude carries its per-agent config on argv (`--settings`/`--mcp-config`),
+    /// so its only env is the claude-login slot (`claude-login-switcher` slice
+    /// 007): `CLAUDE_CONFIG_DIR` set to the member's store slot, removed for a
+    /// pooled member on `home`, and nothing at all for an unpooled member while
+    /// the human's active slot is `home`. `HOME` is never touched.
+    /// opencode has no such flags: its single generated config is named by
+    /// `OPENCODE_CONFIG`, so for it this is as load-bearing as the pre-approval
+    /// it points at.
+    ///
+    /// `Err` fails the spawn closed (e.g. a slot whose directory or credential
+    /// is missing). A member meant for one account must not silently fall back
+    /// to another — that is the exact hazard the switcher removes.
+    ///
+    /// Called before the spawn, which may still fail: anything that must only
+    /// be recorded for a session that really started belongs in
+    /// [`spawned`](Self::spawned).
+    fn child_env(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+    ) -> Result<Vec<EnvChange>, crate::supervisor::SpawnKind>;
 
     /// The directory the child runs in, or `None` to inherit growlightd's own.
     /// Constant per backend, so it takes no per-spawn input.
     fn working_dir(&self) -> Option<PathBuf>;
+
+    /// `agent`'s child was launched: called once, right after `cmd.spawn()`
+    /// succeeds and never after a failed one. claude commits the slot it chose
+    /// in [`child_env`](Self::child_env) here (its pin and pick history), so a
+    /// spawn that never started leaves no trace in the picker's history.
+    fn spawned(&self, agent: &str);
 
     /// Build this spawn's [`LineObserver`], installing any per-agent cell the
     /// flavor keeps (e.g. claude's account-wide reserve cell). Called once per
@@ -841,15 +902,15 @@ impl Harness {
     /// runs on what" is a routing decision, and the only honest proof that a member
     /// routes where the operator asked is the command line it would be launched
     /// with. Pure: it spawns nothing and writes nothing (the paths are an input,
-    /// not a generation). `model` is the per-spawn override the caller (a
+    /// not a generation). `choice` is the resolved per-spawn model the caller (a
     /// [`crate::supervisor::AgentSpec`]) carries, `None` = the roster default.
     pub fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
-        self.flavor.command_argv(agent, paths, model)
+        self.flavor.command_argv(agent, paths, choice)
     }
 
     /// Spawn `spec`'s agent: generate its pre-approval fail-closed, launch the
@@ -858,7 +919,13 @@ impl Harness {
     /// detached reader threads (stdout → observer, stderr → ring).
     ///
     /// The [`AgentBackend`] contract — see that trait for the supervisor's side.
-    pub fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    pub fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
+        // Admission preflight (claude-login-pool-wiring slice 002 M-B part 2):
+        // run the backend's own picker BEFORE regenerating the pre-approval, so
+        // a per-profile exhaustion short-circuits as `SpawnKind::Hold` without
+        // rewriting `inject.sh`/`loop.json`/`mcp.json` this tick. Default is
+        // `Ok(())`; ClaudeFlavor runs its pool-slot picker here.
+        self.flavor.preflight(&spec.agent)?;
         // §15 fail-closed pre-approval: generate THIS agent's config BEFORE exec.
         // A headless agent errors out on the first un-approved tool, so an agent
         // whose pre-approval can't be generated must NOT be spawned — the Err
@@ -902,14 +969,18 @@ impl Harness {
             // the child) does not apply: the reader thread below drains it
             // continuously, the exact deadlock-safe shape the stdout `pump` uses.
             .stderr(Stdio::piped());
-        // The flavor's environment + cwd (spec-agents §10 phase 2): claude adds
-        // neither, so its spawn stays byte-identical; opencode names its generated
+        // The flavor's environment + cwd (spec-agents §10 phase 2): claude sets
+        // only its claude-login slot (none at all for an unpooled member on
+        // `home`, so that spawn stays byte-identical); opencode names its generated
         // config through `OPENCODE_CONFIG` and roots at the garden so garden docs
         // are ordinary in-project reads. Applied to the `systemd-run` process,
         // which `--scope` runs the real command as a direct child of, so both
         // reach it.
-        for (key, value) in self.flavor.child_env(&paths) {
-            cmd.env(key, value);
+        for (key, value) in self.flavor.child_env(&spec.agent, &paths)? {
+            match value {
+                Some(value) => cmd.env(key, value),
+                None => cmd.env_remove(key),
+            };
         }
         if let Some(dir) = self.flavor.working_dir() {
             cmd.current_dir(dir);
@@ -920,6 +991,8 @@ impl Harness {
                 spec.agent
             ))
         })?;
+        // Only now is there a session to record (claude-login-switcher slice 007).
+        self.flavor.spawned(&spec.agent);
 
         let stdout = child
             .stdout
@@ -1054,7 +1127,7 @@ impl Harness {
 /// The harness IS the [`AgentBackend`] once a flavor is bound — a concrete backend
 /// forwards its own `impl` here (see [`crate::claude_backend`]).
 impl AgentBackend for Harness {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         Harness::spawn(self, spec)
     }
 }
@@ -1346,5 +1419,77 @@ mod tests {
                 .collect::<Vec<_>>()[..sep],
             "the wrapper half is unchanged by the join",
         );
+    }
+
+    /// claude-login-switcher slice 007: `spawned` is the commit point for a
+    /// flavor's per-session record (claude's pin + pick history), so the harness
+    /// must call it only after `cmd.spawn()` succeeds. A cwd that does not exist
+    /// fails the launch before any program runs.
+    #[test]
+    fn a_failed_launch_never_reports_spawned() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct Counting {
+            agents: PathBuf,
+            cwd: PathBuf,
+            spawned: AtomicUsize,
+        }
+        struct Quiet;
+        impl LineObserver for Quiet {
+            fn observe(&self, _line: &str, _at: i64) {}
+            fn finish(&self, _at: i64) {}
+        }
+        impl BackendFlavor for Counting {
+            fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError> {
+                Ok(crate::preapproval::agent_paths(&self.agents, agent))
+            }
+            fn command_argv(
+                &self,
+                _agent: &str,
+                _paths: &AgentPaths,
+                _choice: Option<&softfig_ipc::model_choice::ModelChoice>,
+            ) -> Vec<OsString> {
+                vec!["true".into()]
+            }
+            fn child_env(
+                &self,
+                _agent: &str,
+                _paths: &AgentPaths,
+            ) -> Result<Vec<EnvChange>, SpawnKind> {
+                Ok(vec![("CLAUDE_CONFIG_DIR".into(), None)])
+            }
+            fn working_dir(&self) -> Option<PathBuf> {
+                Some(self.cwd.clone())
+            }
+            fn spawned(&self, _agent: &str) {
+                self.spawned.fetch_add(1, Ordering::Relaxed);
+            }
+            fn new_observer(&self, _agent: &str, _rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+                Box::new(Quiet)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let flavor = Arc::new(Counting {
+            agents: tmp.path().join("agents"),
+            cwd: tmp.path().join("no-such-dir"),
+            spawned: AtomicUsize::new(0),
+        });
+        let live = Arc::new(Mutex::new(BTreeMap::new()));
+        let harness = Harness::new(
+            Arc::clone(&flavor) as Arc<dyn BackendFlavor>,
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::clone(&live),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        );
+        let spec = AgentSpec::new("a1", tmp.path().join("l.json"), tmp.path().join("m.json"));
+        let err = harness
+            .spawn(&spec)
+            .expect_err("a missing cwd fails the launch")
+            .into_failed();
+        assert!(err.0.contains("failed to launch agent a1"), "{err}");
+        assert_eq!(flavor.spawned.load(Ordering::Relaxed), 0, "no session, no commit");
+        assert!(live.lock().unwrap().is_empty(), "no live scope recorded either");
     }
 }

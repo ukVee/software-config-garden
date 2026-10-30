@@ -98,8 +98,10 @@ impl HolderStore {
         self.held.remove(key);
     }
 
-    /// The recorded holder of `key`, if any. Test/inspection only.
-    #[cfg(test)]
+    /// The recorded holder of `key`, if any. `None` covers a part never
+    /// claimed AND the post-`daemon cycle` window where the map was rebuilt
+    /// empty — the member write guard (report 036) reads that as an unknown
+    /// holder and fails closed.
     pub fn holder_of(&self, key: &PartKey) -> Option<&str> {
         self.held.get(key).map(|s| s.as_str())
     }

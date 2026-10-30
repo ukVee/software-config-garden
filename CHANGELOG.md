@@ -56,6 +56,14 @@ decision record or crate that owns it, rather than at every internal change.
   `softfig upgrade --rollback` restores it (then cycle the daemon), and
   `--force` re-installs even an identical build. `uninstall` removes the kept set
   and the install lock too.
+- `claude:<alias|id>[1m] [effort=<low|medium|high|xhigh|max>]` grammar across
+  `softfig growlight start --model`, the interactive picker, `> Model:` lines
+  and `[[fleet]] model` entries, so the claude backend's model and effort are
+  choosable per session, per item and per fleet member — matching Claude Code's
+  own `--model` / `--effort` flags (`claude-model-select`; CLI slices 001–002,
+  fleet slice 003). A claude member whose model Claude Code refuses
+  (`model_not_found` / 404) parks the unit with an alert carrying the reason;
+  there is no crash loop and no backoff retry.
 
 ### Protocol
 

@@ -43,7 +43,7 @@ mod split;
 mod sync_conflict;
 mod thrash;
 mod unlink;
-mod worktree;
+pub(crate) mod worktree;
 
 pub use add_code_review::add_code_review;
 pub use add_note::{add_note, revise_note};

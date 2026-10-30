@@ -8,17 +8,23 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backlog_doc;
 pub mod baton;
+pub mod claude_profiles;
 pub mod client;
 pub mod compat;
+pub mod fleet;
 pub mod growlightd;
+pub mod item_meta;
 pub mod item_repo;
 pub mod member;
 pub mod model_choice;
 pub mod opencode;
 pub mod proto;
 pub mod queue_v2;
+pub mod slot_name;
 pub mod socket;
+pub mod testing;
 pub mod usage;
 pub mod verbs;
 
@@ -26,6 +32,7 @@ pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
 pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
+pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
     Backend, Declaration, DeclaredModels, ModelChoice, ModelList, ModelRuleError, ModelSpec,
@@ -33,6 +40,7 @@ pub use model_choice::{
     resolve_item_models, validate_declared_subset, validate_model_change,
 };
 pub use proto::{ErrorKind, Request, Response};
+pub use slot_name::{validate_slot_name, SlotNameError};
 pub use queue_v2::{
     sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
     QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,

@@ -139,13 +139,15 @@ pub struct AgentSpec {
     pub loop_settings: PathBuf,
     /// Per-agent `mcp.json` — the softfig-mcp attach config.
     pub mcp_config: PathBuf,
-    /// The per-spawn model override (queue-v2-scheduling slice 006): the
-    /// assignment's resolved `> Model:` choice for an opencode member, carried
-    /// on argv `--model` for THIS spawn. `None` = the backend's roster default
-    /// (every legacy spawn). A claude member's assignment resolves to `None` —
-    /// claude carries its whole config on argv and its model is the harness's
-    /// own, not settable from this launch path.
-    pub model: Option<crate::opencode_backend::ModelSelection>,
+    /// The per-spawn resolved §6.4 model (queue-v2-scheduling slice 006 +
+    /// claude-model-select slice 003): the assignment's choice (item declaration
+    /// beats roster entry beats backend default) carried on argv `--model` and
+    /// (for claude) `--effort` for THIS spawn. `None` = the backend's roster
+    /// default (every legacy spawn). The flavor matches on
+    /// [`ModelChoice::backend`](softfig_ipc::model_choice::ModelChoice) and
+    /// extracts its own argv shape; a mismatch is ignored defensively (the
+    /// drive loop never routes a claude choice to opencode or vice versa).
+    pub model: Option<softfig_ipc::model_choice::ModelChoice>,
 }
 
 impl AgentSpec {
@@ -164,12 +166,14 @@ impl AgentSpec {
         }
     }
 
-    /// Pin this spawn's opencode `--model` argv value (slice 006): the unit's
-    /// resolved model, overriding the backend's roster default for THIS spawn.
+    /// Pin this spawn's resolved model (queue-v2-scheduling slice 006 +
+    /// claude-model-select slice 003): the unit's resolved §6.4 choice,
+    /// overriding the backend's roster default for THIS spawn. The choice
+    /// carries its own backend; each flavor extracts the argv shape it needs.
     #[must_use]
     pub fn with_model(
         mut self,
-        model: crate::opencode_backend::ModelSelection,
+        model: softfig_ipc::model_choice::ModelChoice,
     ) -> Self {
         self.model = Some(model);
         self
@@ -190,6 +194,82 @@ impl fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// How a spawn attempt resolved for admission (claude-login-pool-wiring slice
+/// 002 M-B part 2). Returned from [`AgentBackend::spawn`] and from the backend
+/// flavor seams so the drive loop can distinguish a hard launch failure
+/// ([`Self::Failed`] — operator alert, pages `AgentCrashed`) from a picker
+/// stall ([`Self::Hold`] — admission re-opens by itself at a window `resets_at`,
+/// no page, no backoff, no per-tick preapproval rewrite).
+///
+/// Hold is **not an error** semantically — it is the backend saying "no slot
+/// in this member's pool is pickable right now, come back after `until`". Named
+/// `SpawnKind` rather than `SpawnErrorKind` so the Hold variant does not read
+/// as a failure in the call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnKind {
+    /// Backend launch failed hard — missing binary, unreadable spec paths,
+    /// unusable credential dir. Mapped to
+    /// [`StartOutcome::SpawnFailed`] and surfaced as an `AgentCrashed` alert.
+    Failed(SpawnError),
+    /// The picker found every pool slot admissibly exhausted
+    /// ([`crate::profile_pin::PickResult::Stall`]). Carries the pool slots the
+    /// stall applied to and the earliest known `resets_at` across them (`None`
+    /// when no slot carried one — the drive-loop Hold path extends with a
+    /// staleness bound in that case). Mapped to [`StartOutcome::Hold`]:
+    /// admission reopens on its own at the window's `resets_at`, with NO alert,
+    /// NO failure-streak bump, and NO preapproval file rewrites this tick.
+    Hold {
+        /// The pool slots the picker found exhausted. The drive loop extends a
+        /// per-slot [`crate::rate_limit_holds::RateLimitHolds`] entry for each
+        /// so the next tick's admission check short-circuits via
+        /// [`crate::rate_limit_holds::RateLimitHolds::member_fully_held`]
+        /// instead of re-running the picker (the per-tick spin fix).
+        slots: Vec<String>,
+        /// Earliest 5h/7d window reset instant the picker saw across the
+        /// stalled pool, or `None` when no slot carried a boundary.
+        until: Option<i64>,
+    },
+}
+
+impl From<SpawnError> for SpawnKind {
+    fn from(e: SpawnError) -> Self {
+        SpawnKind::Failed(e)
+    }
+}
+
+impl fmt::Display for SpawnKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(e) => e.fmt(f),
+            Self::Hold { slots, until } => write!(
+                f,
+                "spawn held: pool {slots:?} is exhausted until {}",
+                match until {
+                    Some(at) => format!("unix seconds {at}"),
+                    None => "the next tick (no reset known)".into(),
+                }
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpawnKind {}
+
+#[cfg(test)]
+impl SpawnKind {
+    /// Test-only: assert this is [`SpawnKind::Failed`] and return the inner
+    /// [`SpawnError`]. Panics on [`SpawnKind::Hold`] — the shape most
+    /// pre-slice-002 spawn-failure tests already assumed.
+    pub(crate) fn into_failed(self) -> SpawnError {
+        match self {
+            Self::Failed(e) => e,
+            Self::Hold { slots, until } => panic!(
+                "expected SpawnKind::Failed, got Hold {{ slots: {slots:?}, until: {until:?} }}",
+            ),
+        }
+    }
+}
+
 /// The spawn seam: produce a live [`AgentChild`] from a per-agent [`AgentSpec`].
 ///
 /// **Default-absent live binding** (like [`crate::leases::ThrashClear`] /
@@ -199,8 +279,11 @@ impl std::error::Error for SpawnError {}
 /// drive-loop task (the [`crate::notify_dispatch::Notifier`] seam shape).
 pub trait AgentBackend: Send + Sync + fmt::Debug {
     /// Spawn a fresh agent process from `spec`, returning its killable handle.
-    /// `Err` means the launch itself failed (not a later crash).
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError>;
+    /// `Err([`SpawnKind::Failed`])` means the launch itself failed (not a later
+    /// crash); `Err([`SpawnKind::Hold`])` means the backend's admission picker
+    /// found no admissible slot in the member's pool right now and the drive
+    /// loop MUST NOT page or trigger backoff — slice 002 M-B part 2.
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind>;
 }
 
 /// One agent's health as the drive loop observed it. The drive loop derives this
@@ -325,6 +408,25 @@ pub enum StartOutcome {
         /// The backend's error text.
         error: String,
     },
+    /// Admission cleared, the claim landed, but the backend's own picker found
+    /// no admissible slot in the member's pool right now
+    /// ([`SpawnKind::Hold`] — claude-login-pool-wiring slice 002 M-B part 2).
+    /// Nothing registered, no preapproval files written, no `AgentCrashed`
+    /// alert fires; the drive loop extends the per-slot
+    /// [`crate::rate_limit_holds::RateLimitHolds`] so next tick's admission
+    /// check skips the member via [`member_fully_held`] instead of re-running
+    /// the picker (the per-tick spin fix). A rate-limit `Hold` is **not** a
+    /// crash — the window reopens on its own.
+    ///
+    /// [`member_fully_held`]: crate::rate_limit_holds::RateLimitHolds::member_fully_held
+    Hold {
+        /// Pool slots the picker found exhausted — the drive loop extends a
+        /// hold for each.
+        slots: Vec<String>,
+        /// Earliest `resets_at` across those slots, or `None` when no slot
+        /// carried one (the drive loop then uses its own staleness bound).
+        until: Option<i64>,
+    },
 }
 
 /// The outcome of one health observation ([`Supervisor::poll`]).
@@ -406,6 +508,25 @@ pub enum PollOutcome {
         /// Earliest Unix-seconds a re-roll may spawn.
         not_before: i64,
     },
+    /// The configured `--model` was refused by the backend (claude-model-select
+    /// slice 003): the exit coincides with the backend's latched
+    /// [`StreamErrorKind::ModelRefused`](crate::agent_harness::StreamErrorKind)
+    /// — the terminal `result` carried `error: "model_not_found"` /
+    /// `api_error_status: 404`. The member is brought down-but-registered with
+    /// NO failure-streak bump and NO backoff schedule (`not_before = i64::MAX`
+    /// — nothing but an operator edit will cause a retry); an
+    /// [`NotifyEvent::AgentCrashed`]-shaped alert still fires so the human
+    /// sees it, carrying the model name and the refusal reason. Semantically a
+    /// configuration refusal, not a crash: no spin re-roll, no punitive streak.
+    ModelRefused {
+        /// The [`NotifyEvent::AgentCrashed`] to dispatch, with the model-refused
+        /// reason text so the alert reads "model refused: …" rather than
+        /// "crashed".
+        event: NotifyEvent,
+        /// Human-readable refusal reason (the stream error's text — the model
+        /// name is embedded by `claude -p`'s message).
+        reason: String,
+    },
     /// A non-zero exit the network classifier attributed to a TRANSIENT network
     /// death (network-failsafe slice 002): the peer lost its API connection mid-
     /// session (link dropped / DNS / TLS / connection reset) rather than genuinely
@@ -458,6 +579,11 @@ pub enum MemberLifecycle {
     /// Rate-limited — a clean `HALTED_RATE_LIMIT` park OR a rate-limit death
     /// (task 070): `status` shows the hold, never `crashed (n)`.
     RateLimitedHeld,
+    /// Parked on a model refusal (claude-model-select slice 003): the backend
+    /// rejected the configured `--model`, so no retry will succeed until the
+    /// operator edits the roster or the item declaration. `status` shows the
+    /// park with its reason, never `crashed (n)`.
+    ParkedModelRefused,
 }
 
 impl MemberLifecycle {
@@ -470,6 +596,7 @@ impl MemberLifecycle {
         match self {
             Self::RateLimitedHeld => Some("held (rate-limited)".to_string()),
             Self::Reconnecting => Some("reconnecting (transient network)".to_string()),
+            Self::ParkedModelRefused => Some("parked (model refused)".to_string()),
             Self::Crashed => Some(match health {
                 Some(AgentHealth::Exited { code }) => format!("crashed ({code})"),
                 _ => "crashed".to_string(),
@@ -494,6 +621,7 @@ pub fn poll_outcome_lifecycle(outcome: &PollOutcome) -> Option<MemberLifecycle> 
         PollOutcome::ParkedRateLimited | PollOutcome::RateLimitDeath => {
             Some(MemberLifecycle::RateLimitedHeld)
         }
+        PollOutcome::ModelRefused { .. } => Some(MemberLifecycle::ParkedModelRefused),
         PollOutcome::Crashed { .. } => Some(MemberLifecycle::Crashed),
         PollOutcome::Reconnecting => Some(MemberLifecycle::Reconnecting),
         PollOutcome::Down | PollOutcome::Unknown => None,
@@ -536,6 +664,29 @@ pub enum RerollOutcome {
         /// The backend's error text.
         error: String,
     },
+    /// The backend's picker refused every pool slot the admission check could
+    /// try ([`SpawnKind::Hold`] — claude-login-pool-wiring slice 009 F1). The
+    /// hold is on the SLOT, not the agent: unlike [`Self::SpawnFailed`] it is
+    /// NOT an operator alert, does NOT bump the crash backoff, and does NOT
+    /// extend `not_before`. The drive loop extends a
+    /// [`crate::rate_limit_holds::RateLimitHolds`] entry per slot so the next
+    /// tick's admission check short-circuits via `member_fully_held` without
+    /// re-running the picker (the per-tick spin fix mirrors
+    /// [`StartOutcome::Hold`]'s start-side handling).
+    HeldForSlot {
+        /// The held agent's id.
+        agent: String,
+        /// The pool slots the picker found exhausted this tick. Carries only
+        /// the slots the Stall actually ran against — the F2 fix of the
+        /// picker site at [`crate::claude_backend`] narrows the payload here
+        /// too, so a slot the pre-filter dropped (its hold already live) does
+        /// not have that hold pushed forward to the surviving slot's reset.
+        slots: Vec<String>,
+        /// Earliest 5h/7d window reset instant the picker saw across the
+        /// stalled slots, or `None` when no slot carried a boundary (the drive
+        /// loop then extends with a staleness bound).
+        until: Option<i64>,
+    },
 }
 
 /// One supervised agent's live state.
@@ -568,6 +719,17 @@ struct Supervised {
     /// Continue-exits the repo signal excused during the current NEXT ACTION run,
     /// capped at [`REPO_EXCUSE_LIMIT`].
     repo_excused: u32,
+    /// The [`ModelChoice`] this member last tried when the backend refused it
+    /// (claude-login-pool-wiring slice 004): latched in
+    /// [`Supervisor::on_model_refused_exit`] from the live `spec.model` at park
+    /// time, read by the drive loop's per-tick reconcile pass through
+    /// [`Supervisor::refused_model`], and dropped alongside the park when the
+    /// reconcile releases the member (slice 008 — `supervisor.retire` on a
+    /// resolved difference) or clears the park defensively (the roster-missing
+    /// branch via [`Supervisor::clear_model_refused_park`]). `None` means the
+    /// member is NOT in a model-refused park (every other lifecycle leaves it
+    /// untouched).
+    last_refused_model: Option<softfig_ipc::model_choice::ModelChoice>,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -675,6 +837,53 @@ impl Supervisor {
         self.agents.remove(agent).and_then(|s| s.child)
     }
 
+    /// Every registered member currently parked on a backend model refusal
+    /// (claude-login-pool-wiring slice 004 M-E): the id-set the drive loop's
+    /// per-tick reconcile pass walks to decide whether a roster or item-doc
+    /// edit has moved the resolution off the latched refusal. Deterministic
+    /// (`BTreeMap` order), so a test may assert on it directly. The latch
+    /// (`last_refused_model.is_some()`) is the strict gate — a member with
+    /// `not_before = i64::MAX` from some other code path (there is none today,
+    /// but the shape is contractual) is NOT returned.
+    pub fn agents_in_model_refused_park(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter(|(_, s)| s.last_refused_model.is_some())
+            .map(|(a, _)| a.clone())
+            .collect()
+    }
+
+    /// The [`ModelChoice`](softfig_ipc::model_choice::ModelChoice) the backend
+    /// refused for `agent` — latched in
+    /// [`on_model_refused_exit`](Self::on_model_refused_exit) from the member's
+    /// live `spec.model` at park time. `None` when the member is not in a
+    /// model-refused park (the drive loop's reconcile skips it in that case).
+    pub fn refused_model(
+        &self,
+        agent: &str,
+    ) -> Option<&softfig_ipc::model_choice::ModelChoice> {
+        self.agents
+            .get(agent)
+            .and_then(|s| s.last_refused_model.as_ref())
+    }
+
+    /// Clear a model-refused park (slice 004 M-E): drop the latch and bring
+    /// `not_before` back to `now` so [`tick`](Self::tick) re-rolls the member
+    /// off its own baton on the next cycle. Called by the drive loop's
+    /// reconcile pass once the resolver has moved on from the latched refusal
+    /// — a roster edit, an item `> Model:` edit, or either combined with a
+    /// milestone-level fallback. Idempotent on members not currently parked
+    /// on a model refusal (a stray call is a no-op, so the reconcile walk is
+    /// safe to run every tick).
+    pub fn clear_model_refused_park(&mut self, agent: &str, now: i64) {
+        if let Some(sup) = self.agents.get_mut(agent)
+            && sup.last_refused_model.is_some()
+        {
+            sup.not_before = now;
+            sup.last_refused_model = None;
+        }
+    }
+
     /// Register and start a brand-new agent ([`Intent::Start`]). The cap *and*
     /// budget/rate gate it; on admit the backend spawns it and it joins the
     /// fleet. A queue/refuse leaves it unregistered for the drive loop to retry.
@@ -739,11 +948,16 @@ impl Supervisor {
                                 unchanged_streak: 0,
                                 seen_repo: Vec::new(),
                                 repo_excused: 0,
+                                last_refused_model: None,
                             },
                         );
                         StartOutcome::Started
                     }
-                    Err(e) => StartOutcome::SpawnFailed {
+                    // Backend's picker refused a slot (slice 002 M-B part 2):
+                    // surface as `Hold`, NOT `SpawnFailed`, so the drive loop
+                    // extends `rate_limit_holds` + skips the alert path.
+                    Err(SpawnKind::Hold { slots, until }) => StartOutcome::Hold { slots, until },
+                    Err(SpawnKind::Failed(e)) => StartOutcome::SpawnFailed {
                         error: e.to_string(),
                     },
                 },
@@ -841,6 +1055,8 @@ impl Supervisor {
             now,
             network_exit,
             rate_limit_exit,
+            // No model-refused classifier → never a configuration refusal.
+            || None,
             // The pre-task-069 behaviour: no repo signal, NEXT ACTION alone decides.
             || None,
         )
@@ -859,6 +1075,7 @@ impl Supervisor {
         F: FnOnce() -> bool,
         G: FnOnce() -> bool,
         H: FnOnce() -> Option<RepoState>,
+        R: FnOnce() -> Option<String>,
     >(
         &mut self,
         agent: &str,
@@ -868,6 +1085,7 @@ impl Supervisor {
         now: i64,
         network_exit: F,
         rate_limit_exit: G,
+        model_refused_exit: R,
         repo_state: H,
     ) -> PollOutcome {
         let hang_secs = self.hang_secs;
@@ -918,7 +1136,8 @@ impl Supervisor {
                     // (A rate-limit death is consumed the same way — its first
                     // observation took the child; re-observations are `Down`,
                     // and the timed rate-limit hold, not a re-classification,
-                    // gates the re-roll until `resets_at`.)
+                    // gates the re-roll until `resets_at`. The model-refused
+                    // park, below, consumes the same way.)
                     PollOutcome::Down
                 } else if rate_limit_exit() {
                     // The quota wall, not a bug (task 070): the exit coincides
@@ -927,6 +1146,14 @@ impl Supervisor {
                     // streak, no backoff; the drive loop's rate-limit hold
                     // gates the re-roll until the window resets.
                     self.on_rate_limit_exit(agent, health, now)
+                } else if let Some(reason) = model_refused_exit() {
+                    // claude-model-select slice 003: the backend refused the
+                    // configured `--model`. Not a crash — a configuration
+                    // refusal that no retry will resolve. Parked indefinitely
+                    // (`not_before = i64::MAX`) with a visible alert naming
+                    // the reason; the operator edits the roster / item
+                    // declaration and the next reconcile re-admits the member.
+                    self.on_model_refused_exit(agent, health, reason)
                 } else {
                     self.on_crash(agent, health, now)
                 }
@@ -1011,6 +1238,56 @@ impl Supervisor {
         sup.seen_repo.clear();
         sup.repo_excused = 0;
         PollOutcome::RateLimitDeath
+    }
+
+    /// Handle a **model-refused** exit (claude-model-select slice 003): the exit
+    /// coincides with a [`StreamErrorKind::ModelRefused`] latch — the backend
+    /// rejected the configured `--model` (e.g. an alias/id Claude Code does not
+    /// recognize). Not a crash: no backoff, no failure-streak bump, no
+    /// `AgentCrashed` alert, no re-spawn. Instead the member is parked
+    /// indefinitely (`not_before = i64::MAX`) and the drive loop surfaces a
+    /// visible alert naming the refusal reason; no retry will succeed until the
+    /// operator edits the roster or the item declaration.
+    fn on_model_refused_exit(
+        &mut self,
+        agent: &str,
+        _health: AgentHealth,
+        reason: String,
+    ) -> PollOutcome {
+        let sup = self
+            .agents
+            .get_mut(agent)
+            .expect("agent exists (checked in poll)");
+        // The child EXITED (same precondition as the rate-limit path) — drop the
+        // handle; nothing to kill.
+        let _ = sup.child.take();
+        // No retry is possible until the config changes. Pin `not_before` past
+        // every reasonable now so `tick` never re-rolls this agent; a daemon
+        // reconcile re-admits it with fresh state. Slice 004 (M-E): latch the
+        // refused `ModelChoice` (the live `spec.model` the backend was told to
+        // run) so the drive loop's per-tick reconcile pass can un-park the
+        // member on a roster/item-doc edit that moves the resolution off it —
+        // no daemon restart needed.
+        sup.not_before = i64::MAX;
+        sup.last_next_action = None;
+        sup.unchanged_streak = 0;
+        sup.seen_repo.clear();
+        sup.repo_excused = 0;
+        // A member whose spec carried no override was running the backend's
+        // harness default; latch that as `ModelChoice::claude()` so a roster
+        // edit that then pins a model trips the reconcile. (A model-refused
+        // claude member never has an opencode-shaped spec, so the claude
+        // harness default is the only "no override" shape to latch.)
+        sup.last_refused_model = Some(
+            sup.spec
+                .model
+                .clone()
+                .unwrap_or_else(softfig_ipc::model_choice::ModelChoice::claude),
+        );
+        PollOutcome::ModelRefused {
+            event: NotifyEvent::agent_crashed(agent),
+            reason,
+        }
     }
 
     /// Decide what a clean (code-0) exit means by reading the agent's terminal
@@ -1226,10 +1503,34 @@ impl Supervisor {
     /// fresh start re-picks the fleet's next workable work (pivot-on-block).
     pub fn tick(
         &mut self,
-        budget: BudgetUsage,
+        budget: &dyn Fn(&str) -> BudgetUsage,
         rate: RateState,
         now: i64,
         workable: &dyn Fn(&str) -> bool,
+    ) -> Vec<RerollOutcome> {
+        self.tick_with(budget, rate, now, workable, &|_| {})
+    }
+
+    /// Like [`tick`](Self::tick), but calls `pre_spawn(agent)` for each member
+    /// it is about to re-roll — after admission admits the roll, immediately
+    /// before the backend spawns — the re-roll twin of
+    /// [`start_claiming`](Self::start_claiming)'s closure. The drive loop runs
+    /// the boot dirty-tree guard here (task 064 review G64-1), so its warning is
+    /// in the member's baton before the member boots; on the old post-spawn call
+    /// a claude member's SessionStart hook raced the git probe.
+    ///
+    /// `budget` is a per-agent resolver (slice 001 M-A): the governor keys the
+    /// 5h/7d fold on the admitting member's claude-login profile so one slot's
+    /// `allowed_warning` can't halt a sibling pooled on a different slot. An
+    /// unpooled fleet collapses to the pre-switcher fleet-wide fold through the
+    /// `"home"` back-compat key; test fakes pass `&|_| fresh_budget()`.
+    pub fn tick_with(
+        &mut self,
+        budget: &dyn Fn(&str) -> BudgetUsage,
+        rate: RateState,
+        now: i64,
+        workable: &dyn Fn(&str) -> bool,
+        pre_spawn: &dyn Fn(&str),
     ) -> Vec<RerollOutcome> {
         let candidates: Vec<String> = self
             .agents
@@ -1259,21 +1560,38 @@ impl Supervisor {
             }
             // A roll keeps the agent's slot — the cap never gates it — but the
             // shared budget/rate rails still do (and hold a rate-limited member here
-            // until its window recovers).
+            // until its window recovers). Budget is resolved per-agent (slice 001
+            // M-A) so a sibling pooled on a different claude-login slot is not
+            // refused on another slot's `allowed_warning`.
             let fleet = self.live_count();
-            let decision = self.governor.decide(Intent::Roll, fleet, budget, rate);
+            let decision = self.governor.decide(Intent::Roll, fleet, budget(&agent), rate);
             if !decision.is_admit() {
                 out.push(RerollOutcome::HeldForAdmission { agent, decision });
                 continue;
             }
             let spec = self.agents[&agent].spec.clone();
+            pre_spawn(&agent);
             match self.backend.spawn(&spec) {
                 Ok(child) => {
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");
                     sup.child = Some(child);
                     out.push(RerollOutcome::Rerolled { agent });
                 }
-                Err(e) => {
+                // Backend's picker refused every pool slot the admission check
+                // could try (claude-login-pool-wiring slice 009 F1). This is
+                // the re-roll side of `start_claiming`'s `StartOutcome::Hold`
+                // (supervisor.rs:936): the hold is on the slot, not the agent,
+                // so do NOT bump `consecutive_failures`, do NOT extend
+                // `not_before`, do NOT emit `SpawnFailed` (the drive-loop
+                // alert dispatcher pages `AgentCrashed` on every
+                // `SpawnFailed`). The drive-loop handler for `HeldForSlot`
+                // extends `rate_limit_holds` per slot so next tick's
+                // admission check short-circuits via `member_fully_held`
+                // without re-running the picker.
+                Err(SpawnKind::Hold { slots, until }) => {
+                    out.push(RerollOutcome::HeldForSlot { agent, slots, until });
+                }
+                Err(SpawnKind::Failed(e)) => {
                     let backoff = self.backoff;
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");
                     sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
@@ -1313,6 +1631,10 @@ mod tests {
     struct FakeBackend {
         spawns: Mutex<Vec<String>>,
         fail: AtomicBool,
+        /// Claude-login-pool-wiring slice 009 F1 — when set, every spawn
+        /// returns `SpawnKind::Hold` carrying this payload. Models an
+        /// exhausted pool at the backend's picker boundary.
+        hold: Mutex<Option<(Vec<String>, Option<i64>)>>,
         kills: Arc<AtomicUsize>,
     }
 
@@ -1332,13 +1654,21 @@ mod tests {
         fn set_fail(&self, fail: bool) {
             self.fail.store(fail, Ordering::SeqCst);
         }
+        /// Slice 009 F1 — arm the backend to return `SpawnKind::Hold` with
+        /// this payload on every spawn. Clear by passing `None`.
+        fn set_hold(&self, hold: Option<(Vec<String>, Option<i64>)>) {
+            *self.hold.lock().unwrap() = hold;
+        }
     }
 
     impl AgentBackend for Arc<FakeBackend> {
-        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
+            if let Some((slots, until)) = self.hold.lock().unwrap().clone() {
+                return Err(SpawnKind::Hold { slots, until });
+            }
             if self.fail.load(Ordering::SeqCst) {
-                return Err(SpawnError("backend down".into()));
+                return Err(SpawnError("backend down".into()).into());
             }
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),
@@ -1438,6 +1768,63 @@ mod tests {
         assert_eq!(backend2.spawn_count(), 0, "a refused start never spawns");
     }
 
+    /// Slice 009 F1 — a re-roll into an exhausted pool surfaces as
+    /// `HeldForSlot` (NOT `SpawnFailed`), does NOT bump `consecutive_failures`,
+    /// does NOT extend `not_before`, and leaves the member re-rollable the
+    /// moment the hold clears — mirroring `start_claiming`'s `StartOutcome::Hold`
+    /// handling.
+    #[test]
+    fn tick_with_hold_err_does_not_page_or_backoff() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        // Admit + cleanly exit so the member becomes a re-roll candidate with
+        // `consecutive_failures = 0` and `not_before = now`.
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        s.poll("a1", AgentHealth::Exited { code: 0 }, None, 10);
+        assert!(!s.is_running("a1"), "the clean exit left the agent down");
+        assert_eq!(s.failures("a1"), 0, "a clean exit cleared the streak");
+
+        // Arm the backend to Hold on the re-roll (the exhausted-pool shape).
+        backend.set_hold(Some((
+            vec!["slot1".to_string(), "slot2".to_string()],
+            Some(42_000),
+        )));
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work);
+        assert_eq!(
+            out,
+            vec![RerollOutcome::HeldForSlot {
+                agent: "a1".into(),
+                slots: vec!["slot1".to_string(), "slot2".to_string()],
+                until: Some(42_000),
+            }],
+            "the Hold shape surfaces, carrying the slots and reset",
+        );
+        assert_eq!(
+            s.failures("a1"),
+            0,
+            "a Hold does NOT bump the crash streak (slot-not-agent invariant)",
+        );
+        // No `SpawnFailed` ⇒ the drive-loop alert dispatcher sees no entry to
+        // page `AgentCrashed` for. (The dispatcher itself is tested at the
+        // drive-loop level, below.)
+        assert!(
+            !matches!(out[0], RerollOutcome::SpawnFailed { .. }),
+            "a Hold never surfaces as SpawnFailed",
+        );
+
+        // Clear the hold and tick again at the SAME instant — a spawn succeeds
+        // (and the agent re-rolls), proving `not_before` was NOT extended by
+        // the Hold branch. Had the Hold path bumped backoff, this tick would
+        // read `HeldForBackoff` instead.
+        backend.set_hold(None);
+        let out2 = s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work);
+        assert_eq!(
+            out2,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "same-instant re-roll proves not_before stayed put through the Hold",
+        );
+    }
+
     /// `start` surfaces a backend launch failure as `SpawnFailed` and registers
     /// nothing.
     #[test]
@@ -1520,7 +1907,7 @@ mod tests {
         assert_eq!(backend.spawn_count(), 1, "no re-spawn for a healthy agent");
         assert_eq!(backend.kill_count(), 0, "no kill for a healthy agent");
         // tick has no candidate (the child is live).
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1000, &any_work).is_empty());
     }
 
     /// An errored exit is detected as a crash, alerts, and re-rolls only after the
@@ -1546,7 +1933,7 @@ mod tests {
 
         // Inside the backoff window → held, no re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 2
@@ -1556,7 +1943,7 @@ mod tests {
 
         // At the backoff boundary → admission admits the roll → re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
@@ -1614,7 +2001,7 @@ mod tests {
             // Advance to the boundary and let it re-roll for the next crash.
             now = not_before;
             assert_eq!(
-                s.tick(fresh_budget(), fresh_rate(), now, &any_work),
+                s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work),
                 vec![RerollOutcome::Rerolled { agent: "a1".into() }]
             );
         }
@@ -1653,7 +2040,7 @@ mod tests {
         // The drive loop's timed rate-limit hold — not the supervisor — paces the
         // actual re-roll until `resets_at`.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
 
@@ -1670,6 +2057,53 @@ mod tests {
             s2.poll_with_exits("a1", AgentHealth::Exited { code: 1 }, None, None, 1, || false, || true),
             PollOutcome::Down,
             "the consumed rate-limit death re-observes inert",
+        );
+    }
+
+    /// claude-model-select slice 003 — a non-zero exit the model-refused
+    /// classifier attributes to a configuration refusal (claude's `--model`
+    /// rejected) is a **park**, not a crash: brought down-but-registered with
+    /// a visible alert (`PollOutcome::ModelRefused`), NO failure-streak bump,
+    /// and NO re-roll — `tick` leaves it alone (parked indefinitely) until the
+    /// operator edits the roster/item and the daemon reconciles.
+    #[test]
+    fn poll_classifies_a_model_refused_exit_as_a_park_without_backoff_or_reroll() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        let out = s.poll_with_progress(
+            "a1",
+            AgentHealth::Exited { code: 1 },
+            None,
+            None,
+            0,
+            || false,
+            || false,
+            || Some("model refused: model_not_found (does-not-exist-7b)".to_string()),
+            || None,
+        );
+        match out {
+            PollOutcome::ModelRefused { ref reason, .. } => {
+                assert!(reason.contains("model_not_found"), "reason carries API text: {reason}");
+            }
+            other => panic!("expected ModelRefused, got {other:?}"),
+        }
+        assert_eq!(
+            s.failures("a1"),
+            0,
+            "a model-refused park never bumps the crash streak",
+        );
+        assert!(!s.is_running("a1"), "the dead child was dropped");
+
+        // `tick` must NOT re-roll a model-refused member: `not_before =
+        // i64::MAX` pins its re-roll past every reasonable now. `tick`
+        // records a HeldForBackoff — the member is still registered — but
+        // never a Rerolled; only a daemon reconcile re-admits it.
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work);
+        assert!(
+            out.iter().all(|o| !matches!(o, RerollOutcome::Rerolled { .. })),
+            "a parked model-refused member is NEVER re-rolled: {out:?}",
         );
     }
 
@@ -1776,7 +2210,7 @@ mod tests {
         // Build up a failure streak first.
         s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert_eq!(s.failures("a1"), 1);
-        s.tick(fresh_budget(), fresh_rate(), 2, &any_work); // re-roll
+        s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work); // re-roll
 
         // Now a clean exit at t=10 with no baton signal (the slice-002 precondition):
         // immediate re-roll, streak cleared, no alert.
@@ -1786,7 +2220,7 @@ mod tests {
         );
         assert_eq!(s.failures("a1"), 0, "a clean run clears the streak");
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
             "no backoff wait after a clean exit"
         );
@@ -1803,7 +2237,7 @@ mod tests {
 
         // Past the backoff window but the budget is hot → held on admission.
         assert_eq!(
-            s.tick(hot_budget(), fresh_rate(), 5, &any_work),
+            s.tick(&|_| hot_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForAdmission {
                 agent: "a1".into(),
                 decision: AdmissionDecision::Refuse {
@@ -1815,7 +2249,7 @@ mod tests {
 
         // Budget recovers → the roll is admitted (the cap is irrelevant to a roll).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert!(s.is_running("a1"));
@@ -1831,7 +2265,7 @@ mod tests {
 
         // Backend now refuses to launch.
         backend.set_fail(true);
-        let out = s.tick(fresh_budget(), fresh_rate(), 2, &any_work);
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work);
         assert_eq!(
             out,
             vec![RerollOutcome::SpawnFailed {
@@ -1844,7 +2278,7 @@ mod tests {
 
         // Still held inside the grown backoff (delay(2) == 4 → not_before 6).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 5, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 6
@@ -1854,7 +2288,7 @@ mod tests {
         // Backend recovers → the retry re-rolls.
         backend.set_fail(false);
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
     }
@@ -1890,7 +2324,7 @@ mod tests {
         // consumed-exit guard (task 044) makes a DOWN member's re-observation
         // inert, so the genuine-crash half below needs a live child to crash.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 0, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 0, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
 
@@ -1934,7 +2368,7 @@ mod tests {
         // The armed backoff elapses → the re-roll fires. Before the guard this was
         // `HeldForBackoff` on every tick forever — the incident's silent stall.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
@@ -2073,7 +2507,7 @@ mod tests {
 
         // The whole point: no re-roll. A tick well past any backoff spawns nothing.
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a retired member is never a re-roll candidate"
         );
         assert_eq!(backend.spawn_count(), 1, "NO fresh claude -p on a drained queue");
@@ -2101,7 +2535,7 @@ mod tests {
         assert!(!s.is_registered("a1"), "a blocked member releases its slot");
         assert_eq!(s.committed_count(), 0, "the slot is freed for a pivot");
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a released member has nothing to re-roll"
         );
         assert_eq!(backend.spawn_count(), 1, "no re-roll of a released member");
@@ -2124,7 +2558,7 @@ mod tests {
             }
         );
         assert!(!s.is_registered("a1"), "a blocked member releases its slot");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
     }
 
     /// An unrecognized terminal status is a `Stuck(_)` disposition — it releases the
@@ -2167,7 +2601,7 @@ mod tests {
 
         // While the window is still hot, the re-arm is HELD by admission — no
         // respawn (it does not spin against the limit).
-        let held = s.tick(hot_budget(), hot_rate(), 1_000, &any_work);
+        let held = s.tick(&|_| hot_budget(), hot_rate(), 1_000, &any_work);
         assert!(
             matches!(held.as_slice(), [RerollOutcome::HeldForAdmission { agent, .. }] if agent == "a1"),
             "a rate-parked member is held, not re-rolled, while the window is hot: {held:?}",
@@ -2175,7 +2609,7 @@ mod tests {
         assert_eq!(backend.spawn_count(), 1, "no respawn while still throttled");
 
         // The window recovers → tick re-arms it (re-rolls) and clears the park.
-        let armed = s.tick(fresh_budget(), fresh_rate(), 2_000, &any_work);
+        let armed = s.tick(&|_| fresh_budget(), fresh_rate(), 2_000, &any_work);
         assert_eq!(
             armed,
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
@@ -2202,7 +2636,7 @@ mod tests {
 
         // Queue empty for this agent → held, not re-rolled.
         let no_work = |_: &str| false;
-        let held = s.tick(fresh_budget(), fresh_rate(), 20, &no_work);
+        let held = s.tick(&|_| fresh_budget(), fresh_rate(), 20, &no_work);
         assert_eq!(
             held,
             vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
@@ -2212,7 +2646,7 @@ mod tests {
         assert!(s.is_registered("a1"), "the member keeps its slot");
 
         // Work reappears → it re-rolls.
-        let armed = s.tick(fresh_budget(), fresh_rate(), 21, &any_work);
+        let armed = s.tick(&|_| fresh_budget(), fresh_rate(), 21, &any_work);
         assert_eq!(armed, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
         assert_eq!(backend.spawn_count(), 2);
     }
@@ -2268,7 +2702,7 @@ mod tests {
         assert!(s.is_registered("a1"));
         // No backoff after a clean exit → an immediate re-roll.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");
@@ -2303,7 +2737,7 @@ mod tests {
         );
         assert!(s.is_registered("a1"), "still in the fleet after the first repeat");
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "the first re-roll fired");
@@ -2327,7 +2761,7 @@ mod tests {
         // Released like an agent-written STUCK — slot freed, never re-rolled, so no
         // further sessions (no shared-budget burn) are spent on the wedged member.
         assert!(!s.is_registered("a1"), "the spun-out member left the fleet");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
         assert_eq!(backend.spawn_count(), 2, "no re-roll of the released member");
         assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
     }
@@ -2363,7 +2797,7 @@ mod tests {
 
         // The re-roll is admission-held (hot budget) — the member stays down.
         assert_eq!(
-            s.tick(hot_budget(), fresh_rate(), 11, &any_work),
+            s.tick(&|_| hot_budget(), fresh_rate(), 11, &any_work),
             vec![RerollOutcome::HeldForAdmission {
                 agent: "a1".into(),
                 decision: AdmissionDecision::Refuse { reason: RefuseReason::Budget5h }
@@ -2390,7 +2824,7 @@ mod tests {
 
         // Admission recovers → the timed resume re-rolls the SAME member.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 20, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 20, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "resumed via the admission window");
@@ -2443,7 +2877,7 @@ mod tests {
             );
             assert!(s.is_registered("a1"));
             // Re-roll it live so the next iteration observes a fresh exit.
-            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+            s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         }
         assert!(s.is_registered("a1"), "progress never trips the guard");
         assert_eq!(backend.spawn_count(), 5, "start + one re-roll per progressing exit");
@@ -2470,7 +2904,7 @@ mod tests {
             ),
             PollOutcome::Rolling
         );
-        s.tick(fresh_budget(), fresh_rate(), 10, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work);
         // A rate-limit park before the next session clears the streak.
         assert_eq!(
             s.poll_with_network(
@@ -2483,7 +2917,7 @@ mod tests {
             ),
             PollOutcome::ParkedRateLimited
         );
-        s.tick(fresh_budget(), fresh_rate(), 20, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 20, &any_work);
         // Window reopened; the member exits on the SAME NEXT ACTION. With the streak
         // reset this is only the FIRST repeat again → re-roll, not a trip.
         assert_eq!(
@@ -2527,7 +2961,7 @@ mod tests {
                 PollOutcome::Rolling,
                 "no NEXT ACTION signal → historical re-roll (iteration {i})"
             );
-            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+            s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         }
         assert!(
             s.is_registered("a1"),
@@ -2561,9 +2995,10 @@ mod tests {
             now,
             || false,
             || false,
+            || None,
             || state,
         );
-        s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         out
     }
 
@@ -2704,7 +3139,7 @@ mod tests {
             ),
             PollOutcome::ParkedRateLimited
         );
-        s.tick(fresh_budget(), fresh_rate(), 100, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 100, &any_work);
         assert_eq!(continue_exit(&mut s, "build it", repo("h1", 0), 110), PollOutcome::Rolling);
         assert_eq!(
             continue_exit(&mut s, "build it", repo("h1", 1), 120),
@@ -2732,6 +3167,7 @@ mod tests {
                 5,
                 || false,
                 || false,
+                || None,
                 never,
             ),
             PollOutcome::Rolling,
@@ -2746,12 +3182,13 @@ mod tests {
                 6,
                 || false,
                 || false,
+                || None,
                 never,
             ),
             PollOutcome::Down,
             "a latched re-observation reads nothing"
         );
-        s.tick(fresh_budget(), fresh_rate(), 6, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work);
         assert_eq!(continue_exit(&mut s, "build it", None, 10), PollOutcome::Rolling);
         assert_eq!(continue_exit(&mut s, "build it", None, 20), spin_trip());
     }
@@ -2779,7 +3216,7 @@ mod tests {
 
         // The supervisor never re-rolls it — the finished part is not re-run.
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a released member is not a re-roll candidate",
         );
         assert_eq!(backend.spawn_count(), 1, "no supervisor self-roll on an item boundary");
@@ -2798,7 +3235,7 @@ mod tests {
             PollOutcome::Completed
         );
         assert!(!s.is_registered("a1"), "ITEM_DEFERRED also frees the slot");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
         assert_eq!(backend.spawn_count(), 1, "no self-roll on a deferred boundary");
     }
 }

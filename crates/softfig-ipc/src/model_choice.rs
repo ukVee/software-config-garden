@@ -65,31 +65,59 @@ impl FromStr for Backend {
     }
 }
 
-/// A resolved launch target: which backend, and (for opencode) which model +
-/// variant to generate the agent config with.
+/// A resolved launch target: which backend, which model, and the effort/variant
+/// knob the backend takes alongside it.
 ///
-/// `model`/`variant` are opencode-only. claude's model + effort are the harness's
-/// own (there is no interactive flag for them), so a claude choice carries `None`
-/// and a `variant=` on a claude spec is inert — see [`parse_model_spec`].
+/// `model` carries the backend-shaped id — on opencode a `provider/model`
+/// (e.g. [`DEEPSEEK_FLASH`]); on claude a `claude --model` alias or full id
+/// (optionally suffixed `[1m]` for the 1M-context mode). `None` means "the
+/// backend's own default": for opencode the roster model, for claude whatever
+/// `~/.claude/settings.json` picks (no `--model` on the argv). `variant` is
+/// the one effort knob a backlog item can declare alongside the model — on
+/// opencode it is free-form (`AgentConfig.variant`), on claude it is `--effort`
+/// out of a closed set. See [`parse_model_spec`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelChoice {
     pub backend: Backend,
-    /// The opencode model id (`provider/model`), e.g. [`DEEPSEEK_FLASH`].
     pub model: Option<String>,
-    /// The opencode agent's `variant` (opencode `AgentConfig.variant`: "default
-    /// model variant for this agent") — the effort/variant knob a backlog item
-    /// can declare alongside its model.
     pub variant: Option<String>,
 }
 
 impl ModelChoice {
-    /// The claude backend: no model/variant of our choosing (the harness owns them).
+    /// The claude backend at the harness default — no `--model`, no `--effort`.
     pub fn claude() -> Self {
+        Self::claude_on(None, None)
+    }
+
+    /// The claude backend pinned to a specific `--model` and/or `--effort`.
+    /// `None` on either field means "leave it to the harness default", matching
+    /// what [`claude_argv`](Self::claude_argv) emits.
+    pub fn claude_on(model: Option<String>, effort: Option<String>) -> Self {
         Self {
             backend: Backend::Claude,
-            model: None,
-            variant: None,
+            model,
+            variant: effort,
         }
+    }
+
+    /// The claude-spawn argv fragment for this choice: `--model <m>` and/or
+    /// `--effort <e>`, each only when set. Returns an empty vec for an opencode
+    /// choice (callers thread opencode's model + variant through the agent
+    /// config instead).
+    pub fn claude_argv(&self) -> Vec<String> {
+        if self.backend != Backend::Claude {
+            return Vec::new();
+        }
+        let mut argv = Vec::new();
+        if let Some(model) = &self.model {
+            argv.push("--model".to_string());
+            argv.push(model.clone());
+        }
+        if let Some(effort) = &self.variant {
+            argv.push("--effort".to_string());
+            argv.push(effort.clone());
+        }
+        argv
     }
 
     /// The opencode backend on a given model id.
@@ -144,12 +172,98 @@ pub enum ModelSpec {
     Fixed(ModelChoice),
 }
 
+/// The claude-model alias set accepted on `claude:<model>`. Claude's own CLI
+/// resolves each to a full `claude-<family>-<rev>` id via the account's
+/// catalog; growlight passes the alias through verbatim.
+const CLAUDE_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+
+/// The closed `effort=` / `variant=` set on claude: `claude --effort` takes one
+/// of these words. Opencode's `variant` stays free-form (the agent config
+/// accepts any string an opencode model declares).
+pub const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The `[1m]` 1M-context suffix allowed on either an alias or a full id, and
+/// preserved verbatim into `--model`.
+const ONE_M_SUFFIX: &str = "[1m]";
+
+/// Whether `stem` matches the full-id grammar `claude-[a-z0-9]+(-[a-z0-9]+)*`.
+/// Pure.
+fn is_full_claude_id(stem: &str) -> bool {
+    let Some(rest) = stem.strip_prefix("claude-") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let mut chunk_has_char = false;
+    for c in rest.chars() {
+        match c {
+            '-' => {
+                if !chunk_has_char {
+                    return false;
+                }
+                chunk_has_char = false;
+            }
+            c if c.is_ascii_lowercase() || c.is_ascii_digit() => {
+                chunk_has_char = true;
+            }
+            _ => return false,
+        }
+    }
+    chunk_has_char
+}
+
+/// Validate the suffix of a `claude:<suffix>` spec and canonicalize it into the
+/// exact `--model` string to pass to claude (preserving any `[1m]` suffix).
+/// Pure.
+fn parse_claude_model(suffix: &str) -> Result<String> {
+    if suffix.is_empty() {
+        bail!(
+            "model spec: `claude:` has no model after `:` (expected an alias \
+             opus | sonnet | haiku | fable or a `claude-<family>-<rev>` id)"
+        );
+    }
+    let (stem, one_m) = match suffix.strip_suffix(ONE_M_SUFFIX) {
+        Some(s) => (s, true),
+        None => (suffix, false),
+    };
+    if stem.is_empty() {
+        bail!("model spec: `claude:{suffix}` has no model before the `[1m]` suffix");
+    }
+    if stem.contains('/') {
+        bail!(
+            "model spec: `claude:{suffix}` contains '/' — claude ids are \
+             `claude-<family>-<rev>`, not `provider/model`"
+        );
+    }
+    if stem.contains('#') {
+        bail!(
+            "model spec: `claude:{suffix}` contains '#' — write effort as a trailing ` effort=<e>`"
+        );
+    }
+    if !CLAUDE_ALIASES.contains(&stem) && !is_full_claude_id(stem) {
+        bail!(
+            "model spec: `claude:{suffix}` is neither an alias (opus | sonnet | \
+             haiku | fable) nor a `claude-<family>-<rev>` id"
+        );
+    }
+    Ok(if one_m {
+        format!("{stem}{ONE_M_SUFFIX}")
+    } else {
+        stem.to_string()
+    })
+}
+
 /// Parse a model spec — the shared grammar behind `--model <spec>`, the picker,
 /// and a backlog item's `> Model:` line, so all three accept exactly the same
 /// words. Pure.
 ///
 /// `<token> [key=value …]` where `<token>` is one of:
-///   - `claude` — the claude backend.
+///   - `claude` — the claude backend at its harness default (no `--model`).
+///   - `claude:<alias|id>` — the claude backend pinned to one `--model`. The
+///     model is either an alias (`opus | sonnet | haiku | fable`) or a full
+///     `claude-<family>-<rev>` id, each optionally suffixed `[1m]` for the
+///     1M-context mode. The suffix is passed through to `claude --model` verbatim.
 ///   - `reasoning` / `deepseek-reasoning` → opencode on [`DEEPSEEK_REASONING`].
 ///   - `flash` / `deepseek-flash` → opencode on [`DEEPSEEK_FLASH`].
 ///   - `auto` → [`ModelSpec::Auto`] (only meaningful from the CLI/picker; an item
@@ -158,9 +272,10 @@ pub enum ModelSpec {
 ///     a model neither alias covers; opencode validates it at launch).
 ///
 /// The optional `key=value` tail carries the effort/variant knob: `variant=<v>`
-/// (or its alias `effort=<v>`) sets the opencode agent's `variant`. It is inert on
-/// a `claude` spec — claude's effort isn't settable from this launch path — so it
-/// parses without error and is simply not carried.
+/// (or its alias `effort=<v>`) sets the opencode agent's `variant`, OR claude's
+/// `--effort` out of a closed set (`low | medium | high | xhigh | max`). It was
+/// silently dropped on `claude` in prior releases and is now carried; a value
+/// outside the closed set is refused on claude.
 pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
     let mut words = spec.split_whitespace();
     let Some(token) = words.next() else {
@@ -174,30 +289,51 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
             .ok_or_else(|| anyhow::anyhow!("model spec: expected `key=value`, got `{pair}` in `{spec}`"))?;
         match key {
             // `effort` is accepted as an alias so the field reads naturally for
-            // either mental model; both land on opencode's one `variant` knob.
-            // An empty value is a typo, not "no variant" — emitting `"variant": ""`
-            // would pin the agent to a nameless variant.
+            // either mental model; on opencode they land on the one `variant`
+            // knob, on claude on `--effort`. An empty value is a typo, not
+            // "no variant" — emitting `"variant": ""` would pin the agent to a
+            // nameless variant.
             "variant" | "effort" if value.is_empty() => {
                 bail!("model spec: `{key}=` has no value in `{spec}`")
             }
-            // The variant is rendered after a `#` (`provider/model#variant`), so
-            // one carrying its own `#` could not be read back unambiguously.
+            // The opencode variant is rendered after a `#` (`provider/model#variant`),
+            // so one carrying its own `#` could not be read back unambiguously.
             "variant" | "effort" if value.contains('#') => {
                 bail!("model spec: `{key}={value}` contains '#' in `{spec}`")
             }
             "variant" | "effort" => variant = Some(value.to_string()),
-            _ => bail!("model spec: unknown key `{key}` in `{spec}` (expected `variant=`)"),
+            _ => bail!("model spec: unknown key `{key}` in `{spec}` (expected `variant=` / `effort=`)"),
         }
     }
 
-    let mut choice = match token.to_ascii_lowercase().as_str() {
+    let token_lower = token.to_ascii_lowercase();
+
+    // The claude backend — `claude` (harness default) or `claude:<alias|id>[1m]`.
+    // `effort=` is live, out of a closed set.
+    if token_lower == "claude" || token_lower.starts_with("claude:") {
+        if let Some(effort) = variant.as_deref()
+            && !CLAUDE_EFFORTS.contains(&effort)
+        {
+            bail!(
+                "model spec: `effort={effort}` is not in claude's closed set \
+                 (low | medium | high | xhigh | max) in `{spec}`"
+            );
+        }
+        let model = if let Some(suffix) = token_lower.strip_prefix("claude:") {
+            Some(parse_claude_model(suffix)?)
+        } else {
+            None
+        };
+        return Ok(ModelSpec::Fixed(ModelChoice::claude_on(model, variant)));
+    }
+
+    let mut choice = match token_lower.as_str() {
         "auto" => {
             if variant.is_some() {
                 bail!("model spec: `auto` takes no `variant=` — declare it on the item instead");
             }
             return Ok(ModelSpec::Auto);
         }
-        "claude" => ModelChoice::claude(),
         "reasoning" | "deepseek-reasoning" => ModelChoice::opencode(DEEPSEEK_REASONING),
         "flash" | "deepseek-flash" => ModelChoice::opencode(DEEPSEEK_FLASH),
         // A `#variant` suffix on the id is opencode's own spelling, but here the
@@ -211,13 +347,10 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
         // A raw `provider/model` passthrough — anything else is a typo, not a model.
         other if other.contains('/') => ModelChoice::opencode(token),
         other => bail!(
-            "unknown model `{other}` — expected claude | reasoning | flash | auto | provider/model"
+            "unknown model `{other}` — expected claude | claude:<model> | reasoning | flash | auto | provider/model"
         ),
     };
-    // Inert on claude (the harness owns its effort), carried on opencode.
-    if choice.backend == Backend::Opencode {
-        choice.variant = variant;
-    }
+    choice.variant = variant;
     Ok(ModelSpec::Fixed(choice))
 }
 
@@ -225,17 +358,13 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
 ///
 /// The field rides the same leading blockquote metadata block the item docs
 /// already use for `> Last reviewed:` / `> Design:`, so declaring a model is one
-/// line and needs no new file. Only a blockquote line counts — prose mentioning a
-/// model can't be mistaken for a declaration — and the first one wins. Pure.
+/// line and needs no new file. Read through the shared scanner
+/// ([`crate::item_meta::field`]): only a blockquote line counts — prose
+/// mentioning a model can't be mistaken for a declaration — a line inside a
+/// fenced example doesn't, and the first one wins (an empty first line is no
+/// declaration). Pure.
 pub fn item_model_field(doc: &str) -> Option<&str> {
-    doc.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix('>')?;
-        let (key, value) = rest.trim().split_once(':')?;
-        key.trim()
-            .eq_ignore_ascii_case("model")
-            .then(|| value.trim())
-            .filter(|v| !v.is_empty())
-    })
+    crate::item_meta::field(doc, crate::item_meta::MODEL).filter(|v| !v.is_empty())
 }
 
 /// An ordered, non-empty list of model specs — the comma-list form of §6.4
@@ -320,15 +449,22 @@ pub fn parse_declaration(field: &str) -> Result<Declaration> {
 }
 
 /// The allowed list for a unit that declares nothing (§6.4 member default): a
-/// single model — the opencode roster's `model` + `variant` (or
-/// [`DEEPSEEK_FLASH`] when they're absent), or `claude` for a claude member.
+/// single model — the roster entry's own `model` + `variant` (claude-model-select
+/// slice 003: a claude member may pin its `--model`/`--effort` on the roster,
+/// just like an opencode member pins its `provider/model` + `variant`), or the
+/// backend's harness default when both are absent. For opencode that default is
+/// [`DEEPSEEK_FLASH`]; for claude it is [`ModelChoice::claude`], which carries
+/// no `--model`/`--effort` and lets `~/.claude/settings.json` decide.
 pub fn member_default(
     backend: Backend,
     roster_model: Option<&str>,
     roster_variant: Option<&str>,
 ) -> ModelList {
     match backend {
-        Backend::Claude => ModelList::single(ModelChoice::claude()),
+        Backend::Claude => ModelList::single(ModelChoice::claude_on(
+            roster_model.map(str::to_string),
+            roster_variant.map(str::to_string),
+        )),
         Backend::Opencode => {
             let mut choice = ModelChoice::opencode(roster_model.unwrap_or(DEEPSEEK_FLASH));
             choice.variant = roster_variant.map(str::to_string);
@@ -395,14 +531,23 @@ const BACKLOG_DIR: &str = "growlight/backlog";
 /// don't know (`005-backend-model-picker.md`), so each is found by its
 /// zero-padded numeric prefix rather than reconstructed. Batons write the slice
 /// unpadded (`6`) as often as padded; the files are always zero-padded.
-pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) -> Vec<PathBuf> {
+///
+/// `Err` when two docs share the number being looked up: which one declares the
+/// model is then a guess, and a second `NNN-*.md` beside the real one is
+/// exactly how a shadow doc would steer it (review 042 G74-2), so the lookup
+/// fails closed instead of taking the first.
+pub fn item_doc_candidates(
+    garden_root: &Path,
+    item: &str,
+    slice: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
     let backlog = garden_root.join(BACKLOG_DIR);
     let top = item.split('/').next().unwrap_or(item);
     if !backlog.join("milestones").join(top).is_dir() {
         // A task (or restack) doc: the single file for the whole chain. A
         // restack's generated doc is queue-v2-git's row; until that lands, the
         // task lookup is the only non-milestone shape.
-        return find_by_number(&backlog.join("tasks"), item).into_iter().collect();
+        return Ok(find_by_number(&backlog.join("tasks"), item)?.into_iter().collect());
     }
 
     let mut candidates = Vec::new();
@@ -410,7 +555,7 @@ pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) 
     if let Some(slice) = slice {
         let padded = format!("{:0>3}", slice.trim());
         let slices = garden_root.join(milestone_path(item)).join("slices");
-        if let Some(doc) = find_by_number(&slices, &padded) {
+        if let Some(doc) = find_by_number(&slices, &padded)? {
             candidates.push(doc);
         }
     }
@@ -420,19 +565,52 @@ pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) 
         let identity = parts[..=depth].join("/");
         candidates.push(garden_root.join(milestone_path(&identity)).join("CLAUDE.md"));
     }
-    candidates
+    Ok(candidates)
 }
 
-/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`.
-fn find_by_number(dir: &Path, number: &str) -> Option<PathBuf> {
+/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`:
+/// `Ok(None)` when there is none (or `dir` is absent), `Err` when more than one
+/// matches (see [`item_doc_candidates`]).
+fn find_by_number(dir: &Path, number: &str) -> Result<Option<PathBuf>, String> {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let names: Vec<String> = listing
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    Ok(unique_numbered(names.iter().map(String::as_str), number)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .map(|name| dir.join(name)))
+}
+
+/// The one `<number>-*.md` name among `names`: `Ok(None)` when none matches,
+/// `Err` naming every match when more than one does — two docs claiming one
+/// item or slice number make every reader's answer a guess, so each fails
+/// closed (review 042 G74-2). Shared by the model resolver here and
+/// growlightd's claim-time item-doc read.
+pub fn unique_numbered<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    number: &str,
+) -> Result<Option<&'a str>, String> {
     let prefix = format!("{number}-");
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
-            .then_some(path)
-    })
+    let mut matches: Vec<&str> = names
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".md"))
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => {
+            matches.sort_unstable();
+            Err(format!(
+                "{} docs share number {number} ({}) — ambiguous, so none is trusted until one is \
+                 removed",
+                matches.len(),
+                matches.join(", ")
+            ))
+        }
+    }
 }
 
 /// A resolved declaration, with the declaring doc for messages.
@@ -461,6 +639,11 @@ where
     for (label, content) in docs {
         let Some(content) = content else { continue };
         let content = content.as_ref();
+        // Review 042 G74-4: a sealed region can hide the `> Model:` line, so a
+        // doc whose metadata can't be read is an error, never "undeclared".
+        if let Some(why) = crate::item_meta::unreadable_metadata(content) {
+            bail!("declared by {}: {why}", label.as_ref());
+        }
         let Some(field) = item_model_field(content) else {
             continue;
         };
@@ -491,6 +674,31 @@ mod tests {
 
     // ---- comma lists (§6.4 syntax) -------------------------------------
 
+
+    /// Review 042 G74-4: a doc whose metadata the redacted read view hides is a
+    /// resolution error. Read as "undeclared", the chain would walk past a
+    /// sealed slice doc to the milestone's declaration.
+    #[test]
+    fn a_sealed_doc_is_a_resolution_error_not_undeclared() {
+        let docs = [
+            ("005-x.md", Some("# s\n<vault id=\"h\">[encrypted]</vault>\n")),
+            ("CLAUDE.md", Some("> Model: claude\n")),
+        ];
+        let err = resolve_item_models(docs).unwrap_err().to_string();
+        assert!(err.contains("005-x.md") && err.contains("sealed"), "{err}");
+    }
+
+    /// Review 042 G74-2: the one `<number>-*.md` among a listing, or an error
+    /// naming every match when two docs claim the number.
+    #[test]
+    fn unique_numbered_fails_closed_on_two_docs_for_one_number() {
+        let names = ["066-loop-self-extend.md", "067-wifi.md", "0660-other.md", "066-notes.txt"];
+        assert_eq!(unique_numbered(names, "066"), Ok(Some("066-loop-self-extend.md")));
+        assert_eq!(unique_numbered(names, "068"), Ok(None));
+        let shadowed = ["066-loop-self-extend.md", "066-0.md"];
+        let err = unique_numbered(shadowed, "066").unwrap_err();
+        assert!(err.contains("066-0.md, 066-loop-self-extend.md"), "{err}");
+    }
     #[test]
     fn a_comma_list_parses_in_order_with_per_entry_variants() {
         let list = match parse_declaration("reasoning, flash variant=high").unwrap() {
@@ -558,9 +766,19 @@ mod tests {
 
     #[test]
     fn the_member_default_is_the_single_model_for_undeclared_work() {
-        // claude member → claude.
-        let claude = member_default(Backend::Claude, Some("deepseek/deepseek-v4-pro"), None);
-        assert_eq!(claude.entries(), &[ModelChoice::claude()]);
+        // claude member with no roster override → the harness default (no
+        // `--model`, no `--effort`).
+        let bare_claude = member_default(Backend::Claude, None, None);
+        assert_eq!(bare_claude.entries(), &[ModelChoice::claude()]);
+
+        // claude-model-select slice 003: a claude member whose roster pins model
+        // + effort carries them as the member default — the roster is the §6.4
+        // default, exactly like an opencode member.
+        let claude_pinned = member_default(Backend::Claude, Some("claude-opus-4-7"), Some("high"));
+        assert_eq!(
+            claude_pinned.entries(),
+            &[ModelChoice::claude_on(Some("claude-opus-4-7".into()), Some("high".into()))],
+        );
 
         // opencode member with a roster model+variant → that model+variant.
         let with_roster = member_default(Backend::Opencode, Some("deepseek/deepseek-flash"), Some("high"));
@@ -682,14 +900,14 @@ mod tests {
         std::fs::write(m.join("subs/s1/subs/s2/CLAUDE.md"), "").unwrap();
 
         // For a top-level milestone slice: [slice doc, milestone CLAUDE.md].
-        let direct = item_doc_candidates(&root, "m", Some("005"));
+        let direct = item_doc_candidates(&root, "m", Some("005")).unwrap();
         assert_eq!(
             direct,
             vec![m.join("slices/005-picker.md"), m.join("CLAUDE.md")]
         );
 
         // For a slice under m/s1: [slice doc, m/subs/s1/CLAUDE.md, m/CLAUDE.md].
-        let one_sub = item_doc_candidates(&root, "m/s1", Some("7"));
+        let one_sub = item_doc_candidates(&root, "m/s1", Some("7")).unwrap();
         assert_eq!(
             one_sub,
             vec![
@@ -700,7 +918,7 @@ mod tests {
         );
 
         // Nested two deep, innermost first.
-        let two_subs = item_doc_candidates(&root, "m/s1/s2", None);
+        let two_subs = item_doc_candidates(&root, "m/s1/s2", None).unwrap();
         assert_eq!(
             two_subs,
             vec![
@@ -715,9 +933,18 @@ mod tests {
         std::fs::create_dir_all(&tasks).unwrap();
         std::fs::write(tasks.join("047-a-task.md"), "").unwrap();
         assert_eq!(
-            item_doc_candidates(&root, "047", None),
+            item_doc_candidates(&root, "047", None).unwrap(),
             vec![tasks.join("047-a-task.md")]
         );
+
+        // Review 042 G74-2: a second doc claiming a number is a shadow — the
+        // lookup fails closed rather than trust whichever sorts first.
+        std::fs::write(tasks.join("047-0.md"), "> Model: claude\n").unwrap();
+        let err = item_doc_candidates(&root, "047", None).unwrap_err();
+        assert!(err.contains("047-0.md") && err.contains("047-a-task.md"), "{err}");
+        std::fs::write(m.join("slices/005-shadow.md"), "").unwrap();
+        assert!(item_doc_candidates(&root, "m", Some("5")).is_err(), "a shadow slice doc");
+        assert!(item_doc_candidates(&root, "m", None).is_ok(), "no slice asked, no slice read");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -757,5 +984,189 @@ mod tests {
         let bad = resolve_item_models([("005-slice.md", Some("> Model: gpt-9\n"))]);
         assert!(bad.is_err());
         assert!(bad.unwrap_err().to_string().contains("005-slice.md"));
+    }
+
+    // ---- claude:<model> + live effort (claude-model-select) ------------
+
+    #[test]
+    fn plain_claude_still_parses_to_the_harness_default() {
+        assert_eq!(fixed("claude"), ModelChoice::claude());
+        assert_eq!(fixed("claude"), ModelChoice::claude_on(None, None));
+        assert!(ModelChoice::claude().claude_argv().is_empty());
+    }
+
+    #[test]
+    fn claude_alias_pins_the_model_and_argv() {
+        for alias in ["opus", "sonnet", "haiku", "fable"] {
+            let choice = fixed(&format!("claude:{alias}"));
+            assert_eq!(choice, ModelChoice::claude_on(Some(alias.into()), None));
+            assert_eq!(
+                choice.claude_argv(),
+                vec!["--model".to_string(), alias.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_full_id_and_the_one_m_suffix_are_passed_through() {
+        let direct = fixed("claude:claude-opus-4-7");
+        assert_eq!(
+            direct,
+            ModelChoice::claude_on(Some("claude-opus-4-7".into()), None)
+        );
+        // `[1m]` suffix survives verbatim on either an alias or a full id.
+        let alias_1m = fixed("claude:opus[1m]");
+        assert_eq!(alias_1m.model.as_deref(), Some("opus[1m]"));
+        assert_eq!(
+            alias_1m.claude_argv(),
+            vec!["--model".to_string(), "opus[1m]".to_string()]
+        );
+        let full_1m = fixed("claude:claude-sonnet-5-5[1m]");
+        assert_eq!(full_1m.model.as_deref(), Some("claude-sonnet-5-5[1m]"));
+    }
+
+    #[test]
+    fn claude_effort_is_live_and_the_set_is_closed() {
+        // The spec's five words all pass.
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let choice = fixed(&format!("claude effort={effort}"));
+            assert_eq!(choice.variant.as_deref(), Some(effort));
+            assert_eq!(choice.model, None);
+            assert_eq!(
+                choice.claude_argv(),
+                vec!["--effort".to_string(), effort.to_string()]
+            );
+        }
+        // Anything else is refused with the closed set named.
+        let err = parse_model_spec("claude effort=insane").unwrap_err().to_string();
+        assert!(err.contains("closed set") && err.contains("xhigh"), "{err}");
+        // `variant=` is an accepted alias on claude too.
+        assert_eq!(
+            fixed("claude variant=high"),
+            ModelChoice::claude_on(None, Some("high".into()))
+        );
+    }
+
+    #[test]
+    fn claude_model_and_effort_pair_up() {
+        let choice = fixed("claude:opus effort=high");
+        assert_eq!(
+            choice,
+            ModelChoice::claude_on(Some("opus".into()), Some("high".into()))
+        );
+        assert_eq!(
+            choice.claude_argv(),
+            vec![
+                "--model".to_string(),
+                "opus".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_colon_refusals_name_the_grammar() {
+        let empty = parse_model_spec("claude:").unwrap_err().to_string();
+        assert!(empty.contains("no model after `:`"), "{empty}");
+
+        let one_m_only = parse_model_spec("claude:[1m]").unwrap_err().to_string();
+        assert!(one_m_only.contains("[1m]"), "{one_m_only}");
+
+        let unknown = parse_model_spec("claude:gpt").unwrap_err().to_string();
+        assert!(unknown.contains("neither an alias") && unknown.contains("fable"), "{unknown}");
+
+        let slash = parse_model_spec("claude:provider/model").unwrap_err().to_string();
+        assert!(slash.contains("'/'"), "{slash}");
+
+        let hash = parse_model_spec("claude:opus#x").unwrap_err().to_string();
+        assert!(hash.contains("'#'"), "{hash}");
+
+        // A plausible-looking id that fails the full-id regex (bare `claude-`,
+        // trailing dash, doubled dash) is also refused as "neither an alias…".
+        for bad in ["claude:claude-", "claude:claude-opus-", "claude:claude--opus"] {
+            assert!(parse_model_spec(bad).is_err(), "{bad} must not parse");
+        }
+
+        // The error message for the top-level unknown lists the new form.
+        let top = parse_model_spec("gpt-9").unwrap_err().to_string();
+        assert!(
+            top.contains("claude | claude:<model>")
+                && top.contains("reasoning")
+                && top.contains("provider/model"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn matches_treats_each_claude_model_as_a_distinct_identity() {
+        let bare = ModelChoice::claude();
+        let opus = fixed("claude:opus");
+        let sonnet = fixed("claude:sonnet");
+        let opus_full = fixed("claude:claude-opus-4-7");
+
+        assert!(bare.matches(&bare));
+        assert!(opus.matches(&opus));
+        // None ≠ Some.
+        assert!(!bare.matches(&opus));
+        assert!(!opus.matches(&bare));
+        // Two different claude models never match.
+        assert!(!opus.matches(&sonnet));
+        assert!(!opus.matches(&opus_full));
+        // Effort/variant is ignored on claude just like on opencode.
+        let opus_high = fixed("claude:opus effort=high");
+        let opus_low = fixed("claude:opus effort=low");
+        assert!(opus_high.matches(&opus_low));
+        assert!(opus_high.matches(&opus));
+    }
+
+    #[test]
+    fn model_change_and_subset_hold_over_claude_ids() {
+        // A declared allowed list naming two claude models + opencode flash.
+        let allowed = match parse_declaration("claude:opus, claude:claude-sonnet-5-5, flash").unwrap() {
+            Declaration::List(list) => list,
+            Declaration::Auto => panic!("a list"),
+        };
+
+        // Each listed claude id is allowed; a listed opencode entry is too.
+        assert!(validate_model_change(&allowed, &fixed("claude:opus"), true).is_ok());
+        assert!(validate_model_change(&allowed, &fixed("claude:claude-sonnet-5-5"), true).is_ok());
+        assert!(
+            validate_model_change(&allowed, &fixed("claude:opus effort=high"), true).is_ok(),
+            "effort is free within an allowed claude model, like variant on opencode"
+        );
+        // Bare `claude` (harness default) is a distinct identity, not listed.
+        assert_eq!(
+            validate_model_change(&allowed, &ModelChoice::claude(), true),
+            Err(ModelRuleError::NotAllowed)
+        );
+        // Another claude model entirely is refused.
+        assert_eq!(
+            validate_model_change(&allowed, &fixed("claude:haiku"), true),
+            Err(ModelRuleError::NotAllowed)
+        );
+
+        // The §6.7 subset rule: a slice may declare a subset of its inheritance
+        // (keeperd's `guard_member_models` / `queue_add_entry` body check).
+        let inherited = allowed;
+        let subset = match parse_declaration("claude:opus").unwrap() {
+            Declaration::List(list) => list,
+            Declaration::Auto => panic!("a list"),
+        };
+        assert!(validate_declared_subset(Some(&inherited), &subset).is_ok());
+        let widened = match parse_declaration("claude:haiku").unwrap() {
+            Declaration::List(list) => list,
+            Declaration::Auto => panic!("a list"),
+        };
+        assert_eq!(
+            validate_declared_subset(Some(&inherited), &widened),
+            Err(ModelRuleError::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn claude_argv_is_empty_for_an_opencode_choice() {
+        let flash = fixed("flash effort=high");
+        assert!(flash.claude_argv().is_empty());
     }
 }

@@ -357,7 +357,17 @@ fn resolve_chain(
     item: &str,
     slice: Option<&str>,
 ) -> Result<Option<ModelList>, V2SourceError> {
-    let docs: Vec<(String, Option<String>)> = item_doc_candidates(garden_root, item, slice)
+    let context = match slice {
+        Some(slice) => format!("milestone \"{item}\" slice \"{slice}\""),
+        None => format!("entry \"{item}\""),
+    };
+    let candidates = item_doc_candidates(garden_root, item, slice).map_err(|message| {
+        V2SourceError::InvalidModelDecl {
+            context: context.clone(),
+            message,
+        }
+    })?;
+    let docs: Vec<(String, Option<String>)> = candidates
         .into_iter()
         .map(|path| {
             let label = path
@@ -369,10 +379,6 @@ fn resolve_chain(
             (label, content)
         })
         .collect();
-    let context = match slice {
-        Some(slice) => format!("milestone \"{item}\" slice \"{slice}\""),
-        None => format!("entry \"{item}\""),
-    };
     match resolve_item_models(docs) {
         Ok(Some(declared)) => Ok(Some(declared.list)),
         Ok(None) => Ok(None),

@@ -327,12 +327,17 @@ fn agent_summary(
         &m.agent,
         health_label(health, lifecycle),
         matches!(health, Some(AgentHealth::Alive { .. })),
-    );
+    )
+    // The claude-login profile slot the member's last spawn ran under
+    // (claude-login-switcher slices 003, 007). `None` for opencode, or for a
+    // claude member that has not spawned yet, which the status renderer shows
+    // as `-`.
+    .with_profile(router.active_profile(&m.agent));
     match &m.backend {
         // A subscription member: no per-member dollar figure exists, and the row
         // deliberately carries no spend rather than a $0.00 that would read as
         // "metered, spent nothing" (see `AgentSummary`'s docs).
-        MemberBackend::Claude => row,
+        MemberBackend::Claude { .. } => row,
         // A metered member: show what it has actually cost. `spend` is `Some` for
         // every opencode route, but the config has ALREADY established this member
         // is metered, so a missing reading is the zero accounting — never a silent

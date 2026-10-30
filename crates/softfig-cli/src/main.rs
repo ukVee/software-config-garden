@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
+mod cmd_claude_login;
 mod cmd_daemon;
 mod cmd_deploy;
 mod cmd_growlight;
@@ -15,6 +16,7 @@ mod cmd_upgrade;
 mod cmd_vault;
 mod growlight_backend;
 mod opencode_catalog;
+mod slot_layout;
 
 #[derive(Parser, Debug)]
 #[command(name = "softfig", version, about = "soft-fig: garden tool", long_about = None)]
@@ -94,6 +96,12 @@ enum Cmd {
     /// are never touched without a separate, explicit `--yes-remove-data`
     /// consent.
     Uninstall(cmd_uninstall::UninstallArgs),
+
+    /// Two-account Anthropic login switcher for Claude Code: each slot is a
+    /// real `CLAUDE_CONFIG_DIR` in the profile store
+    /// (`~/.local/share/softfig/claude-profiles/`); `home` is the default.
+    #[command(name = "claude-login", subcommand)]
+    ClaudeLogin(cmd_claude_login::ClaudeLoginCmd),
 }
 
 #[derive(Args, Debug)]
@@ -126,5 +134,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
         Cmd::Upgrade(args) => cmd_upgrade::run(args),
         Cmd::Uninstall(args) => cmd_uninstall::run(args),
+        Cmd::ClaudeLogin(cmd) => cmd_claude_login::run(cmd),
     }
 }

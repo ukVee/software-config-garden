@@ -86,7 +86,7 @@ pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
             None => managed::remove(content, BACKLINKS_TAG),
         };
         if &new != content {
-            let _ = wt.write(&target, new.as_bytes());
+            let _ = wt.write_derived(&target, new.as_bytes());
         }
     }
 }
@@ -105,7 +105,7 @@ pub fn rewrite_refs_to_archived(
             continue;
         };
         if let Some(new) = refs::rewrite_to(&content, &rel, src_rel, dst_rel) {
-            let _ = wt.write(&rel, new.as_bytes());
+            let _ = wt.write_derived(&rel, new.as_bytes());
         }
     }
 }

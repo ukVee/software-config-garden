@@ -144,6 +144,58 @@ pub fn malformed_placeholder(path: &str) -> Vec<u8> {
     format!("[malformed vault tag in {path}]\n").into_bytes()
 }
 
+/// Session-free scan of inline `<vault id="…">…</vault>` regions. Returns
+/// each region as `(open_tag_byte_range, body_byte_range)` under
+/// `parser`'s mask — the same open/close detection and markdown/toml
+/// exemptions [`parse`] uses, without any ciphertext/plaintext
+/// classification. Used by `member_vault_refusal` so one scanner defines
+/// what is and isn't a region (report 084 / spec-growlight-queue §6.7).
+///
+/// An id-less or inline-code `<vault>` is text (same as [`parse`]: it
+/// never calls it a region). A real `<vault id="…">` whose `</vault>`
+/// is missing (or sits in a masked byte) is returned with an **empty**
+/// body range at `body_start..body_start`, so a following prose edit
+/// never looks like a region change — but a write that adds, removes
+/// or changes the open tag itself still shows a diff and the caller
+/// can refuse it. Nothing in this scanner errors; duplicate ids,
+/// nested tags and malformed ids all round-trip as whatever regions
+/// their open/close tags describe.
+pub(crate) fn scan_region_bounds(
+    parser: RegionParser,
+    content: &[u8],
+) -> Vec<(Range<usize>, Range<usize>)> {
+    if std::str::from_utf8(content).is_err() {
+        return Vec::new();
+    }
+    let allow = match parser {
+        RegionParser::Markdown => compute_markdown_mask(content),
+        RegionParser::Toml => compute_toml_mask(content),
+        RegionParser::PlainText => vec![true; content.len()],
+    };
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open) = next_open_tag(content, cursor) {
+        if !is_allowed(&allow, open.open_start) {
+            cursor = open.open_start + 1;
+            continue;
+        }
+        let open_tag = open.open_start..open.body_start;
+        match next_close_tag(content, open.body_start) {
+            Some(close) if is_allowed(&allow, close.start) => {
+                out.push((open_tag, open.body_start..close.start));
+                cursor = close.end;
+            }
+            _ => {
+                // Unterminated real open tag. Empty body — the caller
+                // still sees any change to the open tag itself.
+                out.push((open_tag, open.body_start..open.body_start));
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Pure helper: apply byte-range substitutions to `content`. Ranges may
 /// be supplied in any order; the helper sorts by start descending so
 /// earlier replacements don't shift later byte indices. Substituted

@@ -450,7 +450,7 @@ pub fn refresh_index(wt: &WorkTree, inner: &DaemonInner) -> Option<String> {
     if new == content {
         return None;
     }
-    wt.write(&host, new.as_bytes()).ok()?;
+    wt.write_derived(&host, new.as_bytes()).ok()?;
     Some(host)
 }
 
@@ -526,7 +526,7 @@ pub fn file_report(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         let wt = WorkTree::new(daemon, &inner);
         let host = reports_claude();
         if !wt.exists(&host) {
-            wt.write(&host, reports_claude_stub().as_bytes())?;
+            wt.write_derived(&host, reports_claude_stub().as_bytes())?;
         }
         let number = numbering::next_number(&wt, &dir);
         let rel = format!("{dir}/{}", conventions::note_filename(number, &slug));

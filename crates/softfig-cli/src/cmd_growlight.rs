@@ -24,6 +24,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, ErrorKind, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::parse_baton,
+    claude_profiles,
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
         PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
@@ -42,9 +43,10 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, ModelChoice, ModelSpec,
-    OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates, opencode_config,
-    opencode_context, opencode_interactive_args, parse_model_spec, resolve_item_models,
+    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, LaunchSlot, ModelChoice,
+    ModelSpec, OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates,
+    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
+    resolve_item_models,
 };
 use crate::opencode_catalog;
 
@@ -84,6 +86,13 @@ pub enum GrowlightCmd {
     /// form) and launch the agent in loop mode. Requires the garden unlocked
     /// and `growlight init` already run.
     Start(StartArgs),
+
+    /// Print the boot dirty-tree signal for the root baton's item (task 064):
+    /// the line `start` prints, for the SessionStart hook to inject on every
+    /// boot — a `/clear` re-boot included — so it lands in the agent's own
+    /// context. Prints nothing when the tree is clean or the check can't run;
+    /// never fails, and never reverts, stages or commits.
+    BootCheck(BootCheckArgs),
 
     /// Show the orchestrator daemon's fleet status — a one-shot query to
     /// growlightd's own IPC socket: state, garden root, policy, the admission
@@ -235,12 +244,22 @@ pub struct StartArgs {
     #[arg(long, conflicts_with = "backend")]
     pub opencode: bool,
     /// Backend + model in one word, bypassing the picker:
-    /// `claude` | `reasoning` | `flash` | `auto` | `provider/model`, with an
-    /// optional ` variant=<v>` (alias ` effort=<v>`) tail for opencode.
+    /// `claude` | `claude:<alias|id>[1m]` | `reasoning` | `flash` |
+    /// `auto` | `provider/model`, with an optional ` variant=<v>` (alias
+    /// ` effort=<v>`) tail. On opencode `variant` is free-form; on claude the
+    /// effort set is closed to `low|medium|high|xhigh|max`. A bare `claude` is
+    /// the harness default (no `--model`/`--effort`); `claude:opus` becomes
+    /// `--model opus`; `claude:claude-opus-4-7 effort=high` becomes
+    /// `--model claude-opus-4-7 --effort high`.
     /// `auto` = "let growlight decide": use the model the active backlog item
     /// declares in its `> Model:` line, defaulting to deepseek flash.
     #[arg(long, conflicts_with_all = ["backend", "opencode"])]
     pub model: Option<String>,
+    /// The claude-login slot the claude session runs on (its
+    /// `CLAUDE_CONFIG_DIR`; `home` = Claude's default config dir). Defaults to
+    /// the store's active slot (`softfig claude-login use`). claude only.
+    #[arg(long, value_name = "SLOT")]
+    pub profile: Option<String>,
 }
 
 /// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
@@ -267,6 +286,18 @@ pub struct SayArgs {
 /// Shared args for the growlight client subcommands. They talk to growlightd's
 /// OWN socket (a separate process from keeperd — spec §2/§13), so the override
 /// defaults to the growlightd socket, not keeperd's.
+/// Args for `boot-check`. Both paths are passed by the generated `inject.sh`,
+/// so the hook needs no daemon round-trip to find them.
+#[derive(Args, Debug)]
+pub struct BootCheckArgs {
+    /// The garden root (the mount the loop's docs are read from).
+    #[arg(long)]
+    pub garden_root: PathBuf,
+    /// The semi-auto root baton whose item to check.
+    #[arg(long)]
+    pub baton: PathBuf,
+}
+
 #[derive(Args, Debug)]
 pub struct ClientArgs {
     /// Override the growlightd socket path. Defaults to
@@ -331,6 +362,10 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
     match cmd {
         GrowlightCmd::Init(args) => init(args),
         GrowlightCmd::Start(args) => start(args),
+        GrowlightCmd::BootCheck(args) => {
+            boot_check(&args);
+            Ok(())
+        }
         GrowlightCmd::Status(args) => client_status(args),
         GrowlightCmd::Watch(args) => client_watch(args),
         GrowlightCmd::Stop(args) => client_stop(args),
@@ -450,10 +485,25 @@ fn start(args: StartArgs) -> Result<()> {
     // project-scoped registration in ~/.claude.json only loads with cwd in the
     // garden). Without it every state-advancing iteration STUCKs (auto-run log).
     write_file(&mcp_path, &mcp_json(&softfig_mcp_path()))?;
-    write_script(&inject_path, &inject_script(&protocol, &baton_path))?;
+    write_script(
+        &inject_path,
+        &inject_script(&protocol, &baton_path, &softfig_bin_path(), &garden_root),
+    )?;
+    // Slice 009 S9: the per-profile dir rides next to usage.json under the
+    // same runtime grant, so the statusline needs no new permission to tee
+    // into it. The active-link path is baked in at launch — a session that
+    // outlives a `claude-login use` keeps writing to its per-profile file
+    // either way (slice 009 S8 statusline half).
+    let by_profile_dir = runtime.join("usage.by-profile");
+    let active_link = claude_profiles::store_root_from_env()
+        .map(|s| s.join(claude_profiles::ACTIVE_LINK))
+        // No slot store (no `$HOME`): a sentinel path under the runtime that
+        // will never exist, so the `[ -L ]` guard falls through to the
+        // `home` default and the shared `usage.json` is written as before.
+        .unwrap_or_else(|| runtime.join("no-store-active-sentinel"));
     write_script(
         &statusline_path,
-        &statusline_script(&runtime.join("usage.json")),
+        &statusline_script(&runtime.join("usage.json"), &by_profile_dir, &active_link),
     )?;
 
     // Live loop state → seed once, never clobber an in-flight loop.
@@ -463,6 +513,15 @@ fn start(args: StartArgs) -> Result<()> {
         .unwrap_or("garden");
     let baton_seeded = seed_if_absent(&baton_path, &seed_baton(garden_name, &today_iso()))?;
     let questions_seeded = seed_if_absent(&questions_path, SEED_QUESTIONS)?;
+
+    // Task 064: surface a repo whose dirt the baton doesn't know about (report
+    // 001's cut-off signature) BEFORE anything is launched: dirt newer than a
+    // carried baton's last write, or any dirt under a baton just seeded (review
+    // 043 G64-2 — a fresh seed's own mtime is "now", which no dirt is newer than).
+    // Read-only and best-effort; a failed probe never blocks a launch.
+    if let Some(line) = boot_dirty_check(&garden_root, &baton_path, baton_seeded) {
+        eprintln!("{line}");
+    }
 
     print_setup(&runtime, &loop_path, baton_seeded, questions_seeded);
 
@@ -483,6 +542,19 @@ fn start(args: StartArgs) -> Result<()> {
     // "let growlight decide" can read the active item's declaration.
     let choice = resolve_model_choice(&args, &garden_root, &baton_path)?;
     let backend = choice.backend;
+    // The claude-login slot, resolved and checked before anything launches
+    // (claude-login-switcher slice 007): the same resolver growlightd's spawn
+    // seam uses, so a slot the fleet would refuse is refused here too.
+    let claude_slot = match backend {
+        Backend::Claude => Some(resolve_launch_slot(
+            claude_profiles::store_root_from_env().as_deref(),
+            args.profile.as_deref(),
+        )?),
+        Backend::Opencode if args.profile.is_some() => {
+            bail!("--profile selects a claude-login slot; it has no meaning for opencode")
+        }
+        Backend::Opencode => None,
+    };
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
     // = protocol-by-reference + step-0 baton boot + the session context (garden
@@ -564,6 +636,7 @@ fn start(args: StartArgs) -> Result<()> {
         garden_root: &garden_root,
         opencode_config: &opencode_path,
         boot_prompt: OPENCODE_KICK,
+        claude_slot: claude_slot.as_ref(),
     };
 
     if args.no_launch {
@@ -571,6 +644,98 @@ fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
     launch_agent(&choice, &launch)
+}
+
+/// Task 064 — the semi-auto/CLI half of the boot-time dirty-tree guard: at
+/// `start`, resolve the root baton's active item repo ([`baton_item_repo`]) and
+/// return the signal growlightd journals before a member spawn
+/// ([`softfig_ipc::item_repo::boot_signal`] — the same text, so the human
+/// launching the loop sees it before the agent does new work). `seeded` says
+/// the baton was just written (no prior handoff, so any dirt surfaces);
+/// otherwise its last write is the handoff. Read-only: it only ever
+/// *surfaces* the answer, never reverts, stages or commits. Best-effort — a
+/// missing item, an unprobeable repo or a `git` failure is `None`, never a
+/// launch failure.
+fn boot_dirty_check(garden_root: &Path, baton_path: &Path, seeded: bool) -> Option<String> {
+    use softfig_ipc::item_repo::{boot_signal, probe, Handoff};
+    let view = parse_baton(&fs::read_to_string(baton_path).ok()?);
+    let item = view.item.as_deref()?;
+    let repo = baton_item_repo(garden_root, item)?;
+    let state = probe(&repo).ok()?;
+    let handoff = if seeded {
+        Handoff::Fresh
+    } else {
+        Handoff::At(fs::metadata(baton_path).and_then(|md| md.modified()).ok()?)
+    };
+    boot_signal(item, &repo, &state, handoff).map(|signal| format!("growlight: {signal}"))
+}
+
+/// The repo the semi-auto baton's item lands in, through the one resolver
+/// growlightd's repo probe uses (review 043 G64-3,
+/// [`softfig_ipc::item_repo::item_repo_path`]): the item's own doc's
+/// `> Worktree:`, else its queue's `## Queues` registry cell. The baton names
+/// no queue, so the queue is the table that lists the item — semi-auto runs
+/// named queues (psy, fid, irface, roadeye), whose items rarely carry
+/// `> Worktree:`.
+fn baton_item_repo(garden_root: &Path, item: &str) -> Option<PathBuf> {
+    use softfig_ipc::backlog_doc::{queue_of, BACKLOG_DOC, DEFAULT_QUEUE};
+    let backlog = fs::read_to_string(garden_root.join(BACKLOG_DOC)).ok();
+    let queue = backlog
+        .as_deref()
+        .and_then(|doc| queue_of(doc, item))
+        .unwrap_or_else(|| DEFAULT_QUEUE.to_string());
+    let doc = item_own_doc(garden_root, item).ok()?;
+    let home = home_dir().ok();
+    softfig_ipc::item_repo::item_repo_path(doc.as_deref(), &queue, || backlog, home.as_deref())
+}
+
+/// The item's own doc off the garden mount — the doc growlightd's claim-time
+/// reader reads, never a slice or sub-milestone doc: a task's
+/// `tasks/<id>-*.md`, else the milestone's `CLAUDE.md`. It fails closed the way
+/// growlightd's reader does, so the two give the same answer: two docs
+/// claiming the number ([`unique_numbered`](softfig_ipc::model_choice::unique_numbered),
+/// review 042 G74-2) or metadata the read view hides
+/// ([`unreadable_metadata`](softfig_ipc::item_meta::unreadable_metadata), G74-4)
+/// is an `Err`, and the caller gives no repo signal rather than a registry guess.
+fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String> {
+    use softfig_ipc::backlog_doc::{is_task_id, MILESTONES_DIR, TASKS_DIR};
+    let path = if is_task_id(item) {
+        let tasks = garden_root.join(TASKS_DIR);
+        let names: Vec<String> = match fs::read_dir(&tasks) {
+            Ok(dir) => dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect(),
+            Err(_) => return Ok(None),
+        };
+        match softfig_ipc::model_choice::unique_numbered(names.iter().map(String::as_str), item)? {
+            Some(name) => tasks.join(name),
+            None => return Ok(None),
+        }
+    } else {
+        garden_root.join(MILESTONES_DIR).join(item).join("CLAUDE.md")
+    };
+    let Ok(doc) = fs::read_to_string(path) else { return Ok(None) };
+    match softfig_ipc::item_meta::unreadable_metadata(&doc) {
+        Some(why) => Err(why.to_string()),
+        None => Ok(Some(doc)),
+    }
+}
+
+/// The slot an interactive claude session runs on: `--profile`, else the
+/// store's `active` pointer, checked by the resolver growlightd's spawn seam
+/// uses ([`claude_profiles::launch_slot`]), so a missing dir or an unusable
+/// credential refuses the launch rather than run on another account. With no
+/// store (no `$HOME`) only `home` exists.
+fn resolve_launch_slot(store: Option<&Path>, profile: Option<&str>) -> Result<LaunchSlot> {
+    let (name, dir) = match (store, profile) {
+        (Some(store), Some(slot)) => (slot.to_string(), claude_profiles::launch_slot(store, slot)?),
+        (Some(store), None) => claude_profiles::launch_active(store)?,
+        (None, None | Some(claude_profiles::HOME_SLOT)) => {
+            (claude_profiles::HOME_SLOT.to_string(), claude_profiles::SlotDir::Home)
+        }
+        (None, Some(slot)) => bail!(
+            "claude-login slot {slot:?}: no slot store can be named (is $HOME set?)"
+        ),
+    };
+    Ok(LaunchSlot { name, dir })
 }
 
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
@@ -589,11 +754,38 @@ fn start(args: StartArgs) -> Result<()> {
 fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
     let garden = launch.garden_root.display();
     match choice.backend {
+        // The slot goes through `env`, which also bypasses the bash `claude()`
+        // shim: a bare `claude` there would re-resolve the active slot, and
+        // `--profile` may have named another one.
         Backend::Claude => format!(
-            "(--no-launch) runtime ready. launch with:\n  cd {garden} && {AGENT_BIN} \
-             --name {AGENT_NAME} --settings {} --mcp-config {}",
+            "(--no-launch) runtime ready{}. launch with:\n  cd {garden} && {}{AGENT_BIN} \
+             --name {AGENT_NAME} --settings {} --mcp-config {}{}",
+            launch
+                .claude_slot
+                .map(|s| format!(" (claude-login slot {})", s.name))
+                .unwrap_or_default(),
+            match launch.claude_slot.map(|s| &s.dir) {
+                Some(claude_profiles::SlotDir::Store(dir)) => {
+                    format!("env {}={} ", claude_profiles::CONFIG_DIR_ENV, dir.display())
+                }
+                Some(claude_profiles::SlotDir::Home) => {
+                    format!("env -u {} ", claude_profiles::CONFIG_DIR_ENV)
+                }
+                None => String::new(),
+            },
             launch.loop_settings.display(),
             launch.mcp_config.display(),
+            // Slice 002: the `--model`/`--effort` tail only prints when one is
+            // pinned; `claude` on the harness default stays byte-identical to
+            // the pre-slice-002 hint.
+            {
+                let argv = choice.claude_argv();
+                if argv.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", argv.join(" "))
+                }
+            },
         ),
         // The opencode config is handed over via `OPENCODE_CONFIG` (its analog of
         // claude's `--settings`), so there is no `--settings`/`--mcp-config` here.
@@ -631,7 +823,19 @@ fn resolve_model_choice(
     let flagged = args.opencode || args.backend.is_some() || args.model.is_some();
 
     let spec = if should_prompt(flagged, args.no_launch, stdin().is_terminal()) {
-        prompt_for_model()?
+        // Slice 002: the picker lists all available claude models. The extras
+        // come from two best-effort sources — the active slot's `.claude.json`
+        // `additionalModelOptionsCache[].value` (pre-switcher-merge the slot's
+        // `.claude.json` is `~/.claude.json`) and `config/growlight.toml`
+        // `[claude] models = [...]`, in that order, deduped first-wins. Any
+        // read error → the row is simply absent.
+        let claude_json = home_dir().ok().map(|h| h.join(".claude.json"));
+        let growlight_toml = garden_root
+            .join("config")
+            .join(softfig_ipc::GROWLIGHT_CONFIG_FILE);
+        let extras = claude_picker_extras(claude_json.as_deref(), Some(&growlight_toml));
+        let mut stdin = BufReader::new(stdin().lock());
+        prompt_for_model_in(&mut stdin, &extras)?
     } else if let Some(spec) = flag_spec(args)? {
         spec
     } else {
@@ -685,31 +889,174 @@ fn should_prompt(flagged: bool, no_launch: bool, stdin_is_tty: bool) -> bool {
     !flagged && !no_launch && stdin_is_tty
 }
 
-/// The interactive picker (spec: the confirmed `1/2/3/4` UX). Reads one line from
-/// stdin; a bare Enter takes option 1, and EOF (stdin closed mid-run) falls back
-/// to the same default rather than erroring out of a launch the human asked for.
-fn prompt_for_model() -> Result<ModelSpec> {
-    println!("\nbackend + model:");
-    println!("  1) claude                (default)");
-    println!("  2) deepseek reasoning    ({DEEPSEEK_REASONING})");
-    println!("  3) deepseek flash        ({DEEPSEEK_FLASH})");
-    println!("  4) let growlight decide  (the active backlog item's `> Model:`, else flash)");
-    print!("choice [1]: ");
-    // The prompt has no newline, so it sits in the line buffer until flushed.
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+/// The claude-alias rows the picker always shows after `1) claude`, in menu
+/// order: `opus | sonnet | haiku | fable`. Slice 002 widened the picker to
+/// cover claude's full family without the human having to type the suffix.
+const CLAUDE_PICKER_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
 
-    let mut line = String::new();
-    if stdin().read_line(&mut line).unwrap_or(0) == 0 {
-        println!();
+/// The interactive picker (slice 002). Thin wrapper around
+/// [`prompt_for_model_in`] that locks real stdin.
+fn prompt_for_model_in<R: BufRead>(reader: &mut R, extras: &[String]) -> Result<ModelSpec> {
+    // The extras list is capped only by what the sources deliver; the picker
+    // never limits it, so a human who added five entries to `[claude] models`
+    // can select any of them by number.
+    let first_extra = 2 + CLAUDE_PICKER_ALIASES.len();
+    loop {
+        println!("\nbackend + model:");
+        println!("  1) claude                (harness default)");
+        for (i, alias) in CLAUDE_PICKER_ALIASES.iter().enumerate() {
+            println!("  {}) claude:{alias}", 2 + i);
+        }
+        for (i, extra) in extras.iter().enumerate() {
+            println!("  {}) claude:{extra}", first_extra + i);
+        }
+        println!("  r) reasoning            ({DEEPSEEK_REASONING})");
+        println!("  f) flash                ({DEEPSEEK_FLASH})");
+        println!("  a) let growlight decide (the active backlog item's `> Model:`, else flash)");
+        println!("     or type any spec, e.g. `claude:claude-opus-4-7 effort=high`");
+        print!("choice [1]: ");
+        // The prompt has no newline, so it sits in the line buffer until flushed.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        if n == 0 {
+            // EOF (stdin closed mid-run): fall back to the documented default
+            // rather than loop forever on empty reads.
+            println!();
+            return Ok(ModelSpec::Fixed(ModelChoice::claude()));
+        }
+        let input = line.trim();
+        if let Some(spec) = picker_fixed_choice(input, extras)? {
+            return Ok(spec);
+        }
+        // Typed input: route through the shared grammar so the words that work
+        // here, on `--model`, and on `> Model:` lines stay the same.
+        match parse_model_spec(input) {
+            Ok(spec) => return Ok(spec),
+            Err(e) => {
+                // A bad typed spec re-prompts rather than failing the launch —
+                // the picker is the last thing between the human and the agent.
+                eprintln!("  not understood ({e}); try again");
+            }
+        }
     }
-    Ok(match line.trim() {
+}
+
+/// Resolve one picker key — the fixed menu rows (`1`, `2..=5`, extras numbers,
+/// `r`/`R`, `f`/`F`, `a`/`A`, empty) to a `ModelSpec`. Returns `Ok(None)` for
+/// anything that isn't a menu key, so the caller can try the typed-spec path.
+/// Pure, so the number mapping (aliases + extras ordering) is unit-testable
+/// without the stdin seam.
+fn picker_fixed_choice(input: &str, extras: &[String]) -> Result<Option<ModelSpec>> {
+    let first_extra = 2 + CLAUDE_PICKER_ALIASES.len();
+    Ok(Some(match input {
         "" | "1" => ModelSpec::Fixed(ModelChoice::claude()),
-        "2" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_REASONING)),
-        "3" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_FLASH)),
-        "4" => ModelSpec::Auto,
-        // A typo shouldn't silently run the wrong (possibly pricier) model.
-        other => bail!("unknown choice `{other}` — pick 1, 2, 3, or 4"),
-    })
+        "r" | "R" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_REASONING)),
+        "f" | "F" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_FLASH)),
+        "a" | "A" => ModelSpec::Auto,
+        other => {
+            if let Ok(n) = other.parse::<usize>() {
+                if (2..first_extra).contains(&n) {
+                    let alias = CLAUDE_PICKER_ALIASES[n - 2];
+                    return Ok(Some(ModelSpec::Fixed(ModelChoice::claude_on(
+                        Some(alias.to_string()),
+                        None,
+                    ))));
+                }
+                if n >= first_extra && n < first_extra + extras.len() {
+                    let m = &extras[n - first_extra];
+                    // Validate through the shared parser so a slot-local id
+                    // picked by number produces the same argv a typed
+                    // `claude:<m>` would.
+                    return Ok(Some(parse_model_spec(&format!("claude:{m}")).with_context(
+                        || format!("picker extra `claude:{m}` (from .claude.json / growlight.toml)"),
+                    )?));
+                }
+            }
+            return Ok(None);
+        }
+    }))
+}
+
+/// The extras list the picker shows under `6…)`: the active slot's
+/// `.claude.json` `additionalModelOptionsCache[].value` first, then
+/// `config/growlight.toml`'s `[claude] models = [...]`, deduped **first-wins**.
+/// Any read / parse error → the source is simply absent (best-effort), because
+/// a stale user file must never block the launch picker. An entry that duplicates
+/// a built-in alias (`opus`/`sonnet`/`haiku`/`fable`) is dropped — the alias
+/// already has a numbered row.
+fn claude_picker_extras(
+    claude_json: Option<&Path>,
+    growlight_toml: Option<&Path>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(path) = claude_json {
+        out.extend(read_claude_json_models(path));
+    }
+    if let Some(path) = growlight_toml {
+        out.extend(read_growlight_toml_claude_models(path));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|v| {
+        if CLAUDE_PICKER_ALIASES.contains(&v.as_str()) {
+            return false;
+        }
+        seen.insert(v.clone())
+    });
+    out
+}
+
+/// Pull `additionalModelOptionsCache[].value` out of a `.claude.json`
+/// (claude-login-switcher-aware eventually; today it points at the active slot's
+/// `.claude.json`, else `~/.claude.json`). Best-effort: an absent file, an
+/// unreadable file, malformed JSON or a missing/wrong-shaped key all yield an
+/// empty list — the picker row is quietly absent, never a launch failure.
+fn read_claude_json_models(path: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(arr) = root
+        .get("additionalModelOptionsCache")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| entry.get("value").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pull `[claude] models = [...]` out of `config/growlight.toml`. Same
+/// best-effort posture as [`read_claude_json_models`]: a missing file / bad
+/// TOML / wrong-shaped section is an empty list. The growlightd parse of the
+/// same file does not know about `[claude]` and ignores it (the top-level
+/// `Doc` struct has no `deny_unknown_fields`), so adding this section cannot
+/// disable the fleet.
+fn read_growlight_toml_claude_models(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(arr) = root
+        .get("claude")
+        .and_then(|c| c.get("models"))
+        .and_then(|m| m.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// "Let growlight decide": use the model the ACTIVE backlog item declares for
@@ -734,7 +1081,14 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
         return default();
     };
 
-    let docs = item_doc_candidates(garden_root, item, view.slice.as_deref())
+    let candidates = match item_doc_candidates(garden_root, item, view.slice.as_deref()) {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring the declarations: {e}");
+            return default();
+        }
+    };
+    let docs = candidates
         .into_iter()
         .map(|doc_path| {
             let label = doc_path
@@ -795,16 +1149,40 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
+/// The ` --model <m> --effort <e>` fragment the claude banner echoes when
+/// either is pinned, built from the same `claude_argv()` the spawn argv uses so
+/// the two cannot drift. Returns an empty string on the harness default (so
+/// `launching claude --name softfig-loop …` stays byte-identical to today).
+fn banner_model_tail(choice: &ModelChoice) -> String {
+    let argv = choice.claude_argv();
+    if argv.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", argv.join(" "))
+    }
+}
+
 fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> {
     // The interactive argv/env/cwd is owned by the backend seam; for `claude`
-    // this is the original hardwired argv rooted at the garden, and for
-    // `opencode` it wires `OPENCODE_CONFIG` + the runtime cwd + the first-turn
-    // kick (slice 003).
+    // this is the original hardwired argv rooted at the garden plus the slice
+    // 002 `--model`/`--effort` tail, and for `opencode` it wires
+    // `OPENCODE_CONFIG` + the runtime cwd + the first-turn kick (slice 003).
     let backend = choice.backend;
-    let mut cmd = interactive_command(backend, launch)?;
+    let claude_argv = choice.claude_argv();
+    let mut cmd = interactive_command(backend, launch, &claude_argv)?;
     let bin = agent_bin(backend);
     match backend {
-        Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
+        Backend::Claude => {
+            let slot = launch
+                .claude_slot
+                .map(|s| format!(" on claude-login slot {}", s.name))
+                .unwrap_or_default();
+            // Name the model + effort when either is pinned, so the human can
+            // see what is about to launch; `claude` on the harness default
+            // stays "launching claude --name …" exactly as before.
+            let tail = banner_model_tail(choice);
+            println!("\nlaunching {bin} --name {AGENT_NAME}{slot}{tail} …\n");
+        }
         // Name the model: with four ways to pick one, the human should never have
         // to guess which one is about to burn tokens.
         Backend::Opencode => {
@@ -1032,9 +1410,9 @@ fn softfig_mcp_path() -> PathBuf {
 }
 
 /// SessionStart hook body: emit the fixed protocol (from the garden pillar) +
-/// the current runtime baton to stdout, which Claude Code adds to the fresh
-/// session's context.
-fn inject_script(protocol: &Path, baton: &Path) -> String {
+/// the current runtime baton + the boot dirty-tree check (task 064, protocol
+/// step 1b) to stdout, which Claude Code adds to the fresh session's context.
+fn inject_script(protocol: &Path, baton: &Path, softfig: &Path, garden_root: &Path) -> String {
     const TPL: &str = r#"#!/usr/bin/env bash
 # GENERATED by `softfig growlight start` — do not edit (refreshed each launch).
 # SessionStart hook: injects the fixed operating protocol + the current baton
@@ -1044,36 +1422,96 @@ printf '=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===\n\n'
 cat @PROTOCOL@ 2>/dev/null || printf '(protocol.md missing — run `softfig growlight init`)\n'
 printf '\n\n=== CURRENT BATON (your only carried state) ===\n\n'
 cat @BATON@ 2>/dev/null || printf '(no baton yet — run `softfig growlight start`)\n'
+@SOFTFIG@ growlight boot-check --garden-root @GARDEN@ --baton @BATON@ 2>/dev/null || true
 "#;
     TPL.replace("@PROTOCOL@", &shell_quote(protocol))
         .replace("@BATON@", &shell_quote(baton))
+        .replace("@SOFTFIG@", &shell_quote(softfig))
+        .replace("@GARDEN@", &shell_quote(garden_root))
+}
+
+/// `softfig growlight boot-check`: print the boot dirty-tree signal under a
+/// heading, or nothing. The baton is a carried one here (the hook runs on a
+/// boot or a `/clear`, never right after `start` seeds it), so its last write
+/// is the handoff.
+fn boot_check(args: &BootCheckArgs) {
+    if let Some(line) = boot_dirty_check(&args.garden_root, &args.baton, false) {
+        println!("\n\n=== BOOT DIRTY-TREE CHECK (protocol step 1b) ===\n\n{line}");
+    }
+}
+
+/// The running `softfig` binary, for the generated hook to call back into —
+/// the absolute path of this executable, else `softfig` on `PATH`.
+fn softfig_bin_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("softfig"))
 }
 
 /// statusLine hook body: on every render, tee the two budgets to `usage.json`
 /// (the loop's budget read path) and print a compact mode + budget line.
-fn statusline_script(usage: &Path) -> String {
+///
+/// Slice 009 S9: the snapshot is tagged with the slot derived from
+/// `CLAUDE_CONFIG_DIR` (a store path gives `<slot>`, unset gives `home`), and
+/// a copy is teed into the per-profile file `usage.by-profile/<slot>.json` —
+/// which is the write that makes the budget picker's per-profile
+/// vouchable-pct path live for an interactive session.
+///
+/// Slice 009 S8 (statusline half): the SHARED `usage.json` is only written
+/// when the session's slot matches the active-pointer slot. A session against
+/// an inactive slot leaves no mark on the shared file, so §2b on an active
+/// slot cannot halt on another slot's reading. The active-pointer path is
+/// baked in at launch; a session that outlives a `claude-login use` keeps
+/// writing to the per-profile file either way, so no slot's reading is lost.
+fn statusline_script(usage: &Path, by_profile_dir: &Path, active_link: &Path) -> String {
     const TPL: &str = r#"#!/usr/bin/env bash
 # GENERATED by `softfig growlight start` — do not edit (refreshed each launch).
 # statusLine hook: tee the two budgets to usage.json (spec-growlight.md §6, the
 # loop's budget read path) and print a compact mode + budget line.
 set -u
 input=$(cat)
+# Slice 009 S9: derive the slot from CLAUDE_CONFIG_DIR — a store path gives
+# <slot>, unset gives "home" (the fallback slot). The slot tags every snapshot
+# and names the per-profile file, so the picker's per-profile vouchable-pct
+# path is live for this session.
+slot=home
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    slot=$(basename -- "$CLAUDE_CONFIG_DIR")
+fi
 # Claude Code derives context_window.used_percentage from a cumulative token
 # total over the window, so it can exceed 100 in a long session. Clamp it to a
 # sane 0..100 the governor can trust (spec-growlight.md §6) BEFORE teeing — but
 # only when it is actually a number, so a missing % stays absent (never coerced
 # to a false 0), and keep remaining_percentage consistent with the clamp.
-printf '%s' "$input" | jq '
+snap=$(printf '%s' "$input" | jq --arg profile "$slot" '
   (if (.context_window.used_percentage | type) == "number" then
         .context_window.used_percentage |= ([., 100] | min) | .context_window.used_percentage |= ([., 0] | max)
       | .context_window.remaining_percentage = (100 - .context_window.used_percentage)
    else . end)
-  | {context_window, rate_limits, ts: now}' > @USAGE@ 2>/dev/null || true
+  | {context_window, rate_limits, ts: now, profile: $profile}' 2>/dev/null) || snap=
+if [ -n "$snap" ]; then
+    # Slice 009 S9: per-profile tee. The dir rides the same runtime grant as
+    # usage.json, so a member's permission floor already covers it.
+    mkdir -p @BY_PROFILE_DIR@ 2>/dev/null || true
+    printf '%s' "$snap" > @BY_PROFILE_DIR@/"$slot".json 2>/dev/null || true
+    # Slice 009 S8: the shared usage.json holds the active slot ONLY. An
+    # inactive-slot session (e.g. one started before a `claude-login use`
+    # swap) tees to its per-profile file above and no further — the shared
+    # file never mixes accounts, and §2b on the active slot cannot halt on
+    # a stale sibling's reading.
+    active=home
+    if [ -L @ACTIVE_LINK@ ]; then
+        active=$(readlink @ACTIVE_LINK@ 2>/dev/null || echo home)
+    fi
+    if [ "$slot" = "$active" ]; then
+        printf '%s' "$snap" > @USAGE@ 2>/dev/null || true
+    fi
+fi
 ctx=$(printf '%s' "$input" | jq -r '([(.context_window.used_percentage // 0), 100] | min)' 2>/dev/null || echo 0)
 five=$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.used_percentage // 0' 2>/dev/null || echo 0)
 printf 'softfig-loop · ctx %s%% · 5h %s%%' "$ctx" "$five"
 "#;
     TPL.replace("@USAGE@", &shell_quote(usage))
+        .replace("@BY_PROFILE_DIR@", &shell_quote(by_profile_dir))
+        .replace("@ACTIVE_LINK@", &shell_quote(active_link))
 }
 
 /// The initial baton (spec §5). Seeded once; the loop rewrites it each handoff.
@@ -1241,7 +1679,7 @@ fn print_fleet_status(r: &FleetStatusReply) {
     } else {
         println!("agents:");
         for a in &r.agents {
-            println!("  {:<16} {:<12} {}", a.id, a.status, agent_accounting(a));
+            println!("{}", agent_row(a));
         }
     }
     // The parts the fleet is leaving for the human (task 068), with the skip reason
@@ -1255,6 +1693,18 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
         }
     }
+}
+
+/// One `agents:` row: id, status, the claude-login slot the member's last
+/// session ran on (claude-login-switcher slice 007; blank for opencode or a
+/// member not yet spawned), then [`agent_accounting`]. Pure over the reply.
+fn agent_row(a: &growlightd::AgentSummary) -> String {
+    let profile = a
+        .profile
+        .as_deref()
+        .map(|p| format!("profile={p}"))
+        .unwrap_or_default();
+    format!("  {:<16} {:<12} {:<16} {}", a.id, a.status, profile, agent_accounting(a))
 }
 
 /// The accounting half of an `agents:` row: which backend serves the member and —
@@ -2590,17 +3040,29 @@ mod tests {
         let s = inject_script(
             Path::new("/garden/growlight/protocol.md"),
             Path::new("/cfg/softfig/growlight/baton.md"),
+            Path::new("/opt/bin/softfig"),
+            Path::new("/garden"),
         );
         assert!(s.starts_with("#!/usr/bin/env bash"));
         assert!(s.contains("cat '/garden/growlight/protocol.md'"));
         assert!(s.contains("cat '/cfg/softfig/growlight/baton.md'"));
         // protocol injected before the baton.
         assert!(s.find("protocol.md").unwrap() < s.find("baton.md").unwrap());
+        // Task 064 review G64-7: the boot dirty-tree check runs on every boot,
+        // after the baton, and never fails the hook.
+        let check = "'/opt/bin/softfig' growlight boot-check --garden-root '/garden' \
+                     --baton '/cfg/softfig/growlight/baton.md' 2>/dev/null || true";
+        assert!(s.contains(check), "{s}");
+        assert!(s.find("cat '/cfg/softfig/growlight/baton.md'").unwrap() < s.find("boot-check").unwrap());
     }
 
     #[test]
     fn statusline_script_tees_both_budgets_to_usage_json() {
-        let s = statusline_script(Path::new("/cfg/softfig/growlight/usage.json"));
+        let s = statusline_script(
+            Path::new("/cfg/softfig/growlight/usage.json"),
+            Path::new("/cfg/softfig/growlight/usage.by-profile"),
+            Path::new("/d/claude-profiles/active"),
+        );
         assert!(s.starts_with("#!/usr/bin/env bash"));
         assert!(s.contains("> '/cfg/softfig/growlight/usage.json'"));
         assert!(s.contains("context_window"));
@@ -2609,12 +3071,37 @@ mod tests {
         // The tee must clamp a >100 used_percentage (spec §6) — see the
         // behavioral test below for the runtime proof.
         assert!(s.contains("used_percentage |= ([., 100] | min)"));
+        // Slice 009 S9: snapshot carries the slot tag + is teed to the
+        // per-profile file. The exact paths are baked at launch, so the
+        // script references both the profile tag JSON key and the dir.
+        assert!(s.contains("profile: $profile"), "snapshot tagged with slot: {s}");
+        assert!(
+            s.contains("'/cfg/softfig/growlight/usage.by-profile'"),
+            "per-profile dir baked in: {s}",
+        );
+        // Slice 009 S8: the shared file write is now guarded on slot==active.
+        assert!(s.contains("if [ \"$slot\" = \"$active\" ]; then"));
     }
 
     // Run the generated statusline through real jq+bash to prove the clamp.
     // Self-skips when jq is unavailable (the script can't write usage.json then
     // anyway — see the jq warning in `cmd_growlight`).
     fn run_statusline(input: &str) -> serde_json::Value {
+        // No CLAUDE_CONFIG_DIR, no active-link ⇒ slot = active = home, so the
+        // shared file is written exactly as before the switcher.
+        let (shared, _per_slot) = run_statusline_full(input, &[], None);
+        shared.expect("home slot's shared usage.json is always written")
+    }
+
+    /// Run the statusline against a controlled slot (`CLAUDE_CONFIG_DIR` env)
+    /// and an optional active-pointer link. Returns `(shared, per_slot_for_env)`
+    /// where `shared` is `None` when the slot-vs-active guard suppressed the
+    /// shared write.
+    fn run_statusline_full(
+        input: &str,
+        env: &[(&str, &str)],
+        active_link_target: Option<&str>,
+    ) -> (Option<serde_json::Value>, serde_json::Value) {
         let dir = std::env::temp_dir().join(format!(
             "softfig-statusline-{}-{:?}",
             std::process::id(),
@@ -2622,15 +3109,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let usage = dir.join("usage.json");
+        let by_profile_dir = dir.join("usage.by-profile");
+        let active_link = dir.join("active");
+        if let Some(target) = active_link_target {
+            std::os::unix::fs::symlink(target, &active_link).unwrap();
+        }
         let script = dir.join("statusline.sh");
-        std::fs::write(&script, statusline_script(&usage)).unwrap();
+        std::fs::write(
+            &script,
+            statusline_script(&usage, &by_profile_dir, &active_link),
+        )
+        .unwrap();
 
-        let mut child = std::process::Command::new("bash")
-            .arg(&script)
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script)
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(std::process::Stdio::null());
+        // Scrub CLAUDE_CONFIG_DIR by default so the host env can't leak in;
+        // explicit overrides below set it when the test wants an inactive slot.
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         use std::io::Write as _;
         child
             .stdin
@@ -2640,10 +3141,21 @@ mod tests {
             .unwrap();
         child.wait().unwrap();
 
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&usage).unwrap()).unwrap();
+        // Derive the slot the way the script does, so the test reads the same
+        // per-profile file the script wrote.
+        let slot = env
+            .iter()
+            .find(|(k, _)| *k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| std::path::Path::new(v).file_name().unwrap().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "home".to_string());
+        let per_slot_path = by_profile_dir.join(format!("{slot}.json"));
+        let per_slot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&per_slot_path).unwrap()).unwrap();
+        let shared = std::fs::read_to_string(&usage)
+            .ok()
+            .map(|raw| serde_json::from_str(&raw).unwrap());
         std::fs::remove_dir_all(&dir).ok();
-        v
+        (shared, per_slot)
     }
 
     #[test]
@@ -2673,6 +3185,68 @@ mod tests {
             v["context_window"]["used_percentage"].is_null(),
             "missing % must not be coerced to 0: {v}"
         );
+    }
+
+    #[test]
+    fn statusline_under_claude_config_dir_slot2_tees_to_slot2_json() {
+        // Slice 009 S9 finish-check: a session with CLAUDE_CONFIG_DIR pointing
+        // at <store>/slot2 derives slot=slot2, tags the snapshot with it, and
+        // writes to `usage.by-profile/slot2.json`.
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":12},"rate_limits":{"five_hour":{"used_percentage":37,"status":"allowed_warning"}}}"#;
+        // Active pointer names "slot1", so slot2 is INACTIVE and the shared
+        // file should NOT be written (slice 009 S8 half).
+        let (shared, per_slot) = run_statusline_full(
+            input,
+            &[("CLAUDE_CONFIG_DIR", "/some/store/slot2")],
+            Some("slot1"),
+        );
+        assert_eq!(
+            per_slot["profile"], "slot2",
+            "snapshot carries the slot tag: {per_slot}",
+        );
+        assert_eq!(per_slot["rate_limits"]["five_hour"]["status"], "allowed_warning");
+        assert!(
+            shared.is_none(),
+            "the shared usage.json is only written when slot == active (S8): {shared:?}",
+        );
+    }
+
+    #[test]
+    fn statusline_shared_write_fires_when_the_session_is_on_the_active_slot() {
+        // Slice 009 S8 counter-case: when CLAUDE_CONFIG_DIR's slot IS the
+        // active pointer's slot, the shared file writes normally — this is
+        // the common everyday case (one slot, interactive).
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":10,"status":"allowed"}}}"#;
+        let (shared, per_slot) = run_statusline_full(
+            input,
+            &[("CLAUDE_CONFIG_DIR", "/some/store/slot1")],
+            Some("slot1"),
+        );
+        let shared = shared.expect("slot == active ⇒ shared is written");
+        assert_eq!(shared["profile"], "slot1");
+        assert_eq!(per_slot["profile"], "slot1");
+        assert_eq!(shared["rate_limits"]["five_hour"]["status"], "allowed");
+    }
+
+    #[test]
+    fn statusline_home_slot_without_an_active_link_still_writes_the_shared_file() {
+        // Back-compat: a human not using the switcher has no store, no active
+        // link, CLAUDE_CONFIG_DIR unset. slot = active = home ⇒ the shared
+        // file is written exactly as before slice 009 landed.
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":1,"status":"allowed"}}}"#;
+        let (shared, per_slot) = run_statusline_full(input, &[], None);
+        let shared = shared.expect("home slot's shared file is always written");
+        assert_eq!(shared["profile"], "home");
+        assert_eq!(per_slot["profile"], "home");
     }
 
     #[test]
@@ -3149,6 +3723,7 @@ mod tests {
             garden_root: garden,
             opencode_config: Path::new("/rt/opencode.json"),
             boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
         };
 
         for choice in [
@@ -3156,7 +3731,7 @@ mod tests {
             ModelChoice::opencode(DEEPSEEK_FLASH),
         ] {
             let hint = no_launch_hint(&choice, &launch);
-            let cwd = interactive_command(choice.backend, &launch)
+            let cwd = interactive_command(choice.backend, &launch, &choice.claude_argv())
                 .unwrap()
                 .get_current_dir()
                 .map(Path::to_path_buf)
@@ -3179,7 +3754,7 @@ mod tests {
         // pasted command attaches to the shared service, which ignores
         // OPENCODE_CONFIG (slice 001 finding 1). The hint's argv is the launch's
         // argv minus the trailing `--prompt <kick>`, which the human types instead.
-        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch)
+        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch, &[])
             .unwrap()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -3203,6 +3778,77 @@ mod tests {
         assert!(claude.contains("--settings /rt/loop.json"));
         assert!(claude.contains("--mcp-config /rt/mcp.json"));
         assert!(!claude.contains("OPENCODE_CONFIG"));
+    }
+
+    /// claude-login-switcher slice 007 finish-check: `growlight start --profile
+    /// slot2 --no-launch` prints a hint that carries `CLAUDE_CONFIG_DIR`, with
+    /// the claude argv otherwise unchanged; `home` unsets it.
+    #[test]
+    fn the_no_launch_hint_carries_the_claude_login_slot() {
+        let launch_on = |slot: Option<&LaunchSlot>| -> String {
+            let launch = InteractiveLaunch {
+                agent_name: AGENT_NAME,
+                loop_settings: Path::new("/rt/loop.json"),
+                mcp_config: Path::new("/rt/mcp.json"),
+                garden_root: Path::new("/g"),
+                opencode_config: Path::new("/rt/opencode.json"),
+                boot_prompt: OPENCODE_KICK,
+                claude_slot: slot,
+            };
+            no_launch_hint(&ModelChoice::claude(), &launch)
+        };
+        let argv = format!("{AGENT_BIN} --name {AGENT_NAME} --settings /rt/loop.json --mcp-config /rt/mcp.json");
+
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        std::fs::create_dir(store.join("slot2")).unwrap();
+        let creds = store.join("slot2").join(claude_profiles::CREDENTIALS_FILE);
+        std::fs::write(&creds, "{}").unwrap();
+        std::fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        let slot2 = resolve_launch_slot(Some(store), Some("slot2")).unwrap();
+        let hint = launch_on(Some(&slot2));
+        assert!(
+            hint.ends_with(&format!(
+                "cd /g && env CLAUDE_CONFIG_DIR={} {argv}",
+                store.join("slot2").display()
+            )),
+            "{hint}"
+        );
+        assert!(hint.contains("(claude-login slot slot2)"), "{hint}");
+
+        let home = resolve_launch_slot(Some(store), Some("home")).unwrap();
+        assert!(launch_on(Some(&home)).ends_with(&format!("cd /g && env -u CLAUDE_CONFIG_DIR {argv}")));
+        assert!(launch_on(None).ends_with(&format!("cd /g && {argv}")), "no slot ⇒ the old hint");
+    }
+
+    #[test]
+    fn the_launch_slot_defaults_to_active_and_fails_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        // No pointer ⇒ home; no store at all ⇒ home too, but a named slot needs one.
+        assert_eq!(resolve_launch_slot(Some(store), None).unwrap().name, "home");
+        assert_eq!(resolve_launch_slot(None, None).unwrap().dir, claude_profiles::SlotDir::Home);
+        assert!(resolve_launch_slot(None, Some("slot1")).is_err());
+
+        // A slot with no credential is refused by name, whether named or active.
+        std::fs::create_dir(store.join("slot1")).unwrap();
+        let err = resolve_launch_slot(Some(store), Some("slot1")).unwrap_err().to_string();
+        assert!(err.contains("\"slot1\"") && err.contains("not logged in"), "{err}");
+        std::os::unix::fs::symlink("slot1", store.join(claude_profiles::ACTIVE_LINK)).unwrap();
+        assert!(resolve_launch_slot(Some(store), None).is_err());
+        assert!(resolve_launch_slot(Some(store), Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn an_agents_row_shows_the_claude_login_slot() {
+        use softfig_ipc::growlightd::AgentSummary;
+        let row = agent_row(&AgentSummary::new("a", "running", true).with_profile(Some("slot2".into())));
+        assert!(row.contains(" profile=slot2 "), "{row:?}");
+        assert!(row.ends_with("claude"), "{row:?}");
+        let bare = agent_row(&AgentSummary::new("oc", "idle", false));
+        assert!(!bare.contains("profile="), "{bare:?}");
+        // The accounting column starts at the same offset either way.
+        assert_eq!(row.find("claude"), bare.find("claude"));
     }
 
     #[test]
@@ -3243,6 +3889,13 @@ mod tests {
         assert!(start(&["g", "start", "--model", "flash", "--opencode"]).is_err());
         assert!(start(&["g", "start", "--model", "claude", "--backend", "claude"]).is_err());
         assert!(start(&["g", "start", "--opencode", "--backend", "claude"]).is_err());
+
+        // claude-login-switcher slice 007: `--profile` names the slot.
+        assert_eq!(bare.profile, None, "default = the store's active slot");
+        assert_eq!(
+            start(&["g", "start", "--profile", "slot2", "--no-launch"]).unwrap().profile.as_deref(),
+            Some("slot2")
+        );
     }
 
     /// A garden with one milestone (slices + CLAUDE.md) and one task, plus a
@@ -3312,6 +3965,175 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    // The workspace's one test `git` helper (review 043 G64-4): it carries a
+    // throwaway identity, so the commit below passes on a CI runner too.
+    use softfig_ipc::testing::git as run_git;
+
+    /// Backdate a file's mtime to 2000-01-01, so a later tree edit is provably
+    /// NEWER than the baton it is compared against (the boot guard's whole test).
+    fn backdate_mtime(path: &Path) {
+        let out = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2000-01-01T00:00:00")
+            .arg(path)
+            .output()
+            .expect("run touch");
+        assert!(out.status.success(), "touch failed");
+    }
+
+    /// TASK 064 — the CLI boot dirty-tree guard surfaces an item repo left dirty
+    /// AND newer than the root baton's last handoff, and stays silent for a
+    /// clean tree / a missing item / a baton with no active item. Read-only:
+    /// nothing is reverted/staged/committed — the only observable effect is the
+    /// returned journal line.
+    #[test]
+    fn boot_dirty_check_surfaces_a_dirty_tree_newer_than_the_baton() {
+        let root = unique_tmp("boot-dirty");
+        let _ = fs::remove_dir_all(&root);
+        let tasks = root.join(PILLAR).join("backlog").join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        // A real repo: one committed base file.
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        fs::write(
+            tasks.join("200-a-task.md"),
+            format!("# Task\n\n> Worktree: {}\n", repo.display()),
+        )
+        .unwrap();
+        let baton = root.join("baton.md");
+
+        // No active item -> no signal.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: null\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
+
+        // A baton naming the item, backdated before the tree's last edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 200\n---\n").unwrap();
+        backdate_mtime(&baton);
+        // Clean tree -> no signal.
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
+
+        // Leave one uncommitted edit, newer than the (backdated) baton.
+        fs::write(repo.join("a.txt"), "dirty\n").unwrap();
+        let line = boot_dirty_check(&root, &baton, false)
+            .expect("a dirty tree newer than the baton handoff surfaces");
+        assert!(line.contains("200"), "names the item: {line}");
+        assert!(
+            line.contains(&repo.display().to_string()),
+            "names the repo: {line}"
+        );
+        assert!(line.contains("1 uncommitted path"), "names the count: {line}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review 043 G64-3: a semi-auto item in a named queue whose doc names no
+    /// `> Worktree:` resolves through the queue's `## Queues` registry cell, the
+    /// way growlightd's repo probe resolves it — the fid shape that started
+    /// task 064. A slice doc's `> Worktree:` is not the item's (growlightd never
+    /// reads it), so it does not count.
+    #[test]
+    fn boot_dirty_check_resolves_a_named_queue_item_through_the_registry() {
+        let root = unique_tmp("boot-dirty-registry");
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let milestone = backlog.join("milestones").join("fid-pam");
+        fs::create_dir_all(milestone.join("slices")).unwrap();
+        let repo = root.join("fid-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("gate.rs"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let region = |tag: &str, body: &str| format!("<!-- softfig:{tag} -->\n\n{body}\n\n<!-- /softfig:{tag} -->");
+        let items = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                     | 1 | fid-pam | milestone | P3 | active |";
+        fs::write(
+            backlog.join("CLAUDE.md"),
+            format!(
+                "# backlog\n\n{}\n\n{}\n\n{}\n",
+                region("queue", "| # | id | type | title | status |\n|---|----|------|-------|--------|"),
+                region("queues", &format!("| queue | repo |\n|---|---|\n| fid | {} |", repo.display())),
+                region("queue:fid", items),
+            ),
+        )
+        .unwrap();
+        fs::write(milestone.join("CLAUDE.md"), "# fid-pam\n\n> Model: claude\n").unwrap();
+        fs::write(milestone.join("slices").join("001-probes.md"), "# probes\n\n> Worktree: /nowhere\n")
+            .unwrap();
+
+        let baton = root.join("baton.md");
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\nslice: 001\n---\n").unwrap();
+        backdate_mtime(&baton);
+        fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
+
+        let line = boot_dirty_check(&root, &baton, false).expect("the registry names the fid repo");
+        assert!(line.contains(&repo.display().to_string()), "names the registry's repo: {line}");
+
+        // Review 043 G64-2: a baton `start` just seeded has no handoff, so the
+        // dirt surfaces even though the seed's mtime is newer than every edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "a just-written carried baton is newer");
+        let fresh = boot_dirty_check(&root, &baton, true).expect("a fresh seed surfaces any dirt");
+        assert!(fresh.contains("fresh"), "{fresh}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Reviews 042 G74-2 / G74-4 meet 043 G64-3: an item doc growlightd's
+    /// reader refuses (a shadow `<id>-*.md` beside the real one, or a sealed
+    /// region that could hide a `> Worktree:`) gives the CLI no repo signal
+    /// either. Before the merge fix-up the CLI read "two docs" as "no doc" and
+    /// fell through to the registry cell, naming a repo growlightd never would.
+    #[test]
+    fn boot_dirty_check_gives_no_signal_for_a_doc_growlightd_refuses() {
+        let root = unique_tmp("boot-dirty-refused");
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let tasks = backlog.join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let repo = root.join("fid-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("gate.rs"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let region = |tag: &str, body: &str| format!("<!-- softfig:{tag} -->\n\n{body}\n\n<!-- /softfig:{tag} -->");
+        let items = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                     | 1 | 201 | task | gate | active |";
+        fs::write(
+            backlog.join("CLAUDE.md"),
+            format!(
+                "# backlog\n\n{}\n\n{}\n\n{}\n",
+                region("queue", "| # | id | type | title | status |\n|---|----|------|-------|--------|"),
+                region("queues", &format!("| queue | repo |\n|---|---|\n| fid | {} |", repo.display())),
+                region("queue:fid", items),
+            ),
+        )
+        .unwrap();
+        fs::write(tasks.join("201-gate.md"), "# gate\n").unwrap();
+
+        let baton = root.join("baton.md");
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 201\n---\n").unwrap();
+        backdate_mtime(&baton);
+        fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_some(), "one readable doc: the registry repo");
+
+        fs::write(tasks.join("201-shadow.md"), "# shadow\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "two docs for 201: no signal");
+
+        fs::remove_file(tasks.join("201-shadow.md")).unwrap();
+        fs::write(tasks.join("201-gate.md"), "# gate\n\n<vault id=\"w\">[encrypted]</vault>\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "a sealed region: no signal");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -4099,5 +4921,320 @@ mod tests {
         handle.shutdown();
         handle.join().unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- slice 002: launch argv, picker, extras, auto resolution ---------
+
+    /// claude-model-select slice 002 argv check: `claude` on the harness
+    /// default is byte-identical to today, `claude:opus` becomes
+    /// `--model opus`, and `claude:claude-opus-4-7 effort=high` becomes
+    /// `--model claude-opus-4-7 --effort high`. Together with
+    /// `claude_interactive_command_is_the_hardwired_argv_rooted_at_the_garden`
+    /// in `growlight_backend` (the no-model case), this covers the finish-check
+    /// matrix for argv construction.
+    #[test]
+    fn slice_002_claude_argv_covers_default_alias_and_full_id_with_effort() {
+        use std::ffi::OsString;
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/g"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
+        };
+        let argv_of = |choice: &ModelChoice| -> Vec<String> {
+            interactive_command(choice.backend, &launch, &choice.claude_argv())
+                .unwrap()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Harness default: no `--model`/`--effort` tail at all.
+        let default = argv_of(&ModelChoice::claude());
+        assert_eq!(
+            default,
+            vec![
+                "--name".to_string(),
+                AGENT_NAME.to_string(),
+                "--settings".to_string(),
+                "/rt/loop.json".to_string(),
+                "--mcp-config".to_string(),
+                "/rt/mcp.json".to_string(),
+            ],
+            "the harness default argv must be byte-identical to the pre-slice-002 invocation",
+        );
+
+        // Alias: `claude:opus` → `--model opus`.
+        let opus = match parse_model_spec("claude:opus").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("`claude:opus` must not resolve to auto"),
+        };
+        assert_eq!(
+            argv_of(&opus).into_iter().rev().take(2).collect::<Vec<_>>(),
+            vec!["opus".to_string(), "--model".to_string()],
+            "claude:opus must land on `--model opus`",
+        );
+        // ... and never leaks an `--effort` when none was declared.
+        assert!(!argv_of(&opus).iter().any(|a| a == "--effort"));
+
+        // Full id + closed-set effort: `claude:claude-opus-4-7 effort=high`
+        // → `--model claude-opus-4-7 --effort high`.
+        let full = match parse_model_spec("claude:claude-opus-4-7 effort=high").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("not auto"),
+        };
+        let full_argv = argv_of(&full);
+        let tail: Vec<OsString> = full_argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--model")
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                OsString::from("--model"),
+                OsString::from("claude-opus-4-7"),
+                OsString::from("--effort"),
+                OsString::from("high"),
+            ],
+            "argv tail for a declared model + effort",
+        );
+    }
+
+    /// The picker's number mapping is pure: `1`/Enter is the harness default,
+    /// `2..=5` are the aliases in menu order, `6..` are the extras in the
+    /// order the dedup produced, and `r`/`f`/`a` take DeepSeek + auto. A key
+    /// outside the menu returns `None` so the caller tries a typed spec.
+    #[test]
+    fn slice_002_picker_number_mapping_covers_aliases_and_extras() {
+        let extras = vec!["claude-opus-4-7".to_string(), "claude-fable-5-1[1m]".to_string()];
+
+        // Enter and `1` both resolve to the harness default (muscle memory).
+        for key in ["", "1"] {
+            match picker_fixed_choice(key, &extras).unwrap().unwrap() {
+                ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+                ModelSpec::Auto => panic!("`{key}` must not resolve to auto"),
+            }
+        }
+
+        // 2..=5 → opus/sonnet/haiku/fable, in menu order.
+        for (n, alias) in ["2", "3", "4", "5"].iter().zip(CLAUDE_PICKER_ALIASES) {
+            match picker_fixed_choice(n, &extras).unwrap().unwrap() {
+                ModelSpec::Fixed(c) => assert_eq!(
+                    c,
+                    ModelChoice::claude_on(Some((*alias).to_string()), None),
+                    "`{n}` must map to `claude:{alias}`",
+                ),
+                ModelSpec::Auto => panic!("`{n}` must not resolve to auto"),
+            }
+        }
+
+        // 6/7 are the two extras — same identity as a typed `claude:<extra>`
+        // (validated through `parse_model_spec`).
+        let typed6 = match parse_model_spec("claude:claude-opus-4-7").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => unreachable!(),
+        };
+        match picker_fixed_choice("6", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, typed6),
+            ModelSpec::Auto => panic!(),
+        }
+        let typed7 = match parse_model_spec("claude:claude-fable-5-1[1m]").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => unreachable!(),
+        };
+        match picker_fixed_choice("7", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, typed7),
+            ModelSpec::Auto => panic!(),
+        }
+
+        // Letter keys cover opencode + auto.
+        match picker_fixed_choice("r", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::opencode(DEEPSEEK_REASONING)),
+            ModelSpec::Auto => panic!(),
+        }
+        match picker_fixed_choice("f", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::opencode(DEEPSEEK_FLASH)),
+            ModelSpec::Auto => panic!(),
+        }
+        match picker_fixed_choice("a", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(_) => panic!("`a` is let-growlight-decide"),
+            ModelSpec::Auto => {}
+        }
+
+        // Out-of-range numbers and arbitrary words aren't menu keys — the
+        // caller must try the typed-spec path, not refuse the launch.
+        assert!(picker_fixed_choice("8", &extras).unwrap().is_none());
+        assert!(picker_fixed_choice("99", &extras).unwrap().is_none());
+        assert!(picker_fixed_choice("claude:opus", &extras).unwrap().is_none());
+    }
+
+    /// The picker stdin seam carries typed specs through the shared grammar;
+    /// an unparseable one re-prompts rather than fails the launch.
+    #[test]
+    fn slice_002_picker_typed_spec_through_shared_grammar_and_reprompts() {
+        // Typed `claude:opus` resolves to the same choice the number row does.
+        let mut r = std::io::Cursor::new(b"claude:opus\n".to_vec());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => {
+                assert_eq!(c, ModelChoice::claude_on(Some("opus".to_string()), None))
+            }
+            ModelSpec::Auto => panic!("typed `claude:opus` must not be auto"),
+        }
+
+        // A bad spec re-prompts; the second line is a good one.
+        let mut r = std::io::Cursor::new(b"not-a-model\nclaude\n".to_vec());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+            ModelSpec::Auto => panic!(),
+        }
+
+        // EOF (closed stdin mid-run) falls back to the harness default rather
+        // than looping — the same posture as the pre-slice-002 picker.
+        let mut r = std::io::Cursor::new(Vec::new());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+            ModelSpec::Auto => panic!(),
+        }
+    }
+
+    /// `claude_picker_extras` orders .claude.json first, then growlight.toml,
+    /// first-wins dedup across the two sources, and drops entries that
+    /// duplicate a built-in alias row.
+    #[test]
+    fn slice_002_claude_picker_extras_order_and_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join(".claude.json");
+        // One real id, one duplicate of a built-in alias (must be dropped), one
+        // id that growlight.toml will also list (first-wins dedup).
+        fs::write(
+            &claude_json,
+            r#"{"additionalModelOptionsCache":[
+                {"value":"claude-opus-4-7"},
+                {"value":"opus"},
+                {"value":"claude-fable-5-1[1m]"}
+            ]}"#,
+        )
+        .unwrap();
+        let growlight = dir.path().join("growlight.toml");
+        // Overlaps `claude-opus-4-7` (dropped by dedup since .claude.json wins
+        // on order) and adds a new id.
+        fs::write(
+            &growlight,
+            "[claude]\nmodels = [\"claude-opus-4-7\", \"claude-sonnet-5-5\"]\n",
+        )
+        .unwrap();
+
+        let extras = claude_picker_extras(Some(&claude_json), Some(&growlight));
+        assert_eq!(
+            extras,
+            vec![
+                "claude-opus-4-7".to_string(),
+                "claude-fable-5-1[1m]".to_string(),
+                "claude-sonnet-5-5".to_string(),
+            ],
+        );
+    }
+
+    /// The .claude.json reader is best-effort: an absent file, malformed JSON,
+    /// and a missing/wrong-shaped key all yield an empty list rather than
+    /// failing the launch.
+    #[test]
+    fn slice_002_read_claude_json_models_is_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absent file → empty.
+        let missing = dir.path().join("none.json");
+        assert!(read_claude_json_models(&missing).is_empty());
+
+        // Malformed JSON → empty, no panic.
+        let bad = dir.path().join("bad.json");
+        fs::write(&bad, b"this is not json").unwrap();
+        assert!(read_claude_json_models(&bad).is_empty());
+
+        // Missing key → empty.
+        let no_key = dir.path().join("no-key.json");
+        fs::write(&no_key, b"{\"other\": []}").unwrap();
+        assert!(read_claude_json_models(&no_key).is_empty());
+
+        // Normal list → entries, in file order; non-string / missing-value
+        // entries are quietly skipped.
+        let good = dir.path().join("good.json");
+        fs::write(
+            &good,
+            r#"{"additionalModelOptionsCache":[
+                {"value":"claude-opus-4-7","label":"Opus"},
+                {"label":"no value"},
+                {"value":""},
+                {"value":"claude-fable-5-1[1m]"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_claude_json_models(&good),
+            vec![
+                "claude-opus-4-7".to_string(),
+                "claude-fable-5-1[1m]".to_string()
+            ],
+        );
+    }
+
+    /// A slice doc's `> Model: claude:claude-opus-4-7` overrides a milestone's
+    /// `> Model: claude` under the `--model auto` path — the finish-check for
+    /// "`auto` honours a `claude:` declaration".
+    #[test]
+    fn slice_002_auto_resolution_slice_claude_id_overrides_milestone_claude() {
+        let docs = [
+            ("005-pick-opus.md", Some("> Model: claude:claude-opus-4-7\n")),
+            ("CLAUDE.md", Some("> Model: claude\n")),
+        ];
+        let resolved = resolve_item_models(docs).unwrap().unwrap();
+        assert_eq!(resolved.origin, "005-pick-opus.md");
+        let first = resolved.list.first().clone();
+        assert_eq!(first.backend, Backend::Claude);
+        assert_eq!(first.model.as_deref(), Some("claude-opus-4-7"));
+        // Resolved choice → `--model claude-opus-4-7` on the spawn argv.
+        assert_eq!(
+            first.claude_argv(),
+            vec!["--model".to_string(), "claude-opus-4-7".to_string()],
+        );
+    }
+
+    /// `--no-launch` hint carries the `--model <m>` tail when the choice names
+    /// one; a bare `claude` keeps the old settings-pair-only hint byte-identical.
+    #[test]
+    fn slice_002_no_launch_hint_names_the_model() {
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/g"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
+        };
+        let bare = no_launch_hint(&ModelChoice::claude(), &launch);
+        assert!(!bare.contains("--model"));
+        assert!(!bare.contains("--effort"));
+
+        let opus = ModelChoice::claude_on(Some("opus".to_string()), None);
+        let hint = no_launch_hint(&opus, &launch);
+        assert!(
+            hint.contains("--mcp-config /rt/mcp.json --model opus"),
+            "hint carries --model after --mcp-config: {hint}",
+        );
+
+        let o47h = ModelChoice::claude_on(
+            Some("claude-opus-4-7".to_string()),
+            Some("high".to_string()),
+        );
+        let hint = no_launch_hint(&o47h, &launch);
+        assert!(
+            hint.ends_with("--model claude-opus-4-7 --effort high"),
+            "hint tail: {hint}",
+        );
     }
 }
