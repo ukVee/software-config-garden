@@ -2676,6 +2676,13 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         } else {
             e.after.join(", ")
         };
+        // A human-only entry (`fleet = false`, spec §2 Holds) says so beside its
+        // status: the fleet leaves it for the human, whatever the status reads.
+        let status = if e.fleet {
+            e.status.to_string()
+        } else {
+            format!("{} (human-only)", e.status)
+        };
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -2684,7 +2691,7 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
             cell(&e.title),
             cell(&e.project),
             cell(&e.lane.to_string()),
-            cell(&e.status.to_string()),
+            cell(&status),
             cell(&after),
             cell(&e.branch),
             cell(&e.base),
@@ -4578,6 +4585,15 @@ mod tests {
         let piped_body = render_queue_show(&QueueToml::new(vec![], vec![piped]));
         assert!(piped_body.contains("a \\| b"), "{piped_body}");
         assert!(piped_body.contains("p\\|1"), "{piped_body}");
+        // A human-only entry is marked beside its status (queue-v2-parity
+        // slice 002); a fleet entry's status cell stays bare, as above.
+        let mut human = e("h1", Lane::Normal, "", "");
+        human.fleet = false;
+        let human_body = render_queue_show(&QueueToml::new(vec![], vec![human]));
+        assert!(
+            human_body.contains("| h1 | milestone | h1 title | softfig | normal | queued (human-only) |"),
+            "{human_body}"
+        );
     }
 
     // The e2e fixture: a REAL keeperd on a temp garden (no FUSE, no watcher,

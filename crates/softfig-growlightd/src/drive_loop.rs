@@ -2544,6 +2544,23 @@ impl DriveLoop {
                         .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
                 });
                 apply_v2_overlay(snapshot, &self.v2_overlay());
+                // Publish the v2 holds to `growlight status` (parity row 2): the
+                // same `held` list the legacy pass fills, read off the one hold
+                // rule `pick_v2` applies. It replaces the whole list, so a hold
+                // the human lifted (or a legacy list from before a mode flip)
+                // drops at the next good read.
+                self.daemon.record_held_parts(
+                    scheduler_v2::held_entries(snapshot)
+                        .into_iter()
+                        .filter_map(|(entry, reason)| {
+                            Some(softfig_ipc::growlightd::HeldPartSummary {
+                                queue: entry.project.clone(),
+                                part: entry.id.clone(),
+                                reason: reason.hold_label()?.to_string(),
+                            })
+                        })
+                        .collect(),
+                );
 
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
@@ -9218,6 +9235,60 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "a2 is held, naming itself: {:?}",
             second.held_fresh,
         );
+    }
+
+    /// Queue-v2-parity slice 002, row 2: a `fleet = false` entry shows under
+    /// `growlight status`'s `held:` in v2 mode, from the same hold rule the pick
+    /// applies. The v2 list replaces whatever was there (a legacy list from
+    /// before a mode flip), and lifting the hold drops the row at the next read.
+    #[test]
+    fn v2_mode_status_lists_a_human_only_entry_until_the_hold_is_lifted() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-held-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let human_only = |status| {
+            let mut snapshot = v2_milestone("m1", status, "001", None);
+            snapshot.entries[0].fleet = false;
+            snapshot
+        };
+        let source = FakeV2Source::with(human_only(EntryStatus::Queued));
+        let (mut loop_, d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+        d.record_held_parts(vec![softfig_ipc::growlightd::HeldPartSummary {
+            queue: "default".into(),
+            part: "stale".into(),
+            reason: "human-only (> Fleet: no)".into(),
+        }]);
+
+        assert!(loop_.tick(0).v2_started.is_empty(), "a1 never claims m1");
+        assert_eq!(
+            held(&d),
+            vec![softfig_ipc::growlightd::HeldPartSummary {
+                queue: "softfig".into(),
+                part: "m1".into(),
+                reason: "human-only (fleet = false)".into(),
+            }],
+            "m1 is listed, and the legacy row is gone",
+        );
+
+        // A `blocked` entry is not a hold: it is ineligible on its status.
+        source.set(human_only(EntryStatus::Blocked));
+        loop_.tick(1);
+        assert_eq!(held(&d), vec![], "a blocked entry is not listed as held");
+
+        // The owner lifts the hold: the row drops and a1 takes the entry.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        assert_eq!(loop_.tick(2).v2_started.len(), 1, "a1 claims the freed m1");
+        assert_eq!(held(&d), vec![], "nothing is held any more");
     }
 
     /// Review R1 — a growlightd restart: the new loop has no v2 assignments, the

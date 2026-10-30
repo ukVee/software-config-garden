@@ -216,6 +216,16 @@ impl SkipReason {
         }
     }
 
+    /// How `growlight status` lists a hold under `held:`, beside the legacy
+    /// pass's `human-only (> Fleet: no)`. `None` for every reason that is not
+    /// a §2 hold, which is what makes a reason a hold.
+    pub fn hold_label(self) -> Option<&'static str> {
+        match self {
+            SkipReason::HumanOnly => Some("human-only (fleet = false)"),
+            _ => None,
+        }
+    }
+
     /// What the reason means, for a reader of `queue pick`.
     pub fn describe(self) -> &'static str {
         match self {
@@ -368,6 +378,36 @@ fn walk_tree(snapshot: &V2Snapshot, milestone: &str) -> WalkOutcome {
     }
 }
 
+/// §2 clause 1: only a `queued`, `active` or `paused` entry is ever eligible.
+fn status_eligible(entry: &EntryView) -> bool {
+    matches!(
+        entry.status,
+        EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
+    )
+}
+
+/// The §2 **Holds**, which depend on the entry alone, never on the member. A
+/// human-only entry is never claimed, and never resumed while no live member
+/// holds it — so `queued`, `paused` and an orphaned `active` entry are all held
+/// (report 086). Only an `active` entry a live member still holds runs on, to
+/// its next handshake; whether *this* member is that holder is clause 4's call.
+fn hold(entry: &EntryView) -> Option<SkipReason> {
+    let live_held = entry.status == EntryStatus::Active && entry.holder.is_some();
+    (!entry.fleet && !live_held).then_some(SkipReason::HumanOnly)
+}
+
+/// Every status-eligible entry a §2 hold keeps from every member, in file
+/// order: what `growlight status` lists under `held:`. The same two checks
+/// `eligible` opens with, so the list and the pick can't disagree.
+pub fn held_entries(snapshot: &V2Snapshot) -> Vec<(&EntryView, SkipReason)> {
+    snapshot
+        .entries
+        .iter()
+        .filter(|entry| status_eligible(entry))
+        .filter_map(|entry| hold(entry).map(|reason| (entry, reason)))
+        .collect()
+}
+
 /// §2 eligibility for a member taking an entry: the conjunction of every
 /// clause, checked in the spec's order, with the first failure as the skip
 /// reason. On success the next unit and its declared model list come back
@@ -378,20 +418,12 @@ pub fn eligible(
     entry: &EntryView,
 ) -> Result<(Unit, Option<ModelList>), SkipReason> {
     // 1. Status.
-    if !matches!(
-        entry.status,
-        EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
-    ) {
+    if !status_eligible(entry) {
         return Err(SkipReason::NotEligible);
     }
-    // Holds (§2), right after the status clause. A human-only entry is never
-    // claimed, and never resumed while no live member holds it — so `queued`,
-    // `paused` and an orphaned `active` entry are all held (report 086). Only
-    // an `active` entry a live member still holds runs on, to its next
-    // handshake; whether *this* member is that holder is clause 4's call.
-    let live_held = entry.status == EntryStatus::Active && entry.holder.is_some();
-    if !entry.fleet && !live_held {
-        return Err(SkipReason::HumanOnly);
+    // Holds (§2), right after the status clause.
+    if let Some(reason) = hold(entry) {
+        return Err(reason);
     }
     // 2. `after` links: every listed id is archived `done`. A `dropped` id is
     // simply absent from `done_ids`, so it never satisfies (§2).
@@ -1126,6 +1158,38 @@ mod tests {
         );
         let outcome = pick_v2(&snapshot, &member("alice"));
         assert_eq!(outcome.picked.map(|p| p.entry), Some("e".to_string()));
+        // So `growlight status` doesn't list it as held either.
+        assert!(held_entries(&snapshot).is_empty());
+    }
+
+    /// `growlight status`'s v2 `held:` list (slice 002, row 2): exactly the
+    /// status-eligible entries the hold keeps from every member, in file order,
+    /// each labelled. A `deferred` human-only entry is ineligible on status, not
+    /// held; a fleet entry is never held.
+    #[test]
+    fn held_entries_lists_each_held_entry_in_file_order() {
+        let human_only = |id: &str, status| {
+            let mut e = entry(id);
+            e.status = status;
+            e.fleet = false;
+            e
+        };
+        let snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![
+                human_only("paused", EntryStatus::Paused),
+                entry("free"),
+                human_only("parked", EntryStatus::Deferred),
+                human_only("queued", EntryStatus::Queued),
+            ],
+        );
+        let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+            .into_iter()
+            .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+            .collect();
+        let label = Some("human-only (fleet = false)");
+        assert_eq!(held, vec![("paused", label), ("queued", label)]);
+        assert_eq!(SkipReason::Held.hold_label(), None, "not every skip is a hold");
     }
 
     #[test]
