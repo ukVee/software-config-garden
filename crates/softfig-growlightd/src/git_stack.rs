@@ -130,22 +130,26 @@ impl Git {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
-    /// `git rev-parse --abbrev-ref <branch>@{upstream}`: does `branch` track
-    /// an upstream? `true` when git resolves it (exit 0), `false` when git
-    /// reports none (exit 128 — a branch with no upstream, or no such branch),
-    /// and an error on anything else (a bad repo, a timeout).
+    /// `git for-each-ref --format=%(upstream) refs/heads/<branch>`: does
+    /// `branch` track an upstream? The answer is the *output*: a non-empty
+    /// upstream ref means yes, empty output means a local-only branch. Any
+    /// non-zero exit is an error, never "no upstream" — the loop must not
+    /// rewrite a branch it could not prove local (`rev-parse @{upstream}` exits
+    /// 128 for "no upstream" and equally for "not a repo" or "dubious
+    /// ownership", which is why it is not used). An absent branch prints
+    /// nothing, so it reads as `false`; the callers only ask about branches
+    /// [`stack_candidates`] found.
     pub fn has_upstream(&self, branch: &str) -> Result<bool, GitError> {
-        let upstream = format!("{branch}@{{upstream}}");
-        let (status, _) = self.run(&["rev-parse", "--abbrev-ref", &upstream])?;
-        match status.code() {
-            Some(0) => Ok(true),
-            Some(128) => Ok(false),
-            _ => Err(GitError::Run {
-                cmd: "rev-parse --abbrev-ref <branch>@{upstream}".into(),
+        let full = format!("refs/heads/{branch}");
+        let (status, out) = self.run(&["for-each-ref", "--format=%(upstream)", &full])?;
+        if !status.success() {
+            return Err(GitError::Run {
+                cmd: "for-each-ref --format=%(upstream) refs/heads/<branch>".into(),
                 repo: self.repo.clone(),
                 cause: status.to_string(),
-            }),
+            });
         }
+        Ok(!String::from_utf8_lossy(&out).trim().is_empty())
     }
 
     /// `git merge-base <a> <b>`: the merge base of two committishes. Fails on
@@ -463,6 +467,22 @@ pub fn detect_restack(
     } else {
         Ok(None)
     }
+}
+
+/// The first branch of a detected restack that tracks an upstream, if any.
+/// The loop never rewrites a pushed branch (§8), so a restack that touches one
+/// is not enqueued: the caller raises an alert for the human instead. Fails
+/// closed — a git error is an `Err`, and the caller must not enqueue on it.
+pub fn restack_upstream_branch(
+    stack: &[RestackBranch],
+    git: &Git,
+) -> Result<Option<String>, GitError> {
+    for b in stack {
+        if git.has_upstream(&b.branch)? {
+            return Ok(Some(b.branch.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// One restacked branch's re-recorded base (§8): the `entry` it belongs to,
@@ -1034,6 +1054,57 @@ mod tests {
             "an upstream branch is never rewritten: block for the human",
         );
         assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip, "the tip is untouched");
+    }
+
+    #[test]
+    fn has_upstream_reads_the_ref_not_the_exit_code() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/local", "main");
+        open_branch_from(repo, "feat/pushed", "main");
+        track_upstream(repo, "feat/pushed", "main");
+        let git = Git::new(repo.to_path_buf());
+        assert!(git.has_upstream("feat/pushed").unwrap());
+        assert!(!git.has_upstream("feat/local").unwrap());
+    }
+
+    #[test]
+    fn has_upstream_fails_closed_when_git_cannot_answer() {
+        // Not a repository: `rev-parse branch@{upstream}` exits 128 here, the
+        // same code it uses for "no upstream", which used to read as `false`.
+        let dir = tempfile::tempdir().unwrap();
+        let git = Git::new(dir.path().to_path_buf());
+        assert!(
+            git.has_upstream("feat/one").is_err(),
+            "a git failure is not 'no upstream'",
+        );
+    }
+
+    #[test]
+    fn restack_upstream_branch_names_the_first_tracked_branch() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        open_branch_from(repo, "feat/two", "feat/one");
+        amend_main(repo);
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+        let git = Git::new(repo.to_path_buf());
+        let repo_kind = Repo::Local(repo.to_path_buf());
+        let stack = detect_restack(&repo_kind, "main", &entries, &git)
+            .unwrap()
+            .expect("main moved under the stack");
+
+        assert_eq!(restack_upstream_branch(&stack, &git).unwrap(), None);
+
+        // Only the TOP branch was pushed: the restack still must not run.
+        track_upstream(repo, "feat/two", "main");
+        assert_eq!(
+            restack_upstream_branch(&stack, &git).unwrap().as_deref(),
+            Some("feat/two"),
+        );
     }
 
     #[test]

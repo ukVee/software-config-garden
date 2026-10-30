@@ -364,6 +364,14 @@ mod template_tests {
             "Never edit a `> Model:`, `> Grants:` or `> Worktree:` line"
         ));
         assert!(v.contains("Do NOT call `set_item_status`"));
+        // V1: a restack never rewrites a branch that tracks an upstream.
+        let restack = v
+            .split_once("11. RESTACK.")
+            .expect("v2 protocol has a restack step")
+            .1;
+        assert!(restack.contains("never rewrite a branch that tracks an upstream"));
+        assert!(restack.contains("git for-each-ref --format='%(upstream)' refs/heads/<branch>"));
+        assert!(restack.contains("`growlight_block`, `kind = human`"));
         // The legacy endings §10 replaces are gone from the v2 text.
         assert!(!v.contains("log_baton"), "v2 protocol must not keep log_baton");
         assert!(

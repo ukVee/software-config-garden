@@ -135,3 +135,12 @@ protocol is fixed; the baton changes each iteration.
     handoff and prefer an early `new_scope` split over burning follow-ups. No
     inbox step yet (§9). Semi-auto keeps its current handoff ("handoff ready –
     /clear") until semi-auto is growlightd-managed (task 025).
+
+11. RESTACK. On a restack entry, never rewrite a branch that tracks an upstream
+    (it may be pushed). Before the first rebase, run
+    `git for-each-ref --format='%(upstream)' refs/heads/<branch>` for every
+    branch in the entry's stack. If any prints a ref — or the command fails —
+    rebase nothing: end with `growlight_block`, `kind = human`, naming the
+    branch. growlightd also withholds an automatic restack over such a branch
+    and alerts the human, so this covers a hand-enqueued restack and a branch
+    pushed after detection.

@@ -1191,6 +1191,13 @@ pub struct V2ClaimFailure {
     pub retry_secs: i64,
 }
 
+/// The alert for a restack the loop will not run because `branch` tracks an
+/// upstream (V1): it names the repo's project and the branch so the human can
+/// rebase it by hand or untrack it.
+fn restack_blocked_alert(project: &str, branch: &str) -> String {
+    format!("restack {project}: {branch} tracks an upstream")
+}
+
 /// Consecutive claim failures after which the human is alerted (V3).
 const V2_CLAIM_ALERT_STREAK: u32 = 3;
 /// First retry delay after a v2 claim failure; doubles per consecutive failure.
@@ -1275,6 +1282,9 @@ pub struct TickReport {
     /// growlightd alerts once, so an item lands here on the tick its block is
     /// first seen, not every tick it persists.
     pub v2_walk_blocked: Vec<String>,
+    /// Restacks withheld because a stack branch tracks an upstream (V1): the
+    /// loop never rewrites a pushed branch, so the human is alerted instead.
+    pub v2_restack_blocked: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
     /// v2 first-claim/claim failures this tick (V3): the reason, so the journal
@@ -2651,7 +2661,7 @@ impl DriveLoop {
                 // start, and once per handoff this tick (deferred from step 1,
                 // which runs before the snapshot loads).
                 if !self.restack_boot_done {
-                    self.scan_restacks(snapshot, None);
+                    self.scan_restacks(snapshot, None, &mut report.v2_restack_blocked);
                     self.restack_boot_done = true;
                 }
                 let handoff_scans = std::mem::take(&mut self.v2_handoff_scans);
@@ -2662,14 +2672,14 @@ impl DriveLoop {
                         .find(|e| e.id == *entry_id)
                         .map(|e| e.project.clone())
                     {
-                        self.scan_restacks(snapshot, Some(&p));
+                        self.scan_restacks(snapshot, Some(&p), &mut report.v2_restack_blocked);
                     }
                 }
                 // §8 re-record (queue-v2-git slice 004): restack completions
                 // deferred from step 1, drained once the snapshot loads.
                 let re_record_scans = std::mem::take(&mut self.v2_re_record_scans);
                 for project in &re_record_scans {
-                    self.re_record_restack(snapshot, project);
+                    self.re_record_restack(snapshot, project, &mut report.v2_restack_blocked);
                 }
 
                 // The per-member `pick_v2` input, built from the configured fleet:
@@ -2949,7 +2959,7 @@ impl DriveLoop {
                                         self.v2_restack_project
                                             .insert(entry_top.to_string(), ev.project.clone());
                                     }
-                                    self.scan_restacks(snapshot, Some(&ev.project));
+                                    self.scan_restacks(snapshot, Some(&ev.project), &mut report.v2_restack_blocked);
                                 }
                             }
                             // The claim landed even though the spawn failed — keep
@@ -3555,6 +3565,11 @@ impl DriveLoop {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
         }
+        // V1: a restack withheld over an upstream-tracking branch needs the human.
+        for what in &report.v2_restack_blocked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: what.clone() }, now);
+        }
         // §2: a walk stopped at a human-`blocked` item (review R3).
         for at in &report.v2_walk_blocked {
             self.dispatcher
@@ -3838,7 +3853,17 @@ impl DriveLoop {
     /// `Some(p)` scans just `p` (a claim or handshake in that repo). Fail-soft:
     /// a detection or enqueue error is skipped — the next scan re-detects it,
     /// and a restack row already enqueued is an idempotent no-op in keeperd.
-    fn scan_restacks(&self, snapshot: &scheduler_v2::V2Snapshot, project: Option<&str>) {
+    ///
+    /// Never auto-enqueues a restack over a branch that tracks an upstream (§8,
+    /// V1): the loop does not rewrite a pushed branch. That repo's restack is
+    /// withheld and `blocked` gets an alert for the human instead; a git error
+    /// while checking withholds it too (fail closed, re-checked next scan).
+    fn scan_restacks(
+        &self,
+        snapshot: &scheduler_v2::V2Snapshot,
+        project: Option<&str>,
+        blocked: &mut Vec<String>,
+    ) {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
@@ -3876,6 +3901,14 @@ impl DriveLoop {
                 Ok(None) => continue,
                 Err(_) => continue, // fail-soft: re-detected on the next scan
             };
+            match git_stack::restack_upstream_branch(&stack, &git) {
+                Ok(None) => {}
+                Ok(Some(branch)) => {
+                    blocked.push(restack_blocked_alert(&proj.name, &branch));
+                    continue;
+                }
+                Err(_) => continue, // fail closed: re-checked on the next scan
+            }
             let _ = seams.restacker.enqueue_restack(&proj.name, &stack);
         }
     }
@@ -3884,12 +3917,20 @@ impl DriveLoop {
     /// recompute each restacked local branch's `base` read-only
     /// (`git merge-base <branch> <its parent's tip or main>`) and write them
     /// back through the re-recorder seam. A branch that tracks an upstream is
-    /// never rewritten — the pass returns [`git_stack::ReRecord::Upstream`]
-    /// and the loop leaves the base untouched (the restack's doc tells the
-    /// agent to end with `growlight_block kind = human`; slice 005's protocol
-    /// carries that instruction). Fail-soft: a git or write error is skipped —
-    /// the next restack detection re-flags the stale base.
-    fn re_record_restack(&self, snapshot: &scheduler_v2::V2Snapshot, project: &str) {
+    /// never rewritten — the pass returns [`git_stack::ReRecord::Upstream`],
+    /// the loop leaves the base untouched and alerts the human through
+    /// `blocked`. This is the backstop: [`Self::scan_restacks`] withholds a
+    /// restack over such a branch up front, and the restack's doc and the v2
+    /// protocol tell the agent to end with `growlight_block kind = human`, so
+    /// reaching it means a branch gained an upstream mid-restack. Fail-soft: a
+    /// git or write error is skipped — the next restack detection re-flags the
+    /// stale base.
+    fn re_record_restack(
+        &self,
+        snapshot: &scheduler_v2::V2Snapshot,
+        project: &str,
+        blocked: &mut Vec<String>,
+    ) {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
@@ -3921,9 +3962,12 @@ impl DriveLoop {
         let git = Git::new(repo_path);
         let bases = match git_stack::re_record_bases(&repo, &proj.main, &entries, &git) {
             Ok(git_stack::ReRecord::Bases(bases)) => bases,
-            // A branch tracks an upstream: the loop never rewrites it — the
-            // restack's doc instructs the agent to block for the human instead.
-            Ok(git_stack::ReRecord::Upstream { .. }) => return,
+            // A branch tracks an upstream: the loop never rewrites it, so the
+            // bases stay as recorded and the human is told.
+            Ok(git_stack::ReRecord::Upstream { branch }) => {
+                blocked.push(restack_blocked_alert(project, &branch));
+                return;
+            }
             Err(_) => return, // fail-soft: re-detected on the next scan
         };
         if bases.is_empty() {
@@ -4427,6 +4471,11 @@ impl TickLogger {
                 a.entry,
                 v2_unit_label(&a.unit),
                 model_ref_label(&a.resolved_model),
+            ));
+        }
+        for what in &r.v2_restack_blocked {
+            out.push(format!(
+                "fleet: {what}; the loop never rewrites a pushed branch, so no restack was enqueued"
             ));
         }
         // Not edge-deduped: the claim backoff already spaces these out, and each
@@ -9558,6 +9607,139 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// failing entry is not re-picked (and re-failed) every tick, the journal line
     /// names why, and past the alert streak the human is paged. A claim that then
     /// succeeds clears the backoff.
+    /// A real repo for the §8 scan: `main`, a branch `feat/one` cut from it,
+    /// then `main` amended so `feat/one`'s recorded base is abandoned (a stale
+    /// stack). Returns the repo and the original main commit (the recorded base).
+    fn stale_stack_repo(track: bool) -> (tempfile::TempDir, String) {
+        fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+        let base = git(repo, &["rev-parse", "main"]);
+        git(repo, &["checkout", "-q", "-b", "feat/one"]);
+        std::fs::write(repo.join("one.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "one"]);
+        git(repo, &["checkout", "-q", "main"]);
+        if track {
+            git(repo, &["update-ref", "refs/remotes/origin/feat/one", "feat/one"]);
+            git(repo, &["remote", "add", "origin", "https://example.invalid/origin"]);
+            git(repo, &["branch", "--set-upstream-to", "origin/feat/one", "feat/one"]);
+        }
+        std::fs::write(repo.join("a.txt"), "amended\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "--amend", "-m", "main rewritten"]);
+        (dir, base)
+    }
+
+    /// A snapshot with one local project at `repo` and one claimed normal entry
+    /// on `feat/one`, whose recorded base is `base`.
+    fn restack_snapshot(repo: &std::path::Path, base: &str) -> V2Snapshot {
+        V2Snapshot {
+            projects: vec![ProjectView {
+                name: "softfig".into(),
+                repo: repo.display().to_string(),
+                main: "main".into(),
+            }],
+            entries: vec![EntryView {
+                id: "one".into(),
+                kind: EntryKind::Task,
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Active,
+                after: vec![],
+                branch: "feat/one".into(),
+                claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: base.into(),
+                follow_ups: 0,
+                pending: None,
+                holder: None,
+                models: None,
+            }],
+            trees: BTreeMap::new(),
+            done_ids: BTreeSet::new(),
+        }
+    }
+
+    fn v2_loop_with_restacker(enq: &Arc<FakeV2RestackEnqueuer>) -> DriveLoop {
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            std::env::temp_dir().join(format!("v2-entries-restack-{}", std::process::id())),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(enq));
+        loop_
+    }
+
+    /// V1: a stale stack whose branch tracks an upstream is NOT auto-enqueued —
+    /// the loop never rewrites a pushed branch — and the human is alerted.
+    #[test]
+    fn v2_mode_withholds_a_restack_over_an_upstream_branch_and_alerts() {
+        let (dir, base) = stale_stack_repo(true);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
+
+        assert!(
+            enq.enqueued.lock().unwrap().is_empty(),
+            "no restack is enqueued over a pushed branch",
+        );
+        assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+        let r = TickReport { v2_restack_blocked: blocked, ..TickReport::default() };
+        let lines = TickLogger::default().lines(&r);
+        assert!(
+            lines.iter().any(|l| l.contains("feat/one") && l.contains("upstream")),
+            "the journal names the branch: {lines:?}",
+        );
+    }
+
+    /// The control: the same stale stack with no upstream is enqueued as before.
+    #[test]
+    fn v2_mode_still_enqueues_a_restack_over_local_branches() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
+
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 1)]);
+        assert!(blocked.is_empty(), "{blocked:?}");
+    }
+
+    /// The backstop: a branch that gained an upstream mid-restack is reported at
+    /// re-record time too, instead of the loop returning silently.
+    #[test]
+    fn v2_mode_re_record_over_an_upstream_branch_alerts_instead_of_returning_silently() {
+        let (dir, base) = stale_stack_repo(true);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.re_record_restack(&restack_snapshot(dir.path(), &base), "softfig", &mut blocked);
+
+        assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+    }
+
     #[test]
     fn v2_mode_a_persistent_claim_failure_backs_off_and_surfaces_its_reason() {
         let claimer = Arc::new(FakeV2Claimer::default());

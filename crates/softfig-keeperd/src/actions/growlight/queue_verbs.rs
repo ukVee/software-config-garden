@@ -1774,12 +1774,28 @@ fn task_doc_v2(id: &str, title: &str, mission: &str, finish: &str) -> String {
     )
 }
 
+/// The upstream rule every restack doc carries (§8, V1): a branch that tracks
+/// an upstream may be pushed, so the loop never rewrites it. The agent checks
+/// BEFORE the first rebase and blocks for the human instead. growlightd also
+/// withholds the auto-enqueue when it sees one, so this covers a human-enqueued
+/// restack and a branch pushed after detection.
+const RESTACK_UPSTREAM_RULE: &str = "## Before you rebase\n\n\
+     Never rewrite a branch that tracks an upstream — it may be pushed. Check \
+     every branch of the restack first, before any rebase:\n\n\
+     ```\n\
+     git for-each-ref --format='%(upstream)' refs/heads/<branch>\n\
+     ```\n\n\
+     If it prints a ref for ANY branch, do not rebase anything: end with \
+     `growlight_block`, `kind = human`, naming the branch. A command that fails \
+     is not an answer — treat it as tracked and block.\n";
+
 /// The §8 restack doc (queue-v2-git slice 003): with a resolved `stack`, the
 /// full template — the stack in order (each branch's `parent` and `base`), the
 /// steps (rebase each unmerged branch in stack order with `git rebase --onto`),
 /// and the gate command. With an empty `stack` (a human/drop-enqueued restack
 /// carries no git resolution) the doc is a placeholder naming `queue show` as
-/// the way to re-derive it.
+/// the way to re-derive it. Both forms carry [`RESTACK_UPSTREAM_RULE`]: the loop
+/// never rewrites a branch that tracks an upstream (§8, V1).
 fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> String {
     if stack.is_empty() {
         return format!(
@@ -1788,7 +1804,7 @@ fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> Str
              > Generated restack entry for project `{project}` (queue v2 §8). Lane, \
              status and branch live in `queue.toml` (the derived `softfig:queue-v2` \
              table in `../CLAUDE.md`). No stack was recorded at enqueue — re-derive \
-             it from `softfig growlight queue show` before rebasing.\n"
+             it from `softfig growlight queue show` before rebasing.\n\n{RESTACK_UPSTREAM_RULE}"
         );
     }
     let mut doc = format!(
@@ -1807,6 +1823,8 @@ fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> Str
             b.branch, b.base
         ));
     }
+    doc.push('\n');
+    doc.push_str(RESTACK_UPSTREAM_RULE);
     doc.push_str(
         "\n## Steps\n\n\
          Rebase each branch in stack order (bottom first), resolving conflicts and \
@@ -2684,9 +2702,24 @@ mod tests {
         assert!(doc.contains("- `git rebase --onto feat/one def456 feat/two`"), "{doc}");
         assert!(doc.contains("## Gate"), "{doc}");
         assert!(doc.contains("cargo test --workspace"), "{doc}");
+        // V1: the upstream rule comes before the first rebase step.
+        let rule = doc.find("## Before you rebase").expect("the upstream rule");
+        assert!(rule < doc.find("## Steps").unwrap(), "{doc}");
+        assert!(doc.contains("git for-each-ref --format='%(upstream)' refs/heads/<branch>"), "{doc}");
+        assert!(doc.contains("`growlight_block`, `kind = human`"), "{doc}");
         assert_eq!(wt.read_to_string("growlight/backlog/tasks/.seq").unwrap(), "1
 ");
         drop(inner);
+    }
+
+    #[test]
+    fn the_placeholder_restack_doc_also_carries_the_upstream_rule() {
+        // A human/drop-enqueued restack has no resolved stack, yet the agent
+        // still must not rewrite a pushed branch (V1).
+        let doc = restack_doc("softfig", "2026-10-30", &[]);
+        assert!(doc.contains("## Before you rebase"), "{doc}");
+        assert!(doc.contains("git for-each-ref --format='%(upstream)'"), "{doc}");
+        assert!(doc.contains("`growlight_block`, `kind = human`"), "{doc}");
     }
 
     #[test]
