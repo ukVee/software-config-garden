@@ -693,6 +693,12 @@ mod tests {
         use std::ffi::OsStr;
         let opencode_cfg = Path::new("/rt/opencode.json");
         let garden = Path::new("/home/u/garden");
+        // Bound to a local: MSRV 1.88 doesn't extend a temporary's lifetime
+        // through `Some(&…)` inside a struct literal (E0716).
+        let slot = LaunchSlot {
+            name: "slot2".into(),
+            dir: SlotDir::Store("/s/slot2".into()),
+        };
         let launch = InteractiveLaunch {
             agent_name: "softfig-loop",
             // claude-only fields — the opencode arm must ignore them entirely.
@@ -701,10 +707,7 @@ mod tests {
             garden_root: garden,
             opencode_config: opencode_cfg,
             boot_prompt: "Begin your growlight iteration.",
-            claude_slot: Some(&LaunchSlot {
-                name: "slot2".into(),
-                dir: SlotDir::Store("/s/slot2".into()),
-            }),
+            claude_slot: Some(&slot),
         };
         let cmd = interactive_command(Backend::Opencode, &launch, &[])
             .expect("opencode backend builds a command");
