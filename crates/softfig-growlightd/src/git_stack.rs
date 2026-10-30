@@ -33,6 +33,7 @@
 //! exercise the whole model against temp git repos, plus the remote path with a
 //! `Git` pointed at a non-repo to prove it is never touched.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -393,6 +394,36 @@ pub struct RestackEntry {
     pub base: String,
 }
 
+/// The `--onto` target for a branch recorded with `parent` (§8): the live
+/// parent entry's branch, or `main` for a main-rooted branch. A parent that has
+/// left the list resolves through its archive row (`archived`: `done` rows'
+/// id → branch, V7) — the loop never merges, so an archived parent's branch is
+/// usually still unmerged work its child was cut from, and rebasing the child
+/// onto `main` would strip those commits. Such a branch is the target while it
+/// exists and is not yet in `main`; once merged (or deleted after the human
+/// merged it) `main` has the work and is the target. An unknown parent falls
+/// back to `main` (defensive).
+fn resolve_onto(
+    parent: &str,
+    main: &str,
+    branch_of: &HashMap<&str, &str>,
+    archived: &BTreeMap<String, String>,
+    git: &Git,
+) -> Result<String, GitError> {
+    if parent.is_empty() {
+        return Ok(main.to_string());
+    }
+    if let Some(branch) = branch_of.get(parent) {
+        return Ok((*branch).to_string());
+    }
+    match archived.get(parent).filter(|b| !b.is_empty()) {
+        Some(branch) if git.branch_exists(branch)? && !git.is_ancestor(branch, main)? => {
+            Ok(branch.clone())
+        }
+        _ => Ok(main.to_string()),
+    }
+}
+
 /// Detect a §8 restack: `main` moved under the open stack (an urgent fix
 /// merged, or a lower branch amended in review). Walks the stack candidates in
 /// claim order (read-only, via [`stack_candidates`]) and returns the ordered
@@ -408,6 +439,7 @@ pub fn detect_restack(
     repo: &Repo,
     main: &str,
     entries: &[RestackEntry],
+    archived: &BTreeMap<String, String>,
     git: &Git,
 ) -> Result<Option<Vec<RestackBranch>>, GitError> {
     if matches!(repo, Repo::Remote) {
@@ -428,7 +460,7 @@ pub fn detect_restack(
     }
     // id → branch (to resolve a parent entry's branch), and branch → the
     // recorded (parent, base) pair.
-    let branch_of: std::collections::HashMap<&str, &str> = entries
+    let branch_of: HashMap<&str, &str> = entries
         .iter()
         .filter(|e| !e.branch.is_empty())
         .map(|e| (e.id.as_str(), e.branch.as_str()))
@@ -448,11 +480,7 @@ pub fn detect_restack(
         // The `--onto` target: the parent's branch, or `main` for a
         // main-rooted branch. A missing parent entry falls back to `main`
         // (defensive — a live parent is the §8 invariant).
-        let onto = if parent.is_empty() {
-            main.to_string()
-        } else {
-            branch_of.get(parent).copied().unwrap_or(main).to_string()
-        };
+        let onto = resolve_onto(parent, main, &branch_of, archived, git)?;
         // Stale when the branch no longer contains its parent's tip (or
         // `main`'s). Judged on the branch itself, not on the recorded base: under
         // §8's ff-only merges `main` only moves forward, so the old base stays an
@@ -524,6 +552,7 @@ pub fn re_record_bases(
     repo: &Repo,
     main: &str,
     entries: &[RestackEntry],
+    archived: &BTreeMap<String, String>,
     git: &Git,
 ) -> Result<ReRecord, GitError> {
     if matches!(repo, Repo::Remote) {
@@ -549,7 +578,7 @@ pub fn re_record_bases(
         .filter(|e| !e.branch.is_empty())
         .map(|e| (e.branch.as_str(), e))
         .collect();
-    let branch_of: std::collections::HashMap<&str, &str> = entries
+    let branch_of: HashMap<&str, &str> = entries
         .iter()
         .filter(|e| !e.branch.is_empty())
         .map(|e| (e.id.as_str(), e.branch.as_str()))
@@ -566,15 +595,7 @@ pub fn re_record_bases(
                 branch: c.branch.clone(),
             });
         }
-        let onto = if entry.parent.is_empty() {
-            main.to_string()
-        } else {
-            branch_of
-                .get(entry.parent.as_str())
-                .copied()
-                .unwrap_or(main)
-                .to_string()
-        };
+        let onto = resolve_onto(&entry.parent, main, &branch_of, archived, git)?;
         // Only a branch that now contains its `onto` tip has been restacked. An
         // unrestacked one keeps its recorded base (merge-base would just
         // re-record the stale commit) and stays flagged by `detect_restack`.
@@ -923,7 +944,7 @@ mod tests {
         ];
 
         let git = Git::new(repo.to_path_buf());
-        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git)
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git)
             .unwrap()
             .expect("a restack is needed");
         // The whole stack, in claim order, with each branch's parent/base/onto.
@@ -960,7 +981,7 @@ mod tests {
             restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
         ];
         let git = Git::new(repo.to_path_buf());
-        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git).unwrap();
         assert!(need.is_none(), "a restacked stack is healthy: {need:?}");
     }
 
@@ -977,7 +998,7 @@ mod tests {
         ];
 
         let git = Git::new(repo.to_path_buf());
-        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git).unwrap();
         assert!(need.is_none(), "no false positive when main is unchanged: {need:?}");
     }
 
@@ -989,8 +1010,111 @@ mod tests {
         let entries = vec![
             restack_entry("one", "feat/one", "", "deadbeef", "2026-10-01T00:00:00Z"),
         ];
-        let need = detect_restack(&Repo::Remote, "main", &entries, &git).unwrap();
+        let need = detect_restack(&Repo::Remote, "main", &entries, &Default::default(), &git).unwrap();
         assert!(need.is_none(), "a remote repo never auto-enqueues");
+    }
+
+    /// `a` is archived `done` (the loop never merges) and its branch `feat/a`
+    /// is still unmerged work; `feat/b` was cut from it. Only `b` is live.
+    fn archived_unmerged_parent(repo: &Path) -> (String, RestackEntry, BTreeMap<String, String>) {
+        let a_tip = open_branch_from(repo, "feat/a", "main");
+        open_branch_from(repo, "feat/b", "feat/a");
+        let b = restack_entry("b", "feat/b", "a", &a_tip, "2026-10-02T00:00:00Z");
+        let archived = BTreeMap::from([("a".to_string(), "feat/a".to_string())]);
+        (a_tip, b, archived)
+    }
+
+    #[test]
+    fn detect_restack_targets_an_archived_unmerged_parent_not_main() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let (a_tip, b, archived) = archived_unmerged_parent(repo);
+        let git = Git::new(repo.to_path_buf());
+        let local = Repo::Local(repo.to_path_buf());
+        let entries = [b];
+
+        // An urgent fix lands on main. feat/b still contains its parent
+        // feat/a, which is all the stack knows about: onto is feat/a, so b is
+        // not flagged (and never rebased onto main, which would strip feat/a's
+        // unmerged commits from it).
+        ff_main(repo);
+        assert_eq!(
+            detect_restack(&local, "main", &entries, &archived, &git).unwrap(),
+            None
+        );
+
+        // feat/a is amended after b was cut: b no longer contains its parent's
+        // tip, and the rebase target is feat/a — not main.
+        sh_git(repo, &["checkout", "-q", "feat/a"]);
+        fs::write(repo.join("feat_a.txt"), "rewritten\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "--amend", "-m", "a rewritten"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+        let need = detect_restack(&local, "main", &entries, &archived, &git)
+            .unwrap()
+            .expect("b is stale against its archived parent");
+        assert_eq!(need.len(), 1, "{need:?}");
+        assert_eq!(need[0].branch, "feat/b");
+        assert_eq!(need[0].parent, "a");
+        assert_eq!(need[0].base, a_tip);
+        assert_eq!(need[0].onto, "feat/a");
+    }
+
+    #[test]
+    fn archived_parent_resolves_to_main_once_merged_or_gone() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let (a_tip, b, archived) = archived_unmerged_parent(repo);
+        let git = Git::new(repo.to_path_buf());
+        let local = Repo::Local(repo.to_path_buf());
+        let entries = [b];
+
+        // The human merges feat/a; then an urgent fix lands on top. main now
+        // carries a's work, so main is the target and b is stale against it.
+        sh_git(repo, &["merge", "--ff-only", "-q", "feat/a"]);
+        ff_main(repo);
+        let need = detect_restack(&local, "main", &entries, &archived, &git)
+            .unwrap()
+            .expect("b lacks the urgent fix");
+        assert_eq!(need[0].onto, "main", "{need:?}");
+        assert_eq!(need[0].base, a_tip);
+
+        // The human then deletes feat/a: the archive row names a branch that
+        // no longer exists. That resolves to main too, and never errors
+        // detection (is_ancestor on a missing ref exits 128).
+        sh_git(repo, &["branch", "-q", "-D", "feat/a"]);
+        let need = detect_restack(&local, "main", &entries, &archived, &git)
+            .expect("a deleted archived branch must not wedge detection")
+            .expect("b is still stale against main");
+        assert_eq!(need[0].onto, "main", "{need:?}");
+    }
+
+    #[test]
+    fn re_record_resolves_an_archived_unmerged_parent_not_main() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let (a_tip, b, archived) = archived_unmerged_parent(repo);
+        let git = Git::new(repo.to_path_buf());
+        ff_main(repo);
+        // b contains its archived parent's tip, so it counts as restacked
+        // against feat/a and its base is re-recorded as feat/a's tip. Against
+        // main (the pre-V7 target) it would be skipped as not restacked yet.
+        let out = re_record_bases(
+            &Repo::Local(repo.to_path_buf()),
+            "main",
+            &[b],
+            &archived,
+            &git,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            ReRecord::Bases(vec![ReRecordedBase {
+                entry: "b".into(),
+                branch: "feat/b".into(),
+                base: a_tip,
+            }])
+        );
     }
 
     #[test]
@@ -1013,7 +1137,7 @@ mod tests {
         ];
 
         let git = Git::new(repo.to_path_buf());
-        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git)
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git)
             .unwrap()
             .expect("a restack is needed");
         assert_eq!(need.len(), 2, "{need:?}");
@@ -1054,7 +1178,7 @@ mod tests {
 
         let git = Git::new(repo.to_path_buf());
         let ReRecord::Bases(bases) =
-            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap()
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git).unwrap()
         else {
             panic!("expected re-recorded bases");
         };
@@ -1094,7 +1218,7 @@ mod tests {
         ];
         let git = Git::new(repo.to_path_buf());
         let ReRecord::Bases(bases) =
-            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap()
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git).unwrap()
         else {
             panic!("expected re-recorded bases");
         };
@@ -1117,7 +1241,7 @@ mod tests {
 
         let git = Git::new(repo.to_path_buf());
         let outcome =
-            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git).unwrap();
         assert_eq!(
             outcome,
             ReRecord::Upstream {
@@ -1165,7 +1289,7 @@ mod tests {
         ];
         let git = Git::new(repo.to_path_buf());
         let repo_kind = Repo::Local(repo.to_path_buf());
-        let stack = detect_restack(&repo_kind, "main", &entries, &git)
+        let stack = detect_restack(&repo_kind, "main", &entries, &Default::default(), &git)
             .unwrap()
             .expect("main moved under the stack");
 
@@ -1185,7 +1309,7 @@ mod tests {
         let entries = vec![
             restack_entry("one", "feat/one", "", "deadbeef", "2026-10-01T00:00:00Z"),
         ];
-        let outcome = re_record_bases(&Repo::Remote, "main", &entries, &git).unwrap();
+        let outcome = re_record_bases(&Repo::Remote, "main", &entries, &Default::default(), &git).unwrap();
         assert_eq!(outcome, ReRecord::Bases(Vec::new()), "no git against a remote repo");
     }
 }

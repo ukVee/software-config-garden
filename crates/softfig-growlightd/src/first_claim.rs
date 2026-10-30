@@ -181,6 +181,7 @@ mod tests {
             entries,
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 

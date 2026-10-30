@@ -886,6 +886,7 @@ mod tests {
                 },
             )]),
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 

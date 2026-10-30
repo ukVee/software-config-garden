@@ -804,6 +804,7 @@ pub(crate) mod tests {
             .into_iter()
             .collect(),
             done_ids: Default::default(),
+            done_branches: Default::default(),
         }
     }
 

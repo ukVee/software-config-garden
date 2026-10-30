@@ -177,6 +177,7 @@ mod tests {
             entries: vec![],
             trees,
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 

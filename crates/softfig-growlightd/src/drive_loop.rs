@@ -3896,7 +3896,13 @@ impl DriveLoop {
                 continue;
             }
             let git = Git::new(repo_path);
-            let stack = match git_stack::detect_restack(&repo, &proj.main, &entries, &git) {
+            let stack = match git_stack::detect_restack(
+                &repo,
+                &proj.main,
+                &entries,
+                &snapshot.done_branches,
+                &git,
+            ) {
                 Ok(Some(stack)) => stack,
                 Ok(None) => continue,
                 Err(_) => continue, // fail-soft: re-detected on the next scan
@@ -3960,7 +3966,13 @@ impl DriveLoop {
             return;
         }
         let git = Git::new(repo_path);
-        let bases = match git_stack::re_record_bases(&repo, &proj.main, &entries, &git) {
+        let bases = match git_stack::re_record_bases(
+            &repo,
+            &proj.main,
+            &entries,
+            &snapshot.done_branches,
+            &git,
+        ) {
             Ok(git_stack::ReRecord::Bases(bases)) => bases,
             // A branch tracks an upstream: the loop never rewrites it, so the
             // bases stay as recorded and the human is told.
@@ -9312,6 +9324,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             .into_iter()
             .collect(),
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 
@@ -9672,6 +9685,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             }],
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 

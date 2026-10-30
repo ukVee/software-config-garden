@@ -159,6 +159,12 @@ pub struct V2Snapshot {
     /// these (§3.2). A `dropped` row is deliberately absent, so it never
     /// satisfies a link (§2).
     pub done_ids: BTreeSet<String>,
+    /// The branch of each archive row with `final_status = done` (id →
+    /// branch; rows that never got a branch are absent). The loop never merges,
+    /// so a `done` entry's branch is usually still unmerged work: restack
+    /// detection resolves a child's archived parent through it (queue-v2-git
+    /// §8, V7).
+    pub done_branches: BTreeMap<String, String>,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -654,6 +660,7 @@ mod tests {
             entries,
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
         }
     }
 

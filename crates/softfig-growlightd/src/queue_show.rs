@@ -356,6 +356,7 @@ mod tests {
             entries,
             trees,
             done_ids: Default::default(),
+            done_branches: Default::default(),
         }
     }
 
@@ -419,6 +420,7 @@ mod tests {
             entries,
             trees: BTreeMap::new(),
             done_ids: Default::default(),
+            done_branches: Default::default(),
         };
         let reply = build(&snapshot, Path::new("/nonexistent"), None);
         assert_eq!(reply.projects.len(), 1);
