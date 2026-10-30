@@ -246,6 +246,16 @@ impl SkipReason {
         }
     }
 
+    /// The `held:` row for `entry` held for this reason: the label, with the
+    /// start time as written for a `NotYet` hold, the way the legacy pass
+    /// carries `> Not before:`. `None` exactly when the reason is not a hold.
+    pub fn hold_text(self, entry: &EntryView) -> Option<String> {
+        match (self, entry.not_before.as_deref()) {
+            (SkipReason::NotYet, Some(at)) => Some(format!("not yet (not_before {at})")),
+            _ => self.hold_label().map(str::to_string),
+        }
+    }
+
     /// What the reason means, for a reader of `queue pick`.
     pub fn describe(self) -> &'static str {
         match self {
@@ -1270,11 +1280,12 @@ mod tests {
                     reason: SkipReason::NotYet,
                 }]
             );
-            let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+            let held: Vec<(&str, Option<String>)> = held_entries(&snapshot)
                 .into_iter()
-                .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+                .map(|(e, reason)| (e.id.as_str(), reason.hold_text(e)))
                 .collect();
-            assert_eq!(held, vec![("later", Some("not yet (not_before)"))]);
+            let text = Some(format!("not yet (not_before {START})"));
+            assert_eq!(held, vec![("later", text)]);
         }
     }
 
@@ -1311,11 +1322,11 @@ mod tests {
             eligible(&snapshot, &member("m"), &bad),
             Err(SkipReason::BadStartTime)
         );
-        let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+        let held: Vec<(&str, Option<String>)> = held_entries(&snapshot)
             .into_iter()
-            .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+            .map(|(e, reason)| (e.id.as_str(), reason.hold_text(e)))
             .collect();
-        assert_eq!(held, vec![("e", Some("bad start time (not_before)"))]);
+        assert_eq!(held, vec![("e", Some("bad start time (not_before)".into()))]);
     }
 
     /// A human-only entry with a start time reads human-only, whether the time

@@ -2703,13 +2703,16 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         } else {
             e.after.join(", ")
         };
-        // A human-only entry (`fleet = false`, spec §2 Holds) says so beside its
-        // status: the fleet leaves it for the human, whatever the status reads.
-        let status = if e.fleet {
-            e.status.to_string()
-        } else {
-            format!("{} (human-only)", e.status)
-        };
+        // The §2 Holds beside the status: a human-only entry (`fleet = false`)
+        // is left for the human whatever the status reads, and a start time
+        // (`not_before`) is shown as written, whether or not it is still ahead.
+        let mut status = e.status.to_string();
+        if !e.fleet {
+            status.push_str(" (human-only)");
+        }
+        if let Some(at) = &e.not_before {
+            status.push_str(&format!(" (not before {at})"));
+        }
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -4567,18 +4570,27 @@ mod tests {
                 unit: "slice 002 of m".into(),
                 declared: Some("reasoning, flash".into()),
             }),
-            skips: vec![growlightd::QueuePickSkip {
-                entry: "n".into(),
-                reason: "blocked_walk".into(),
-                detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
-            }],
+            skips: vec![
+                growlightd::QueuePickSkip {
+                    entry: "n".into(),
+                    reason: "blocked_walk".into(),
+                    detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
+                },
+                growlightd::QueuePickSkip {
+                    entry: "t".into(),
+                    reason: "not_yet".into(),
+                    detail: "a queued entry whose `not_before` start time is still ahead (§2 Holds)"
+                        .into(),
+                },
+            ],
         };
         let out = render_queue_pick(&reply);
         assert!(out.contains("member c (backend claude, pin default)"), "{out}");
         assert!(out.contains("picked: m / slice 002 of m"), "{out}");
         assert!(out.contains("model: reasoning, flash"), "{out}");
-        assert!(out.contains("skipped: 1"), "{out}");
+        assert!(out.contains("skipped: 2"), "{out}");
         assert!(out.contains("  - n: blocked_walk — its walk stops"), "{out}");
+        assert!(out.contains("  - t: not_yet — a queued entry whose `not_before`"), "{out}");
     }
 
     #[test]
@@ -4663,6 +4675,23 @@ mod tests {
         assert!(
             human_body.contains("| h1 | milestone | h1 title | softfig | normal | queued (human-only) |"),
             "{human_body}"
+        );
+        // A start time is shown as written (slice 003), after the human-only
+        // marker when both apply.
+        let mut timed = e("t1", Lane::Normal, "", "");
+        timed.not_before = Some("2026-10-31 02:00 -04:00".into());
+        let mut both = e("t2", Lane::Normal, "", "");
+        both.not_before = Some("2026-10-31 02:00 -04:00".into());
+        both.fleet = false;
+        let timed_body = render_queue_show(&QueueToml::new(vec![], vec![timed, both]));
+        assert!(
+            timed_body.contains("| normal | queued (not before 2026-10-31 02:00 -04:00) |"),
+            "{timed_body}"
+        );
+        assert!(
+            timed_body
+                .contains("| normal | queued (human-only) (not before 2026-10-31 02:00 -04:00) |"),
+            "{timed_body}"
         );
     }
 

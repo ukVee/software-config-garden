@@ -2558,7 +2558,7 @@ impl DriveLoop {
                             Some(softfig_ipc::growlightd::HeldPartSummary {
                                 queue: entry.project.clone(),
                                 part: entry.id.clone(),
-                                reason: reason.hold_label()?.to_string(),
+                                reason: reason.hold_text(entry)?,
                             })
                         })
                         .collect(),
@@ -9292,6 +9292,45 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // The owner lifts the hold: the row drops and a1 takes the entry.
         source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
         assert_eq!(loop_.tick(2).v2_started.len(), 1, "a1 claims the freed m1");
+        assert_eq!(held(&d), vec![], "nothing is held any more");
+    }
+
+    /// Queue-v2-parity slice 003, row 3: a `queued` entry before its
+    /// `not_before` is listed under `held:` with the time as written, read off
+    /// the tick's own clock. The tick at the time lists nothing and claims it.
+    #[test]
+    fn v2_mode_status_lists_a_not_yet_entry_until_its_start_time() {
+        const START: &str = "2026-10-31 02:00 -04:00";
+        let at = softfig_ipc::fleet::parse_not_before(START).expect("valid start time");
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-not-yet-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+        snapshot.entries[0].not_before = Some(START.into());
+        let source = FakeV2Source::with(snapshot);
+        let (mut loop_, d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source,
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+
+        assert!(loop_.tick(at - 1).v2_started.is_empty(), "a1 waits for m1's time");
+        assert_eq!(
+            held(&d),
+            vec![softfig_ipc::growlightd::HeldPartSummary {
+                queue: "softfig".into(),
+                part: "m1".into(),
+                reason: format!("not yet (not_before {START})"),
+            }],
+        );
+
+        assert_eq!(loop_.tick(at).v2_started.len(), 1, "a1 claims m1 at its time");
         assert_eq!(held(&d), vec![], "nothing is held any more");
     }
 
