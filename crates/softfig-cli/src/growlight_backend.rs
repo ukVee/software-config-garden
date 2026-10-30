@@ -14,6 +14,7 @@ use std::process::Command;
 
 use anyhow::Result;
 use serde_json::Value;
+use softfig_ipc::claude_profiles::{CONFIG_DIR_ENV, SlotDir};
 use softfig_ipc::opencode::{
     Context as SessionContext, Floor, MemoryPolicy, Posture, context, file_ref, floor,
 };
@@ -46,6 +47,17 @@ fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
         Some(variant) => format!("{model}#{variant}"),
         None => model.to_string(),
     }
+}
+
+/// The claude-login slot an interactive claude session runs on
+/// (`claude-login-switcher` slice 007): the name, for the banner and the
+/// `--no-launch` hint, and where it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSlot {
+    /// The slot name (`home` or a store slot).
+    pub name: String,
+    /// What the name resolved to: unset `CLAUDE_CONFIG_DIR`, or set it here.
+    pub dir: SlotDir,
 }
 
 /// The inputs an interactive launch needs, across backends. Each backend
@@ -90,6 +102,10 @@ pub struct InteractiveLaunch<'a> {
     /// claude's interactive TUI takes no kick — the human sends the first turn —
     /// so this is opencode-only.
     pub boot_prompt: &'a str,
+    /// claude's claude-login slot: `CLAUDE_CONFIG_DIR` set to a store slot, or
+    /// removed for `home`. `None` adds no env change at all (the pre-switcher
+    /// launch). Ignored by opencode.
+    pub claude_slot: Option<&'a LaunchSlot>,
 }
 
 /// Build the interactive loop command for a backend. Pure (constructs,
@@ -98,10 +114,13 @@ pub struct InteractiveLaunch<'a> {
 /// side stayed here.)
 ///
 /// - **claude** reproduces the original hardwired argv exactly —
-///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>` —
-///   inheriting the caller's environment, and rooted at the garden
-///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
-///   invoked it from. It still sets no env.
+///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>
+///   [--model <m>] [--effort <e>]` — inheriting the caller's environment, and
+///   rooted at the garden (`launch.garden_root`, slice 005's auto-cd) instead
+///   of wherever the human invoked it from. It still sets no env. The optional
+///   `--model`/`--effort` tail is `claude_argv` (built upstream from the
+///   resolved `ModelChoice::claude_argv()`); with no model and no effort the
+///   argv is byte-identical to the pre-slice-002 invocation.
 /// - **opencode** launches the TUI on the generated agent —
 ///   `opencode --standalone --prompt <boot>` (see [`opencode_interactive_args`]
 ///   for why `--standalone`, and why no `--agent`) — with `OPENCODE_CONFIG`
@@ -115,7 +134,11 @@ pub struct InteractiveLaunch<'a> {
 ///   is the reseed kick: opencode has no SessionStart hook, so the roll is the
 ///   agent prompt's step-0 baton read, and this first turn nudges the fresh
 ///   session into it.
-pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Result<Command> {
+pub fn interactive_command(
+    backend: Backend,
+    launch: &InteractiveLaunch,
+    claude_argv: &[String],
+) -> Result<Command> {
     let mut cmd = Command::new(agent_bin(backend));
     match backend {
         Backend::Claude => {
@@ -125,7 +148,19 @@ pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Resu
                 .arg(launch.loop_settings)
                 .arg("--mcp-config")
                 .arg(launch.mcp_config)
+                .args(claude_argv)
                 .current_dir(launch.garden_root);
+            // The slot rides the env, never argv, so the argv above stays the
+            // hardwired seam contract whatever account the session is on.
+            match launch.claude_slot.map(|s| &s.dir) {
+                Some(SlotDir::Store(dir)) => {
+                    cmd.env(CONFIG_DIR_ENV, dir);
+                }
+                Some(SlotDir::Home) => {
+                    cmd.env_remove(CONFIG_DIR_ENV);
+                }
+                None => {}
+            }
         }
         Backend::Opencode => {
             cmd.args(opencode_interactive_args())
@@ -392,9 +427,10 @@ mod tests {
             // opencode-only fields — the claude arm must ignore them entirely.
             opencode_config: Path::new("/run/softfig/growlight/opencode.json"),
             boot_prompt: "begin",
+            claude_slot: None,
         };
-        let cmd =
-            interactive_command(Backend::Claude, &launch).expect("claude backend builds a command");
+        let cmd = interactive_command(Backend::Claude, &launch, &[])
+            .expect("claude backend builds a command");
         assert_eq!(cmd.get_program(), OsStr::new("claude"));
         let args: Vec<OsString> = cmd.get_args().map(OsStr::to_owned).collect();
         assert_eq!(
@@ -416,6 +452,57 @@ mod tests {
             !cmd.get_envs()
                 .any(|(k, _)| k == OsStr::new("OPENCODE_CONFIG")),
             "claude must not set OPENCODE_CONFIG"
+        );
+    }
+
+    /// claude-login-switcher slice 007: the slot reaches claude as an env
+    /// change (set for a store slot, removed for `home`), and the argv is the
+    /// same with or without one.
+    #[test]
+    fn the_claude_slot_rides_the_env_and_leaves_the_argv_alone() {
+        use std::ffi::OsStr;
+        let base = InteractiveLaunch {
+            agent_name: "softfig-loop",
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/home/u/garden"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: "begin",
+            claude_slot: None,
+        };
+        let args = |l: &InteractiveLaunch| -> Vec<String> {
+            interactive_command(Backend::Claude, l, &[])
+                .unwrap()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let env = |l: &InteractiveLaunch| -> Vec<(String, Option<String>)> {
+            interactive_command(Backend::Claude, l, &[])
+                .unwrap()
+                .get_envs()
+                .map(|(k, v)| {
+                    (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                })
+                .collect()
+        };
+        assert!(env(&base).is_empty(), "no slot ⇒ no env change at all");
+
+        let store = LaunchSlot { name: "slot2".into(), dir: SlotDir::Store("/s/slot2".into()) };
+        let on_store = InteractiveLaunch { claude_slot: Some(&store), ..base };
+        assert_eq!(env(&on_store), [("CLAUDE_CONFIG_DIR".into(), Some("/s/slot2".into()))]);
+        assert_eq!(args(&on_store), args(&base));
+
+        let home = LaunchSlot { name: "home".into(), dir: SlotDir::Home };
+        let on_home = InteractiveLaunch { claude_slot: Some(&home), ..base };
+        assert_eq!(env(&on_home), [("CLAUDE_CONFIG_DIR".into(), None)]);
+        assert_eq!(args(&on_home), args(&base));
+        assert!(
+            interactive_command(Backend::Claude, &on_home, &[])
+                .unwrap()
+                .get_envs()
+                .all(|(k, _)| k != OsStr::new("HOME")),
+            "HOME is never touched",
         );
     }
 
@@ -606,6 +693,12 @@ mod tests {
         use std::ffi::OsStr;
         let opencode_cfg = Path::new("/rt/opencode.json");
         let garden = Path::new("/home/u/garden");
+        // Bound to a local: MSRV 1.88 doesn't extend a temporary's lifetime
+        // through `Some(&…)` inside a struct literal (E0716).
+        let slot = LaunchSlot {
+            name: "slot2".into(),
+            dir: SlotDir::Store("/s/slot2".into()),
+        };
         let launch = InteractiveLaunch {
             agent_name: "softfig-loop",
             // claude-only fields — the opencode arm must ignore them entirely.
@@ -614,8 +707,9 @@ mod tests {
             garden_root: garden,
             opencode_config: opencode_cfg,
             boot_prompt: "Begin your growlight iteration.",
+            claude_slot: Some(&slot),
         };
-        let cmd = interactive_command(Backend::Opencode, &launch)
+        let cmd = interactive_command(Backend::Opencode, &launch, &[])
             .expect("opencode backend builds a command");
 
         assert_eq!(cmd.get_program(), OsStr::new("opencode"));
@@ -728,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn model_spec_carries_variant_on_opencode_and_drops_it_on_claude() {
+    fn model_spec_carries_variant_on_both_backends() {
         let opencode = match parse_model_spec("flash effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
@@ -740,13 +834,19 @@ mod tests {
             ModelSpec::Fixed(opencode)
         );
 
-        // claude's effort isn't settable from this launch path, so a variant on a
-        // claude spec parses (no error for the human) but is not carried.
-        let claude = match parse_model_spec("claude variant=high").unwrap() {
+        // claude-model-select slice 001: `claude effort=high` was silently
+        // dropped before this milestone and now carries the effort on the
+        // `--effort` argv. The value must be in claude's closed set.
+        let claude = match parse_model_spec("claude effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
         };
-        assert_eq!(claude, ModelChoice::claude());
+        assert_eq!(claude.variant.as_deref(), Some("high"));
+        assert_eq!(claude.model, None);
+        assert!(
+            parse_model_spec("claude effort=insane").is_err(),
+            "claude's effort set is closed"
+        );
 
         assert!(parse_model_spec("flash speed=fast").is_err(), "unknown key");
         assert!(parse_model_spec("flash high").is_err(), "not key=value");

@@ -3672,6 +3672,7 @@ dependencies = [
  "softfig-store",
  "softfig-vault",
  "softfig-vcs",
+ "tempfile",
  "toml",
  "zeroize",
 ]

@@ -17,6 +17,13 @@ softfig-store.workspace = true
 softfig-vcs.workspace = true
 softfig-ipc.workspace = true
 softfig-growlightd-client.workspace = true
+# claude-login-switcher: `claude-login status` reads the budget-aware picker's
+# per-profile samples, pins and runtime dir through growlightd's own functions
+# (profile_budget, profile_pin, fleet::runtime_growlight_dir) rather than
+# re-deriving them. The growlightd crate stays lean (serde/toml/thiserror/
+# anyhow/clap/signal-hook/libc/rusqlite — no tokio), so this is one edge, not
+# a transitive bloom.
+softfig-growlightd.workspace = true
 softfig-onboard.workspace = true
 softfig-deploy.workspace = true
 clap.workspace = true
@@ -30,12 +37,11 @@ toml.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-# Tests boot a real growlightd Daemon on a temp socket as the fake-agent fixture
-# for the slice-004 client + e2e tests (spec §13). Dev-only — the CLI client
-# code depends solely on the shared wire types in softfig-ipc::growlightd.
-softfig-growlightd.workspace = true
 # queue-v2-state slice 009: the §6.9 CLI-form e2e test boots a real keeperd on
 # a temp garden + socket (no FUSE) and drives the forms over the wire exactly
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
+# claude-login-switcher: isolate the HOME-rooted filesystem tests in a temp
+# directory. Dev-only — prod uses hand-rolled sibling tempfiles.
+tempfile.workspace = true

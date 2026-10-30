@@ -97,6 +97,14 @@ pub enum ClaimHold {
     /// The item doc could not be read, so the marker is unknown — fail-closed
     /// for this pass rather than risk claiming human-only work. Carries the error.
     Unreadable(String),
+    /// The item doc declares `> Not before: <value>` and that time hasn't come
+    /// (the interim scheduler, 2026-10-30). Carries the value as written. The
+    /// hold is re-read every [`HOLD_RECHECK_SECS`](crate::drive_loop::HOLD_RECHECK_SECS),
+    /// so the item becomes claimable within that long of its time.
+    NotYet(String),
+    /// The `> Not before:` value doesn't parse, so the start time is unknown —
+    /// fail-closed rather than start it early. Carries the parse error.
+    BadStartTime(String),
 }
 
 impl ClaimHold {
@@ -105,6 +113,16 @@ impl ClaimHold {
         match self {
             Self::HumanOnly(value) => format!("human-only (> Fleet: {value})"),
             Self::Unreadable(error) => format!("fleet marker unreadable: {error}"),
+            Self::NotYet(value) => format!("scheduled (> Not before: {value})"),
+            Self::BadStartTime(error) => format!("start time unreadable: {error}"),
+        }
+    }
+
+    /// What the held part is waiting for, for the journal's "left queued for …".
+    pub fn waits_for(&self) -> &'static str {
+        match self {
+            Self::NotYet(_) => "its start time",
+            Self::HumanOnly(_) | Self::Unreadable(_) | Self::BadStartTime(_) => "the human",
         }
     }
 }

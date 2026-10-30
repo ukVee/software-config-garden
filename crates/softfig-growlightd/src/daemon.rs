@@ -886,7 +886,9 @@ mod tests {
     fn hard_kill_reaches_a_supervised_agents_live_child() {
         use crate::admission::{AdmissionGovernor, BudgetUsage, RateState};
         use crate::config::Policy;
-        use crate::supervisor::{AgentBackend, AgentSpec, SpawnError, StartOutcome, Supervisor};
+        use crate::supervisor::{
+            AgentBackend, AgentSpec, SpawnKind, StartOutcome, Supervisor,
+        };
 
         /// A backend mirroring `ClaudeBackend`: every spawn records a kill handle
         /// in the daemon-shared registry (and hands the supervisor its own). The
@@ -900,7 +902,7 @@ mod tests {
             fn spawn(
                 &self,
                 spec: &AgentSpec,
-            ) -> std::result::Result<Box<dyn AgentChild>, SpawnError> {
+            ) -> std::result::Result<Box<dyn AgentChild>, SpawnKind> {
                 self.kill_handles.lock().unwrap().insert(
                     spec.agent.clone(),
                     LiveKill::new(

@@ -58,6 +58,75 @@ carries no model key at all. The member's `opencode.json` (still written fresh p
 still holding the permission map) and the argv are built by the same spawn path, so the
 model a member runs on and the permission map that member was granted cannot drift apart.
 
+## Declaring a claude member's model
+
+A claude member picks up its model and effort from the same `[[fleet]]` block,
+in a grammar that mirrors `claude -p`'s own `--model` / `--effort`:
+
+```toml
+[[fleet]]
+agent   = "a"                            # backend omitted ⇒ claude, no --model/--effort
+# model   = "claude:claude-opus-4-7"     # optional; spawn adds `--model claude-opus-4-7`
+# variant = "high"                       # optional; spawn adds `--effort high`
+
+[[fleet]]
+agent   = "b"
+backend = "claude"
+model   = "claude:fable[1m]"             # alias + 1M-context suffix also parse
+variant = "max"                          # closed set: low | medium | high | xhigh | max
+```
+
+- `model` on a claude member is **optional**. Omitting it spawns `claude -p`
+  without `--model`, which is byte-identical to a pre-`claude-model-select`
+  claude member.
+- When set, it must be prefixed `claude:<alias|id>`; `<alias>` is one of
+  `opus | sonnet | haiku | fable`, `<id>` matches
+  `claude-[a-z0-9]+(-[a-z0-9]+)*`, and either may carry the `[1m]` suffix. A
+  bare `<id>` without the `claude:` prefix is refused at arm time with a parse
+  message naming the fix. An opencode-shape `provider/model` on a claude member
+  stays refused as opencode-only.
+- `variant` names the effort and is passed as `--effort <v>`. It is a **closed
+  set** on claude: `low | medium | high | xhigh | max`; a value outside the set
+  is refused at parse time.
+- An item's declared `> Model: claude:<m>` (plus optional `effort=`) overrides
+  the roster entry on spawn; the roster entry is the member's default for work
+  with no `> Model:` line. See `spec-growlight-queue.md` §6.4 for the full
+  resolution chain.
+- When Claude Code refuses the requested model (`model_not_found` / 404), the
+  REFUSING MEMBER parks (its `not_before` is set to `i64::MAX`) with a single
+  alert carrying the refusal reason — there is no crash loop and no backoff
+  retry (`claude-model-select` slice 003, 2026-10-23). The ITEM is parked at
+  the same time (`park_item` through keeperd + `pause_v2_entry` for a v2
+  assignment), the member's claim is released, and its slot is freed, so a
+  sibling member runs other work; the refusing member stays registered and
+  parked (`claude-login-pool-wiring` slice 004 M-E, 2026-10-24). Every
+  subsequent tick runs a reconcile pass that re-reads the item's `> Model:`
+  chain (slice doc → milestone doc) and the live roster through the §6.4
+  resolver, compares the resolved choice to the latched refused one, and —
+  if they differ — **releases the member at an item boundary**
+  (`supervisor.retire` + `aggregator.forget` + the latch drop; slice 008,
+  2026-10-28). The same tick's step 3 then picks + claims + copies a fresh
+  §3.6 baton + spawns on the live-resolved model, so a human edit to the
+  item declaration or the roster model un-parks the member on the next tick
+  with no daemon restart and no stale baton re-roll. A v2 paused entry is
+  pickable by `pick_v2` so an edited entry resumes through a real claim; a
+  legacy `blocked` item stays blocked by default and the freed member moves
+  to the next workable part (the human re-queues the item to re-run it). An
+  unreadable item doc is treated as "undeclared" so a transient keeperd miss
+  cannot spuriously un-park. The single ModelRefused alert is never
+  re-emitted while the park stands.
+- **Known gap (review 048 M-A/M-B/M-C, tracked in `claude-login-pool-wiring`
+  milestone):** with `profile_pool` configured, the admission budget rail folds
+  fleet-wide (one slot's `allowed_warning` can halt members pooled on other
+  accounts), `RateLimitHolds` is memory-only (so a daemon restart loses the
+  hold and may spin the member against a still-closed window until it
+  observes a fresh `rate_limit_event`), and `pick_pool_slot` does not filter
+  credential-missing or already-held slots before its LRU sort (so a slot made
+  with `add --no-login` can keep winning and wedging the member). With no
+  `profile_pool` configured (today's `config/growlight.toml`), behaviour is
+  byte-identical to the pre-switcher spawn, so the gaps are gated behind the
+  owner enabling pools in config.
+
 ## What is refused
 
 Four config mistakes are reported and refused at arm time rather than defaulted. All

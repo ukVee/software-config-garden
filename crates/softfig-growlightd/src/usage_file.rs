@@ -41,6 +41,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use softfig_ipc::claude_profiles;
 use softfig_ipc::usage::{RateWindow, UsageSnapshot};
 
 use crate::claude_backend::BudgetWindow;
@@ -62,6 +63,14 @@ pub const REFRESH_FLOOR_SECS: i64 = 300;
 pub struct UsageCapture {
     /// The `usage.json` to keep fresh; `None` disables writing entirely.
     path: Option<PathBuf>,
+    /// Shared-capture active-slot gate (claude-login-switcher slice 009 S8).
+    /// When set, a reading tagged with a `profile` is written only when that
+    /// profile matches `claude_profiles::read_active(&store)` at write time;
+    /// a non-active slot's reading is dropped entirely — not folded into
+    /// state, not written. An untagged reading (unpooled member) always
+    /// writes. Per-slot captures leave this unset so each writes its own
+    /// file regardless.
+    active_store: Option<PathBuf>,
     state: Mutex<CaptureState>,
 }
 
@@ -74,10 +83,49 @@ struct CaptureState {
 }
 
 impl UsageCapture {
-    /// A capture that keeps `path` fresh.
+    /// A capture that keeps `path` fresh. No active-slot gate — every reading
+    /// is written. Used for the shared `usage.json` on a daemon without a
+    /// claude-login store (nothing to be active against) and in tests.
     pub fn new(path: PathBuf) -> Self {
         Self {
             path: Some(path),
+            active_store: None,
+            state: Mutex::new(CaptureState::default()),
+        }
+    }
+
+    /// A per-slot capture seeded from whatever already lives on disk at `path`
+    /// (claude-login-switcher slice 009 S7). On fresh construction, the first
+    /// write of a steady unchanged reading used to overwrite the file with
+    /// just one window's data, losing the other window's prior reading;
+    /// seeding fixes that. A malformed or missing file reads as empty — a
+    /// torn file is overwritten by the next real reading, and the picker's
+    /// own read already treats such a file as warn-tier via
+    /// [`crate::profile_budget::slot_headroom`].
+    pub fn seeded(path: PathBuf) -> Self {
+        let mut state = CaptureState::default();
+        if let Ok(Some(snap)) = UsageSnapshot::load(&path) {
+            let last = snap.ts as i64;
+            state.snapshot = snap;
+            state.written_at = Some(last);
+        }
+        Self {
+            path: Some(path),
+            active_store: None,
+            state: Mutex::new(state),
+        }
+    }
+
+    /// The shared `usage.json` capture, gated on the human's `active` slot
+    /// (claude-login-switcher slice 009 S8). A reading tagged with a `profile`
+    /// is written only when that profile matches `read_active(&store)` at
+    /// write time; a non-active slot's reading is dropped entirely so the
+    /// shared file never mixes accounts. An untagged reading (an unpooled
+    /// member) always writes.
+    pub fn new_shared_with_active_gate(path: PathBuf, store: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            active_store: Some(store),
             state: Mutex::new(CaptureState::default()),
         }
     }
@@ -88,19 +136,49 @@ impl UsageCapture {
     pub fn disabled() -> Self {
         Self {
             path: None,
+            active_store: None,
             state: Mutex::new(CaptureState::default()),
         }
     }
 
     /// Tee one window's reading — exactly as the wire reported it — into the file,
-    /// stamping the snapshot `at` (unix seconds, the reader thread's clock).
+    /// stamping the snapshot `at` (unix seconds, the reader thread's clock) and
+    /// tagging it with the writing member's `profile` slot (claude-login-switcher
+    /// slice 004) when the member has one pinned. The tag is a hint to readers
+    /// bucketing by profile; the shared top-level `usage.json` reflects the LAST
+    /// writer's slot (one capture, many members), while a per-profile file
+    /// (`usage.by-profile/<slot>.json`) is written by a sibling capture pointed
+    /// at that path with the same slot every time.
     ///
     /// Merges per window: a reading of the 5h window never disturbs what is known
-    /// about the 7d one. Writes when the reading **changed**, or when the last write
-    /// is [`REFRESH_FLOOR_SECS`] old (see the module docs); a write failure is
-    /// reported to the daemon's stderr — the journal — and dropped, because a
-    /// budget tee must never take down an agent's reader thread.
-    pub fn record(&self, window: BudgetWindow, reading: RateWindow, at: i64) {
+    /// about the 7d one. Writes when the reading **changed** or when the last
+    /// write is [`REFRESH_FLOOR_SECS`] old (see the module docs); a tag flip
+    /// alone no longer forces a write — the shared file's slot is governed by
+    /// the active-slot gate, and a per-profile capture only ever sees its own
+    /// slot. A write failure is reported to the daemon's stderr — the
+    /// journal — and dropped, because a budget tee must never take down an
+    /// agent's reader thread.
+    ///
+    /// With a shared-capture [`active_store`](Self::new_shared_with_active_gate)
+    /// a reading tagged with a `profile` that is not the human's current
+    /// `active` slot is dropped entirely: not folded into state, not written.
+    /// That is what keeps the shared `usage.json` holding one account's
+    /// readings only, so protocol §2b readers never mix accounts.
+    pub fn record(
+        &self,
+        window: BudgetWindow,
+        reading: RateWindow,
+        at: i64,
+        profile: Option<&str>,
+    ) {
+        // Slice 009 S8: a shared capture with an active gate drops every
+        // reading tagged with a non-active slot — before any state is touched,
+        // so the file keeps the active slot's history alone.
+        if let (Some(store), Some(p)) = (self.active_store.as_deref(), profile)
+            && claude_profiles::read_active(store).ok().as_deref() != Some(p)
+        {
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         let slot = match window {
             BudgetWindow::FiveHour => &mut state.snapshot.rate_limits.five_hour,
@@ -108,6 +186,7 @@ impl UsageCapture {
         };
         let changed = *slot != reading;
         *slot = reading;
+        state.snapshot.profile = profile.map(str::to_string);
         let due = state
             .written_at
             .is_none_or(|last| at.saturating_sub(last) >= REFRESH_FLOOR_SECS);
@@ -157,8 +236,8 @@ mod tests {
         let path = dir.path().join("growlight").join("usage.json");
         let cap = UsageCapture::new(path.clone());
 
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000);
-        cap.record(BudgetWindow::SevenDay, window("warning", 9_000), 1_001);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, None);
+        cap.record(BudgetWindow::SevenDay, window("warning", 9_000), 1_001, None);
 
         let raw = std::fs::read_to_string(&path).expect("the capture created the file");
         assert!(
@@ -186,12 +265,12 @@ mod tests {
         let path = dir.path().join("usage.json");
         let cap = UsageCapture::new(path.clone());
 
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, None);
         let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let first = mtime(&path);
 
         // Re-reported unchanged a minute later: no write, so `ts` still reads 1_000.
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060, None);
         assert_eq!(
             UsageSnapshot::load(&path).unwrap().unwrap().ts,
             1_000.0,
@@ -200,17 +279,221 @@ mod tests {
         assert_eq!(mtime(&path), first, "…and the file was not touched at all");
 
         // Past the floor: the same reading is re-stamped so its age stays honest.
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS, None);
         assert_eq!(
             UsageSnapshot::load(&path).unwrap().unwrap().ts,
             (1_000 + REFRESH_FLOOR_SECS) as f64,
         );
 
         // A changed status is written immediately, floor or no floor.
-        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 1_000 + REFRESH_FLOOR_SECS + 1);
+        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 1_000 + REFRESH_FLOOR_SECS + 1, None);
         let back = UsageSnapshot::load(&path).unwrap().unwrap();
         assert_eq!(back.rate_limits.five_hour.status.as_deref(), Some("rejected"));
         assert_eq!(back.ts, (1_000 + REFRESH_FLOOR_SECS + 1) as f64);
+    }
+
+    /// The `profile` tag is persisted to the file; after slice 009 S8 a tag
+    /// flip alone (same reading, different slot, same window) no longer forces
+    /// a write — the shared file's slot is governed by the active-slot gate
+    /// below, not by whoever wrote last. The eMMC floor is restored.
+    #[test]
+    fn a_profile_tag_is_persisted_but_a_tag_flip_alone_does_not_force_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let cap = UsageCapture::new(path.clone());
+
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, Some("slot1"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot1"));
+        assert_eq!(back.ts, 1_000.0);
+
+        // Same reading, different slot, inside the floor — no write (slice 009
+        // S8 removed the `profile_changed` forced write; the file still reads
+        // the first writer's content).
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_030, Some("slot2"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(
+            back.profile.as_deref(),
+            Some("slot1"),
+            "tag flip alone no longer forces a shared-file write",
+        );
+        assert_eq!(back.ts, 1_000.0);
+
+        // Past the floor, the same reading is re-stamped; state has slot2 by
+        // now, so a floor refresh promotes the tag honestly.
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS, Some("slot2"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot2"));
+    }
+
+    /// A seeded per-slot capture loads whatever already lives on disk at `path`
+    /// (claude-login-switcher slice 009 S7). The first unchanged event inside
+    /// the floor no longer overwrites the file with just one window's data,
+    /// losing the other window's prior reading.
+    #[test]
+    fn a_seeded_capture_preserves_the_other_windows_prior_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slot1.json");
+        // Pre-exist: both windows have readings.
+        let seed = UsageSnapshot {
+            context_window: None,
+            rate_limits: softfig_ipc::usage::RateLimits {
+                five_hour: window("allowed", 2_000),
+                seven_day: window("allowed_warning", 90_000),
+            },
+            ts: 500.0,
+            profile: Some("slot1".into()),
+        };
+        seed.write_atomic(&path).unwrap();
+
+        // Fresh daemon, same slot: seed loads the file. A 5h unchanged event
+        // inside the floor is a no-op (no disk churn), and the 7d data stays.
+        let cap = UsageCapture::seeded(path.clone());
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 600, Some("slot1"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.rate_limits.seven_day.status.as_deref(), Some("allowed_warning"));
+        assert_eq!(back.rate_limits.seven_day.resets_at, Some(90_000));
+        assert_eq!(back.ts, 500.0, "unchanged inside the floor ⇒ no write");
+
+        // A changed 5h reading writes — and still carries the seeded 7d data,
+        // because state was seeded, not empty.
+        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 601, Some("slot1"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.rate_limits.five_hour.status.as_deref(), Some("rejected"));
+        assert_eq!(
+            back.rate_limits.seven_day.status.as_deref(),
+            Some("allowed_warning"),
+            "seeded 7d reading survived the first write",
+        );
+    }
+
+    /// Two interleaved writers to one slot leave no torn file, and a stale
+    /// temp from a crashed writer doesn't block the next write
+    /// (claude-login-switcher slice 009 S7). The unique-per-write temp names
+    /// in [`UsageSnapshot::write_atomic`] mean concurrent writers no longer
+    /// collide on one `*.json.tmp`.
+    #[test]
+    fn two_interleaved_writers_to_one_slot_leave_no_torn_file_and_a_stale_temp_does_not_block_the_next_write() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slot1.json");
+
+        // Pre-plant a stale temp as if a prior process crashed between write and
+        // rename (the OLD fixed `slot1.json.tmp` name). The new write path never
+        // touches it, so it must not block.
+        let stale = dir.path().join("slot1.json.tmp");
+        std::fs::write(&stale, "garbage-from-a-crashed-writer").unwrap();
+
+        let path_a = Arc::new(path.clone());
+        let path_b = Arc::clone(&path_a);
+        let t1 = std::thread::spawn(move || {
+            for i in 0..200 {
+                UsageSnapshot {
+                    context_window: None,
+                    rate_limits: softfig_ipc::usage::RateLimits {
+                        five_hour: window("allowed", 2_000 + i),
+                        seven_day: RateWindow::default(),
+                    },
+                    ts: 1_000.0 + i as f64,
+                    profile: Some("slot1".into()),
+                }
+                .write_atomic(&path_a)
+                .expect("writer A: write_atomic should succeed");
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..200 {
+                UsageSnapshot {
+                    context_window: None,
+                    rate_limits: softfig_ipc::usage::RateLimits {
+                        five_hour: window("rejected", 3_000 + i),
+                        seven_day: RateWindow::default(),
+                    },
+                    ts: 2_000.0 + i as f64,
+                    profile: Some("slot1".into()),
+                }
+                .write_atomic(&path_b)
+                .expect("writer B: write_atomic should succeed");
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // The file parses: no half-written content survived.
+        let back = UsageSnapshot::load(&path).unwrap().expect("file exists");
+        assert!(
+            back.rate_limits.five_hour.status.is_some(),
+            "file is intact JSON after 400 interleaved writes",
+        );
+        // The stale temp is harmless (left on disk; the next write doesn't need it).
+        assert!(stale.exists(), "stale temp still there, no block, no corruption");
+    }
+
+    /// With the shared capture's active-slot gate installed, interleaved
+    /// slot1/slot2 events (active = slot1) leave the shared `usage.json`
+    /// holding slot1 only, and the eMMC floor is respected
+    /// (claude-login-switcher slice 009 S8).
+    #[test]
+    fn interleaved_slot1_slot2_events_leave_the_shared_file_slot1_only_and_respect_the_300s_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(store.join("slot1")).unwrap();
+        std::fs::create_dir_all(store.join("slot2")).unwrap();
+        // `active` -> `slot1`.
+        std::os::unix::fs::symlink("slot1", store.join("active")).unwrap();
+
+        let shared = dir.path().join("usage.json");
+        let cap = UsageCapture::new_shared_with_active_gate(shared.clone(), store.clone());
+
+        // slot1 event ⇒ written (first write).
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, Some("slot1"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot1"));
+        assert_eq!(back.rate_limits.five_hour.status.as_deref(), Some("allowed"));
+        assert_eq!(back.ts, 1_000.0);
+
+        // slot2 event ⇒ dropped entirely by the gate (state untouched, no write).
+        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 1_010, Some("slot2"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(
+            back.profile.as_deref(),
+            Some("slot1"),
+            "shared file holds the active slot only",
+        );
+        assert_eq!(
+            back.rate_limits.five_hour.status.as_deref(),
+            Some("allowed"),
+            "slot2's rejection never polluted slot1's reading",
+        );
+        assert_eq!(back.ts, 1_000.0);
+
+        // slot1 same reading, inside the floor ⇒ no write (floor respected).
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060, Some("slot1"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(back.ts, 1_000.0, "floor still respected (same slot, same reading)");
+
+        // slot1 past the floor ⇒ written (refresh).
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS, Some("slot1"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(back.ts, (1_000 + REFRESH_FLOOR_SECS) as f64);
+
+        // Change the active pointer to slot2: now a slot1 event is dropped and
+        // a slot2 event writes.
+        std::fs::remove_file(store.join("active")).unwrap();
+        std::os::unix::fs::symlink("slot2", store.join("active")).unwrap();
+        let later = 1_000 + REFRESH_FLOOR_SECS * 3;
+        cap.record(BudgetWindow::FiveHour, window("rejected", 5_555), later, Some("slot1"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(
+            back.rate_limits.five_hour.status.as_deref(),
+            Some("allowed"),
+            "slot1 is no longer active ⇒ its reading is dropped",
+        );
+        cap.record(BudgetWindow::FiveHour, window("rejected", 5_555), later, Some("slot2"));
+        let back = UsageSnapshot::load(&shared).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot2"));
+        assert_eq!(back.rate_limits.five_hour.status.as_deref(), Some("rejected"));
     }
 
     /// A disabled capture folds readings in memory and never creates a file — the
@@ -219,7 +502,7 @@ mod tests {
     #[test]
     fn a_disabled_capture_never_touches_disk() {
         let cap = UsageCapture::disabled();
-        cap.record(BudgetWindow::FiveHour, window("rejected", 5), 1);
+        cap.record(BudgetWindow::FiveHour, window("rejected", 5), 1, None);
         assert_eq!(
             cap.snapshot().rate_limits.five_hour.status.as_deref(),
             Some("rejected"),

@@ -31,6 +31,8 @@ pub const FLEET: &str = "fleet";
 pub const GRANTS: &str = "grants";
 /// The `> Worktree:` key.
 pub const WORKTREE: &str = "worktree";
+/// The `> Not before:` key.
+pub const NOT_BEFORE: &str = "not before";
 
 /// `line` as a metadata line: its key (trimmed, case as written) and value
 /// (trimmed), or `None` when it is not a blockquote `key: value` line.
