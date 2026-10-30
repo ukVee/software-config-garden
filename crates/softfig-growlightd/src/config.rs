@@ -124,6 +124,15 @@ pub struct BuildCaps {
     /// the agent against growlightd + the rest of the box, keeping the tablet
     /// responsive. Only slows the build. `None` leaves it unset.
     pub cpu_weight: Option<u32>,
+    /// `CPUQuota`, a systemd percentage (`"50%"` = half of one CPU; over `100%`
+    /// spans CPUs). Unlike `CPUWeight`, which only bites under contention, it
+    /// caps a lone building agent too, which makes it the thermal lever on a
+    /// fanless device. On the Surface Go 3 (2026-10-30) a sustained `-j 1`
+    /// rebuild peaked at 84–90 °C uncapped and 74 °C at `50%`, with no guard
+    /// stop. Still a throttle, never a kill: the build only takes longer.
+    /// `None` (the default) leaves it unset; it is read from the config at
+    /// spawn and not yet settable live.
+    pub cpu_quota: Option<String>,
 }
 
 impl Default for BuildCaps {
@@ -132,8 +141,26 @@ impl Default for BuildCaps {
             cargo_build_jobs: Some(2),
             memory_high: Some("3G".to_string()),
             cpu_weight: Some(50),
+            cpu_quota: None,
         }
     }
+}
+
+/// Does `value` parse as a systemd `CPUQuota=` percentage (`N%` or `N.N%`,
+/// greater than zero)? Checked when the config loads, so a typo like `50` (no
+/// `%`) disables the fleet with a clear error instead of failing every spawn
+/// the way an unchecked `MemoryHigh` once did (slice 001).
+pub fn is_valid_cpu_quota(value: &str) -> bool {
+    let Some(pct) = value.strip_suffix('%') else {
+        return false;
+    };
+    let mut parts = pct.splitn(2, '.');
+    let int = parts.next().unwrap_or("");
+    let frac = parts.next();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(int)
+        && frac.is_none_or(digits)
+        && pct.bytes().any(|b| (b'1'..=b'9').contains(&b))
 }
 
 /// systemd's valid `CPUWeight` range (inclusive). A value outside it is a
@@ -409,6 +436,7 @@ mod tests {
                 cargo_build_jobs: Some(2), // untouched
                 memory_high: Some("6G".to_string()), // set
                 cpu_weight: Some(50), // untouched
+                cpu_quota: None,
             },
         );
 
@@ -432,8 +460,28 @@ mod tests {
                 cargo_build_jobs: Some(4),
                 memory_high: Some("5G".to_string()),
                 cpu_weight: Some(80),
+                cpu_quota: None,
             },
         );
+    }
+
+    #[test]
+    fn cpu_quota_accepts_only_a_positive_systemd_percentage() {
+        for good in ["50%", "12.5%", "200%", "100%", "0.5%"] {
+            assert!(is_valid_cpu_quota(good), "{good:?} is a valid CPUQuota");
+        }
+        for bad in ["", "50", "%", "0%", "0.0%", "50 %", " 50%", "abc%", "-5%", "5.%", ".5%", "50%%"] {
+            assert!(!is_valid_cpu_quota(bad), "{bad:?} is NOT a valid CPUQuota");
+        }
+    }
+
+    #[test]
+    fn with_update_keeps_the_config_cpu_quota() {
+        let base = BuildCaps { cpu_quota: Some("50%".into()), ..BuildCaps::default() };
+        let merged = base
+            .with_update(&SetResourcesArgs { cpu_weight: Some(80), ..SetResourcesArgs::default() })
+            .unwrap();
+        assert_eq!(merged.cpu_quota.as_deref(), Some("50%"), "a live update never drops it");
     }
 
     #[test]

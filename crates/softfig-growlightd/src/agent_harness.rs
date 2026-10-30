@@ -582,6 +582,10 @@ pub(crate) fn build_cap_args(caps: &BuildCaps) -> Vec<OsString> {
     if let Some(weight) = caps.cpu_weight {
         args.push(format!("--property=CPUWeight={weight}").into());
     }
+    // A hard ceiling on CPU time, still a throttle: the build only runs slower.
+    if let Some(quota) = &caps.cpu_quota {
+        args.push(format!("--property=CPUQuota={quota}").into());
+    }
     args
 }
 
@@ -1276,6 +1280,7 @@ mod tests {
             cargo_build_jobs: None,
             memory_high: None,
             cpu_weight: None,
+            cpu_quota: None,
         };
         assert!(build_cap_args(&none).is_empty());
         // A partial cap emits only what's set.
@@ -1283,10 +1288,17 @@ mod tests {
             cargo_build_jobs: None,
             memory_high: Some("70%".to_string()),
             cpu_weight: None,
+            cpu_quota: None,
         };
         assert_eq!(
             build_cap_args(&partial),
             vec![OsString::from("--property=MemoryHigh=70%")]
+        );
+        // The thermal cap rides the same scope as a CPUQuota property.
+        let quota = BuildCaps { cpu_quota: Some("50%".to_string()), ..BuildCaps::default() };
+        assert_eq!(
+            build_cap_args(&quota).last(),
+            Some(&OsString::from("--property=CPUQuota=50%"))
         );
     }
 

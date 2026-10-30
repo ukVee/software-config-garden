@@ -612,6 +612,16 @@ impl FleetConfig {
                     .to_string(),
             );
         }
+        // A `cpu_quota` systemd would refuse would fail every spawn; refuse it here
+        // instead, so the loader disables the fleet with the reason.
+        if let Some(quota) = &doc.build_caps.cpu_quota
+            && !crate::config::is_valid_cpu_quota(quota)
+        {
+            return Err(format!(
+                "[build_caps] cpu_quota {quota:?} is not a systemd CPUQuota value \
+                 (want a positive percentage like \"50%\")"
+            ));
+        }
         // Validate each member's backend declaration (slice 005) — an unknown
         // backend, or an opencode-only key on a claude member, is REPORTED AND
         // REFUSED here rather than defaulted, because both mistakes end the same
@@ -1620,6 +1630,7 @@ agent = "reviewer"
                 cargo_build_jobs: Some(4),
                 memory_high: Some("5G".to_string()),
                 cpu_weight: Some(80),
+                cpu_quota: None,
             }
         );
 
@@ -1637,9 +1648,26 @@ agent = "reviewer"
                 cargo_build_jobs: Some(2),
                 memory_high: Some("6G".to_string()),
                 cpu_weight: Some(50),
+                cpu_quota: None,
             },
             "an unset field falls back to the conservative default",
         );
+    }
+
+    #[test]
+    fn cpu_quota_parses_and_a_bad_one_disables_the_fleet() {
+        let cfg = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ncpu_quota = \"50%\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.build_caps.cpu_quota.as_deref(), Some("50%"));
+        assert_eq!(cfg.build_caps.cargo_build_jobs, Some(2), "the rest keep their defaults");
+
+        let err = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ncpu_quota = \"50\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("cpu_quota"), "names the bad key: {err}");
     }
 
     #[test]
