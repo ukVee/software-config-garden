@@ -513,8 +513,10 @@ pub enum ReRecord {
 }
 
 /// Re-record the restacked branches' bases after a restack completes (§8):
-/// each branch's new `base` is `git merge-base <branch> <its parent's tip or
-/// main>`. A branch that has an upstream is never rewritten — the pass returns
+/// each restacked branch's new `base` is `git merge-base <branch> <its parent's
+/// tip or main>`. Only a branch that already contains that tip counts as
+/// restacked; a partially restacked stack re-records just those, and the rest
+/// stay as recorded until they are restacked too. A branch that has an upstream is never rewritten — the pass returns
 /// [`ReRecord::Upstream`] and the loop blocks for the human. A remote repo runs
 /// no git and has no commit to resolve, so its pass is empty (the human
 /// re-records by hand, §8). `git` is never written to.
@@ -573,6 +575,12 @@ pub fn re_record_bases(
                 .unwrap_or(main)
                 .to_string()
         };
+        // Only a branch that now contains its `onto` tip has been restacked. An
+        // unrestacked one keeps its recorded base (merge-base would just
+        // re-record the stale commit) and stays flagged by `detect_restack`.
+        if !git.is_ancestor(&onto, &c.branch)? {
+            continue;
+        }
         let base = git.merge_base(&c.branch, &onto)?;
         out.push(ReRecordedBase {
             entry: c.id.clone(),
@@ -1065,6 +1073,35 @@ mod tests {
         );
         // The tips are untouched by the read-only re-record.
         assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip);
+    }
+
+    #[test]
+    fn re_record_skips_a_branch_that_is_not_restacked_yet() {
+        // V6: a partially restacked stack. feat/one has been rebased onto the new
+        // main; feat/two has not been put back on top of it. Only feat/one is
+        // re-recorded: feat/two's merge-base would just be its stale old base.
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        let two_tip = open_branch_from(repo, "feat/two", "feat/one");
+        let new_main = ff_main(repo);
+        sh_git(repo, &["rebase", "-q", "main", "feat/one"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+        let git = Git::new(repo.to_path_buf());
+        let ReRecord::Bases(bases) =
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap()
+        else {
+            panic!("expected re-recorded bases");
+        };
+        assert_eq!(bases.len(), 1, "only the restacked branch: {bases:?}");
+        assert_eq!(bases[0].entry, "one");
+        assert_eq!(bases[0].base, new_main, "feat/one now sits on the new main");
+        assert_eq!(rev_parse_sh(repo, "feat/two"), two_tip, "feat/two is untouched");
     }
 
     #[test]
