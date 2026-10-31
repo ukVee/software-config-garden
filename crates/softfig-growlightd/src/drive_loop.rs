@@ -65,7 +65,8 @@ use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::first_claim::{self, FirstClaim};
-use crate::git_stack::{self, Git, Repo};
+use crate::git_probe::ProbeCache;
+use crate::git_stack::{self, Repo};
 use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
@@ -1212,7 +1213,7 @@ const V2_CLAIM_BACKOFF_BASE_SECS: i64 = 5;
 const V2_CLAIM_BACKOFF_MAX_SECS: i64 = 300;
 
 /// The retry delay after the `streak`-th consecutive v2 claim failure.
-fn v2_claim_backoff_secs(streak: u32) -> i64 {
+pub(crate) fn v2_claim_backoff_secs(streak: u32) -> i64 {
     let doublings = streak.saturating_sub(1).min(16);
     (V2_CLAIM_BACKOFF_BASE_SECS << doublings).min(V2_CLAIM_BACKOFF_MAX_SECS)
 }
@@ -1539,6 +1540,9 @@ pub struct DriveLoop {
     /// Set on the first v2 tick after the snapshot loads; a daemon restart
     /// re-runs it (the spec's "at daemon start").
     restack_boot_done: bool,
+    /// The §8 git probes (queue-v2-git V13): bounded worker-thread probes whose
+    /// answers are shared per repo for the tick and backed off across ticks.
+    git_probes: ProbeCache,
     /// Top-level entry ids that handed off this tick (queue-v2-git slice 003):
     /// the handshake runs in step 1, before the snapshot loads, so its §8
     /// restack scan is deferred here and drained once the snapshot is read.
@@ -1750,6 +1754,7 @@ impl DriveLoop {
             model_refused_items: std::collections::BTreeMap::new(),
             v2: None,
             restack_boot_done: false,
+            git_probes: ProbeCache::new(),
             v2_handoff_scans: std::collections::BTreeSet::new(),
             v2_restack_project: std::collections::BTreeMap::new(),
             v2_re_record_scans: std::collections::BTreeSet::new(),
@@ -1901,6 +1906,7 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        self.git_probes.begin_tick(now);
         // Per-slot rate-limit hold re-scan (slice 002 M-B part 1). First tick
         // seeds from disk BEFORE any admission read; a non-first tick re-scans
         // every N ticks so a sibling writer reaches admission without a daemon
@@ -2880,6 +2886,7 @@ impl DriveLoop {
                         let entries = &v2_seams.entries;
                         let member_writer = &v2_seams.member_writer;
                         let v2_claimer = &v2_seams.claimer;
+                        let git_probes = &self.git_probes;
                         // Per-member admission budget (slice 001 M-A): fold on
                         // this member's claude-login profile only.
                         let member_budget = budget_for(agent);
@@ -2912,8 +2919,13 @@ impl DriveLoop {
                                     Some(ev) if ev.claimed.is_empty() => {
                                         let home =
                                             std::env::var_os("HOME").map(std::path::PathBuf::from);
-                                        first_claim::first_claim(snapshot, ev, home.as_deref())
-                                            .map_err(|e| e.to_string())?
+                                        first_claim::first_claim(
+                                            snapshot,
+                                            ev,
+                                            home.as_deref(),
+                                            git_probes,
+                                        )
+                                        .map_err(|e| e.to_string())?
                                     }
                                     _ => None,
                                 };
@@ -3874,6 +3886,9 @@ impl DriveLoop {
             return;
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        // One bounded probe per repo (V13), all started before any is waited on,
+        // so a boot scan over every project costs one deadline, not one each.
+        let mut probes = Vec::new();
         for proj in &snapshot.projects {
             if let Some(want) = project
                 && proj.name != want
@@ -3901,27 +3916,32 @@ impl DriveLoop {
             if entries.is_empty() {
                 continue;
             }
-            let git = Git::new(repo_path);
-            let stack = match git_stack::detect_restack(
-                &repo,
-                &proj.main,
-                &entries,
-                &snapshot.done_branches,
-                &git,
-            ) {
-                Ok(Some(stack)) => stack,
-                Ok(None) => continue,
-                Err(_) => continue, // fail-soft: re-detected on the next scan
-            };
-            match git_stack::restack_upstream_branch(&stack, &git) {
-                Ok(None) => {}
-                Ok(Some(branch)) => {
-                    blocked.push(restack_blocked_alert(&proj.name, &branch));
-                    continue;
+            let main = proj.main.clone();
+            let archived = snapshot.done_branches.clone();
+            let probe = self.git_probes.spawn(&repo_path, move |git| {
+                let Some(stack) =
+                    git_stack::detect_restack(&repo, &main, &entries, &archived, git)?
+                else {
+                    return Ok(None);
+                };
+                let upstream = git_stack::restack_upstream_branch(&stack, git)?;
+                Ok(Some((stack, upstream)))
+            });
+            probes.push((proj.name.clone(), probe));
+        }
+        for (name, probe) in probes {
+            match probe.wait() {
+                Ok(Some((stack, None))) => {
+                    let _ = seams.restacker.enqueue_restack(&name, &stack);
                 }
-                Err(_) => continue, // fail closed: re-checked on the next scan
+                Ok(Some((_, Some(branch)))) => {
+                    blocked.push(restack_blocked_alert(&name, &branch));
+                }
+                Ok(None) => {}
+                // Fail-soft / fail closed: nothing is enqueued, and the next scan
+                // re-detects (a timed-out repo is held, not re-probed every tick).
+                Err(_) => {}
             }
-            let _ = seams.restacker.enqueue_restack(&proj.name, &stack);
         }
     }
 
@@ -3971,14 +3991,14 @@ impl DriveLoop {
         if entries.is_empty() {
             return;
         }
-        let git = Git::new(repo_path);
-        let bases = match git_stack::re_record_bases(
-            &repo,
-            &proj.main,
-            &entries,
-            &snapshot.done_branches,
-            &git,
-        ) {
+        // Fresh reads: this runs after a restack the loop was told about, and
+        // writes bases back, so it must not answer from this tick's earlier scans.
+        let main = proj.main.clone();
+        let archived = snapshot.done_branches.clone();
+        let probe = self.git_probes.spawn_fresh(&repo_path, move |git| {
+            git_stack::re_record_bases(&repo, &main, &entries, &archived, git)
+        });
+        let bases = match probe.wait() {
             Ok(git_stack::ReRecord::Bases(bases)) => bases,
             // A branch tracks an upstream: the loop never rewrites it, so the
             // bases stay as recorded and the human is told.
@@ -9736,6 +9756,55 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             lines.iter().any(|l| l.contains("feat/one") && l.contains("upstream")),
             "the journal names the branch: {lines:?}",
         );
+    }
+
+    /// V13: restack scans of one repo within a tick share git's answers — the
+    /// scan at claim and the scan at a handshake do not each re-run the probe.
+    #[test]
+    fn v2_mode_scans_of_one_repo_in_a_tick_spawn_git_once() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        loop_.git_probes.begin_tick(500);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        let first = loop_.git_probes.spawned(dir.path());
+        assert!(first > 0, "the first scan ran git");
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        assert_eq!(
+            loop_.git_probes.spawned(dir.path()),
+            first,
+            "later scans in the tick are answered from the first",
+        );
+
+        loop_.git_probes.begin_tick(501);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(loop_.git_probes.spawned(dir.path()), first, "a new tick asks git again");
+    }
+
+    /// V13: a git that never answers costs the tick one overall deadline, not a
+    /// kill per call, and the next scan in the tick does not wait again.
+    #[test]
+    fn v2_mode_scan_of_a_hung_repo_is_bounded_and_enqueues_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let tools = tempfile::tempdir().unwrap();
+        let (slow_git, _) = crate::git_probe::tests::fake_git(tools.path(), "30");
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        loop_.git_probes = ProbeCache::with(Duration::from_millis(300), slow_git);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        loop_.git_probes.begin_tick(500);
+
+        let started = std::time::Instant::now();
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(enq.enqueued.lock().unwrap().is_empty());
+        assert!(blocked.is_empty());
     }
 
     /// The control: the same stale stack with no upstream is enqueued as before.

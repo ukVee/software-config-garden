@@ -31,6 +31,7 @@ pub mod daemon;
 pub mod drive_loop;
 pub mod first_claim;
 pub mod fleet;
+pub mod git_probe;
 pub mod git_stack;
 pub mod handshake;
 pub mod hub;

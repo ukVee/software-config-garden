@@ -21,6 +21,7 @@ use std::path::Path;
 
 use softfig_ipc::queue_v2::Lane;
 
+use crate::git_probe::ProbeCache;
 use crate::git_stack::{self, Git, Repo, Stack, StackEntry};
 use crate::scheduler_v2::{EntryView, V2Snapshot};
 
@@ -40,7 +41,9 @@ pub struct FirstClaim {
 
 /// Compute what `entry`'s first claim records, or `None` when the entry has no
 /// branch (a restack — nothing to cut, nothing to seed). Pure over the snapshot
-/// plus the read-only git surface; `home` expands `~` repo paths.
+/// plus the read-only git surface; `home` expands `~` repo paths. The git runs
+/// as one probe on a worker thread under `probes` (V13): bounded by a deadline,
+/// sharing this tick's answers, and backed off after a timeout.
 ///
 /// The stack candidates are the snapshot's live entries in the same project,
 /// in claim order. An **urgent** entry skips the stack entirely — it branches
@@ -51,6 +54,7 @@ pub fn first_claim(
     snapshot: &V2Snapshot,
     entry: &EntryView,
     home: Option<&Path>,
+    probes: &ProbeCache,
 ) -> Result<Option<FirstClaim>, git_stack::GitError> {
     if entry.branch.is_empty() {
         return Ok(None); // a restack — no branch, so no base to record
@@ -61,11 +65,6 @@ pub fn first_claim(
         return Ok(None);
     };
     let repo = Repo::classify(&project.repo, home);
-    let git = match &repo {
-        Repo::Local(path) => Git::new(path.clone()),
-        // A remote project runs no git (§8); the handle is never touched.
-        Repo::Remote => Git::new(std::path::PathBuf::new()),
-    };
     let stack_entries: Vec<StackEntry> = snapshot
         .entries
         .iter()
@@ -77,12 +76,26 @@ pub fn first_claim(
             claimed: e.claimed.clone(),
         })
         .collect();
-    let stack = if entry.lane == Lane::Urgent {
-        Stack::default() // urgent branches from `main`; the stack is irrelevant
-    } else {
-        git_stack::stack_candidates(&repo, &project.main, &stack_entries, &git)?
+    let main = project.main.clone();
+    let lane = entry.lane;
+    let compute = {
+        let repo = repo.clone();
+        move |git: &Git| {
+            let stack = if lane == Lane::Urgent {
+                Stack::default() // urgent branches from `main`; the stack is irrelevant
+            } else {
+                git_stack::stack_candidates(&repo, &main, &stack_entries, git)?
+            };
+            git_stack::claim_base(&repo, &main, lane, &stack, git)
+        }
     };
-    let base = git_stack::claim_base(&repo, &project.main, entry.lane, &stack, &git)?;
+    let base = match &repo {
+        // One bounded probe for the whole chain (V13), sharing this tick's
+        // answers with every other probe of the repo.
+        Repo::Local(path) => probes.spawn(path, compute).wait()?,
+        // A remote project runs no git (§8); the handle is never touched.
+        Repo::Remote => compute(&Git::new(std::path::PathBuf::new()))?,
+    };
     Ok(Some(FirstClaim {
         branch: entry.branch.clone(),
         parent: base.parent,
@@ -211,7 +224,7 @@ mod tests {
         let snapshot = local_snap(dir.path(), entries);
         let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
 
-        let fc = first_claim(&snapshot, claiming, None).unwrap().unwrap();
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
         assert_eq!(fc.branch, "feat/three");
         assert_eq!(fc.parent, "two", "cut from the newest-claimed candidate");
         assert_eq!(fc.base, two_tip, "local base is the cut-from commit");
@@ -224,7 +237,7 @@ mod tests {
         let snapshot = local_snap(dir.path(), entries);
         let claiming = snapshot.entries.first().unwrap();
 
-        let fc = first_claim(&snapshot, claiming, None).unwrap().unwrap();
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
         assert_eq!(fc.parent, "", "main has no parent entry");
         assert_eq!(fc.base, main_tip, "branches from main's tip");
     }
@@ -244,7 +257,7 @@ mod tests {
         let snapshot = local_snap(dir.path(), entries);
         let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
 
-        let fc = first_claim(&snapshot, claiming, None)
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new())
             .expect("an uncut sibling branch must not fail the claim")
             .unwrap();
         assert_eq!(fc.parent, "one", "the uncut ghost is skipped");
@@ -264,7 +277,7 @@ mod tests {
         let snapshot = local_snap(dir.path(), entries);
         let claiming = snapshot.entries.iter().find(|e| e.id == "hotfix").unwrap();
 
-        let fc = first_claim(&snapshot, claiming, None).unwrap().unwrap();
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
         assert_eq!(fc.parent, "", "urgent branches from main");
         assert_eq!(fc.base, main_tip);
     }
@@ -287,7 +300,7 @@ mod tests {
         );
         let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
 
-        let fc = first_claim(&snapshot, claiming, None).unwrap().unwrap();
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
         assert_eq!(fc.parent, "two", "newest claimed by list state");
         assert_eq!(fc.base, "feat/two", "remote base is the branch name, not a commit");
     }
@@ -305,6 +318,6 @@ mod tests {
         );
         let claiming = snapshot.entries.first().unwrap();
 
-        assert_eq!(first_claim(&snapshot, claiming, None).unwrap(), None);
+        assert_eq!(first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap(), None);
     }
 }

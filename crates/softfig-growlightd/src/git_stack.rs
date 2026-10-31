@@ -29,7 +29,10 @@
 //! and returns data. [`Git`] is the *only* thing that talks to the repo, and
 //! every call is read-only (`merge-base --is-ancestor`, `rev-parse`) and takes
 //! `--no-optional-locks`, so it never races the member's own git in the same
-//! worktree (the same guard [`crate::item_repo`]'s probe uses). The unit tests
+//! worktree (the same guard [`crate::item_repo`]'s probe uses). The drive loop runs
+//! the model on a bounded worker thread ([`crate::git_probe`], V13) — one
+//! overall deadline per repo, answers shared for the tick, a timed-out repo held
+//! with backoff — never on its own thread. The unit tests
 //! exercise the whole model against temp git repos, plus the remote path with a
 //! `Git` pointed at a non-repo to prove it is never touched.
 
@@ -37,14 +40,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use softfig_ipc::queue_v2::{Lane, RestackBranch};
 
-/// How long one read-only `git` call may run before it is killed. The stack is
-/// computed at claim time, on the drive loop's one thread, so it must never
-/// wedge the supervisor on a hung mount.
+/// How long one read-only `git` call may run before it is killed. A probe
+/// chain also carries an overall deadline ([`Git::with_deadline`], V13) and the
+/// drive loop only ever waits on a worker thread ([`crate::git_probe`]), so a
+/// hung mount can neither wedge the supervisor nor burn this once per call.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A read-only git call that failed: git could not be run, the repo is not a
@@ -74,12 +79,78 @@ pub enum GitError {
 #[derive(Debug, Clone)]
 pub struct Git {
     repo: PathBuf,
+    /// The git binary; `git` outside tests.
+    program: PathBuf,
+    /// The overall deadline of the probe chain this handle belongs to (V13): no
+    /// call starts after it and none runs past it.
+    deadline: Option<Instant>,
+    /// The per-tick answer cache shared by every probe of this repo (V13).
+    memo: Option<Arc<GitMemo>>,
+}
+
+/// One repo's per-tick git answers (V13). Every probe of a repo within a tick
+/// shares one, so a command already run is answered from here instead of
+/// spawning git again, and a call that timed out fails every later call at once
+/// instead of costing each its own timeout. The drive loop replaces it each
+/// tick, so an answer is at most one tick old.
+#[derive(Debug, Default)]
+pub struct GitMemo {
+    state: Mutex<MemoState>,
+}
+
+#[derive(Debug, Default)]
+struct MemoState {
+    results: HashMap<Vec<String>, (ExitStatus, Vec<u8>)>,
+    /// `(command, seconds)` of the call that timed out, if one did.
+    hung: Option<(String, u64)>,
+    spawned: usize,
+}
+
+impl GitMemo {
+    fn lock(&self) -> MutexGuard<'_, MemoState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many git processes this memo's repo has had spawned.
+    pub fn spawned(&self) -> usize {
+        self.lock().spawned
+    }
+
+    /// Record that a probe on this repo timed out, so the rest of the tick's
+    /// probes fail at once.
+    pub(crate) fn mark_hung(&self, cmd: &str, secs: u64) {
+        self.lock().hung.get_or_insert((cmd.to_string(), secs));
+    }
 }
 
 impl Git {
     /// A handle over `repo`, used only for read-only queries.
     pub fn new(repo: impl Into<PathBuf>) -> Self {
-        Self { repo: repo.into() }
+        Self { repo: repo.into(), program: PathBuf::from("git"), deadline: None, memo: None }
+    }
+
+    /// Run `program` instead of `git` (tests point it at a slow fake).
+    pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.program = program.into();
+        self
+    }
+
+    /// No call on this handle starts after `deadline`, and none runs past it.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Answer repeated commands from `memo` and share its timeout.
+    pub fn with_memo(mut self, memo: Arc<GitMemo>) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    /// A handle over another worktree of the same repo, bound by the same
+    /// deadline (its answers are not shared: they differ per path).
+    fn at(&self, path: PathBuf) -> Self {
+        Self { repo: path, program: self.program.clone(), deadline: self.deadline, memo: None }
     }
 
     /// `git merge-base --is-ancestor <ancestor> <descendant>`: is `ancestor`
@@ -199,7 +270,7 @@ impl Git {
             let Some(path) = path.filter(|_| !skip) else {
                 continue;
             };
-            let wt = Git::new(path.clone());
+            let wt = self.at(path.clone());
             for dir in ["rebase-merge", "rebase-apply"] {
                 let (status, out) = wt.run(&["rev-parse", "--git-path", dir])?;
                 if !status.success() {
@@ -223,8 +294,56 @@ impl Git {
         Ok(found)
     }
 
+    /// Run one git command, from the per-tick memo when it already ran.
     fn run(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
-        let mut child = Command::new("git")
+        let Some(memo) = &self.memo else {
+            return self.spawn_and_wait(args);
+        };
+        let key: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        {
+            let state = memo.lock();
+            if let Some(hit) = state.results.get(&key) {
+                return Ok(hit.clone());
+            }
+            if let Some((cmd, secs)) = &state.hung {
+                return Err(GitError::Timeout {
+                    cmd: cmd.clone(),
+                    repo: self.repo.clone(),
+                    secs: *secs,
+                });
+            }
+        }
+        let out = self.spawn_and_wait(args);
+        let mut state = memo.lock();
+        state.spawned += 1;
+        match &out {
+            Ok(hit) => {
+                state.results.insert(key, hit.clone());
+            }
+            Err(GitError::Timeout { cmd, secs, .. }) => {
+                state.hung.get_or_insert((cmd.clone(), *secs));
+            }
+            Err(_) => {}
+        }
+        out
+    }
+
+    fn spawn_and_wait(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
+        let start = Instant::now();
+        let mut deadline = start + GIT_TIMEOUT;
+        if let Some(overall) = self.deadline {
+            deadline = deadline.min(overall);
+        }
+        let secs = deadline.saturating_duration_since(start).as_secs_f64().ceil() as u64;
+        let timed_out = || GitError::Timeout {
+            cmd: args[0].into(),
+            repo: self.repo.clone(),
+            secs,
+        };
+        if deadline <= start {
+            return Err(timed_out()); // the chain's budget is spent: don't spawn
+        }
+        let mut child = Command::new(&self.program)
             .arg("--no-optional-locks")
             .arg("-C")
             .arg(&self.repo)
@@ -244,7 +363,6 @@ impl Git {
             let _ = stdout.read_to_end(&mut out);
             out
         });
-        let deadline = Instant::now() + GIT_TIMEOUT;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -252,14 +370,12 @@ impl Git {
                     thread::sleep(Duration::from_millis(5))
                 }
                 Ok(None) => {
+                    // Runs on a probe worker, never the drive loop: a git in
+                    // D-state that outlives this kill only parks the worker.
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = reader.join();
-                    return Err(GitError::Timeout {
-                        cmd: args[0].into(),
-                        repo: self.repo.clone(),
-                        secs: GIT_TIMEOUT.as_secs(),
-                    });
+                    return Err(timed_out());
                 }
                 Err(e) => {
                     let _ = reader.join();
