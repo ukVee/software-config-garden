@@ -1228,6 +1228,7 @@ mod tests {
             entry: "m1".into(),
             unit: Unit::Slice { milestone: "m1".into(), slice: "001".into() },
             resolved_model: softfig_ipc::model_choice::ModelChoice::claude(),
+            repo: None,
         };
         daemon.publish_v2_assignments(&std::iter::once(("c".to_string(), assignment)).collect());
 

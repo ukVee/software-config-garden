@@ -423,9 +423,18 @@ The guard is read-only: it never reverts, stages or commits, and ignored paths s
 on every boot and `/clear`, from the `softfig growlight boot-check` call in the generated
 `inject.sh`. Protocol step 1b tells the member what to do with it.
 
-Not yet covered: under `queue = "v2"` the guard is not wired (the v2 start rewrites the
-member baton from the entry baton, so the entry baton's time is the handoff there). That
-is part of `queue-v2-git-hardening`, before the v2 flip.
+Under `queue = "v2"` the guard runs on the same two spawns (queue-v2-parity row 6). The
+repo is the entry's project `repo` from `queue.toml`, resolved once when the member claims
+the entry and only when the project is local: `~`, `~/…` and `~<you>/…` expand against
+your home, and a remote or ambiguous repo gets no guard. The v2 start rewrites the member
+baton from the entry baton, so a fresh start compares against the entry baton's last
+write, which is its last handoff. An entry with no baton yet is seeded, so any dirt is
+surfaced. A re-roll compares against the member's carried baton, as under legacy. The
+line names the entry rather than `<queue>/<part>`:
+
+```
+growlightd: boot dirty tree: queue-v2-parity (a): /home/u/repo has 11 uncommitted path(s), newest ~533s newer than the baton handoff
+```
 
 ## Known gaps
 

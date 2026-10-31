@@ -462,6 +462,13 @@ impl FsEntryBatonStore {
         fs::read_to_string(self.entry_path(entry_id)).ok()
     }
 
+    /// When an entry's baton was last written — its last handoff, since the
+    /// §6.3 store step is this store's only post-seed writer. `None` when
+    /// there is no baton or its metadata is unreadable.
+    pub fn mtime(&self, entry_id: &str) -> Option<std::time::SystemTime> {
+        fs::metadata(self.entry_path(entry_id)).and_then(|md| md.modified()).ok()
+    }
+
     /// Write an entry's baton — the §6.3 handshake's store step ("growlightd
     /// stores the baton as the entry's baton"). Creates the entry dir when
     /// absent (idempotent with [`Self::seed`]'s create); a failed create or

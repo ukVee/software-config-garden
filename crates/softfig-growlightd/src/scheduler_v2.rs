@@ -344,24 +344,21 @@ pub enum WalkOutcome {
     NoUnit,
 }
 
-/// The repo an entry works on, joined from the snapshot's projects. A
+/// The project an entry belongs to, joined from the snapshot's projects. A
 /// validated snapshot guarantees every entry's project exists (writer
 /// invariant 4); `None` is the defensive, fail-closed case.
+pub(crate) fn project_of<'a>(snapshot: &'a V2Snapshot, entry: &EntryView) -> Option<&'a ProjectView> {
+    snapshot.projects.iter().find(|p| p.name == entry.project)
+}
+
+/// The repo an entry works on ([`project_of`]'s `repo`).
 fn repo_of<'a>(snapshot: &'a V2Snapshot, entry: &EntryView) -> Option<&'a str> {
-    snapshot
-        .projects
-        .iter()
-        .find(|p| p.name == entry.project)
-        .map(|p| p.repo.as_str())
+    project_of(snapshot, entry).map(|p| p.repo.as_str())
 }
 
 /// [`repo_of`]'s locality: where the entry's project repo lives.
 fn locality_of(snapshot: &V2Snapshot, entry: &EntryView) -> Option<RepoLocality> {
-    snapshot
-        .projects
-        .iter()
-        .find(|p| p.name == entry.project)
-        .map(|p| p.locality)
+    project_of(snapshot, entry).map(|p| p.locality)
 }
 
 /// The §4 unit walk for a picked entry: a milestone walks its slice tree (in

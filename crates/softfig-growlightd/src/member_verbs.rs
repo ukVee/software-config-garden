@@ -898,6 +898,7 @@ mod tests {
                 slice: id.into(),
             },
             resolved_model: ModelChoice::opencode(DEEPSEEK_FLASH),
+            repo: None,
         }
     }
 

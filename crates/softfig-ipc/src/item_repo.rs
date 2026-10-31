@@ -87,12 +87,26 @@ pub fn resolve_repo(
         v.map(|v| v.trim().trim_matches('`').trim()).filter(|v| !v.is_empty())
     }
     let value = present(worktree).or_else(|| present(registry))?;
-    let path = if value == "~" {
-        home?.to_path_buf()
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home?.join(rest)
-    } else {
-        PathBuf::from(value)
+    expand_home(value, home, None)
+}
+
+/// `value` as a local absolute path: `~`, `~/…`, and — when `user` names the
+/// current user — `~<user>` and `~<user>/…` expand against `home`. The one
+/// tilde expander, shared by [`resolve_repo`] (which passes no `user`, so its
+/// `~user` stays `None`) and the v2 repo resolver (which passes `$USER`, to
+/// match [`RepoLocality`](crate::queue_v2::RepoLocality)'s `Local`). Anything
+/// that is not absolute after that — relative, another user's `~`, a remote
+/// `host:/path`, `~` with no `home` — gives `None`.
+pub fn expand_home(value: &str, home: Option<&Path>, user: Option<&str>) -> Option<PathBuf> {
+    let path = match value.strip_prefix('~') {
+        Some(rest) => {
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if !name.is_empty() && Some(name) != user {
+                return None;
+            }
+            if tail.is_empty() { home?.to_path_buf() } else { home?.join(tail) }
+        }
+        None => PathBuf::from(value),
     };
     path.is_absolute().then_some(path)
 }
@@ -375,6 +389,22 @@ mod tests {
         assert_eq!(r(Some("~"), None), Some(PathBuf::from("/home/u")));
         assert_eq!(r(Some("`/w`"), None), Some(PathBuf::from("/w")), "backticks unwrap");
         assert_eq!(resolve_repo(Some("~/p"), None, None), None, "no home to expand against");
+    }
+
+    #[test]
+    fn expand_home_expands_the_current_users_tilde_forms_only() {
+        let home = Some(Path::new("/home/u"));
+        let e = |v| expand_home(v, home, Some("u"));
+        assert_eq!(e("/r"), Some(PathBuf::from("/r")));
+        assert_eq!(e("~"), Some(PathBuf::from("/home/u")));
+        assert_eq!(e("~/p/x"), Some(PathBuf::from("/home/u/p/x")));
+        assert_eq!(e("~u"), Some(PathBuf::from("/home/u")));
+        assert_eq!(e("~u/p"), Some(PathBuf::from("/home/u/p")));
+        assert_eq!(e("~bob/p"), None, "another user's home is not ours to guess");
+        assert_eq!(expand_home("~u/p", home, None), None, "no user: ~user stays unexpanded");
+        assert_eq!(e("p/x"), None, "relative");
+        assert_eq!(e("host:/x"), None, "remote");
+        assert_eq!(expand_home("~/p", None, Some("u")), None, "no home to expand against");
     }
 
     #[test]

@@ -813,6 +813,7 @@ pub(crate) mod tests {
             entry: "m1".into(),
             unit,
             resolved_model: ModelChoice::opencode("deepseek/deepseek-flash"),
+            repo: None,
         }
     }
 

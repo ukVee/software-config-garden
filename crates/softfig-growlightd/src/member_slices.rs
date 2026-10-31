@@ -155,6 +155,7 @@ mod tests {
             entry: entry.into(),
             unit,
             resolved_model: ModelChoice::claude(),
+            repo: None,
         }
     }
 

@@ -72,6 +72,7 @@ use crate::scheduler::{
     classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
+use crate::v2_repo;
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
@@ -694,6 +695,16 @@ pub trait RepoProbe: Send + Sync + fmt::Debug {
     /// spin guard then decides on NEXT ACTION alone. The path is the one probed,
     /// so the boot dirty-tree guard (task 064) names exactly the repo it read.
     fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)>;
+
+    /// The v2 resolution (queue-v2-parity slice 005): the local repo a v2
+    /// entry of `project` lands in ([`crate::v2_repo::local_repo`], against
+    /// this probe's `$HOME` / `$USER`), or `None` for a remote or ambiguous
+    /// repo. Read once at claim and carried on the [`V2Assignment`].
+    fn v2_repo(&self, project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf>;
+
+    /// [`RepoState`] of an already-resolved `repo` — the v2 twin of
+    /// [`RepoProbe::repo_state`]'s read half. `None` when the read failed.
+    fn probe_repo(&self, repo: &std::path::Path) -> Option<RepoState>;
 }
 
 /// The default [`RepoProbe`]: no repo signal, so the spin guard is the
@@ -703,6 +714,14 @@ pub struct NoRepoProbe;
 
 impl RepoProbe for NoRepoProbe {
     fn repo_state(&self, _queue: &str, _part: &str) -> Option<(std::path::PathBuf, RepoState)> {
+        None
+    }
+
+    fn v2_repo(&self, _project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn probe_repo(&self, _repo: &std::path::Path) -> Option<RepoState> {
         None
     }
 }
@@ -927,18 +946,22 @@ impl BatonSeeder for DeferredBatonSeeder {
 /// from [`Supervisor::tick_with`]'s pre-spawn hook. Read-only: it journals the
 /// signal and puts it in the member's baton; it never reverts, stages or
 /// commits. Returns whether it surfaced a signal.
+///
+/// `work` names the unit for the line (`<queue>/<part>`, or a v2 entry), and
+/// `read` is the repo it lands in with its state — legacy reads it through
+/// [`RepoProbe::repo_state`], v2 through [`v2_repo_read`]. `None` = no repo
+/// signal, so nothing to surface.
 fn boot_guard(
-    repo_probe: &dyn RepoProbe,
     seeder: &dyn BatonSeeder,
     agent: &str,
-    queue: &str,
-    part: &str,
+    work: &str,
+    read: Option<(std::path::PathBuf, RepoState)>,
     handoff: Handoff,
 ) -> bool {
-    let Some((repo, state)) = repo_probe.repo_state(queue, part) else {
+    let Some((repo, state)) = read else {
         return false;
     };
-    let Some(signal) = boot_signal(&format!("{queue}/{part} ({agent})"), &repo, &state, handoff) else {
+    let Some(signal) = boot_signal(&format!("{work} ({agent})"), &repo, &state, handoff) else {
         return false;
     };
     eprintln!("growlightd: {signal}");
@@ -946,6 +969,19 @@ fn boot_guard(
         eprintln!("growlightd: boot dirty tree: failed to warn {agent}: {e}");
     }
     true
+}
+
+/// A v2 member's repo and its state, for the boot guard and the spin guard
+/// (queue-v2-parity rows 6/7): the repo the claim resolved
+/// ([`V2Assignment::repo`]), probed now. `None` for a remote or ambiguous
+/// repo, or a failed read — no repo signal, as legacy gives none.
+fn v2_repo_read(
+    repo_probe: &dyn RepoProbe,
+    assignment: &V2Assignment,
+) -> Option<(std::path::PathBuf, RepoState)> {
+    let repo = assignment.repo.clone()?;
+    let state = repo_probe.probe_repo(&repo)?;
+    Some((repo, state))
 }
 
 // ---- queue v2 scheduling seams (queue-v2-scheduling slice 006) ----
@@ -1108,6 +1144,10 @@ pub struct V2Assignment {
     /// declared (§6.4). A claude member's choice is always `claude` (its model
     /// is the harness's own, not settable from this path).
     pub resolved_model: ModelChoice,
+    /// The local repo the entry's work lands in, resolved once at claim
+    /// ([`RepoProbe::v2_repo`] over the entry's project). `None` for a remote
+    /// or ambiguous repo: the boot and spin guards then get no repo signal.
+    pub repo: Option<std::path::PathBuf>,
 }
 
 /// A v2 session the loop ended after its member-verb handoff (§6.3 step 4).
@@ -2615,7 +2655,23 @@ impl DriveLoop {
                                 .get(agent)
                                 .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
                     };
-                    report.rerolls = self.supervisor.tick(&budget_for, rate, now, &workable);
+                    // The boot dirty-tree guard before each re-roll's spawn
+                    // (parity row 6) — the legacy `pre_spawn` twin: a
+                    // re-rolled member boots onto its carried baton, whose last
+                    // write is the handoff.
+                    let (repo_probe, baton, seeder) =
+                        (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
+                    let pre_spawn = |agent: &str| {
+                        if let Some(assignment) = assignments.get(agent)
+                            && let Some(handoff) = baton.baton_mtime(agent)
+                        {
+                            let read = v2_repo_read(repo_probe, assignment);
+                            boot_guard(seeder, agent, &assignment.entry, read, Handoff::At(handoff));
+                        }
+                    };
+                    report.rerolls =
+                        self.supervisor
+                            .tick_with(&budget_for, rate, now, &workable, &pre_spawn);
                     for outcome in &report.rerolls {
                         if let RerollOutcome::Rerolled { agent } = outcome {
                             self.reconnecting.remove(agent);
@@ -2745,6 +2801,12 @@ impl DriveLoop {
                         let entries = &v2_seams.entries;
                         let member_writer = &v2_seams.member_writer;
                         let v2_claimer = &v2_seams.claimer;
+                        let (repo_probe, seeder) = (self.repo_probe.as_ref(), self.seeder.as_ref());
+                        // Where the entry's work lands (queue-v2-parity slice
+                        // 005), resolved once here and carried on the
+                        // assignment for the re-roll and the spin guard.
+                        let repo = v2_repo::entry_project(snapshot, &pick.entry)
+                            .and_then(|project| repo_probe.v2_repo(project));
                         // Per-member admission budget (slice 001 M-A): fold on
                         // this member's claude-login profile only.
                         let member_budget = budget_for(agent);
@@ -2758,8 +2820,20 @@ impl DriveLoop {
                                 // (seed before claim), so a baton failure aborts
                                 // before the keeperd write and never orphans an
                                 // `active` entry.
-                                copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
-                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())
+                                let handoff =
+                                    copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
+                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())?;
+                                // The boot dirty-tree guard (parity row 6), once the
+                                // claim has landed and before the spawn — the legacy
+                                // fresh start's placement. The entry baton says what
+                                // the last handoff was. Read-only; best-effort.
+                                if let Some(handoff) = handoff
+                                    && let Some(repo) = &repo
+                                {
+                                    let read = repo_probe.probe_repo(repo).map(|state| (repo.clone(), state));
+                                    boot_guard(seeder, agent, &pick.entry, read, handoff);
+                                }
+                                Ok(())
                             },
                         );
                         match outcome {
@@ -2777,6 +2851,7 @@ impl DriveLoop {
                                     entry: pick.entry.clone(),
                                     unit: pick.unit.clone(),
                                     resolved_model: resolved,
+                                    repo,
                                 };
                                 self.v2_assignments.insert(agent.clone(), assignment.clone());
                                 report.v2_started.push(assignment);
@@ -2938,7 +3013,8 @@ impl DriveLoop {
                 if let Some((queue, part)) = assignments.get(agent)
                     && let Some(handoff) = baton.baton_mtime(agent)
                 {
-                    boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
+                    let read = repo_probe.repo_state(queue, part);
+                    boot_guard(seeder, agent, &format!("{queue}/{part}"), read, Handoff::At(handoff));
                 }
             };
             report.rerolls =
@@ -3139,7 +3215,8 @@ impl DriveLoop {
                         // seed says what the last handoff was — the member's kept
                         // baton, or none under a fresh one. Read-only; best-effort.
                         if let Some(handoff) = seeded.handoff() {
-                            boot_guard(repo_probe, seeder, agent, &queue, &part, handoff);
+                            let read = repo_probe.repo_state(&queue, &part);
+                            boot_guard(seeder, agent, &format!("{queue}/{part}"), read, handoff);
                         }
                         Ok(())
                     },
@@ -3919,17 +3996,19 @@ fn copy_entry_baton(
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
-) -> Result<(), String> {
-    let baton = match entries.read(entry_top) {
-        Some(baton) => baton,
+) -> Result<Option<Handoff>, String> {
+    let (baton, handoff) = match entries.read(entry_top) {
+        Some(baton) => (baton, entries.mtime(entry_top).map(Handoff::At)),
         None => {
             entries.seed(entry_top, None, None)?;
-            entries
+            let baton = entries
                 .read(entry_top)
-                .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?
+                .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?;
+            (baton, Some(Handoff::Fresh))
         }
     };
-    member_writer.write(agent, &baton)
+    member_writer.write(agent, &baton)?;
+    Ok(handoff)
 }
 
 /// The journal label for a v2 unit (slice 006) — the `unit` half of a
@@ -6330,12 +6409,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     }
 
     /// A scripted [`RepoProbe`] (task 069): every read answers the current state
-    /// and is recorded with the `(queue, part)` it asked for.
+    /// and is recorded with the `(queue, part)` it asked for. A v2 read
+    /// resolves through the real [`v2_repo::local_repo`] (home `/home/t`, user
+    /// `t`) and is recorded with the path it probed (slot 3).
     #[derive(Debug, Default)]
     struct ScriptedRepo(
         Mutex<Option<RepoState>>,
         Mutex<Vec<(String, String)>>,
         Mutex<Option<std::path::PathBuf>>,
+        Mutex<Vec<std::path::PathBuf>>,
     );
     impl ScriptedRepo {
         fn set(&self, head: &str, dirty: usize, fingerprint: u64) {
@@ -6362,12 +6444,22 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn reads(&self) -> Vec<(String, String)> {
             self.1.lock().unwrap().clone()
         }
+        fn v2_reads(&self) -> Vec<std::path::PathBuf> {
+            self.3.lock().unwrap().clone()
+        }
     }
     impl RepoProbe for Arc<ScriptedRepo> {
         fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)> {
             self.1.lock().unwrap().push((queue.into(), part.into()));
             let path = self.2.lock().unwrap().clone().unwrap_or_else(|| "/scripted-repo".into());
             self.0.lock().unwrap().clone().map(|state| (path, state))
+        }
+        fn v2_repo(&self, project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf> {
+            v2_repo::local_repo(project, Some(std::path::Path::new("/home/t")), Some("t"))
+        }
+        fn probe_repo(&self, repo: &std::path::Path) -> Option<RepoState> {
+            self.3.lock().unwrap().push(repo.to_path_buf());
+            self.0.lock().unwrap().clone()
         }
     }
 
@@ -8911,6 +9003,121 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         ))
     }
 
+    /// A fresh per-test entry-baton dir under the system temp dir.
+    fn v2_entries_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("v2-entries-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// QUEUE-V2-PARITY ROW 6 — the boot dirty-tree guard on both v2 spawn
+    /// paths. The fresh start compares against the entry baton's handoff (its
+    /// last write), so dirt older than it is silent and dirt newer than it
+    /// warns before the spawn; the re-roll compares against the member's
+    /// carried baton from the pre-spawn hook. The repo is the one the claim
+    /// resolved from the entry's project.
+    #[test]
+    fn a_v2_spawn_warns_on_dirt_newer_than_the_baton() {
+        let t = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let carried_entry = |tag: &str| {
+            let dir = v2_entries_dir(tag);
+            let store = FsEntryBatonStore::new(&dir, "garden");
+            store.write("m1", "---\nitem: m1\n---\n# NEXT ACTION\ncarry on\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("m1").join("baton.md"))
+                .unwrap()
+                .set_modified(t(1_000))
+                .unwrap();
+            dir
+        };
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        // Fresh start, dirt newer than the entry's handoff: warned, then spawned.
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot(EntryStatus::Queued)),
+            carried_entry("row6-newer"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, t(1_060));
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started[0].repo, Some(PathBuf::from("/garden")), "resolved at claim");
+        assert_eq!(repo.v2_reads(), vec![PathBuf::from("/garden")], "the project's repo is probed");
+        let warns = backend.warns();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].1.contains("m1 (a1)")
+                && warns[0].1.contains("/garden has 3 uncommitted path(s)")
+                && warns[0].1.contains("newer than the baton"),
+            "the guard names the entry, the repo, the count and the recency: {warns:?}",
+        );
+        assert_eq!(backend.events(), vec!["warn:a1", "spawn:a1"], "before the spawn");
+
+        // Fresh start, dirt OLDER than the entry's handoff: the baton knows it.
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            carried_entry("row6-older"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, t(900));
+        loop_.tick(0);
+        assert!(backend.warns().is_empty(), "dirt older than the handoff is not a cut-off session");
+        assert_eq!(backend.events(), vec!["spawn:a1"]);
+
+        // The session is cut off by the network, leaving work newer than the
+        // member's carried baton: the re-roll warns before it spawns.
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_baton_mtime("a1", t(1_000));
+        repo.set_dirty("h1", 4, 9, t(1_060));
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr("a1", &["error: getaddrinfo ENOTFOUND api.anthropic.com"]);
+        let rerolled = (1..40).any(|now| {
+            loop_.tick(now).rerolls.contains(&RerollOutcome::Rerolled { agent: "a1".into() })
+        });
+        assert!(rerolled, "the member re-rolls");
+        assert_eq!(backend.events(), vec!["spawn:a1", "warn:a1", "spawn:a1"], "warned, then spawned");
+        assert!(backend.warns()[0].1.contains("/garden has 4 uncommitted path(s)"));
+    }
+
+    /// QUEUE-V2-PARITY ROW 6 — a remote entry gives no repo signal, as legacy
+    /// gives none for a repo it cannot probe: a claude member (the remote rule
+    /// lets it take the entry) spawns with no guard, and nothing is probed —
+    /// even under a fresh entry baton, where any local dirt would surface.
+    #[test]
+    fn a_v2_remote_entry_gets_no_boot_guard() {
+        let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+        snapshot.projects[0].repo = "otg-travel:/srv/r".into();
+        snapshot.projects[0].locality = softfig_ipc::queue_v2::RepoLocality::Remote;
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![FleetMember::unpinned(spec("c1"))],
+            FakeV2Source::with(snapshot),
+            v2_entries_dir("row6-remote"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, std::time::UNIX_EPOCH);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "the claude member takes the remote entry");
+        assert_eq!(r.v2_started[0].repo, None, "a remote repo resolves to no path");
+        assert!(repo.v2_reads().is_empty(), "nothing is probed");
+        assert!(backend.warns().is_empty());
+        assert_eq!(backend.events(), vec!["spawn:c1"]);
+    }
+
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
     /// is issued with the `(entry, unit)`, the never-claimed entry's baton is
     /// seeded from the template and copied verbatim into the member's path, and
@@ -8950,6 +9157,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     slice: "001".into(),
                 },
                 resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_REASONING),
+                repo: None,
             }],
             "the assignment names the entry, the walked unit, and the resolved model",
         );
@@ -9460,6 +9668,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     slice: "001".into(),
                 },
                 resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_FLASH),
+                repo: None,
             }],
             "the released member's assignment is recorded as parked",
         );
