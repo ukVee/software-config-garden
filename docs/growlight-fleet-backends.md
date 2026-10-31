@@ -14,7 +14,8 @@ fleet_enabled = true
 
 # Which queue model growlightd schedules from (spec-growlight-queue §11).
 # Default `legacy` (today's backlog tables + queues); `v2` reads the v2 files.
-# Unknown values are refused at arm time. The migration session flips it.
+# Unknown values are refused at arm time. The migration session flips it,
+# after `softfig growlight queue migrate` (docs/growlight-queue-migrate.md).
 # queue = "legacy"
 
 # The v2 handshake's grace: seconds a member may linger after growlightd asks

@@ -35,7 +35,8 @@ use softfig_ipc::{
     verbs::{
         GrowlightInitArgs, GrowlightInitReply, ListReportsArgs, ListReportsReply, PostMessageArgs,
         PostMessageReply, QueueAddEntryReply, QueueAddProjectReply, QueueDropReply, QueueMoveSpec,
-        QueueStatusArg, QueueUpdateEntryReply, ReadFileArgs, ReadFileReply, ReportRow,
+        QueueStatusArg, QueueUpdateEntryReply, QueueV2MigrateApplyArgs, QueueV2MigrateApplyReply,
+        ReadFileArgs, ReadFileReply, ReportRow,
         SliceInsertReply, SliceUpdateReply, StatusReply, op,
     },
 };
@@ -2270,19 +2271,29 @@ pub enum QueueSub {
     /// Convert the legacy backlog to the v2 files (§11). `--dry-run` reads the
     /// backlog off the mount and the runtime batons, and prints the plan,
     /// every judgment call and every refusal. It writes nothing and calls no
-    /// daemon.
+    /// daemon. `--apply` has keeperd write the v2 files in one commit, then
+    /// copies the in-flight batons into `entries/<id>/baton.md`.
     Migrate(QueueMigrateArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct QueueMigrateArgs {
-    /// Print the plan; write nothing. Required until `--apply` lands.
-    #[arg(long, required = true)]
+    /// Print the plan; write nothing.
+    #[arg(long, required_unless_present = "apply", conflicts_with = "apply")]
     pub dry_run: bool,
+    /// Write the v2 files in one keeperd commit. keeperd refuses while the
+    /// fleet is armed, the switch says v2, a v2 file exists, the backlog doc
+    /// moved off `--expect`, or a call is still open. Never flips the switch.
+    #[arg(long, requires = "answers", requires = "expect")]
+    pub apply: bool,
     /// The owner's settlements (`schema = 1`, `[class]`, `[call]`).
     /// Omitted: every call stays open.
     #[arg(long, value_name = "TOML")]
     pub answers: Option<PathBuf>,
+    /// The backlog doc version the dry run printed; `--apply` refuses if the
+    /// doc has changed since.
+    #[arg(long, value_name = "VERSION", requires = "apply")]
+    pub expect: Option<String>,
     /// The mounted garden. Defaults to `~/soft-fig_garden`.
     #[arg(long, value_name = "PATH")]
     pub garden: Option<PathBuf>,
@@ -2588,7 +2599,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Fleet(a) => queue_fleet(&socket, a),
         QueueSub::NotBefore(a) => queue_not_before(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
-        QueueSub::Migrate(a) => queue_migrate(a),
+        QueueSub::Migrate(a) => queue_migrate(&socket, a),
     }
 }
 
@@ -2725,13 +2736,9 @@ fn queue_pick(socket: &Path, member: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `queue migrate --dry-run`: snapshot the legacy files, plan, print. Read
-/// only — plain file reads, no daemon call.
-fn queue_migrate(args: QueueMigrateArgs) -> Result<()> {
-    let garden = match args.garden {
-        Some(p) => p,
-        None => home_dir()?.join("soft-fig_garden"),
-    };
+/// `queue migrate`. `--dry-run`: snapshot the legacy files, plan, print —
+/// plain file reads, no daemon call. `--apply`: see [`queue_migrate_apply`].
+fn queue_migrate(socket: &Path, args: QueueMigrateArgs) -> Result<()> {
     let runtime = runtime_dir(args.config_dir)?;
     let answers = match &args.answers {
         Some(path) => {
@@ -2745,6 +2752,14 @@ fn queue_migrate(args: QueueMigrateArgs) -> Result<()> {
             class: Default::default(),
             call: Default::default(),
         },
+    };
+    if args.apply {
+        let expect = args.expect.ok_or_else(|| anyhow!("--apply needs --expect"))?;
+        return queue_migrate_apply(socket, &runtime, answers, expect);
+    }
+    let garden = match args.garden {
+        Some(p) => p,
+        None => home_dir()?.join("soft-fig_garden"),
     };
     let files = migrate_snapshot(&garden, &runtime)?;
     let doc = files
@@ -2760,6 +2775,78 @@ fn queue_migrate(args: QueueMigrateArgs) -> Result<()> {
     let plan = migrate::plan(&legacy, &answers, &crate::cmd_repo::iso8601(now));
     print!("{}", render_migrate_dry_run(&plan, &version));
     Ok(())
+}
+
+/// `queue migrate --apply`: a thin client. keeperd reads the garden half from
+/// its own WorkTree and recomputes the plan; the runtime batons, which keeperd
+/// cannot see, ride in the args. Once the commit lands, the batons the plan
+/// names are copied into the per-entry store (§3.6).
+fn queue_migrate_apply(
+    socket: &Path,
+    runtime: &Path,
+    answers: migrate::Answers,
+    expect: String,
+) -> Result<()> {
+    let batons = migrate_batons(runtime)?;
+    let wire = QueueV2MigrateApplyArgs { answers, expect, batons: batons.clone() };
+    let value = queue_call(socket, op::QUEUE_V2_MIGRATE_APPLY, serde_json::to_value(wire)?)?;
+    let reply: QueueV2MigrateApplyReply = serde_json::from_value(value)?;
+    println!("queue migrate --apply — commit {}", short_hash(&reply.hash));
+    println!(
+        "wrote: {} entries, {} archived, {} slices files",
+        reply.entries, reply.archived, reply.slices
+    );
+    println!("baton copies: {}", reply.batons.len());
+    let entries = runtime.join("entries");
+    for mv in &reply.batons {
+        let line = match copy_migrated_baton(&entries, &batons, mv) {
+            Ok(BatonCopy::Copied) => "copied",
+            Ok(BatonCopy::TargetExists) => "skipped, target exists",
+            Err(e) => {
+                println!("  {} -> entries/{}/baton.md: FAILED, {e}", mv.from, mv.entry);
+                continue;
+            }
+        };
+        println!("  {} -> entries/{}/baton.md: {line}", mv.from, mv.entry);
+    }
+    println!("the switch is unchanged; flip `queue = \"v2\"` yourself, with the fleet disarmed");
+    Ok(())
+}
+
+/// What one §3.6 baton copy did.
+#[derive(Debug, PartialEq, Eq)]
+enum BatonCopy {
+    Copied,
+    TargetExists,
+}
+
+/// Copy one planned baton into `<entries>/<entry>/baton.md`. The bytes are
+/// the ones sent to keeperd, so what lands is what the plan judged. A copy
+/// never overwrites a target (`create_new`, so no check-then-write race) and
+/// never touches the source.
+fn copy_migrated_baton(
+    entries: &Path,
+    sent: &std::collections::BTreeMap<String, String>,
+    mv: &migrate::BatonMove,
+) -> Result<BatonCopy> {
+    let mut parts = Path::new(&mv.entry).components();
+    if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+        bail!("entry id {:?} is not a single path component", mv.entry);
+    }
+    let text = sent
+        .get(&mv.from)
+        .ok_or_else(|| anyhow!("{} was not among the batons sent", mv.from))?;
+    let dir = entries.join(&mv.entry);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let target = dir.join("baton.md");
+    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(BatonCopy::TargetExists),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", target.display())),
+    };
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", target.display()))?;
+    Ok(BatonCopy::Copied)
 }
 
 /// The converter's snapshot: every `.md` under the garden's
@@ -2787,7 +2874,14 @@ fn migrate_snapshot(garden: &Path, runtime: &Path) -> Result<migrate::LegacyFile
     let backlog = garden.join(BACKLOG_DOC);
     let backlog_dir = backlog.parent().expect("BACKLOG_DOC has a parent");
     walk(garden, backlog_dir, &mut files.garden)?;
+    files.batons = migrate_batons(runtime)?;
+    Ok(files)
+}
 
+/// The runtime half of the snapshot: the root `baton.md` and each
+/// `agents/<id>/baton.md`, keyed runtime-relative.
+fn migrate_batons(runtime: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
     let mut batons = vec![PathBuf::from("baton.md")];
     if let Ok(agents) = fs::read_dir(runtime.join("agents")) {
         for agent in agents.flatten() {
@@ -2801,10 +2895,10 @@ fn migrate_snapshot(garden: &Path, runtime: &Path) -> Result<migrate::LegacyFile
         if path.is_file() {
             let key = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", path.display()))?;
             let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            files.batons.insert(key.to_string(), text);
+            out.insert(key.to_string(), text);
         }
     }
-    Ok(files)
+    Ok(out)
 }
 
 /// The `queue migrate --dry-run` rendering: the backlog doc's version, the
@@ -5924,6 +6018,76 @@ mod tests {
             hint.ends_with("--model claude-opus-4-7 --effort high"),
             "hint tail: {hint}",
         );
+    }
+
+    /// `queue migrate` takes exactly one of `--dry-run` / `--apply`;
+    /// `--apply` needs `--answers` and `--expect`, and `--expect` only means
+    /// something under `--apply` (queue-v2-migrate slice 005).
+    #[test]
+    fn migrate_modes_are_an_either_or_and_apply_needs_its_inputs() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+        let parse = |tail: &[&str]| {
+            let argv = ["g", "queue", "migrate"].iter().chain(tail).copied();
+            TestCli::try_parse_from(argv).map(|c| match c.cmd {
+                GrowlightCmd::Queue(q) => match q.cmd {
+                    Some(QueueSub::Migrate(m)) => m,
+                    other => panic!("expected migrate, got {other:?}"),
+                },
+                other => panic!("expected Queue, got {other:?}"),
+            })
+        };
+        assert!(parse(&[]).is_err(), "a mode is required");
+        assert!(parse(&["--dry-run", "--apply", "--answers", "a.toml", "--expect", "v"]).is_err());
+        assert!(parse(&["--apply"]).is_err(), "--apply without --answers/--expect");
+        assert!(parse(&["--apply", "--answers", "a.toml"]).is_err(), "--apply without --expect");
+        assert!(parse(&["--apply", "--expect", "v"]).is_err(), "--apply without --answers");
+        assert!(parse(&["--dry-run", "--expect", "v"]).is_err(), "--expect is an apply input");
+        let dry = parse(&["--dry-run", "--answers", "a.toml"]).unwrap();
+        assert!(dry.dry_run && !dry.apply);
+        let apply = parse(&["--apply", "--answers", "a.toml", "--expect", "v1"]).unwrap();
+        assert!(apply.apply && !apply.dry_run);
+        assert_eq!(apply.expect.as_deref(), Some("v1"));
+    }
+
+    /// The §3.6 copy after `--apply`: the bytes the plan saw land at
+    /// `entries/<id>/baton.md`; an existing target is skipped, never
+    /// overwritten; the source is never touched; an id that is not one path
+    /// component, or a `from` that was never sent, is refused.
+    #[test]
+    fn migrated_baton_copy_never_overwrites_and_never_moves() {
+        let runtime = tempfile::tempdir().unwrap();
+        let entries = runtime.path().join("entries");
+        fs::create_dir_all(runtime.path().join("agents/a")).unwrap();
+        let source = runtime.path().join("agents/a/baton.md");
+        fs::write(&source, "on disk\n").unwrap();
+        let sent: std::collections::BTreeMap<String, String> =
+            [("agents/a/baton.md".to_string(), "sent\n".to_string())].into();
+        let mv = |entry: &str, from: &str| migrate::BatonMove { from: from.into(), entry: entry.into() };
+
+        let first = copy_migrated_baton(&entries, &sent, &mv("001", "agents/a/baton.md")).unwrap();
+        assert_eq!(first, BatonCopy::Copied);
+        assert_eq!(fs::read_to_string(entries.join("001/baton.md")).unwrap(), "sent\n");
+
+        fs::create_dir_all(entries.join("002")).unwrap();
+        fs::write(entries.join("002/baton.md"), "existing\n").unwrap();
+        let skip = copy_migrated_baton(&entries, &sent, &mv("002", "agents/a/baton.md")).unwrap();
+        assert_eq!(skip, BatonCopy::TargetExists);
+        assert_eq!(fs::read_to_string(entries.join("002/baton.md")).unwrap(), "existing\n");
+        // A re-run is a skip too, not a second write.
+        let again = copy_migrated_baton(&entries, &sent, &mv("001", "agents/a/baton.md")).unwrap();
+        assert_eq!(again, BatonCopy::TargetExists);
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "on disk\n", "the source stays put");
+        for bad in ["../x", "a/b", "", ".", "/abs"] {
+            assert!(copy_migrated_baton(&entries, &sent, &mv(bad, "agents/a/baton.md")).is_err(), "{bad:?}");
+        }
+        assert!(copy_migrated_baton(&entries, &sent, &mv("003", "baton.md")).is_err(), "never sent");
+        assert!(!entries.join("003").exists());
     }
 
     /// `queue migrate --dry-run` (queue-v2-migrate slice 004): the snapshot
