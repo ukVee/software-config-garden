@@ -56,6 +56,48 @@ impl V2Action {
         }
     }
 
+    /// What the action addresses, for the confirm overlay: the entry id, or
+    /// `milestone/slice` for a slice verb. Read from the action itself, never
+    /// from the cursor, so the overlay shows what the confirm will hit.
+    pub fn target(&self) -> String {
+        match self {
+            V2Action::EntryUpdate(a) => a.id.clone(),
+            V2Action::Drop(a) => a.id.clone(),
+            V2Action::SliceUpdate(a) => format!("{}/{}", a.milestone, a.id),
+        }
+    }
+
+    /// A one-line statement of the change, for the confirm overlay.
+    pub fn change(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        match self {
+            V2Action::EntryUpdate(a) => {
+                if let Some(lane) = a.lane {
+                    parts.push(format!("lane → {}", wire_word(&lane)));
+                }
+                if let Some(m) = &a.move_spec {
+                    parts.push(move_words(m));
+                }
+                if let Some(after) = &a.after {
+                    parts.push(format!("after → [{}]", after.join(", ")));
+                }
+                if let Some(status) = &a.status {
+                    parts.push(format!("status → {}", wire_word(status)));
+                }
+            }
+            V2Action::Drop(a) => parts.push(format!("reason: {}", a.reason)),
+            V2Action::SliceUpdate(a) => {
+                if let Some(m) = &a.move_spec {
+                    parts.push(move_words(m));
+                }
+                if let Some(status) = &a.status {
+                    parts.push(format!("status → {}", wire_word(status)));
+                }
+            }
+        }
+        parts.join(", ")
+    }
+
     /// The would-be `view` string from a verb reply, decoded by the reply type
     /// this action expects. `value` is the raw `ok` payload.
     pub fn view_from(&self, value: &serde_json::Value) -> Option<String> {
@@ -76,6 +118,22 @@ impl V2Action {
             .ok()
             .map(|r| r.view),
         }
+    }
+}
+
+/// A wire enum's serialized word (`blocked`, `urgent`), so the overlay says
+/// what the verb will be sent, not a Rust variant name.
+fn wire_word<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn move_words(m: &QueueMoveSpec) -> String {
+    match &m.ref_id {
+        Some(r) => format!("move {} {r}", m.to),
+        None => format!("move {}", m.to),
     }
 }
 
@@ -394,14 +452,19 @@ pub fn entry_status_cycle(reply: &QueueShowReply, view: &QueueV2View) -> Option<
     }))
 }
 
-/// Replace the selected entry's `after` links (the `edit links` action).
-pub fn entry_after(reply: &QueueShowReply, view: &QueueV2View, after: Vec<String>) -> Option<V2Action> {
-    let row = selected_entry(reply, view)?;
-    if !matches!(row.kind, V2RowKind::Urgent | V2RowKind::Normal) {
-        return None;
-    }
+/// The live lane entry `id`, or `None` once a reload has taken it out of the
+/// list. The overlay-driven actions (`after`, `drop`) address the id they
+/// captured when the overlay opened, never the cursor row at submit time — a
+/// reload while the overlay is open moves the rows under the cursor.
+fn live_entry<'a>(reply: &'a QueueShowReply, id: &str) -> Option<&'a softfig_ipc::growlightd::QueueShowEntry> {
+    reply.entries.iter().find(|e| e.id == id)
+}
+
+/// Replace entry `id`'s `after` links (the `edit links` action).
+pub fn entry_after(reply: &QueueShowReply, id: &str, after: Vec<String>) -> Option<V2Action> {
+    live_entry(reply, id)?;
     Some(V2Action::EntryUpdate(QueueUpdateEntryArgs {
-        id: row.entry_id.clone(),
+        id: id.to_string(),
         lane: None,
         move_spec: None,
         after: Some(after),
@@ -410,14 +473,11 @@ pub fn entry_after(reply: &QueueShowReply, view: &QueueV2View, after: Vec<String
     }))
 }
 
-/// Drop the selected entry (the `drop` action) with `reason`.
-pub fn entry_drop(reply: &QueueShowReply, view: &QueueV2View, reason: String) -> Option<V2Action> {
-    let row = selected_entry(reply, view)?;
-    if !matches!(row.kind, V2RowKind::Urgent | V2RowKind::Normal) {
-        return None;
-    }
+/// Drop entry `id` (the `drop` action) with `reason`.
+pub fn entry_drop(reply: &QueueShowReply, id: &str, reason: String) -> Option<V2Action> {
+    live_entry(reply, id)?;
     Some(V2Action::Drop(QueueDropArgs {
-        id: row.entry_id.clone(),
+        id: id.to_string(),
         reason,
         dry_run: false,
     }))
@@ -637,5 +697,30 @@ mod tests {
         view.select(idx, rows.len());
         assert!(slice_move(&r, &view).is_none());
         assert!(slice_status_cycle(&r, &view).is_none());
+    }
+
+    #[test]
+    fn the_confirm_overlay_names_the_op_the_target_and_the_change() {
+        let r = reply(vec![entry("u1", "urgent", "queued", &[], false)], vec![]);
+        let view = QueueV2View::new();
+        let status = entry_status_cycle(&r, &view).unwrap();
+        assert_eq!(status.op(), op::QUEUE_UPDATE_ENTRY);
+        assert_eq!(status.target(), "u1");
+        assert_eq!(status.change(), "status → blocked");
+        let drop = entry_drop(&r, "u1", "obsolete".into()).unwrap();
+        assert_eq!(drop.op(), op::QUEUE_DROP);
+        assert_eq!(drop.target(), "u1");
+        assert_eq!(drop.change(), "reason: obsolete");
+        let after = entry_after(&r, "u1", vec!["x".into(), "y".into()]).unwrap();
+        assert_eq!(after.change(), "after → [x, y]");
+        let mv = entry_move(&reply(vec![entry("a", "normal", "queued", &[], false), entry("b", "normal", "queued", &[], false)], vec![]), &view, false).unwrap();
+        assert_eq!(mv.change(), "move after b");
+    }
+
+    #[test]
+    fn a_drop_or_edit_for_an_entry_that_left_the_list_is_none() {
+        let r = reply(vec![entry("u1", "urgent", "queued", &[], false)], vec![]);
+        assert!(entry_drop(&r, "gone", "r".into()).is_none());
+        assert!(entry_after(&r, "gone", vec![]).is_none());
     }
 }

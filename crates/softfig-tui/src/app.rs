@@ -4,7 +4,7 @@
 //! their own modules and carry the unit tests; this module wires them to
 //! the worker-thread [`IpcClient`] and the key stream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crossterm::event::{
@@ -34,7 +34,7 @@ use crate::editor::{Editor, EditorMode};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::hit::{self, Hit, HitMap, ListId};
-use crate::ipc::{IpcClient, Reply, Tag};
+use crate::ipc::{IpcClient, ReqId, Reply, Tag};
 use crate::prefs::{self, UiPrefs};
 use crate::queue_v2_view::{self, QueueV2View, V2Action, V2RowKind};
 use crate::listpane::ListPane;
@@ -194,6 +194,14 @@ pub enum BackupRow {
 pub enum PairField {
     Fingerprint,
     Endpoint,
+}
+
+/// One in-flight §6.9 request: the action it carries and which half of the
+/// dry-run/commit pair it is (see [`App::growlight_v2_pending`]).
+#[derive(Debug, Clone)]
+pub struct PendingV2 {
+    pub action: V2Action,
+    pub dry_run: bool,
 }
 
 #[derive(Debug)]
@@ -551,10 +559,12 @@ pub struct App {
     pub growlight_v2_view: bool,
     /// The two-lane selection + expansion state (see [`QueueV2View`]).
     pub growlight_v2: QueueV2View,
-    /// The in-flight §6.9 action whose `dry_run` reply we are awaiting. `Some`
-    /// = a dry-run is in flight (its reply opens the confirm overlay); `None` =
-    /// any reply is a committed write (reload + status). Cleared on cancel/entry.
-    pub growlight_v2_pending: Option<V2Action>,
+    /// The in-flight §6.9 requests, by request id. Each carries its own action
+    /// and which half of the pair it is: a `dry_run` reply opens the confirm
+    /// overlay for ITS action, a committed one reloads. Keyed by id (the worker
+    /// answers in order, but a single slot let one action's commit reply be
+    /// read as another's preview).
+    pub growlight_v2_pending: HashMap<ReqId, PendingV2>,
     /// Set when the v2 snapshot is stale (tab entry, refresh, a confirmed action)
     /// and cleared by the run loop once `queue_show` is re-fired. Mirrors
     /// `growlight_stale` but rides the growlightd channel, so it is drained by
@@ -667,7 +677,7 @@ impl App {
             growlight_queue_v2: None,
             growlight_v2_view: false,
             growlight_v2: QueueV2View::new(),
-            growlight_v2_pending: None,
+            growlight_v2_pending: HashMap::new(),
             growlight_v2_stale: false,
             hits: HitMap::new(),
             drag: None,
@@ -1805,38 +1815,40 @@ impl App {
                 }
                 Err(_) => self.growlight_queue_v2 = None,
             },
-            Tag::GrowlightQueueAction => match reply.result {
-                // One half of a §6.9 action pair. When a dry-run is in flight
-                // (`growlight_v2_pending` is Some), this reply is its preview → open
-                // the confirm overlay. Otherwise it is a committed write → reload
-                // the snapshot + the legacy queue and report.
-                Ok(v) => {
-                    if let Some(action) = self.growlight_v2_pending.take() {
-                        let view = action.view_from(&v).unwrap_or_else(|| {
-                            "(the dry-run reply could not be decoded)".to_string()
-                        });
-                        self.overlay = Overlay::QueueConfirm {
-                            action,
-                            preview: view,
-                            error: None,
-                        };
-                    } else {
-                        self.status = "queue v2: updated".into();
-                        self.mark_growlight_v2_stale();
-                        // The legacy queue table may have shifted too (a drop /
-                        // status change), so refire it for the tree on the other
-                        // side of the toggle.
-                        ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+            Tag::GrowlightQueueAction => {
+                // One half of a §6.9 action pair, matched to its request by id.
+                // A dry-run reply is its action's preview → open the confirm
+                // overlay for THAT action. Anything else is a committed write →
+                // reload the snapshot + the legacy queue and report.
+                let pending = self.growlight_v2_pending.remove(&reply.id);
+                match reply.result {
+                    Ok(v) => {
+                        if let Some(PendingV2 { action, dry_run: true }) = pending {
+                            let view = action.view_from(&v).unwrap_or_else(|| {
+                                "(the dry-run reply could not be decoded)".to_string()
+                            });
+                            self.overlay = Overlay::QueueConfirm {
+                                action,
+                                preview: view,
+                                error: None,
+                            };
+                        } else {
+                            self.status = "queue v2: updated".into();
+                            self.mark_growlight_v2_stale();
+                            // The legacy queue table may have shifted too (a drop /
+                            // status change), so refire it for the tree on the other
+                            // side of the toggle.
+                            ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+                        }
+                    }
+                    Err((kind, m)) => {
+                        // A refusal (e.g. `running`, `linked_from`) is a status line:
+                        // the dry-run itself was refused, so there is nothing to
+                        // preview or confirm.
+                        self.status = format!("queue v2 action failed ({kind:?}): {m}");
                     }
                 }
-                Err((kind, m)) => {
-                    // A refusal (e.g. `running`, `linked_from`) is a status line:
-                    // the dry-run itself was refused, so there is nothing to
-                    // preview or confirm. Clear the in-flight dry-run.
-                    self.growlight_v2_pending = None;
-                    self.status = format!("queue v2 action failed ({kind:?}): {m}");
-                }
-            },
+            }
             Tag::GrowlightInjectedProtocol => match reply.result {
                 // The protocol half of the injected-context node — a keeperd garden
                 // read (`growlight/protocol.md`). Cache it; the detail pane assembles
@@ -3882,8 +3894,8 @@ impl App {
             self.status = "locked — unlock before editing the queue".into();
             return;
         }
-        self.growlight_v2_pending = Some(action.clone());
-        ipc.send(action.op(), action.to_value(true), Tag::GrowlightQueueAction);
+        let id = ipc.send(action.op(), action.to_value(true), Tag::GrowlightQueueAction);
+        self.growlight_v2_pending.insert(id, PendingV2 { action, dry_run: true });
     }
 
     /// `y` — re-issue the confirmed (non-dry-run) action from the overlay.
@@ -3899,9 +3911,9 @@ impl App {
                 };
                 let action = action.clone();
                 self.overlay = Overlay::None;
-                // The committed reply must not reopen the confirm overlay.
-                self.growlight_v2_pending = None;
-                ipc.send(action.op(), action.to_value(false), Tag::GrowlightQueueAction);
+                // Tagged as the commit half, so its reply cannot reopen the overlay.
+                let id = ipc.send(action.op(), action.to_value(false), Tag::GrowlightQueueAction);
+                self.growlight_v2_pending.insert(id, PendingV2 { action, dry_run: false });
             }
             _ => {}
         }
@@ -3940,9 +3952,10 @@ impl App {
     }
 
     fn submit_edit_after(&mut self, ipc: &mut IpcClient) {
-        let Overlay::QueueEditAfter { buf, error, .. } = &mut self.overlay else {
+        let Overlay::QueueEditAfter { buf, entry, error } = &mut self.overlay else {
             return;
         };
+        let entry = entry.clone();
         let after: Vec<String> = buf
             .split(',')
             .map(|s| s.trim().to_string())
@@ -3951,8 +3964,8 @@ impl App {
         *error = None;
         self.overlay = Overlay::None;
         let Some(reply) = &self.growlight_queue_v2 else { return };
-        let Some(action) = queue_v2_view::entry_after(reply, &self.growlight_v2, after) else {
-            self.status = "edit links needs an entry row".into();
+        let Some(action) = queue_v2_view::entry_after(reply, &entry, after) else {
+            self.status = format!("edit links: {entry} is no longer in the queue");
             return;
         };
         self.run_v2_action(action, ipc);
@@ -3991,9 +4004,10 @@ impl App {
     }
 
     fn submit_queue_drop(&mut self, ipc: &mut IpcClient) {
-        let Overlay::QueueDrop { buf, error, .. } = &mut self.overlay else {
+        let Overlay::QueueDrop { buf, entry, error } = &mut self.overlay else {
             return;
         };
+        let entry = entry.clone();
         let reason = buf.trim().to_string();
         if reason.is_empty() {
             *error = Some("a drop needs a reason".into());
@@ -4002,8 +4016,8 @@ impl App {
         *error = None;
         self.overlay = Overlay::None;
         let Some(reply) = &self.growlight_queue_v2 else { return };
-        let Some(action) = queue_v2_view::entry_drop(reply, &self.growlight_v2, reason) else {
-            self.status = "drop needs an entry row".into();
+        let Some(action) = queue_v2_view::entry_drop(reply, &entry, reason) else {
+            self.status = format!("drop: {entry} is no longer in the queue");
             return;
         };
         self.run_v2_action(action, ipc);
@@ -7959,5 +7973,133 @@ mod tests {
         assert_eq!(app.view, View::Browse);
         assert!(app.editor.is_none(), "a clean save-and-exit closes the editor");
         assert_eq!(app.status, "saved");
+    }
+
+    // ---- queue v2 actions address the captured entry (review 044 V12) ------
+
+    fn v2_entry(id: &str) -> softfig_ipc::growlightd::QueueShowEntry {
+        softfig_ipc::growlightd::QueueShowEntry {
+            id: id.into(),
+            kind: "milestone".into(),
+            project: "softfig".into(),
+            lane: "normal".into(),
+            status: "queued".into(),
+            after: Vec::new(),
+            branch: String::new(),
+            base: String::new(),
+            claimed: String::new(),
+            open: false,
+        }
+    }
+
+    /// An app showing a two-entry v2 list (`a`, `b`) with the cursor on `b`.
+    fn v2_app_cursor_on_b() -> App {
+        let mut app = App::new();
+        app.locked = false;
+        app.growlight_queue_v2 = Some(QueueShowReply {
+            list: true,
+            projects: Vec::new(),
+            entries: vec![v2_entry("a"), v2_entry("b")],
+            archived: Vec::new(),
+            sessions: Vec::new(),
+            trees: Vec::new(),
+        });
+        app.growlight_v2.select(1, 2);
+        app
+    }
+
+    fn only_pending(app: &App) -> &PendingV2 {
+        assert_eq!(app.growlight_v2_pending.len(), 1, "{:?}", app.growlight_v2_pending);
+        app.growlight_v2_pending.values().next().unwrap()
+    }
+
+    #[test]
+    fn drop_submit_targets_the_captured_entry_not_the_cursor_row() {
+        // The overlay opened on `a`; a reload since then left the cursor on `b`.
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueDrop {
+            buf: "obsolete".into(),
+            entry: "a".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_queue_drop(&mut ipc);
+        let p = only_pending(&app);
+        assert!(p.dry_run, "the first send is the dry-run half");
+        let V2Action::Drop(args) = &p.action else { panic!("expected a drop") };
+        assert_eq!(args.id, "a", "the drop must hit the entry the overlay named");
+    }
+
+    #[test]
+    fn edit_after_submit_targets_the_captured_entry_not_the_cursor_row() {
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueEditAfter {
+            buf: "b".into(),
+            entry: "a".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_edit_after(&mut ipc);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.id, "a");
+        assert_eq!(args.after.as_deref(), Some(&["b".to_string()][..]));
+    }
+
+    #[test]
+    fn a_captured_entry_that_left_the_list_is_refused_not_retargeted() {
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueDrop {
+            buf: "obsolete".into(),
+            entry: "gone".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_queue_drop(&mut ipc);
+        assert!(app.growlight_v2_pending.is_empty(), "nothing was sent");
+        assert!(app.status.contains("gone"), "{}", app.status);
+    }
+
+    #[test]
+    fn replies_are_matched_to_their_own_request_by_id() {
+        // A's dry-run (id 1) and B's committed write (id 2) are both in flight.
+        let mut app = v2_app_cursor_on_b();
+        let drop = |id: &str| {
+            V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+                id: id.into(),
+                reason: "r".into(),
+                dry_run: false,
+            })
+        };
+        app.growlight_v2_pending.insert(1, PendingV2 { action: drop("a"), dry_run: true });
+        app.growlight_v2_pending.insert(2, PendingV2 { action: drop("b"), dry_run: false });
+        let mut ipc = dummy_ipc();
+        // B's commit reply lands first. It must not open a confirm overlay.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueueAction,
+                result: Ok(json!({"id": "b", "view": "v", "hash": "h"})),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert_eq!(app.status, "queue v2: updated");
+        // A's dry-run reply then opens the overlay for A, and only A.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueueAction,
+                result: Ok(json!({"id": "a", "view": "would-be", "hash": "h"})),
+            },
+            &mut ipc,
+        );
+        let Overlay::QueueConfirm { action, preview, .. } = &app.overlay else {
+            panic!("expected the confirm overlay, got {:?}", app.overlay)
+        };
+        assert_eq!(action.target(), "a");
+        assert_eq!(preview, "would-be");
+        assert!(app.growlight_v2_pending.is_empty());
     }
 }

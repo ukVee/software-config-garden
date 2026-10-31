@@ -18,7 +18,7 @@ use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
-use crate::queue_v2_view::V2RowKind;
+use crate::queue_v2_view::{V2Action, V2RowKind};
 use softfig_ipc::{human_age_secs, DeployAction};
 
 /// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
@@ -159,10 +159,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
             render_deploy_force(f, error.as_deref(), &mut hits, area)
         }
         Overlay::QueueConfirm {
-            action: _,
+            action,
             preview,
             error,
-        } => render_queue_confirm(f, preview, error.as_deref(), &mut hits, area),
+        } => render_queue_confirm(f, action, preview, error.as_deref(), &mut hits, area),
         Overlay::QueueEditAfter { buf, entry, error } => {
             render_queue_edit_after(f, entry, buf, error.as_deref(), &mut hits, area)
         }
@@ -1544,7 +1544,14 @@ fn render_growlight_v2_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, a
 }
 
 /// Confirm a §6.9 mutating action: show the dry-run `view` (capped) and ask y/n.
-fn render_queue_confirm(f: &mut Frame, preview: &str, error: Option<&str>, hits: &mut HitMap, area: Rect) {
+fn render_queue_confirm(
+    f: &mut Frame,
+    action: &V2Action,
+    preview: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(80, 60, area);
     f.render_widget(Clear, rect);
     let mut preview_lines: Vec<&str> = preview.lines().collect();
@@ -1554,6 +1561,11 @@ fn render_queue_confirm(f: &mut Frame, preview: &str, error: Option<&str>, hits:
     }
     let mut lines: Vec<Line> = vec![
         Line::raw("Apply this queue-v2 change?"),
+        Line::styled(
+            format!("{}  →  {}", action.op(), action.target()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(action.change()),
         Line::raw(""),
         Line::styled(
             "dry-run result (the list as it would be):",
