@@ -276,6 +276,43 @@ halts on them, and it omits the 5h/7d percentages from the baton. Without that o
 session started while the Claude window was spent would halt immediately, and that is
 exactly when the human reaches for opencode.
 
+## When members run: the `[schedule]` table
+
+`[schedule]` in `config/growlight.toml` is an admission filter on top of everything above
+(growlight-schedule spec §3). `fleet_enabled` stays the master arm. With
+`[schedule] enabled = true`, an armed fleet admits a member only while one of its windows
+is open, in local time:
+
+```toml
+[schedule]
+enabled = true
+windows = ["23:00-07:00"]          # every day, every member
+reserve_weekly_pct = { slot1 = 20, "*" = 0 }
+
+[[schedule.window]]
+days     = ["mon-fri"]
+start    = "10:00"
+end      = "20:00"
+backends = ["opencode"]            # and/or members = ["b"]
+```
+
+- **Windows union.** A member is admitted when any window whose filters match it is open.
+  `backends` and `members` must both match. A window that crosses midnight belongs to the
+  day it starts.
+- **A close never kills.** A member mid-iteration finishes, and its re-roll waits for the
+  next open window. Past `close_grace_minutes` (default 45) it is flagged `overrun`.
+- **Timed items.** With `tasks = true` (the default), an item whose `> Not before:` has
+  arrived may run outside every window.
+- **The weekly reserve** is per claude-login slot. A slot is held once its vouchable 7d
+  reading reaches `100 − reserve`, until the window resets. opencode members are never
+  reserve-held, because they draw on no weekly window.
+- **Fail-closed.** An unknown key, a bad time or day, or a `members` id with no `[[fleet]]`
+  agent disables the fleet at load. An unreadable local zone closes the schedule for
+  everyone.
+
+The shipped template (`templates/default-garden/config/growlight.toml`) documents every
+key.
+
 ## Reading a mixed fleet: `growlight status`
 
 `growlight status` reports two lists, and the difference matters:
