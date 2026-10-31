@@ -3269,16 +3269,16 @@ soft-fig TUI — keys
   D            unpair / revoke selected (peers / backup view)
   g            grant a backup host (backup view)
   a F          apply / force-apply deploy plan (deploy view)
-  v            growlight: switch to the v2 two-lane queue (when queue.toml exists)
-  K J          growlight v2: move the selected entry or slice up / down
-  s            growlight v2: status picker for the selected entry or slice
-  t a d        growlight v2: toggle lane · edit `after` links · drop an entry
   r            refresh view
   u            unlock (when locked)
   :            command palette
   m            open the floating action menu (same as the ☰ button)
   ?            this help
   q            quit
+  v            growlight: switch to the v2 two-lane queue (when queue.toml exists)
+  K J          growlight v2: move the selected entry or slice up / down
+  s            growlight v2: status picker for the selected entry or slice
+  t a d        growlight v2: toggle lane · edit `after` links · drop an entry
 
 command palette runs actions: log_decision, log_incident,
 archive, add_project, refresh_snapshot, propose, seal, unseal,
