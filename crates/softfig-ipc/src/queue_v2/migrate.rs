@@ -371,7 +371,8 @@ pub enum CallClass {
     Branch,
     /// A started item's `parent` / `base` the prose does not state.
     StackBase,
-    /// A started milestone's per-slice progress (legacy records none).
+    /// A started milestone's per-slice progress (legacy records none); a
+    /// milestone with no slices raises none.
     SliceProgress,
     /// A `> Not before:` value that does not parse.
     NotBefore,
@@ -825,7 +826,7 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
         };
         p.call(CallClass::ItemDoc, id, evidence, item.docs.first().cloned().unwrap_or_default());
     }
-    entry.branch = plan_branch(p, id, item.branch_policy.as_deref(), &default_branch);
+    entry.branch = plan_branch(p, item, &default_branch);
     let started = status != EntryStatus::Queued || ctx.started_by_baton;
     if started {
         plan_stack_base(p, &mut entry, item.branch_policy.as_deref(), ctx.now);
@@ -889,8 +890,11 @@ fn strip_tag(title: &str, tag: &str) -> String {
     title.to_string()
 }
 
-/// The backticked tokens in `text` that read as branch names (`feat/x`).
-fn branch_names(text: &str) -> Vec<&str> {
+/// The backticked tokens in `text` that read as branch names (`feat/x`). A
+/// token the item's `> Worktree:` path ends in (`codebase/<id>`) names the
+/// worktree directory, not a branch.
+fn branch_names<'a>(text: &'a str, worktree: Option<&str>) -> Vec<&'a str> {
+    let worktree = worktree.map(|w| w.trim().trim_end_matches('/'));
     let mut names: Vec<&str> = text
         .split('`')
         .skip(1)
@@ -899,6 +903,7 @@ fn branch_names(text: &str) -> Vec<&str> {
             t.contains('/')
                 && !t.starts_with(['/', '~', '.'])
                 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_/".contains(&b))
+                && !worktree.is_some_and(|w| w == *t || w.ends_with(&format!("/{t}")))
         })
         .collect();
     names.dedup();
@@ -907,9 +912,9 @@ fn branch_names(text: &str) -> Vec<&str> {
     names
 }
 
-fn plan_branch(p: &mut Planner, id: &str, policy: Option<&str>, default: &str) -> String {
-    let Some(policy) = policy else { return default.to_string() };
-    let names = branch_names(policy);
+fn plan_branch(p: &mut Planner, item: &LegacyItem, default: &str) -> String {
+    let Some(policy) = item.branch_policy.as_deref() else { return default.to_string() };
+    let names = branch_names(policy, item.meta.worktree.as_deref());
     if names == [default] {
         return default.to_string();
     }
@@ -921,7 +926,7 @@ fn plan_branch(p: &mut Planner, id: &str, policy: Option<&str>, default: &str) -
         [only] => only.to_string(),
         _ => default.to_string(),
     };
-    p.decide(CallClass::Branch, id, evidence, proposed)
+    p.decide(CallClass::Branch, &item.id, evidence, proposed)
 }
 
 /// A started entry's `parent`/`base`: only from a settled `stack_base` answer
@@ -1008,7 +1013,7 @@ fn plan_slices(p: &mut Planner, item: &LegacyItem, status: EntryStatus, started:
         return None;
     }
     let mut statuses = vec![SliceStatus::Queued; item.slices.len()];
-    if started {
+    if started && !item.slices.is_empty() {
         let proposed = if status == EntryStatus::Deferred { "done" } else { "" };
         let evidence = format!("{} slices ({}); legacy records no per-slice status", item.slices.len(), item.slices.join(", "));
         let answer = p.decide(CallClass::SliceProgress, id, evidence, proposed.to_string());
@@ -1328,6 +1333,7 @@ mod tests {
     fn started_entries_need_a_settled_stack_base() {
         let mut a = item("a", "milestone", "active");
         a.branch_policy = Some("Branch `feat/a` off `main` `abc1234`.".into());
+        a.slices = vec!["001".into()];
         let mut answers = base_answers();
         let open = plan(&backlog(vec![a.clone()], vec![]), &answers, NOW);
         let call = open.calls.iter().find(|c| c.key.class == CallClass::StackBase).unwrap();

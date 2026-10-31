@@ -5,30 +5,12 @@
 //! since the live garden has neither shape: task 069's `> Not before:` line,
 //! and agent c's baton naming 069 (live: 064).
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
+mod common;
 
-use softfig_ipc::queue_v2::migrate::{LegacyBacklog, LegacyFiles, LegacyItem, read_legacy};
-
-fn load(root: &Path, dir: &Path, into: &mut BTreeMap<String, String>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            load(root, &path, into);
-        } else {
-            let key = path.strip_prefix(root).unwrap().to_str().unwrap().to_string();
-            into.insert(key, fs::read_to_string(&path).unwrap());
-        }
-    }
-}
+use softfig_ipc::queue_v2::migrate::{LegacyBacklog, LegacyItem, read_legacy};
 
 fn fixture() -> LegacyBacklog {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/migrate");
-    let mut files = LegacyFiles::default();
-    load(&root.join("garden"), &root.join("garden"), &mut files.garden);
-    load(&root.join("batons"), &root.join("batons"), &mut files.batons);
-    read_legacy(&files).unwrap()
+    read_legacy(&common::fixture_files()).unwrap()
 }
 
 fn item<'a>(backlog: &'a LegacyBacklog, id: &str) -> &'a LegacyItem {
