@@ -36,10 +36,12 @@
 //! the loader) and [`evaluate`] computes the verdict against a
 //! [`softfig_ipc::tz::Zone`]. Slice 003: the drive loop evaluates it every
 //! tick through a [`ZoneSource`] and gates admission on
-//! [`ScheduleVerdict::admission`], including the `tasks` exception; slice 004
-//! adds the reserve hold.
+//! [`ScheduleVerdict::admission`], including the `tasks` exception. Slice 004:
+//! [`apply_reserve`] adds the weekly reserve per claude-login slot (§3.6) —
+//! a member whose every pool slot is held gets [`HoldReason::Reserve`], and
+//! the profile picker skips a held slot while its pool has a clear one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -131,6 +133,21 @@ pub struct ScheduleConfig {
     /// Per pool, `0..=100`. See [`ScheduleDoc::reserve_weekly_pct`].
     pub reserve_weekly_pct: BTreeMap<String, u8>,
 }
+
+impl ScheduleConfig {
+    /// `slot`'s weekly reserve, `0..=100`: its own `reserve_weekly_pct` key,
+    /// else the `"*"` default, else `0` (no reserve, §3.6).
+    pub fn reserve_pct(&self, slot: &str) -> u8 {
+        self.reserve_weekly_pct
+            .get(slot)
+            .or_else(|| self.reserve_weekly_pct.get(RESERVE_DEFAULT_KEY))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The `reserve_weekly_pct` key that covers every slot not named on its own.
+pub const RESERVE_DEFAULT_KEY: &str = "*";
 
 /// One validated window: a local wall-clock interval on a set of days, with
 /// optional backend and member filters.
@@ -380,6 +397,9 @@ pub struct ScheduleVerdict {
     /// Members held this tick, with the reason. A member absent here is
     /// admitted by the schedule (the governor and holds still apply).
     pub held: BTreeMap<String, HoldReason>,
+    /// The weekly reserve of every slot in a member's admission pool, from
+    /// [`apply_reserve`]. Empty until that pass runs.
+    pub reserves: BTreeMap<String, ReserveState>,
 }
 
 impl ScheduleVerdict {
@@ -406,6 +426,91 @@ impl ScheduleVerdict {
                 Admission::TimedOnly
             }
             Some(&reason) => Admission::Held(reason),
+        }
+    }
+}
+
+impl ScheduleVerdict {
+    /// The slots at or past their weekly reserve: the profile picker skips
+    /// these while another slot of the pool is clear (§3.6).
+    pub fn reserve_held_slots(&self) -> BTreeSet<String> {
+        self.reserves
+            .iter()
+            .filter(|(_, state)| **state == ReserveState::Held)
+            .map(|(slot, _)| slot.clone())
+            .collect()
+    }
+}
+
+/// One slot's weekly reserve this tick (§3.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveState {
+    /// The vouchable 7d reading is at or past `100 − reserve`: no new spawn on
+    /// this slot until the 7d window resets.
+    Held,
+    /// Below the threshold, or the slot keeps no reserve.
+    Clear,
+    /// No vouchable 7d reading (none at all, no `used_percentage`, or a
+    /// `resets_at` that has passed). Never held: an unusable reading is not a
+    /// low one (protocol §2b).
+    Unknown,
+}
+
+impl ReserveState {
+    /// The short status label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Clear => "clear",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A slot's reserve state from its reserve `pct` and its vouchable 7d
+/// percentage (`None` when no reading can vouch for one). Pure.
+///
+/// A reserve of `0` keeps nothing back, so it is [`ReserveState::Clear`]
+/// whatever the reading says: a weekly-exhausted slot is the rate-limit
+/// path's to hold, not the reserve's.
+pub fn reserve_state(pct: u8, vouchable_7d: Option<u8>) -> ReserveState {
+    if pct == 0 {
+        return ReserveState::Clear;
+    }
+    match vouchable_7d {
+        None => ReserveState::Unknown,
+        Some(used) if u16::from(used) + u16::from(pct) >= 100 => ReserveState::Held,
+        Some(_) => ReserveState::Clear,
+    }
+}
+
+/// Add the weekly reserve to `verdict` (§3.6). Pure over its inputs.
+///
+/// `pools` is each member's admission pool, as the rate-limit hold reads it
+/// (an opencode member's is empty, so it is never reserve-held). `vouchable_7d`
+/// gives a slot's vouchable 7d percentage, and is asked only for a slot that
+/// keeps a reserve. Every pool slot lands in [`ScheduleVerdict::reserves`]. A
+/// member whose every slot is [`ReserveState::Held`] is held with
+/// [`HoldReason::Reserve`], which replaces a window hold (the reserve holds
+/// outright, even from a timed item) but never an unreadable zone.
+pub fn apply_reserve(
+    verdict: &mut ScheduleVerdict,
+    cfg: &ScheduleConfig,
+    pools: &[(&str, Vec<String>)],
+    mut vouchable_7d: impl FnMut(&str) -> Option<u8>,
+) {
+    for (agent, pool) in pools {
+        for slot in pool {
+            if !verdict.reserves.contains_key(slot) {
+                let pct = cfg.reserve_pct(slot);
+                let reading = if pct == 0 { None } else { vouchable_7d(slot) };
+                verdict.reserves.insert(slot.clone(), reserve_state(pct, reading));
+            }
+        }
+        let all_held = !pool.is_empty()
+            && pool.iter().all(|slot| verdict.reserves[slot] == ReserveState::Held);
+        if all_held && verdict.held.get(*agent) != Some(&HoldReason::ZoneUnreadable) {
+            verdict.held.insert((*agent).to_string(), HoldReason::Reserve);
         }
     }
 }
@@ -572,6 +677,7 @@ pub fn evaluate(cfg: &ScheduleConfig, zone: &Zone, now: i64, members: &[MemberRe
         open_windows: open.iter().map(|w| w.label.clone()).collect(),
         next_edge,
         held,
+        reserves: BTreeMap::new(),
     }
 }
 
@@ -623,6 +729,63 @@ mod tests {
         assert_eq!(verdict.admission("out", false), Admission::Held(HoldReason::OutsideWindow));
         assert_eq!(verdict.admission("reserve", true), Admission::Held(HoldReason::Reserve));
         assert_eq!(verdict.admission("zone", true), Admission::Held(HoldReason::ZoneUnreadable));
+    }
+
+    #[test]
+    fn a_reserve_holds_at_its_threshold_and_never_on_an_unvouchable_reading() {
+        assert_eq!(reserve_state(25, Some(75)), ReserveState::Held, "at 100 - X");
+        assert_eq!(reserve_state(25, Some(90)), ReserveState::Held);
+        assert_eq!(reserve_state(25, Some(74)), ReserveState::Clear, "below it");
+        assert_eq!(reserve_state(25, None), ReserveState::Unknown);
+        assert_eq!(reserve_state(0, Some(100)), ReserveState::Clear, "no reserve kept");
+        assert_eq!(reserve_state(100, Some(0)), ReserveState::Held, "a whole-week reserve");
+    }
+
+    #[test]
+    fn a_slot_takes_its_own_reserve_else_the_star_default_else_none() {
+        let cfg = schedule("reserve_weekly_pct = { home = 25, \"*\" = 10 }\n");
+        assert_eq!(cfg.reserve_pct("home"), 25);
+        assert_eq!(cfg.reserve_pct("slot1"), 10);
+        assert_eq!(schedule("").reserve_pct("slot1"), 0);
+    }
+
+    #[test]
+    fn a_member_is_reserve_held_only_when_every_pool_slot_is() {
+        let cfg = schedule("reserve_weekly_pct = { slot1 = 20, slot2 = 20 }\n");
+        let used = BTreeMap::from([("slot1", 85), ("slot2", 50), ("slot3", 99)]);
+        let pools = vec![
+            ("two", vec!["slot1".to_string(), "slot2".to_string()]),
+            ("one", vec!["slot1".to_string()]),
+            ("free", vec!["slot3".to_string()]),
+            ("metered", Vec::new()),
+        ];
+        let mut verdict = ScheduleVerdict::ungated();
+        apply_reserve(&mut verdict, &cfg, &pools, |slot| used.get(slot).copied());
+        assert_eq!(verdict.held, BTreeMap::from([("one".to_string(), HoldReason::Reserve)]));
+        assert_eq!(verdict.reserve_held_slots(), BTreeSet::from(["slot1".to_string()]));
+        assert_eq!(verdict.reserves["slot2"], ReserveState::Clear);
+        assert_eq!(verdict.reserves["slot3"], ReserveState::Clear, "slot3 keeps no reserve");
+        assert_eq!(verdict.admission("one", true), Admission::Held(HoldReason::Reserve));
+    }
+
+    #[test]
+    fn a_reserve_hold_replaces_a_window_hold_but_not_an_unreadable_zone() {
+        let cfg = schedule("reserve_weekly_pct = { \"*\" = 10 }\n");
+        let pools = vec![("out", vec!["home".to_string()]), ("zone", vec!["home".to_string()])];
+        let mut verdict = ScheduleVerdict {
+            held: BTreeMap::from([
+                ("out".to_string(), HoldReason::OutsideWindow),
+                ("zone".to_string(), HoldReason::ZoneUnreadable),
+            ]),
+            ..ScheduleVerdict::default()
+        };
+        apply_reserve(&mut verdict, &cfg, &pools, |_| Some(95));
+        assert_eq!(verdict.held["out"], HoldReason::Reserve);
+        assert_eq!(verdict.held["zone"], HoldReason::ZoneUnreadable);
+        let mut unknown = ScheduleVerdict::ungated();
+        apply_reserve(&mut unknown, &cfg, &pools, |_| None);
+        assert!(unknown.held.is_empty());
+        assert_eq!(unknown.reserves["home"], ReserveState::Unknown);
     }
 
     #[test]

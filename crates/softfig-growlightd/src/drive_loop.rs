@@ -72,7 +72,8 @@ use crate::scheduler::{
     classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
 use crate::schedule::{
-    evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone, ZoneSource,
+    apply_reserve, evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone,
+    ZoneSource,
 };
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
 use crate::state::State;
@@ -1612,6 +1613,12 @@ pub struct DriveLoop {
     /// the edge memory behind the one `schedule: …` journal line per open/close.
     /// `None` while no schedule is enabled.
     schedule_last: Option<(bool, Vec<String>)>,
+    /// The claude-login slots at or past their weekly reserve this tick
+    /// (growlight-schedule slice 004), rewritten from every verdict. Shared
+    /// with the claude backend's pool-slot picker through
+    /// [`with_reserve_view`](Self::with_reserve_view), which skips these while
+    /// the pool has a clear slot.
+    reserve_held: Arc<Mutex<BTreeSet<String>>>,
     /// Per part, whether its item doc declares a `> Not before:` that has
     /// arrived, and when that was read — the `tasks = true` exception (§3.5).
     /// Re-read after [`TIMED_DUE_TTL_SECS`], like a claim hold.
@@ -1702,6 +1709,7 @@ impl DriveLoop {
             iteration_bound_reached: false,
             zone: Box::new(SystemZone::new()),
             schedule_last: None,
+            reserve_held: Arc::default(),
             timed_due: BTreeMap::new(),
         }
     }
@@ -1759,6 +1767,16 @@ impl DriveLoop {
         holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     ) -> Self {
         self.rate_limit_holds = holds;
+        self
+    }
+
+    /// Share the reserve-held slot set (growlight-schedule slice 004) with the
+    /// claude backend's pool-slot picker, in place of the owned default. The
+    /// fleet assembly hands the same `Arc` to
+    /// [`crate::claude_backend::ClaudeBackend::with_reserve_view`].
+    #[must_use]
+    pub fn with_reserve_view(mut self, reserve_held: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.reserve_held = reserve_held;
         self
     }
 
@@ -2582,6 +2600,7 @@ impl DriveLoop {
         let schedule = self.daemon.schedule().filter(|cfg| cfg.enabled);
         let tasks = schedule.as_ref().is_some_and(|cfg| cfg.tasks);
         let verdict = self.schedule_verdict(schedule.as_ref(), &fleet, now);
+        *self.reserve_held.lock().unwrap() = verdict.reserve_held_slots();
         report.schedule_edge = self.schedule_edge(schedule.is_some(), &verdict);
         report.schedule_held = verdict.held.iter().map(|(a, r)| (a.clone(), *r)).collect();
         let admission = |agent: &str| verdict.admission(agent, tasks);
@@ -3407,10 +3426,22 @@ impl DriveLoop {
             .iter()
             .map(|m| MemberRef { agent: &m.spec.agent, backend: m.backend.ipc_backend() })
             .collect();
-        match self.zone.zone() {
+        let mut verdict = match self.zone.zone() {
             Ok(zone) => evaluate(cfg, zone, now, &members),
             Err(_) => ScheduleVerdict::zone_unreadable(&members),
-        }
+        };
+        // The weekly reserve (slice 004, §3.6), over the same admission pools
+        // the rate-limit hold reads. No per-slot usage directory means no
+        // reading, so every reserve is unknown and nothing is held.
+        let pools: Vec<(&str, Vec<String>)> = fleet
+            .iter()
+            .map(|m| (m.spec.agent.as_str(), self.profiles_resolver.admission_profiles(&m.spec.agent)))
+            .collect();
+        let dir = self.usage_by_profile_dir.as_deref();
+        apply_reserve(&mut verdict, cfg, &pools, |slot| {
+            dir.and_then(|dir| crate::profile_budget::slot_vouchable_7d(dir, slot, now))
+        });
+        verdict
     }
 
     /// The journal line for the schedule's open/close edge, if `verdict`
@@ -12333,6 +12364,43 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r = loop_.tick(DAY + OPEN);
         assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
         assert_eq!(backend.spawn_count(), 2);
+    }
+
+    #[test]
+    fn a_pool_at_its_weekly_reserve_holds_the_member_even_in_an_open_window() {
+        let runtime = tempfile::tempdir().unwrap();
+        let by_profile = runtime.path().join("usage.by-profile");
+        std::fs::create_dir_all(&by_profile).unwrap();
+        let (loop_, backend, _claimer, _q) = make_scheduled(
+            &[("p1", "queued")],
+            &format!("{WINDOW}reserve_weekly_pct = {{ \"*\" = 10 }}\n"),
+        );
+        let mut loop_ = loop_.with_usage_by_profile_dir(Some(by_profile));
+        // a1 follows `home`; the shared reading (no `profile` ⇒ home) is at 95%.
+        let reading = |used: Option<u8>| softfig_ipc::usage::UsageSnapshot {
+            rate_limits: softfig_ipc::usage::RateLimits {
+                seven_day: softfig_ipc::usage::RateWindow {
+                    used_percentage: used,
+                    resets_at: Some(DAY),
+                    status: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let shared = runtime.path().join(crate::fleet::USAGE_FILE);
+        reading(Some(95)).write_atomic(&shared).unwrap();
+        let r = loop_.tick(OPEN);
+        assert!(backend.spawns().is_empty(), "the reserve holds inside the window");
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::Reserve)]);
+        assert_eq!(*loop_.reserve_held.lock().unwrap(), BTreeSet::from(["home".to_string()]));
+
+        // The same reading without a percentage can't vouch: not held.
+        reading(None).write_atomic(&shared).unwrap();
+        let r = loop_.tick(OPEN + 60);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert!(loop_.reserve_held.lock().unwrap().is_empty());
     }
 
     #[test]

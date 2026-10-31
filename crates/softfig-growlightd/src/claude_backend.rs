@@ -1014,6 +1014,12 @@ struct ClaudeFlavor {
     /// [`ClaudeBackend::with_holds_view`]; a bare test backend leaves it unset
     /// and the pre-filter degrades to credential-only (today's behaviour).
     holds_view: OnceLock<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
+    /// A read-handle to the drive loop's reserve-held slot set
+    /// (growlight-schedule slice 004): slots at or past their weekly reserve,
+    /// rewritten every tick. The picker skips them while the pool has a clear
+    /// slot. Installed once via [`ClaudeBackend::with_reserve_view`]; unset, no
+    /// slot is reserve-held.
+    reserve_view: OnceLock<Arc<Mutex<BTreeSet<String>>>>,
 }
 
 impl ClaudeFlavor {
@@ -1230,6 +1236,28 @@ impl ClaudeFlavor {
             pool
         } else {
             survivors.as_slice()
+        };
+        // The weekly reserve (growlight-schedule slice 004, §3.6): skip a
+        // reserve-held slot while the pool has a clear one. A pool held on
+        // every slot never reaches a spawn — the schedule verdict holds the
+        // member with `HoldReason::Reserve` — so an all-held view here is a
+        // tick-boundary race, and the pick proceeds on the unnarrowed set.
+        let unreserved: Vec<String> = self
+            .reserve_view
+            .get()
+            .map(|view| {
+                let held = view.lock().unwrap();
+                candidates.iter().filter(|slot| !held.contains(*slot)).cloned().collect()
+            })
+            .unwrap_or_default();
+        let candidates: &[String] = if unreserved.is_empty() || unreserved.len() == candidates.len() {
+            candidates
+        } else {
+            eprintln!(
+                "growlightd: agent {agent:?}: skipping claude-login slot(s) at their weekly \
+                 reserve; picking from {unreserved:?}"
+            );
+            unreserved.as_slice()
         };
 
         let histories: Vec<Vec<pin::ProfilePin>> = profiles
@@ -1566,6 +1594,7 @@ impl ClaudeBackend {
             usage_capture: OnceLock::new(),
             per_slot_captures: Mutex::new(BTreeMap::new()),
             holds_view: OnceLock::new(),
+            reserve_view: OnceLock::new(),
         });
         Self {
             harness: Harness::new(
@@ -1614,6 +1643,15 @@ impl ClaudeBackend {
         holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     ) -> Self {
         let _ = self.flavor.holds_view.set(holds);
+        self
+    }
+
+    /// Share the drive loop's reserve-held slot set (growlight-schedule slice
+    /// 004) with this backend's pool-slot picker, which skips a slot at its
+    /// weekly reserve while the pool has a clear one. One-shot like
+    /// [`Self::with_holds_view`]; a bare test backend leaves it unset.
+    pub fn with_reserve_view(self, reserve_held: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        let _ = self.flavor.reserve_view.set(reserve_held);
         self
     }
 
@@ -3140,6 +3178,23 @@ mod tests {
         // Both slots are allowed on disk (no `by_profile_dir`, so headroom
         // reads full for every slot). The picker still skips slot1.
         assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// growlight-schedule slice 004 — a slot at its weekly reserve is skipped
+    /// while the pool has a clear one, and an all-reserved view (a
+    /// tick-boundary race: the verdict holds such a member) leaves the pick
+    /// unnarrowed instead of failing it.
+    #[test]
+    fn a_reserve_held_slot_is_skipped_while_the_pool_has_a_clear_one() {
+        let mut fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        reserve.lock().unwrap().insert("slot1".to_string());
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+        reserve.lock().unwrap().insert("slot2".to_string());
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        assert!(fx.backend.flavor.child_env("a", &paths).is_ok(), "an all-reserved view still picks");
     }
 
     /// M-C finish check 3a — every slot held = quiet Stall-shape, same as

@@ -97,6 +97,7 @@ pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use profile_budget::{
     headroom_from, pool_headroom, profile_budget_path, read_profile_budget, slot_headroom,
+    slot_vouchable_7d,
     Headroom, STALE_FLOOR_SECS,
 };
 pub use profile_pin::{
