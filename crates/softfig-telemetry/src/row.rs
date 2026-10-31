@@ -60,12 +60,24 @@ impl SettledFrom {
     }
 }
 
-/// The five token classes a request is billed on (spec §6). `thinking` is
-/// `None` where the wire folds reasoning into `output` instead of reporting it
-/// separately.
+/// The five token classes a request is billed on (spec §6).
+///
+/// The classes are **disjoint**, so [`total`](Self::total) and the price sum
+/// never count a token twice. The wires disagree on reasoning, and capture
+/// normalises it:
+///
+/// - claude reports `usage.output_tokens_details.thinking_tokens` as a
+///   breakdown *inside* `output_tokens`, so a claude row stores
+///   `output = output_tokens − thinking_tokens`, `thinking = Some(thinking_tokens)`;
+/// - opencode reports `tokens.reasoning` *beside* `tokens.output`, so it maps
+///   straight across.
+///
+/// `thinking` is `None` where the wire gives no split at all (reasoning, if
+/// any, is then inside `output`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
     pub input: u64,
+    /// Non-reasoning output — see the type docs.
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
