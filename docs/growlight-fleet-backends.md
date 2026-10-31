@@ -328,8 +328,8 @@ Below the lists come the **`[schedule]`** block (growlight-schedule spec §3.8) 
 live **build caps**. The schedule block is the drive loop's last verdict: whether a
 window is open, the next open or close edge in local time, each member the schedule
 holds and why, the items waiting on their `> Not before:`, and every claude-login
-slot's weekly reserve. It reads `schedule (none)` while no schedule is enabled or the
-fleet is disarmed.
+slot's weekly reserve and budget projection. It reads `schedule (none)` while no
+schedule is enabled or the fleet is disarmed.
 
 ```
 schedule      closed (zone America/New_York)
@@ -338,6 +338,9 @@ schedule      closed (zone America/New_York)
   held          b                overrun
   waiting       default/084 at 2026-11-01 02:00 -04:00
   reserve       slot1            keep 20% · 7d used unknown · clear
+  projection    slot1            5h           resets first, resets in 2h
+  projection    slot1            7d           cap in 1d–3d, resets in 4d
+  projection    slot1            reserve 80%  cap in 18h at the earliest, or resets first, resets in 4d
 build caps    (live default — the next spawn's throttle)
   cargo_build_jobs  2
   …
@@ -352,6 +355,17 @@ build caps    (live default — the next spawn's throttle)
 - **A reserve reads `unknown`** when no reading can vouch for the slot's 7d percentage.
   A headless capture records no percentage, so this is the usual state until an
   interactive statusline writes one. An unknown reserve does not hold.
+- **`projection`** rows (spec §3.11) say when each claude-login slot's 5h and 7d windows
+  are projected to reach 100%, and, for a slot that keeps a reserve, when its 7d window
+  reaches the reserve threshold. Each row is a range, never a point. The fastest and
+  slowest burn over a few recent look-back spans give its two ends. `at the earliest,
+  or resets first` means only the fastest burn reaches the cap before the window
+  resets, and `resets first` means none does. The samples are the same per-slot
+  readings the reserve reads. They are kept in memory only, so a restarted growlightd
+  reads `unknown` until two fresh measured readings land in the current window. A
+  window reset or an expired reading (`resets_at` passed) also makes the row `unknown`.
+  The projection is information only and holds nothing. opencode (metered) members get
+  no row.
 
 ### Spend accounting is session-scoped, and it is not a cap
 

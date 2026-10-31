@@ -1883,7 +1883,30 @@ fn render_schedule(s: Option<&growlightd::ScheduleSummary>, now: i64) -> String 
             r.slot, r.reserve_pct
         );
     }
+    for p in &s.projection {
+        out += &format!("  projection    {:<16} {:<12} {}\n", p.slot, projection_label(p), projection_eta(p, now));
+    }
     out
+}
+
+/// Which cap a projection row runs to: `5h`, `7d`, or `reserve 80%`.
+fn projection_label(p: &growlightd::PoolProjection) -> String {
+    if p.window == "reserve" { format!("reserve {}%", p.target_pct) } else { p.window.clone() }
+}
+
+/// A projection row's range, relative to `now` (§3.11): never a point.
+fn projection_eta(p: &growlightd::PoolProjection, now: i64) -> String {
+    let until = |at: i64| softfig_ipc::human_age_secs(at.saturating_sub(now).max(0) as u64);
+    let resets = p.resets_at.map(|at| format!(", resets in {}", until(at))).unwrap_or_default();
+    match (p.cap_at_earliest, p.cap_at_latest) {
+        (Some(e), Some(l)) => match (until(e), until(l)) {
+            (e, l) if e == l => format!("cap in ~{e}{resets}"),
+            (e, l) => format!("cap in {e}–{l}{resets}"),
+        },
+        (Some(e), None) => format!("cap in {} at the earliest, or resets first{resets}", until(e)),
+        (None, _) if p.resets_first => format!("resets first{resets}"),
+        (None, _) => "unknown".to_string(),
+    }
 }
 
 /// Render `resources show`: the live default caps + the genuinely-running scope
@@ -3370,7 +3393,12 @@ mod tests {
                     resets_at: None,
                 },
             ],
-            projection: Vec::new(),
+            projection: vec![
+                projection("slot1", "7d", 100, (Some(3_600), Some(10_800)), false),
+                projection("slot1", "reserve", 80, (Some(3_600), None), false),
+                projection("slot1", "5h", 100, (None, None), true),
+                projection("slot2", "7d", 100, (None, None), false),
+            ],
         };
         let text = render_schedule(Some(&s), 0);
         assert!(text.starts_with("schedule      open (zone America/New_York)\n"), "{text}");
@@ -3381,6 +3409,29 @@ mod tests {
         assert!(text.contains("  waiting       default/084 at 2026-11-01 02:00 -04:00\n"));
         assert!(text.contains("slot1            keep 20% · 7d used 85% · held, resets in 2h\n"), "{text}");
         assert!(text.contains("slot2            keep 20% · 7d used unknown · clear\n"), "{text}");
+        assert!(text.contains("projection    slot1            7d           cap in 1h–3h, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot1            reserve 80%  cap in 1h at the earliest, or resets first, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot1            5h           resets first, resets in 2h\n"), "{text}");
+        assert!(text.contains("projection    slot2            7d           unknown\n"), "{text}");
+    }
+
+    fn projection(
+        slot: &str,
+        window: &str,
+        target_pct: u8,
+        (cap_at_earliest, cap_at_latest): (Option<i64>, Option<i64>),
+        resets_first: bool,
+    ) -> growlightd::PoolProjection {
+        let resets_at = (slot == "slot1").then_some(7_200);
+        growlightd::PoolProjection {
+            slot: slot.into(),
+            window: window.into(),
+            target_pct,
+            cap_at_earliest,
+            cap_at_latest,
+            resets_at,
+            resets_first,
+        }
     }
 
     #[test]

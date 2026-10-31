@@ -287,7 +287,8 @@ pub struct ScheduleSummary {
     /// The weekly reserve of every slot in a member's admission pool.
     #[serde(default)]
     pub reserve: Vec<ReserveSummary>,
-    /// The budget projection per pool (slice 008). Empty until then.
+    /// The budget projection per pool (slice 008): one row per slot and
+    /// [`PoolProjection::window`].
     #[serde(default)]
     pub projection: Vec<PoolProjection>,
 }
@@ -321,19 +322,37 @@ pub struct ReserveSummary {
     pub resets_at: Option<i64>,
 }
 
-/// One pool's budget projection ([`ScheduleSummary::projection`], slice 008).
+/// One pool's budget projection ([`ScheduleSummary::projection`], slice 008):
+/// when one of a slot's rate windows is projected to reach `target_pct`, as a
+/// range over the recent burn rates, never a point (§3.11).
+///
+/// No cap time and `resets_first == false` is `unknown`: fewer than two
+/// vouchable samples in the current window. An older peer sends neither
+/// `window` nor `target_pct`; it never sent a projection either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolProjection {
     pub slot: String,
-    /// The earliest Unix time the pool is projected to reach its cap.
+    /// `5h` or `7d` — the window projected to its full cap — or `reserve`,
+    /// the 7d window projected to its reserve threshold (`100 − reserve`).
+    #[serde(default)]
+    pub window: String,
+    /// The used percentage the projection runs to.
+    #[serde(default)]
+    pub target_pct: u8,
+    /// The earliest Unix time the window is projected to reach `target_pct`
+    /// (the fastest recent burn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_at_earliest: Option<i64>,
-    /// The latest Unix time the pool is projected to reach its cap.
+    /// The latest Unix time (the slowest recent burn). `None` beside an
+    /// earliest time: the slowest burn reaches no cap before the reset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_at_latest: Option<i64>,
-    /// When the pool's 7d window resets, Unix seconds.
+    /// When the window resets, Unix seconds, if the readings said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<i64>,
+    /// Even the fastest recent burn reaches no cap before the window resets.
+    #[serde(default)]
+    pub resets_first: bool,
 }
 
 /// One configured roster member echoed in [`FleetStatusReply::roster`] — the
@@ -1857,15 +1876,27 @@ mod tests {
                 held: false,
                 resets_at: None,
             }],
-            projection: Vec::new(),
+            projection: vec![PoolProjection {
+                slot: "slot1".into(),
+                window: "reserve".into(),
+                target_pct: 80,
+                cap_at_earliest: Some(1_793_600_000),
+                cap_at_latest: None,
+                resets_at: Some(1_793_700_000),
+                resets_first: false,
+            }],
         });
         let json = serde_json::to_string(&reply).unwrap();
         assert!(!json.contains("used_7d_pct"), "an unknown reading is omitted: {json}");
+        assert!(!json.contains("cap_at_latest"), "{json}");
         let back: FleetStatusReply = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schedule, reply.schedule);
         // A bare block (a newer peer that sends only what it knows) decodes too.
         let bare: ScheduleSummary = serde_json::from_str(r#"{"open":true}"#).unwrap();
         assert!(bare.open && bare.zone.is_empty() && bare.reserve.is_empty());
+        // A pre-008 projection row (no window, target or resets_first) decodes too.
+        let old: PoolProjection = serde_json::from_str(r#"{"slot":"home"}"#).unwrap();
+        assert!(old.window.is_empty() && old.target_pct == 0 && !old.resets_first);
     }
 
     #[test]

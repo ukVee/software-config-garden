@@ -40,6 +40,8 @@
 //! [`apply_reserve`] adds the weekly reserve per claude-login slot (§3.6) —
 //! a member whose every pool slot is held gets [`HoldReason::Reserve`], and
 //! the profile picker skips a held slot while its pool has a clear one.
+//! Slice 008: [`summary`] carries the budget projection
+//! ([`crate::projection`]) the drive loop folds from the same readings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -728,11 +730,13 @@ pub fn local_label(zone: &Zone, unix: i64) -> String {
 /// The `status` block for a verdict (§3.8). `overrun` names the members
 /// still running more than `close_grace_minutes` past their window's close;
 /// each shows as `overrun` in place of its window reason. `held_items` are
-/// the items waiting on `> Not before:`.
+/// the items waiting on `> Not before:`; `projection` is the budget
+/// projection ([`crate::projection`]), carried through as is.
 pub fn summary(
     verdict: &ScheduleVerdict,
     overrun: &BTreeSet<String>,
     held_items: Vec<String>,
+    projection: Vec<softfig_ipc::growlightd::PoolProjection>,
 ) -> softfig_ipc::growlightd::ScheduleSummary {
     use softfig_ipc::growlightd::{ReserveSummary, ScheduleHeld, ScheduleSummary};
     ScheduleSummary {
@@ -761,7 +765,7 @@ pub fn summary(
                 resets_at: r.reading.and_then(|x| x.resets_at),
             })
             .collect(),
-        projection: Vec::new(),
+        projection,
     }
 }
 
@@ -1035,7 +1039,8 @@ mod tests {
         apply_reserve(&mut v, &cfg, &pools, |_| {
             Some(Reading7d { used_pct: 50, resets_at: Some(99) })
         });
-        let s = summary(&v, &BTreeSet::from(["b".to_string()]), vec!["q/084".into()]);
+        let ring = crate::projection::Projections::default().tick([("slot1", 20)], |_| Vec::new(), 0);
+        let s = summary(&v, &BTreeSet::from(["b".to_string()]), vec!["q/084".into()], ring.clone());
         assert!(!s.open && s.current_windows.is_empty());
         assert_eq!(s.zone, v.zone);
         assert!(!s.zone.is_empty());
@@ -1048,7 +1053,8 @@ mod tests {
         assert_eq!((slot1.held, slot1.resets_at), (false, Some(99)));
         // slot2 keeps no reserve, so its reading is never taken.
         assert_eq!((s.reserve[1].reserve_pct, s.reserve[1].used_7d_pct), (0, None));
-        assert!(s.projection.is_empty(), "slice 008");
+        assert_eq!(s.projection, ring, "the projection rides through as is");
+        assert_eq!(s.projection.len(), 3, "5h, 7d and slot1's reserve");
     }
 
     #[test]

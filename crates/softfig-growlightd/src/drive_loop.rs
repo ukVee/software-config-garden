@@ -1634,6 +1634,10 @@ pub struct DriveLoop {
     /// The members past their close grace as of last tick, so each overrun
     /// notifies once.
     overrun: BTreeSet<String>,
+    /// Every pooled slot's usage samples, in memory, and this tick's budget
+    /// projection from them (slice 008, §3.11).
+    projections: crate::projection::Projections,
+    projection: Vec<softfig_ipc::growlightd::PoolProjection>,
     /// Per part, whether its item doc declares a `> Not before:` that has
     /// arrived, and when that was read — the `tasks = true` exception (§3.5).
     /// Re-read after [`TIMED_DUE_TTL_SECS`], like a claim hold.
@@ -1728,6 +1732,8 @@ impl DriveLoop {
             window_closed_at: BTreeMap::new(),
             window_held_last: BTreeSet::new(),
             overrun: BTreeSet::new(),
+            projections: Default::default(),
+            projection: Vec::new(),
             timed_due: BTreeMap::new(),
         }
     }
@@ -3430,7 +3436,7 @@ impl DriveLoop {
                     _ => None,
                 })
                 .collect();
-            crate::schedule::summary(&verdict, &self.overrun, held_items)
+            crate::schedule::summary(&verdict, &self.overrun, held_items, self.projection.clone())
         }));
 
         // 4. Route this tick's events through the single owned dispatcher (spec
@@ -3472,9 +3478,23 @@ impl DriveLoop {
             .map(|m| (m.spec.agent.as_str(), self.profiles_resolver.admission_profiles(&m.spec.agent)))
             .collect();
         let dir = self.usage_by_profile_dir.as_deref();
+        let readings: BTreeMap<&str, Vec<softfig_ipc::usage::UsageSnapshot>> = pools
+            .iter()
+            .flat_map(|(_, pool)| pool)
+            .map(|slot| {
+                let read = dir.map(|dir| crate::profile_budget::slot_readings(dir, slot));
+                (slot.as_str(), read.unwrap_or_default())
+            })
+            .collect();
         apply_reserve(&mut verdict, cfg, &pools, |slot| {
-            dir.and_then(|dir| crate::profile_budget::slot_vouchable_7d(dir, slot, now))
+            crate::profile_budget::vouchable_7d(&readings[slot], now)
         });
+        // The same readings feed the budget projection (slice 008, §3.11).
+        self.projection = self.projections.tick(
+            verdict.reserves.iter().map(|(slot, r)| (slot.as_str(), r.reserve_pct)),
+            |slot| readings.get(slot).cloned().unwrap_or_default(),
+            now,
+        );
         verdict
     }
 

@@ -236,20 +236,35 @@ pub fn slot_vouchable_7d(
     slot: &str,
     now: i64,
 ) -> Option<crate::schedule::Reading7d> {
-    let own = read_profile_budget(by_profile_dir, slot);
-    let shared = by_profile_dir
-        .parent()
-        .and_then(|runtime| UsageSnapshot::load(&runtime.join(crate::fleet::USAGE_FILE)).ok().flatten())
-        .filter(|snap| snap.profile.as_deref().unwrap_or(softfig_ipc::claude_profiles::HOME_SLOT) == slot);
-    [own, shared]
+    vouchable_7d(&slot_readings(by_profile_dir, slot), now)
+}
+
+/// The vouchable 7d reading among `readings` (one slot's
+/// [`slot_readings`]): the largest vouchable percentage, per
+/// [`slot_vouchable_7d`].
+pub fn vouchable_7d(readings: &[UsageSnapshot], now: i64) -> Option<crate::schedule::Reading7d> {
+    readings
         .iter()
-        .flatten()
         .filter_map(|snap| {
             let week = &snap.rate_limits.seven_day;
             week.vouchable_pct_at(now)
                 .map(|used_pct| crate::schedule::Reading7d { used_pct, resets_at: week.resets_at })
         })
         .max_by_key(|reading| reading.used_pct)
+}
+
+/// Every reading that names `slot`: its own `<slot>.json` under
+/// `by_profile_dir`, then the shared `usage.json` beside that directory when
+/// the shared file's `profile` is `slot` (no `profile` is `home`'s). A missing
+/// or unreadable file contributes nothing. [`slot_vouchable_7d`] reads these,
+/// and so does the budget projection's sample ring (slice 008).
+pub fn slot_readings(by_profile_dir: &Path, slot: &str) -> Vec<UsageSnapshot> {
+    let own = read_profile_budget(by_profile_dir, slot);
+    let shared = by_profile_dir
+        .parent()
+        .and_then(|runtime| UsageSnapshot::load(&runtime.join(crate::fleet::USAGE_FILE)).ok().flatten())
+        .filter(|snap| snap.profile.as_deref().unwrap_or(softfig_ipc::claude_profiles::HOME_SLOT) == slot);
+    own.into_iter().chain(shared).collect()
 }
 
 /// Snapshot every slot in `pool` to `(slot, headroom)` pairs, in pool order.
