@@ -195,6 +195,17 @@ impl BatonStatusSource for FsBatonStore {
         fs::metadata(self.baton_path(agent)).and_then(|md| md.modified()).ok()
     }
 
+    fn baton_slice(&self, agent: &str, item: &str) -> Option<String> {
+        let raw = fs::read_to_string(self.baton_path(agent)).ok()?;
+        let view = parse_baton(&raw);
+        if view.item.as_deref() != Some(item) {
+            return None;
+        }
+        // The frontmatter parse keeps a quoted value's quotes (`slice: "004"`).
+        let slice = view.slice?.trim_matches('"').to_string();
+        (!slice.is_empty()).then_some(slice)
+    }
+
     fn status(&self, agent: &str) -> BatonRead {
         let per_member_path = self.baton_path(agent);
         let per_member_raw = fs::read_to_string(&per_member_path).ok();
@@ -692,6 +703,22 @@ mod tests {
         let mtime = s.baton_mtime("a").expect("a seeded baton has an mtime");
         let file_mtime = std::fs::metadata(s.baton_path("a")).unwrap().modified().unwrap();
         assert_eq!(mtime, file_mtime, "the trait reads the real file mtime");
+    }
+
+    #[test]
+    fn baton_slice_reads_the_slice_only_for_the_same_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        assert_eq!(s.baton_slice("a", "t1"), None, "no baton yet reads as no slice");
+
+        std::fs::create_dir_all(s.baton_path("a").parent().unwrap()).unwrap();
+        std::fs::write(s.baton_path("a"), "---\nstatus: IN_PROGRESS\nitem: t1\nslice: \"004\"\n---\n")
+            .unwrap();
+        assert_eq!(s.baton_slice("a", "t1").as_deref(), Some("004"), "quotes are trimmed");
+        assert_eq!(s.baton_slice("a", "t2"), None, "a baton on another item names no slice");
+
+        std::fs::write(s.baton_path("a"), "---\nstatus: IN_PROGRESS\nitem: t1\n---\n").unwrap();
+        assert_eq!(s.baton_slice("a", "t1"), None, "a task baton names no slice");
     }
 
     /// Review 043 G64-8: a second warning replaces the first in place — one

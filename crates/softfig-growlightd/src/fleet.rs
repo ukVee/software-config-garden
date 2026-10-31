@@ -1055,6 +1055,9 @@ fn build_claude_backend(
     // (built once in `assemble_fleet` and cloned here), so a stdout-only 429
     // (no on-disk `rate_limit_event`) deprioritises its slot immediately.
     .with_holds_view(rate_limit_holds)
+    // Token telemetry (token-telemetry-p1 slice 004): one row per API request
+    // into the daemon's recorder; the default sink when `main` installed none.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// Collect the claude members' `profile_pool` roster into a
@@ -1228,6 +1231,8 @@ fn build_opencode_backend(
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
     )
+    // Token telemetry (token-telemetry-p1 slice 004), the claude backend's sink.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`

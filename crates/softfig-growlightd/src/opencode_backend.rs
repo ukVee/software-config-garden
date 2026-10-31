@@ -92,7 +92,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
@@ -109,6 +109,9 @@ use crate::opencode_ledger::SessionLedger;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::AgentPaths;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
+use crate::telemetry_capture::{
+    opencode_ledger_row, opencode_step_row, CaptureContext, StepTokens, TelemetrySink,
+};
 
 // Imports for the test-only opencode-shaped `pump` seam below, which wires
 // borrowed cells into the harness's line loop so a fixture drives the real
@@ -247,6 +250,10 @@ struct RunState {
     /// A `step_start` with no `step_finish` yet. On 2.x the final step always ends
     /// open.
     open_step: bool,
+    /// Streamed `step_finish` lines so far: the next step row's `turn_index`.
+    steps: u32,
+    /// USD already accrued from streamed `step_finish` lines (`part.cost`).
+    streamed_cost: f64,
 }
 
 /// The content deltas one event carries. Pure. A type that carries no renderable
@@ -338,20 +345,25 @@ fn tool_subject(tool: &str, state: Option<&Value>) -> String {
 }
 
 /// What one completed model step cost: the tokens feeding the rolling-minute meter
-/// and the USD this step spent.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// and the telemetry row, and the USD this step spent.
+#[derive(Debug, Clone, PartialEq)]
 struct StepFinish {
-    /// `input + output + reasoning + cache.read + cache.write`. 2.x dropped
-    /// `tokens.total`; on every 1.18.15 step the sum equals it. A missing part
-    /// counts 0, so a `step_finish` with no `tokens` still meters one request at
-    /// zero tokens, mirroring claude's `Some(0)` for a `result` with no `usage`.
-    tokens: u64,
-    /// `part.cost`, USD for THIS step (not a running total).
-    cost_usd: f64,
+    /// Per class. Their [`total`](StepTokens::total) is what the meter records:
+    /// 2.x dropped `tokens.total`, and on every 1.18.15 step the sum equals it. A
+    /// missing part counts 0, so a `step_finish` with no `tokens` still meters one
+    /// request at zero tokens, mirroring claude's `Some(0)` for a `result` with no
+    /// `usage`.
+    tokens: StepTokens,
+    /// `part.messageID`: the model call this step closed, the row's request id.
+    message_id: Option<String>,
+    /// `part.reason` (`stop`, `tool-calls`, …), the row's stop reason.
+    reason: Option<String>,
+    /// `part.cost`, USD for THIS step (not a running total); `None` when absent.
+    cost: Option<f64>,
 }
 
-/// A `step_finish` event's tokens and cost, or `None` for any other type or a
-/// `step_finish` with no `part`. Pure — a fixture drives it, no real spawn.
+/// A `step_finish` event's tokens, ids and cost, or `None` for any other type or
+/// a `step_finish` with no `part`. Pure — a fixture drives it, no real spawn.
 fn step_finish_of(ev: &Value) -> Option<StepFinish> {
     if ev.get("type").and_then(Value::as_str) != Some("step_finish") {
         return None;
@@ -359,23 +371,23 @@ fn step_finish_of(ev: &Value) -> Option<StepFinish> {
     let part = ev.get("part")?;
     let tokens = part.get("tokens");
     let count = |path: &[&str]| {
-        path.iter()
-            .try_fold(tokens?, |v, k| v.get(*k))
+        tokens
+            .and_then(|t| path.iter().try_fold(t, |v, k| v.get(*k)))
             .and_then(Value::as_u64)
+            .unwrap_or(0)
     };
-    let sum = [
-        count(&["input"]),
-        count(&["output"]),
-        count(&["reasoning"]),
-        count(&["cache", "read"]),
-        count(&["cache", "write"]),
-    ]
-    .into_iter()
-    .flatten()
-    .fold(0u64, u64::saturating_add);
+    let text = |key: &str| part.get(key).and_then(Value::as_str).map(str::to_string);
     Some(StepFinish {
-        tokens: sum,
-        cost_usd: part.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        tokens: StepTokens {
+            input: count(&["input"]),
+            output: count(&["output"]),
+            reasoning: count(&["reasoning"]),
+            cache_read: count(&["cache", "read"]),
+            cache_write: count(&["cache", "write"]),
+        },
+        message_id: text("messageID"),
+        reason: text("reason"),
+        cost: part.get("cost").and_then(Value::as_f64),
     })
 }
 
@@ -409,6 +421,10 @@ struct Fold<'a> {
     rate: &'a AgentRateState,
     run: &'a Mutex<RunState>,
     ledger: &'a dyn SessionLedger,
+    /// This spawn's token-telemetry identity (token-telemetry-p1 slice 004).
+    capture: &'a CaptureContext,
+    /// The spawn's `provider/model`: the step event names none.
+    model: &'a str,
 }
 
 impl LineObserver for Fold<'_> {
@@ -441,10 +457,29 @@ impl LineObserver for Fold<'_> {
         // One `step_finish` == one completed model turn == one real API call
         // costing its tokens. See the module docs on why this is per-step.
         if let Some(step) = step_finish_of(&ev) {
+            let tokens = step.tokens.total();
+            let cost = step.cost.unwrap_or(0.0);
             run.open_step = false;
-            run.streamed_tokens = run.streamed_tokens.saturating_add(step.tokens);
-            self.rate.record(at, step.tokens);
-            self.member.spend.record_cost(step.cost_usd);
+            run.streamed_tokens = run.streamed_tokens.saturating_add(tokens);
+            run.streamed_cost += cost;
+            self.rate.record(at, tokens);
+            self.member.spend.record_cost(cost);
+            // A step with no message id still gets a row key unique in its run.
+            let request_id = step
+                .message_id
+                .unwrap_or_else(|| format!("step-{}", run.steps));
+            self.capture.record_settled(opencode_step_row(
+                self.capture,
+                self.model,
+                run.session_id.as_deref().unwrap_or_default(),
+                &request_id,
+                run.steps,
+                step.tokens,
+                step.reason,
+                step.cost,
+                at,
+            ));
+            run.steps = run.steps.saturating_add(1);
         }
         if let Some(reason) = error_of(&ev) {
             self.member.errors.push(reason);
@@ -465,6 +500,19 @@ impl LineObserver for Fold<'_> {
                 let unseen = totals.tokens.saturating_sub(run.streamed_tokens);
                 if run.open_step || unseen > 0 {
                     self.rate.record(at, unseen);
+                }
+                // What the ledger settled beyond the stream (the final step,
+                // which 2.x never streams) is one ledger row.
+                if unseen > 0 {
+                    self.capture.record_settled(opencode_ledger_row(
+                        self.capture,
+                        self.model,
+                        session,
+                        run.steps,
+                        unseen,
+                        totals.cost_usd - run.streamed_cost,
+                        at,
+                    ));
                 }
                 if !totals.settled {
                     eprintln!(
@@ -499,6 +547,8 @@ pub(crate) struct OpencodeSpawnObserver {
     rate: Arc<AgentRateState>,
     run: Mutex<RunState>,
     ledger: Arc<dyn SessionLedger>,
+    capture: CaptureContext,
+    model: String,
 }
 
 impl OpencodeSpawnObserver {
@@ -510,6 +560,8 @@ impl OpencodeSpawnObserver {
             rate: &self.rate,
             run: &self.run,
             ledger: self.ledger.as_ref(),
+            capture: &self.capture,
+            model: &self.model,
         }
     }
 }
@@ -542,6 +594,13 @@ fn pump<R: BufRead>(
     now: &dyn Fn() -> i64,
 ) {
     let run = Mutex::new(RunState::default());
+    let capture = CaptureContext {
+        sink: TelemetrySink::default(),
+        member: agent.to_string(),
+        profile: None,
+        tags: Default::default(),
+        effort: None,
+    };
     crate::agent_harness::pump(
         reader,
         health,
@@ -552,6 +611,8 @@ fn pump<R: BufRead>(
             rate,
             run: &run,
             ledger,
+            capture: &capture,
+            model: "",
         },
         now,
     );
@@ -645,11 +706,28 @@ struct OpencodeFlavor {
     /// Per-agent spend + error cells, keyed by agent id; re-spawn replaces the
     /// cell, the same lifecycle the harness gives its own health/rate/stderr cells.
     members: Mutex<BTreeMap<String, Arc<MemberCells>>>,
+    /// Where this backend's token-telemetry rows go (token-telemetry-p1 slice
+    /// 004), installed once by [`OpencodeBackend::with_telemetry`]; unset, every
+    /// row is dropped.
+    telemetry: OnceLock<TelemetrySink>,
 }
 
 impl OpencodeFlavor {
     fn member(&self, agent: &str) -> Option<Arc<MemberCells>> {
         self.members.lock().unwrap().get(agent).cloned()
+    }
+
+    /// The model a spawn runs on: `choice` overrides the roster default for
+    /// THIS spawn (queue-v2-scheduling slice 006). A claude-shaped choice is
+    /// ignored defensively; the drive loop never routes one to this flavor.
+    fn selection(&self, choice: Option<&softfig_ipc::model_choice::ModelChoice>) -> ModelSelection {
+        choice
+            .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Opencode)
+            .map(|c| ModelSelection {
+                model: c.opencode_model().to_string(),
+                variant: c.variant.clone(),
+            })
+            .unwrap_or_else(|| self.launch.model.clone())
     }
 
     /// `agent`'s accumulated session spend, or the zero reading if it was never
@@ -734,16 +812,8 @@ impl BackendFlavor for OpencodeFlavor {
         // just written. `choice` overrides the roster default for THIS spawn
         // (queue-v2-scheduling slice 006 — the assignment's resolved `> Model:`
         // choice rides argv `--model`, the one path `run` honors fail-closed).
-        // A claude-shaped choice is ignored defensively; the drive loop never
-        // routes one to this flavor.
-        let override_sel = choice
-            .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Opencode)
-            .map(|c| ModelSelection {
-                model: c.opencode_model().to_string(),
-                variant: c.variant.clone(),
-            });
-        let sel = override_sel.as_ref().unwrap_or(&self.launch.model);
-        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, sel)
+        let sel = self.selection(choice);
+        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, &sel)
     }
 
     fn child_env(
@@ -765,10 +835,12 @@ impl BackendFlavor for OpencodeFlavor {
         // Nothing to commit: opencode picks no account per spawn.
     }
 
-    fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+    fn new_observer(&self, spec: &AgentSpec, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+        let agent = spec.agent.as_str();
         // Fresh spend + error cells for this spawn, overwriting any prior
         // generation's — so `spend` and the crash reason always read the CURRENT
         // child, the same replace-on-re-roll lifecycle as the harness's own cells.
+        let sel = self.selection(spec.model.as_ref());
         let member = Arc::new(MemberCells::default());
         self.members
             .lock()
@@ -781,6 +853,16 @@ impl BackendFlavor for OpencodeFlavor {
             rate,
             run: Mutex::new(RunState::default()),
             ledger: Arc::clone(&self.ledger),
+            // The same selection argv `--model` carried for this spawn; its
+            // variant is the step rows' effort.
+            capture: CaptureContext {
+                sink: self.telemetry.get().cloned().unwrap_or_default(),
+                member: agent.to_string(),
+                profile: None,
+                tags: spec.telemetry.clone(),
+                effort: sel.variant,
+            },
+            model: sel.model,
         })
     }
 }
@@ -831,6 +913,7 @@ impl OpencodeBackend {
             preapproval,
             ledger,
             members: Mutex::new(BTreeMap::new()),
+            telemetry: OnceLock::new(),
         });
         Self {
             harness: Harness::new(
@@ -841,6 +924,14 @@ impl OpencodeBackend {
             ),
             flavor,
         }
+    }
+
+    /// Install the sink every spawn's token-telemetry rows go to
+    /// (token-telemetry-p1 slice 004) — the daemon's recorder and price table.
+    /// Set once at construction; without it rows are dropped.
+    pub fn with_telemetry(self, sink: TelemetrySink) -> Self {
+        let _ = self.flavor.telemetry.set(sink);
+        self
     }
 
     /// `agent`'s current health (heartbeat-or-exit), or `None` if this backend
@@ -1165,8 +1256,16 @@ mod tests {
         assert_eq!(
             step_finish_for_line(v2),
             Some(StepFinish {
-                tokens: 251 + 167 + 66 + 5376,
-                cost_usd: 0.000193578
+                tokens: StepTokens {
+                    input: 251,
+                    output: 167,
+                    reasoning: 66,
+                    cache_read: 5376,
+                    cache_write: 0,
+                },
+                message_id: None,
+                reason: Some("tool-calls".into()),
+                cost: Some(0.000193578),
             })
         );
 
@@ -1177,7 +1276,7 @@ mod tests {
             let ev: Value = serde_json::from_str(line).unwrap();
             let Some(step) = step_finish_of(&ev) else { continue };
             let total = ev["part"]["tokens"]["total"].as_u64().unwrap();
-            assert_eq!(step.tokens, total, "sum ≠ 1.18 total on {line}");
+            assert_eq!(step.tokens.total(), total, "sum ≠ 1.18 total on {line}");
             checked += 1;
         }
         assert_eq!(checked, 4, "every 1.18.15 step_finish was checked");
@@ -1187,15 +1286,22 @@ mod tests {
         assert_eq!(
             step_finish_for_line(r#"{"type":"step_finish","part":{"reason":"stop"}}"#),
             Some(StepFinish {
-                tokens: 0,
-                cost_usd: 0.0
+                tokens: StepTokens::default(),
+                message_id: None,
+                reason: Some("stop".into()),
+                cost: None,
             })
         );
         assert_eq!(
             step_finish_for_line(r#"{"type":"step_finish","part":{"tokens":{"input":7}}}"#),
             Some(StepFinish {
-                tokens: 7,
-                cost_usd: 0.0
+                tokens: StepTokens {
+                    input: 7,
+                    ..StepTokens::default()
+                },
+                message_id: None,
+                reason: None,
+                cost: None,
             })
         );
 
@@ -1556,7 +1662,78 @@ mod tests {
             ),
             ledger: Arc::new(FakeLedger::default()),
             members: Mutex::new(BTreeMap::new()),
+            telemetry: OnceLock::new(),
         }
+    }
+
+    fn spec(agent: &str) -> AgentSpec {
+        AgentSpec::new(agent, "loop.json", "mcp.json")
+    }
+
+    #[derive(Debug, Default)]
+    struct Collect(Mutex<Vec<softfig_telemetry::RequestRow>>);
+    impl softfig_telemetry::Recorder for Collect {
+        fn record(&self, row: softfig_telemetry::RequestRow) {
+            self.0.lock().unwrap().push(row);
+        }
+    }
+
+    /// Slice 004: the production observer records the streamed step as one row
+    /// keyed by its message id and the ledger's remainder (2.x's unstreamed
+    /// final step) as one ledger row, both on the spawn's model and tags.
+    #[test]
+    fn a_2x_tool_run_records_a_step_row_and_a_ledger_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = flavor(tmp.path(), Path::new("/garden"));
+        let rows = Arc::new(Collect::default());
+        let backend = OpencodeBackend::new(
+            f.launch.clone(),
+            f.hub.clone(),
+            f.preapproval.clone(),
+            Arc::new(FakeLedger::with(TOOL_RECORD)),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .with_telemetry(TelemetrySink {
+            recorder: Arc::clone(&rows) as Arc<dyn softfig_telemetry::Recorder>,
+            prices: None,
+        });
+        let tags = crate::telemetry_capture::TelemetryTags {
+            item_id: Some("t1".into()),
+            slice_id: Some("004".into()),
+            queue: Some("default".into()),
+        };
+        let observer = backend
+            .flavor
+            .new_observer(&spec("a1").with_telemetry(tags.clone()), Arc::new(AgentRateState::default()));
+        for line in TOOL_RUN_2.lines() {
+            observer.observe(line, 1);
+        }
+        observer.finish(2);
+
+        let rows = rows.0.lock().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        let (step, ledger) = (&rows[0], &rows[1]);
+        let streamed = 251 + 167 + 66 + 5376;
+        assert_eq!(step.request_id, "msg_124af916b001IxaLkREseMIBHv");
+        assert_eq!(step.session_id, TOOL_RECORD.0);
+        assert_eq!((step.provider.as_str(), step.model.as_str()), ("deepseek", "deepseek-flash"));
+        assert_eq!(step.effort.as_deref(), Some("high"), "the roster variant is the effort");
+        assert_eq!(step.item_id, tags.item_id);
+        assert_eq!(step.slice_id, tags.slice_id);
+        assert_eq!(step.queue, tags.queue);
+        assert_eq!(step.tokens.thinking, Some(66));
+        assert_eq!(step.stop_reason.as_deref(), Some("tool-calls"));
+        assert_eq!(step.cost_usd, Some(0.00019357799999999997), "unpriced: the wire cost");
+        assert_eq!(step.settled_from, softfig_telemetry::SettledFrom::Stream);
+
+        assert_eq!(ledger.request_id, "ledger");
+        assert_eq!(ledger.turn_index, 1);
+        assert_eq!(ledger.settled_from, softfig_telemetry::SettledFrom::Ledger);
+        assert_eq!(ledger.tokens.input, TOOL_RECORD.2 - streamed);
+        let rest = ledger.cost_usd.unwrap();
+        assert!((rest - (TOOL_RECORD.1 - 0.00019357799999999997)).abs() < 1e-12, "{rest}");
     }
 
     fn backend(tmp: &Path, garden: &Path) -> Arc<OpencodeBackend> {
@@ -1793,7 +1970,7 @@ mod tests {
         // reader thread holds: an error run, then EOF.
         let observer = backend
             .flavor
-            .new_observer("a1", Arc::new(AgentRateState::default()));
+            .new_observer(&spec("a1"), Arc::new(AgentRateState::default()));
         for line in ERROR_RUN_2.lines() {
             observer.observe(line, 1);
         }
@@ -1813,7 +1990,7 @@ mod tests {
         // A re-spawn replaces the cells: the next run starts with no reason.
         let _ = backend
             .flavor
-            .new_observer("a1", Arc::new(AgentRateState::default()));
+            .new_observer(&spec("a1"), Arc::new(AgentRateState::default()));
         assert!(source.stderr_tail("a1").is_empty());
     }
 

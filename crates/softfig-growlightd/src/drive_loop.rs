@@ -73,6 +73,7 @@ use crate::scheduler::{
 };
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
 use crate::state::State;
+use crate::telemetry_capture::TelemetryTags;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
     Supervisor, STALL_LIMIT,
@@ -807,6 +808,14 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
     /// `None` so the deferred/test sources keep the guard inert; the live
     /// [`crate::baton_store::FsBatonStore`] reads the real file.
     fn baton_mtime(&self, _agent: &str) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// The `slice:` `agent`'s baton names, when that baton is on `item` — the
+    /// slice a spawn's token-telemetry rows are tagged with (token-telemetry-p1
+    /// slice 004). `None` when the baton is on another item, names no slice, or
+    /// is unreadable. The default is `None`, like [`baton_mtime`](Self::baton_mtime).
+    fn baton_slice(&self, _agent: &str, _item: &str) -> Option<String> {
         None
     }
 }
@@ -2702,10 +2711,6 @@ impl DriveLoop {
                             } => None,
                             other => Some(other.clone()),
                         };
-                        let spec = match override_choice {
-                            Some(c) => member.spec.clone().with_model(c),
-                            None => member.spec.clone(),
-                        };
                         // The entry id the per-entry store keys on: the TOP-LEVEL
                         // entry (a `"parent/sub"` identity shares its top-level
                         // entry's baton, §3.6). The claim op takes the unit's
@@ -2719,6 +2724,22 @@ impl DriveLoop {
                             Unit::CloseOut { milestone } => (milestone.clone(), None),
                             Unit::Entry => (pick.entry.clone(), None),
                         };
+                        // v2 has no named queues: the entry's project stands in
+                        // as the telemetry `queue` tag.
+                        let tags = TelemetryTags {
+                            item_id: Some(claim_entry.clone()),
+                            slice_id: unit_arg.clone(),
+                            queue: snapshot
+                                .entries
+                                .iter()
+                                .find(|e| e.id == pick.entry)
+                                .map(|e| e.project.clone()),
+                        };
+                        let spec = match override_choice {
+                            Some(c) => member.spec.clone().with_model(c),
+                            None => member.spec.clone(),
+                        }
+                        .with_telemetry(tags);
                         // Borrow the v2 seams as locals so the claim closure below
                         // captures disjoint fields while `start_claiming` takes
                         // `&mut self.supervisor` (the legacy seed/claim pattern).
@@ -2915,12 +2936,17 @@ impl DriveLoop {
             // readable time has nothing to compare against, so it stays silent.
             let (repo_probe, baton, seeder) =
                 (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
-            let pre_spawn = |agent: &str| {
-                if let Some((queue, part)) = assignments.get(agent)
-                    && let Some(handoff) = baton.baton_mtime(agent)
-                {
-                    boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
+            // The re-roll also re-reads the slice the carried baton names, so
+            // the new session's telemetry rows follow the member's handoff.
+            let pre_spawn = |spec: &mut AgentSpec| {
+                let agent = spec.agent.clone();
+                let Some((queue, part)) = assignments.get(&agent) else {
+                    return;
+                };
+                if let Some(handoff) = baton.baton_mtime(&agent) {
+                    boot_guard(repo_probe, seeder, &agent, queue, part, Handoff::At(handoff));
                 }
+                spec.telemetry.slice_id = baton.baton_slice(&agent, part);
             };
             report.rerolls =
                 self.supervisor
@@ -3107,8 +3133,15 @@ impl DriveLoop {
                 // Per-member admission budget (slice 001 M-A): fold on this
                 // member's claude-login profile only.
                 let member_budget = budget_for(agent);
+                // The slice comes from the member's baton only while that baton
+                // is on this part: a kept baton carries it, a fresh seed has none.
+                let tags = TelemetryTags {
+                    item_id: Some(part.clone()),
+                    slice_id: self.baton.baton_slice(agent, &part),
+                    queue: Some(queue.clone()),
+                };
                 let outcome = self.supervisor.start_claiming(
-                    member.spec.clone(),
+                    member.spec.clone().with_telemetry(tags),
                     member_budget,
                     rate,
                     now,
