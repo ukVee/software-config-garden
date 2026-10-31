@@ -545,8 +545,8 @@ pub fn item_doc_candidates(
     let top = item.split('/').next().unwrap_or(item);
     if !backlog.join("milestones").join(top).is_dir() {
         // A task (or restack) doc: the single file for the whole chain. A
-        // restack's generated doc is queue-v2-git's row; until that lands, the
-        // task lookup is the only non-milestone shape.
+        // restack's generated doc is numbered like a task, so the task
+        // lookup covers both non-milestone shapes.
         return Ok(find_by_number(&backlog.join("tasks"), item)?.into_iter().collect());
     }
 

@@ -233,6 +233,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             name: p.name.clone(),
             repo: p.repo.clone(),
             locality: p.locality(),
+            main: p.main.clone(),
         })
         .collect();
 
@@ -259,7 +260,10 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             lane: entry.lane,
             status: entry.status,
             after: entry.after.clone(),
+            branch: entry.branch.clone(),
             claimed: entry.claimed.clone(),
+            parent: entry.parent.clone(),
+            base: entry.base.clone(),
             follow_ups: entry.follow_ups,
             pending: entry.pending_status,
             fleet: entry.fleet,
@@ -280,6 +284,15 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         .map(|a| a.row.id.clone())
         .collect();
 
+    // The same rows' branches, for restack detection's archived-parent
+    // resolution (V7). A `dropped` row's branch is abandoned work, so it stays out.
+    let done_branches: BTreeMap<String, String> = archive
+        .entries
+        .iter()
+        .filter(|a| a.final_status == FinalStatus::Done && !a.row.branch.is_empty())
+        .map(|a| (a.row.id.clone(), a.row.branch.clone()))
+        .collect();
+
     Ok(Some(V2Snapshot {
         projects,
         entries,
@@ -287,6 +300,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         done_ids,
         // The source reads no clock; the picker stamps its own.
         now_unix: 0,
+        done_branches,
     }))
 }
 
@@ -697,6 +711,11 @@ mod tests {
             snapshot.done_ids,
             BTreeSet::from(["done-one".to_string()]),
             "a dropped row never satisfies a link"
+        );
+        // done_branches: the same rows' branches — a dropped row's is abandoned.
+        assert_eq!(
+            snapshot.done_branches,
+            BTreeMap::from([("done-one".to_string(), "feat/done-one".to_string())]),
         );
 
         // Trees: the milestone, the sub, and the sub-sub — each in file order.

@@ -47,6 +47,7 @@ mod tests {
             name: "p".into(),
             repo: repo.into(),
             locality: RepoLocality::of(repo, Some("u")),
+            main: "main".into(),
         }
     }
 
@@ -100,7 +101,10 @@ mod tests {
             lane: Lane::Normal,
             status: EntryStatus::Active,
             after: vec![],
+            branch: String::new(),
             claimed: String::new(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
             fleet: true,

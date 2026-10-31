@@ -179,6 +179,7 @@ mod tests {
             trees,
             done_ids: BTreeSet::new(),
             now_unix: 0,
+            done_branches: Default::default(),
         }
     }
 

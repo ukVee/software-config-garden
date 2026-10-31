@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::queue_v2::{EntryKind, Lane, SliceStatus};
+use crate::queue_v2::{EntryKind, Lane, RestackBranch, SliceStatus};
 
 pub mod op {
     pub const STATUS: &str = "status";
@@ -328,6 +328,21 @@ pub mod op {
     /// slice (the front of the remaining items, the default) or at the end
     /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
     pub const QUEUE_V2_ADD_SUB: &str = "queue_v2_add_sub";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): enqueue ONE urgent `restack` entry for a repo whose stack moved
+    /// under an open branch (§8, `queue-v2-git` slice 003). Idempotent per
+    /// project — a live restack row already present is returned untouched (the
+    /// reply's `id`/`path` are `None`). The full restack doc is generated from
+    /// `stack` (growlightd resolved it read-only with git). One commit,
+    /// `queue_v2_updated`.
+    pub const QUEUE_V2_ENQUEUE_RESTACK: &str = "queue_v2_enqueue_restack";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): re-record the restacked branches' bases after a restack completed
+    /// (§8, `queue-v2-git` slice 004). growlightd recomputed each branch's base
+    /// read-only with `git merge-base` and passes `entries: [{entry, base}]`;
+    /// keeperd replaces each named live entry's `base`. One commit,
+    /// `queue_v2_bases_rerecorded`.
+    pub const QUEUE_V2_RE_RECORD_BASES: &str = "queue_v2_re_record_bases";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2536,12 +2551,19 @@ pub struct DeferredTestSpec {
     pub expected: String,
 }
 
-/// `queue_v2_claim({entry, unit?}) -> {entry, unit, hash}` — the daemon claim
-/// (spec §6.3 step 3's claim at assignment, `queue-v2-scheduling` slice 005).
-/// Entry `queued | paused → active`; `unit` (a slice id) `queued → active`.
-/// `unit` is omitted for a task/restack or a milestone close-out. A re-claim
-/// of an already-active unit is an idempotent no-op; a different already-active
-/// slice of the same entry is refused `started`.
+/// `queue_v2_claim({entry, unit?, parent?, base?}) -> {entry, unit, hash}` —
+/// the daemon claim (spec §6.3 step 3's claim at assignment,
+/// `queue-v2-scheduling` slice 005). Entry `queued | paused → active`; `unit`
+/// (a slice id) `queued → active`. `unit` is omitted for a task/restack or a
+/// milestone close-out. A re-claim of an already-active unit is an idempotent
+/// no-op; a different already-active slice of the same entry is refused
+/// `started`.
+///
+/// `parent`/`base` are the §8 first-claim recording (`queue-v2-git` slice 002):
+/// growlightd computes them from the stack and passes them only on a first
+/// claim (a never-claimed entry). keeperd records them — and stamps `claimed`
+/// itself — only when the entry's `claimed` is still empty, so a resume or a
+/// re-claim never overwrites an already-recorded base.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2ClaimArgs {
     /// The live entry id (a milestone identity, a task's NNN, or a restack's
@@ -2551,6 +2573,14 @@ pub struct QueueV2ClaimArgs {
     /// task, restack or close-out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// §8 `parent` — the entry whose branch this was cut from (`""` = `main`).
+    /// First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// §8 `base` — the commit cut from (local) or the parent branch name
+    /// (remote). First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2697,6 +2727,62 @@ pub struct QueueV2AddSubReply {
     pub slices: Vec<String>,
     /// Its `CLAUDE.md` (garden-relative).
     pub path: String,
+    pub hash: String,
+}
+
+/// `queue_v2_enqueue_restack({project, stack}) -> {id?, path?, hash}` — the §8
+/// auto-restack enqueue (`queue-v2-git` slice 003), keeperd↔growlightd only.
+/// growlightd detected a stale stack (read-only git) and passes the ordered
+/// stack; keeperd enqueues ONE urgent restack row for `project` and generates
+/// the full restack doc from `stack`. Idempotent per project: if a live restack
+/// row for `project` already exists, `id`/`path` are `None` and nothing is
+/// written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackArgs {
+    /// The project whose repo needs a restack.
+    pub project: String,
+    /// The ordered stack (claim order) growlightd resolved with git — each
+    /// branch, its recorded `parent`/`base`, and the resolved `--onto` target.
+    pub stack: Vec<RestackBranch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackReply {
+    /// The new restack entry's id (`NNN`); `None` when a live restack row for
+    /// `project` already existed (idempotent no-op).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The new restack doc (garden-relative); `None` on the idempotent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The commit hash, or the untouched tip on the idempotent no-op.
+    pub hash: String,
+}
+
+/// One restacked branch's re-recorded base (§8, `queue-v2-git` slice 004):
+/// growlightd recomputed it read-only with `git merge-base` after the restack
+/// completed, and keeperd writes it back onto the named live entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueV2BaseRecord {
+    /// The live entry whose `base` is re-recorded.
+    pub entry: String,
+    /// The new base (a commit hash for a local repo).
+    pub base: String,
+}
+
+/// `queue_v2_re_record_bases({entries}) -> {hash}` — the §8 re-record
+/// (`queue-v2-git` slice 004), keeperd↔growlightd only. growlightd recomputed
+/// each restacked branch's base after the restack completed and passes the
+/// `(entry, base)` pairs; keeperd replaces each named live entry's `base`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesArgs {
+    /// The re-recorded `(entry, base)` pairs.
+    pub entries: Vec<QueueV2BaseRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesReply {
+    /// The commit hash, or the untouched tip on an all-no-op write.
     pub hash: String,
 }
 

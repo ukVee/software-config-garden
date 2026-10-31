@@ -65,6 +65,9 @@ pub struct ProjectView {
     /// ([`Project::locality`](softfig_ipc::queue_v2::Project::locality),
     /// report 062) — the remote rule reads this, never the string.
     pub locality: RepoLocality,
+    /// The branch merges land on (§3.1). The stack computation (queue-v2-git
+    /// §8) reads it as the cut-from branch when the stack is empty.
+    pub main: String,
 }
 
 /// One `[[entry]]` row plus the runtime fields the pick needs (§3.1). The v2
@@ -80,9 +83,21 @@ pub struct EntryView {
     pub status: EntryStatus,
     /// Ids that must be archived `done` first (§2 links).
     pub after: Vec<String>,
+    /// The entry's branch (`feat/<id>` / `fix/<id>`; `""` for a restack) — set
+    /// at enqueue (§3.1). Carried so the first-claim stack computation
+    /// (queue-v2-git §8) sees each live entry's branch; the pick ignores it.
+    pub branch: String,
     /// First-claim time, UTC (§3.1). Carried for completeness; the pick does
     /// not order by it (stack order is `queue-v2-git`'s row).
     pub claimed: String,
+    /// The recorded `parent` — the entry whose branch this was cut from;
+    /// `""` = `main` (§8). Carried so restack detection (`queue-v2-git` slice
+    /// 003) can compare each branch's recorded base against its parent's tip.
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote) (§8). `""` = never claimed. Carried for restack
+    /// detection.
+    pub base: String,
     /// Consecutive follow-ups (§7) — the cap's count for a task, restack or
     /// close-out unit ([`crate::member_verbs`]); the pick itself ignores it.
     pub follow_ups: u64,
@@ -161,6 +176,12 @@ pub struct V2Snapshot {
     /// start time is still ahead, so a forgotten stamp holds, never starts
     /// early.
     pub now_unix: i64,
+    /// The branch of each archive row with `final_status = done` (id →
+    /// branch; rows that never got a branch are absent). The loop never merges,
+    /// so a `done` entry's branch is usually still unmerged work: restack
+    /// detection resolves a child's archived parent through it (queue-v2-git
+    /// §8, V7).
+    pub done_branches: BTreeMap<String, String>,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -718,6 +739,7 @@ mod tests {
             name: name.into(),
             repo: repo.into(),
             locality: RepoLocality::of(repo, Some("u")),
+            main: "main".into(),
         }
     }
 
@@ -729,7 +751,10 @@ mod tests {
             lane: Lane::Normal,
             status: EntryStatus::Queued,
             after: vec![],
+            branch: String::new(),
             claimed: String::new(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
             fleet: true,
@@ -763,6 +788,7 @@ mod tests {
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
             now_unix: 0,
+            done_branches: Default::default(),
         }
     }
 

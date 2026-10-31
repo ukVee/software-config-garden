@@ -40,6 +40,14 @@ const PROTOCOL_FLEET_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../templates/growlight/protocol-fleet.md"
 ));
+/// The queue-v2 fleet-member variant (queue-v2-git slice 005) — the legacy
+/// [`PROTOCOL_FLEET_MD`] plus the §10 v2 changes (roll verbs, the cap, planning,
+/// declared lines). growlightd injects this instead of the legacy file only when
+/// `queue = "v2"`; the legacy file is byte-unchanged.
+const PROTOCOL_FLEET_V2_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../templates/growlight/protocol-fleet-v2.md"
+));
 /// The claude-memory rules opencode sessions get by `{file:}` reference: the read
 /// half always, the write half only where memory is writable (opencode-v2-repin
 /// slice 005).
@@ -113,10 +121,11 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         // never clobbered if the MCP verbs already seeded it). The numbered
         // folders get a `.seq` seed so their first entry counts from 001,
         // materializing the dir as a tracked entity at the same time.
-        let pillar: [(String, String); 12] = [
+        let pillar: [(String, String); 13] = [
             (paths::pillar_claude(), paths::pillar_claude_stub()),
             (paths::protocol_md(), PROTOCOL_MD.to_string()),
             (paths::protocol_fleet_md(), PROTOCOL_FLEET_MD.to_string()),
+            (paths::protocol_fleet_v2_md(), PROTOCOL_FLEET_V2_MD.to_string()),
             (paths::memory_read_md(), MEMORY_READ_MD.to_string()),
             (paths::memory_write_md(), MEMORY_WRITE_MD.to_string()),
             (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
@@ -272,7 +281,7 @@ fn current_tip(inner: &DaemonInner) -> Result<String, (ErrorKind, String)> {
 
 #[cfg(test)]
 mod template_tests {
-    use super::{PROTOCOL_FLEET_MD, PROTOCOL_MD};
+    use super::{PROTOCOL_FLEET_MD, PROTOCOL_FLEET_V2_MD, PROTOCOL_MD};
 
     /// The boundary between the shared steps (1–6) and the mode-specific
     /// continuation (step 7). The two protocols are byte-identical before this
@@ -294,6 +303,149 @@ mod template_tests {
         assert_eq!(s, f, "the shared protocol prefix must stay byte-identical");
     }
 
+    /// The boundary between the shared steps (intro–2b) and the v2-specific
+    /// continuation (step 3, WORK) for the fleet/v2 pair (queue-v2-git slice
+    /// 005). The v2 protocol is the fleet protocol plus §10's changes, so
+    /// everything before step 3 is the SAME text. Step 3 itself differs on
+    /// purpose (V9: a v2 entry's branch lives in queue.toml, not a `## Branch
+    /// policy`), so the guard stops before it.
+    const STEP_3: &str = "\n3. WORK.";
+
+    #[test]
+    fn fleet_and_v2_protocols_share_the_intro_through_step_2b() {
+        let f = PROTOCOL_FLEET_MD
+            .split_once(STEP_3)
+            .expect("fleet protocol has a step 3")
+            .0;
+        let v = PROTOCOL_FLEET_V2_MD
+            .split_once(STEP_3)
+            .expect("v2 protocol has a step 3")
+            .0;
+        // The intro + steps 1–2b are the SAME text — the v2 file is the legacy
+        // fleet protocol plus §10's changes, so a shared step edited in one file
+        // fails this until both are synced.
+        assert_eq!(f, v, "the shared fleet/v2 prefix must stay byte-identical");
+    }
+
+    #[test]
+    fn v2_protocol_commits_on_the_entry_branch_never_main() {
+        // V9: v2 entry docs never declare a `## Branch policy` (the branch lives
+        // in queue.toml), so the legacy "per its `## Branch policy` … main only
+        // if it declares none" wording read as permission to commit on main.
+        fn between<'a>(doc: &'a str, from: &str, to: &str) -> &'a str {
+            doc.split_once(from)
+                .unwrap_or_else(|| panic!("v2 protocol has {from:?}"))
+                .1
+                .split_once(to)
+                .unwrap_or_else(|| panic!("{from:?} is followed by {to:?}"))
+                .0
+        }
+        let v = PROTOCOL_FLEET_V2_MD;
+        let work = between(v, "\n3. WORK.", "\n3b. DAEMON RESTART");
+        let handoff = between(v, "\n5. HANDOFF.", "\n6. STUCK.");
+        for (name, step) in [("step 3", work), ("step 5", handoff)] {
+            // Rewrapped prose: compare on single-spaced text.
+            let step = step.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                step.contains("entry's `branch`") && step.contains("FIRST STEP"),
+                "v2 {name} must say to commit on the entry's `branch` (queue.toml / baton FIRST STEP)"
+            );
+            assert!(step.contains("never main"), "v2 {name} must say never main");
+            assert!(
+                !step.contains("Branch policy") && !step.contains("main only"),
+                "v2 {name} must not keep the legacy branch-policy / main-only wording"
+            );
+        }
+        // The legacy fleet protocol keeps the `## Branch policy` wording.
+        let legacy = PROTOCOL_FLEET_MD.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(legacy.contains("commit on main only when the item declares no branch policy"));
+    }
+
+    #[test]
+    fn v2_protocol_leaves_deferred_verification_to_the_verb() {
+        // V10: `queue_v2_deferred` replaces the whole `## Deferred verification`
+        // section (down to the next same-or-higher heading), so a runbook the
+        // member hand-wrote there is lost. The verb is the only writer; step 7b
+        // must not tell the member to write the section itself.
+        let step = PROTOCOL_FLEET_V2_MD
+            .split_once("\n7b. DEFERRED VERIFICATION.")
+            .expect("v2 protocol has a step 7b")
+            .1
+            .split_once("\n8. THE CAP.")
+            .expect("step 7b is followed by step 8")
+            .0;
+        let step = step.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !step.contains("in the item doc under"),
+            "v2 step 7b must not tell the member to hand-write the section"
+        );
+        assert!(
+            step.contains("only writer of the item doc's `## Deferred verification` section"),
+            "v2 step 7b must name the verb as the only writer"
+        );
+        // The legacy fleet protocol (no such verb) still hand-writes it.
+        assert!(PROTOCOL_FLEET_MD.contains("under a `## Deferred verification`"));
+    }
+
+    #[test]
+    fn v2_protocol_keeps_step_3c_byte_identical() {
+        // Step 3c (REPORT) sits between the changed 3b and 4, so it is outside the
+        // shared-prefix guard — assert it stays byte-identical on its own.
+        fn section(doc: &str) -> &str {
+            doc.split_once("3c. REPORT.")
+                .expect("protocol has a step 3c")
+                .1
+                .split_once("4. HUMAN CHECKPOINTS.")
+                .expect("step 3c is followed by step 4")
+                .0
+        }
+        assert_eq!(
+            section(PROTOCOL_FLEET_MD),
+            section(PROTOCOL_FLEET_V2_MD),
+            "step 3c must stay byte-identical between the fleet and v2 protocols"
+        );
+    }
+
+    #[test]
+    fn v2_protocol_carries_the_section_10_changes() {
+        // Each §10 change is pinned so an edit can't silently regress the v2
+        // contract: the roll/close verbs must be named, and the legacy handoff
+        // endings it replaces must be gone.
+        let v = PROTOCOL_FLEET_V2_MD;
+        for verb in [
+            "`growlight_add_follow_up_session`",
+            "`growlight_complete_slice`",
+            "`growlight_block`",
+            "`growlight_complete_entry`",
+            "`growlight_add_sub_milestone`",
+            "`slice_insert`",
+        ] {
+            assert!(v.contains(verb), "v2 protocol must name {verb}");
+        }
+        assert!(v.contains(
+            "Never edit a `> Model:`, `> Grants:` or `> Worktree:` line"
+        ));
+        assert!(v.contains("Do NOT call `set_item_status`"));
+        // V1: a restack never rewrites a branch that tracks an upstream.
+        let restack = v
+            .split_once("11. RESTACK.")
+            .expect("v2 protocol has a restack step")
+            .1;
+        assert!(restack.contains("never rewrite a branch that tracks an upstream"));
+        assert!(restack.contains("git for-each-ref --format='%(upstream)' refs/heads/<branch>"));
+        assert!(restack.contains("`growlight_block`, `kind = human`"));
+        // The legacy endings §10 replaces are gone from the v2 text.
+        assert!(!v.contains("log_baton"), "v2 protocol must not keep log_baton");
+        assert!(
+            !v.contains("set status STUCK"),
+            "v2 protocol must not keep the legacy STUCK ending"
+        );
+        assert!(
+            !v.contains("status BLOCKED_ON_HUMAN"),
+            "v2 protocol must not keep the legacy BLOCKED_ON_HUMAN ending"
+        );
+    }
+
     /// Task 048 leg C: §2b's budget rule must stay a `resets_at` judgement, not
     /// an age one. The prose is the only thing that makes a *member* refuse to
     /// echo a fossil's percentage into its baton head (there is no code path
@@ -303,7 +455,11 @@ mod template_tests {
     fn session_budget_step_judges_a_window_by_its_reset_boundary() {
         // §2b lives in the shared prefix, so asserting once per protocol keeps
         // both honest even if the drift guard above is ever relaxed.
-        for (name, doc) in [("single-agent", PROTOCOL_MD), ("fleet", PROTOCOL_FLEET_MD)] {
+        for (name, doc) in [
+            ("single-agent", PROTOCOL_MD),
+            ("fleet", PROTOCOL_FLEET_MD),
+            ("v2", PROTOCOL_FLEET_V2_MD),
+        ] {
             let step = doc
                 .split_once("2b. SESSION BUDGET")
                 .unwrap_or_else(|| panic!("{name} protocol has a step 2b"))

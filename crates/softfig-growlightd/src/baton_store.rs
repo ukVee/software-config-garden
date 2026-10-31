@@ -397,8 +397,8 @@ pub fn runtime_entries_dir() -> PathBuf {
 /// be resumed by a different member (spec §2): the carried state follows the
 /// work, not the worker. The member's own `agents/<id>/baton.md` still exists
 /// and still feeds the SessionStart hook — at spawn, growlightd copies this
-/// store's baton into it (spec §3.6). That copy is queue-v2-scheduling's job,
-/// not this store's; and growlightd is this store's only writer (the §6.3 roll
+/// store's baton into it (spec §3.6). That copy is the drive loop's job, not
+/// this store's; and growlightd is this store's only writer (the §6.3 roll
 /// verbs), a member never touches `entries/` directly.
 #[derive(Debug, Clone)]
 pub struct FsEntryBatonStore {
@@ -435,7 +435,7 @@ impl FsEntryBatonStore {
     /// create), and a failed create errors fail-closed.
     ///
     /// `branch`/`base` carry the §8 base line's FIELDS — the concrete values
-    /// are queue-v2-scheduling's, computed at first claim, where §8 says
+    /// are the drive loop's, computed at first claim, where §8 says
     /// growlightd puts `create <branch> from <base>` in the seeded baton. A
     /// never-claimed entry's seed passes `None` and gets the literal
     /// `<branch>`/`<base>` tokens; this store never computes git state.
@@ -494,7 +494,7 @@ impl FsEntryBatonStore {
 /// its first iteration (growlightd does not embed them, matching the member
 /// seed). The §8 base line carries the `branch`/`base` fields: `None` renders
 /// the literal `<branch>`/`<base>` tokens; the concrete values are
-/// queue-v2-scheduling's, passed in at first claim (spec §8).
+/// the drive loop's, passed in at first claim (spec §8).
 fn seed_entry_baton(
     garden_name: &str,
     entry_id: &str,

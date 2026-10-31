@@ -205,7 +205,8 @@ opencode 2.x loads `AGENTS.md` only. It never falls back to `CLAUDE.md`, ignores
 `agents.<id>.system` carries everything a Claude Code session would have been handed, in
 this order, every piece by `{file:}` reference (house rule 1: never copied):
 
-1. the fleet protocol, `growlight/protocol-fleet.md`;
+1. the fleet protocol, `growlight/protocol-fleet.md` (`growlight/protocol-fleet-v2.md` under
+   `queue = "v2"`);
 2. the step-0 line naming this member's own `agents/<id>/baton.md`;
 3. the garden root `CLAUDE.md` (the map and the house rules);
 4. `growlight/memory-read.md`, the read half of the memory rules;
@@ -439,6 +440,17 @@ line names the entry rather than `<queue>/<part>`:
 ```
 growlightd: boot dirty tree: queue-v2-parity (a): /home/u/repo has 11 uncommitted path(s), newest ~533s newer than the baton handoff
 ```
+
+## Queue v2: the stack's git probes are bounded
+
+Only under `queue = "v2"`. The §8 stack model reads git (`git_stack.rs`) to record a first
+claim's `parent`/`base`, to spot a stale stack and to decide when a restack's bases can be
+re-recorded. `git_probe.rs` keeps that from stalling the drive loop: one worker-thread probe
+per repo under one overall deadline, memoised for the tick so a claim, the handshake and a
+second entry's first claim share the answers, and a repo whose probe misses its deadline is
+held with a doubling backoff across ticks. A probe that cannot answer is "unknown", never
+"stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
+detection skips the repo until it answers.
 
 ## Known gaps
 

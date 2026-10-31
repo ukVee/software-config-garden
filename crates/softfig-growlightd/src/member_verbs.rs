@@ -833,7 +833,10 @@ mod tests {
             lane: Lane::Normal,
             status,
             after: vec![],
+            branch: String::new(),
             claimed: "2026-10-14T00:00Z".into(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
             fleet: true,
@@ -868,6 +871,7 @@ mod tests {
                 name: "softfig".into(),
                 repo: "/r".into(),
                 locality: softfig_ipc::queue_v2::RepoLocality::Local,
+                main: "main".into(),
             }],
             entries: vec![
                 entry("m", EntryKind::Milestone, EntryStatus::Active),
@@ -886,6 +890,7 @@ mod tests {
             )]),
             done_ids: BTreeSet::new(),
             now_unix: 0,
+            done_branches: Default::default(),
         }
     }
 

@@ -70,7 +70,8 @@ use softfig_ipc::queue_v2::{
 use softfig_ipc::verbs::{
     DaemonStatusArg, QueueV2AddSubArgs, QueueV2AddSubReply, QueueV2ClaimArgs, QueueV2ClaimReply,
     QueueV2DeferredArgs,
-    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply, QueueV2SessionLogArgs,
+    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply,
+    QueueV2ReRecordBasesArgs, QueueV2ReRecordBasesReply, QueueV2SessionLogArgs,
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
 use softfig_ipc::ErrorKind;
@@ -295,9 +296,25 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     // resumable by any member — the slice doc's "queued → active" is the
     // first-claim case, the resume is the §2 case); `active` is an
     // idempotent re-claim; anything else is a protocol bug, refused loud.
+    //
+    // §8 first claim (queue-v2-git slice 002): a never-claimed entry records
+    // the `parent`/`base` growlightd computed from the stack, and keeperd (the
+    // writer) stamps `claimed` itself. A resume or a re-claim — `claimed`
+    // already set — leaves all three untouched, so an already-recorded base is
+    // never overwritten by a stale first-claim attempt.
+    let first_claim = queue.entries[eidx].claimed.is_empty();
     let entry_changed = match queue.entries[eidx].status {
         EntryStatus::Queued | EntryStatus::Paused => {
             queue.entries[eidx].status = EntryStatus::Active;
+            if first_claim {
+                queue.entries[eidx].claimed = conventions::now_rfc3339();
+                if let Some(parent) = args.parent.as_deref() {
+                    queue.entries[eidx].parent = parent.to_string();
+                }
+                if let Some(base) = args.base.as_deref() {
+                    queue.entries[eidx].base = base.to_string();
+                }
+            }
             true
         }
         EntryStatus::Active => false,
@@ -1192,6 +1209,78 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     .unwrap())
 }
 
+/// `queue_v2_re_record_bases` (queue-v2-git slice 004): keeperd↔growlightd only —
+/// growlightd recomputed each restacked branch's base read-only after the
+/// restack completed (§8, `git merge-base`) and writes them back: each named
+/// live entry's `base` is replaced. An all-no-op write (every `base` already
+/// the given value) mints no commit. One commit, `queue_v2_bases_rerecorded`;
+/// the derived view re-renders.
+pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2ReRecordBasesArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_re_record_bases args: {e}")))?;
+    if args.entries.is_empty() {
+        return Err((ErrorKind::BadArgs, "entries must be non-empty".to_string()));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, archive) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_queue_state(&wt, &inner) {
+            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model),
+            Ok(None) => {
+                return Err((
+                    ErrorKind::NotFound,
+                    "no queue.toml — there is no v2 state".to_string(),
+                ))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+
+    let mut changed = false;
+    for rec in &args.entries {
+        let Some(e) = queue.entries.iter_mut().find(|e| e.id == rec.entry) else {
+            return Err(refuse(QueueRefusal::UnknownId { id: rec.entry.clone() }));
+        };
+        if e.base != rec.base {
+            e.base = rec.base.clone();
+            changed = true;
+        }
+    }
+    queue.validate(&archive).map_err(refuse)?;
+
+    if !changed {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash }).unwrap());
+    }
+
+    let files = [FileWrite {
+        rel: QUEUE_FILE.to_string(),
+        expected: queue_version,
+        bytes: queue
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_bases_rerecorded",
+        serde_json::json!({ "entries": args.entries.len() }),
+        &files,
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(queue_view(&queue)),
+        }],
+        &ExtraWrites::NONE,
+    )?;
+
+    Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash: hash.to_string() }).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,6 +1397,22 @@ mod tests {
         Ok(serde_json::from_value(v).unwrap())
     }
 
+    /// A claim carrying the §8 first-claim `parent`/`base` (queue-v2-git slice
+    /// 002) — the shape growlightd sends for a never-claimed entry.
+    fn claim_first(
+        daemon: &Daemon,
+        entry: &str,
+        unit: Option<&str>,
+        parent: &str,
+        base: &str,
+    ) -> Result<QueueV2ClaimReply, (ErrorKind, String)> {
+        let v = queue_v2_claim(
+            daemon,
+            serde_json::json!({ "entry": entry, "unit": unit, "parent": parent, "base": base }),
+        )?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
     fn set_status(
         daemon: &Daemon,
         entry: &str,
@@ -1405,6 +1510,60 @@ mod tests {
         let slices_region = managed::region_body(&claude, SLICES_V2_TAG).unwrap();
         assert!(slices_region.contains("| slice | 001 | active |"), "{slices_region}");
         assert!(!reply.hash.is_empty());
+    }
+
+    #[test]
+    fn first_claim_records_parent_base_and_claimed_and_resume_keeps_them() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        claim_first(&daemon, "m", Some("001"), "other", "deadbeef").expect("first claim");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent recorded at first claim");
+        assert_eq!(e.base, "deadbeef", "base recorded at first claim");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed stamped by keeperd: {}",
+            e.claimed
+        );
+
+        // A resume (pause → active) without parent/base must not overwrite the
+        // recorded base.
+        set_status(&daemon, "m", None, "paused").expect("pause");
+        claim(&daemon, "m", None).expect("resume");
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent unchanged by a resume");
+        assert_eq!(e.base, "deadbeef", "base unchanged by a resume");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed unchanged by a resume: {}",
+            e.claimed
+        );
+    }
+
+    #[test]
+    fn a_first_claim_without_parent_or_base_stamps_claimed_and_leaves_them_empty() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        // A restack (or any branchless first claim) sends no parent/base —
+        // `claimed` is still stamped, parent/base stay empty.
+        claim(&daemon, "m", Some("001")).expect("first claim, no base");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "", "no parent without a base line");
+        assert_eq!(e.base, "", "no base without a base line");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed still stamped: {}",
+            e.claimed
+        );
     }
 
     #[test]
@@ -2181,5 +2340,78 @@ mod tests {
                 _ => assert!(c.is_ascii_digit(), "digit at byte {i} in {ts:?}"),
             }
         }
+    }
+
+    // ---- slice 004: queue_v2_re_record_bases ----------------------------
+
+    fn re_record(
+        daemon: &Daemon,
+        entries: Vec<(&str, &str)>,
+    ) -> Result<QueueV2ReRecordBasesReply, (ErrorKind, String)> {
+        let v = queue_v2_re_record_bases(
+            daemon,
+            serde_json::json!({
+                "entries": entries
+                    .iter()
+                    .map(|(e, b)| serde_json::json!({ "entry": e, "base": b }))
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn re_record_replaces_each_named_entry_base_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "abc123".to_string();
+        let mut b = entry("b", Lane::Normal, EntryStatus::Queued);
+        b.claimed = "2026-10-11T12:10:00Z".to_string();
+        b.base = "def456".to_string();
+        b.parent = "a".to_string();
+        seed_queue_rows(&daemon, vec![a, b]);
+        let before = commit_count(&daemon);
+
+        let reply = re_record(&daemon, vec![("a", "111aaa"), ("b", "222bbb")]).expect("re-record");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit");
+        assert!(!reply.hash.is_empty());
+
+        let (queue, _) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].base, "111aaa");
+        assert_eq!(queue.entries[1].base, "222bbb");
+        // parent/claimed/status are untouched by a re-record.
+        assert_eq!(queue.entries[1].parent, "a");
+        assert_eq!(queue.entries[0].claimed, "2026-10-11T12:00:00Z");
+        assert_eq!(queue.entries[0].status, EntryStatus::Queued);
+    }
+
+    #[test]
+    fn re_record_refuses_an_unknown_entry_and_a_noop_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.base = "abc123".to_string();
+        seed_queue_rows(&daemon, vec![a]);
+        let before = commit_count(&daemon);
+
+        // An unknown entry is refused, nothing written.
+        let err = re_record(&daemon, vec![("ghost", "x")]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
+
+        // An all-no-op write (base already the given value) mints no commit.
+        re_record(&daemon, vec![("a", "abc123")]).expect("no-op re-record");
+        assert_eq!(commit_count(&daemon), before, "no commit for a no-op");
+    }
+
+    #[test]
+    fn re_record_refuses_an_empty_entries_list() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue_rows(&daemon, vec![entry("a", Lane::Normal, EntryStatus::Queued)]);
+        let err = re_record(&daemon, vec![]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
     }
 }
