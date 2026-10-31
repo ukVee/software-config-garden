@@ -3844,6 +3844,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-telemetry"
+version = "1.0.0-alpha.1"
+
+[[package]]
 name = "softfig-tui"
 version = "1.0.0-alpha.1"
 dependencies = [
