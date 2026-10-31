@@ -82,6 +82,41 @@ pub fn fleet_enabled(garden_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The two `config/growlight.toml` switches the §11 migration apply gates on
+/// (queue-v2-migrate slice 005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateSwitches {
+    /// `fleet_enabled = true`.
+    pub fleet_enabled: bool,
+    /// `queue = "v2"`.
+    pub queue_v2: bool,
+}
+
+/// Parse [`MigrateSwitches`] from the file's text (`None` = absent: both off,
+/// the defaults). Unlike [`fleet_enabled`] this fails **closed toward a
+/// refusal**: the apply must not write v2 state under a config it cannot
+/// read, so malformed TOML or a `queue` value other than `legacy` / `v2` is an
+/// error, never a default. The caller reads the text through its WorkTree.
+pub fn migrate_switches(text: Option<&str>) -> Result<MigrateSwitches, String> {
+    #[derive(Deserialize)]
+    struct Switches {
+        #[serde(default)]
+        fleet_enabled: bool,
+        #[serde(default)]
+        queue: Option<String>,
+    }
+    let Some(text) = text else {
+        return Ok(MigrateSwitches { fleet_enabled: false, queue_v2: false });
+    };
+    let s: Switches = toml::from_str(text).map_err(|e| e.to_string())?;
+    let queue_v2 = match s.queue.as_deref() {
+        None | Some("legacy") => false,
+        Some("v2") => true,
+        Some(other) => return Err(format!("unknown `queue = {other:?}` (expected \"legacy\" or \"v2\")")),
+    };
+    Ok(MigrateSwitches { fleet_enabled: s.fleet_enabled, queue_v2 })
+}
+
 /// On an unlock/resume: bring the growlightd unit into line with the in-garden
 /// `fleet_enabled` gate — **start** it if the gate is on, **ensure it is stopped**
 /// if the gate is off. The stop half is what makes a *live disable* take effect:
@@ -350,5 +385,20 @@ mod tests {
         // construct the Command.
         stop_on_terminal_lock(false, false); // supervision off
         stop_on_terminal_lock(true, true); // resume pending
+    }
+
+    #[test]
+    fn migrate_switches_default_off_and_fail_closed() {
+        let off = MigrateSwitches { fleet_enabled: false, queue_v2: false };
+        assert_eq!(migrate_switches(None), Ok(off));
+        assert_eq!(migrate_switches(Some("claude_bin = \"x\"\n")), Ok(off));
+        assert_eq!(migrate_switches(Some("queue = \"legacy\"\n")), Ok(off));
+        assert_eq!(
+            migrate_switches(Some("fleet_enabled = true\nqueue = \"v2\"\n")),
+            Ok(MigrateSwitches { fleet_enabled: true, queue_v2: true })
+        );
+        // Unreadable config refuses the apply instead of defaulting.
+        assert!(migrate_switches(Some("queue = \"v3\"\n")).is_err());
+        assert!(migrate_switches(Some("fleet_enabled = \n")).is_err());
     }
 }

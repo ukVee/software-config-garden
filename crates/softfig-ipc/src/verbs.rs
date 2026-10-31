@@ -4,10 +4,12 @@
 //! shapes are convenience helpers on both ends. Mismatched shapes surface
 //! as `ErrorKind::BadArgs` in the daemon.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::queue_v2::{EntryKind, Lane, RestackBranch, SliceStatus};
+use crate::queue_v2::{migrate, EntryKind, Lane, RestackBranch, SliceStatus};
 
 pub mod op {
     pub const STATUS: &str = "status";
@@ -343,6 +345,17 @@ pub mod op {
     /// keeperd replaces each named live entry's `base`. One commit,
     /// `queue_v2_bases_rerecorded`.
     pub const QUEUE_V2_RE_RECORD_BASES: &str = "queue_v2_re_record_bases";
+    /// queue v2 one-time op (spec §11, `queue-v2-migrate` slice 005), called
+    /// by `softfig growlight queue migrate --apply` only: rebuild the legacy
+    /// snapshot from keeperd's own working tree (the runtime batons ride in
+    /// the args), recompute the migration plan under the owner's answers, and
+    /// refuse (`migrate::ApplyRefusal`) before any write when the fleet is
+    /// armed, the switch is already `v2`, any v2 file exists, the backlog doc
+    /// is not the `expect` version, or the plan has a refusal or an open call.
+    /// Otherwise `queue.toml` + `queue-archive.toml` + every `slices.toml` and
+    /// their derived views land in one commit, `queue_v2_migrated`. Never
+    /// touches the legacy tables, never flips the switch.
+    pub const QUEUE_V2_MIGRATE_APPLY: &str = "queue_v2_migrate_apply";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2784,6 +2797,35 @@ pub struct QueueV2ReRecordBasesArgs {
 pub struct QueueV2ReRecordBasesReply {
     /// The commit hash, or the untouched tip on an all-no-op write.
     pub hash: String,
+}
+
+/// `queue_v2_migrate_apply({answers, expect, batons}) -> {hash, entries,
+/// archived, slices, batons}` — the §11 converter's apply (`queue-v2-migrate`
+/// slice 005).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2MigrateApplyArgs {
+    /// The owner's settlements, the parsed `--answers` file.
+    pub answers: migrate::Answers,
+    /// The backlog doc version the dry run printed (`--expect`), a CAS.
+    pub expect: String,
+    /// The runtime batons (runtime-relative path → content), read by the
+    /// caller as the dry run reads them; keeperd cannot see runtime state.
+    #[serde(default)]
+    pub batons: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2MigrateApplyReply {
+    /// The `queue_v2_migrated` commit hash.
+    pub hash: String,
+    /// Entries written to `queue.toml`.
+    pub entries: usize,
+    /// Rows written to `queue-archive.toml`.
+    pub archived: usize,
+    /// `slices.toml` files written.
+    pub slices: usize,
+    /// The baton copies the caller makes now that the commit landed (§3.6).
+    pub batons: Vec<migrate::BatonMove>,
 }
 
 /// `growlight_init({}) -> {created, skipped, nav_wired, committed, hash}`.

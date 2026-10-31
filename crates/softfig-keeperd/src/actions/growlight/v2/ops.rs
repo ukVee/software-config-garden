@@ -67,14 +67,20 @@ use softfig_ipc::queue_v2::{
     QueueRefusal, SliceItem, SliceKind, SliceStatus, SlicesToml, SubSliceText,
     QUEUE_ARCHIVE_FILE,
 };
+use std::collections::BTreeMap;
+
+use softfig_ipc::backlog_doc::BACKLOG_DOC;
+use softfig_ipc::queue_v2::migrate::{self, ApplyRefusal};
 use softfig_ipc::verbs::{
     DaemonStatusArg, QueueV2AddSubArgs, QueueV2AddSubReply, QueueV2ClaimArgs, QueueV2ClaimReply,
     QueueV2DeferredArgs,
     QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply,
+    QueueV2MigrateApplyArgs, QueueV2MigrateApplyReply,
     QueueV2ReRecordBasesArgs, QueueV2ReRecordBasesReply, QueueV2SessionLogArgs,
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
-use softfig_ipc::ErrorKind;
+use softfig_ipc::{ErrorKind, GARDEN_CONFIG_DIR, GROWLIGHT_CONFIG_FILE};
+use softfig_store::Hash;
 
 use super::{
     apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
@@ -1281,6 +1287,191 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
     Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash: hash.to_string() }).unwrap())
 }
 
+// ---- queue_v2_migrate_apply ----------------------------------------------
+
+/// An [`ApplyRefusal`] as a wire error; the message leads with its code.
+/// `legacy_changed` is the CAS miss, so it is `Conflict` like every stale
+/// write; `v2_files_present` is `PathAlreadyExists`; the rest are state
+/// refusals, `BadArgs` as [`refuse`] maps them.
+fn apply_refusal(r: ApplyRefusal, detail: impl std::fmt::Display) -> (ErrorKind, String) {
+    let kind = match r {
+        ApplyRefusal::LegacyChanged => ErrorKind::Conflict,
+        ApplyRefusal::V2FilesPresent => ErrorKind::PathAlreadyExists,
+        _ => ErrorKind::BadArgs,
+    };
+    (kind, format!("{}: {detail}", r.code()))
+}
+
+/// The apply's half of the dry run's snapshot, read through the worktree.
+struct BacklogSnapshot {
+    /// Every `.md` under the backlog dir, garden-relative path → text.
+    md: BTreeMap<String, String>,
+    /// The v2 files already present there (`queue.toml`,
+    /// `queue-archive.toml`, any `slices.toml`, sub-milestones included), in
+    /// path order.
+    v2_present: Vec<String>,
+}
+
+fn migrate_snapshot(wt: &WorkTree) -> Result<BacklogSnapshot, (ErrorKind, String)> {
+    fn walk(
+        wt: &WorkTree,
+        dir: &str,
+        md: &mut BTreeMap<String, String>,
+        v2: &mut Vec<String>,
+    ) -> Result<(), (ErrorKind, String)> {
+        let mut children = wt.read_dir(dir);
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in children {
+            let rel = format!("{dir}/{}", child.name);
+            if child.is_dir {
+                walk(wt, &rel, md, v2)?;
+            } else if rel == QUEUE_FILE || rel == QUEUE_ARCHIVE_FILE || child.name == "slices.toml" {
+                v2.push(rel);
+            } else if child.name.ends_with(".md") {
+                let text = wt
+                    .read_to_string(&rel)
+                    .ok_or_else(|| (ErrorKind::Io, format!("{rel}: unreadable")))?;
+                md.insert(rel, text);
+            }
+        }
+        Ok(())
+    }
+    let dir = BACKLOG_DOC.rsplit_once('/').expect("BACKLOG_DOC has a parent").0;
+    let mut snap = BacklogSnapshot { md: BTreeMap::new(), v2_present: Vec::new() };
+    walk(wt, dir, &mut snap.md, &mut snap.v2_present)?;
+    Ok(snap)
+}
+
+/// `queue_v2_migrate_apply` (`queue-v2-migrate` slice 005, spec §11): the
+/// legacy→v2 converter's write. keeperd rebuilds the snapshot from its own
+/// worktree (the runtime batons ride in the args), recomputes the plan under
+/// the owner's answers, and checks every [`ApplyRefusal`] before anything is
+/// staged: the fleet armed, the switch already `v2`, any v2 file present, the
+/// backlog doc not the `expect` version, a plan refusal or open call.
+/// Otherwise `queue.toml`, `queue-archive.toml` and every `slices.toml`, with
+/// their §3.4 views, land in one commit, `queue_v2_migrated`. The legacy
+/// tables are never edited and the switch is never flipped; the reply's baton
+/// copies are the caller's to make.
+pub fn queue_v2_migrate_apply(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2MigrateApplyArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_migrate_apply args: {e}")))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (plan, version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let config = format!("{GARDEN_CONFIG_DIR}/{GROWLIGHT_CONFIG_FILE}");
+        let text = match wt.exists(&config) {
+            true => Some(
+                wt.read_to_string(&config)
+                    .ok_or_else(|| (ErrorKind::Io, format!("{config}: unreadable")))?,
+            ),
+            false => None,
+        };
+        let switches = crate::growlight_unit::migrate_switches(text.as_deref()).map_err(|e| {
+            (ErrorKind::BadArgs, format!("{config}: {e}; the apply refuses under a config it cannot read"))
+        })?;
+        if switches.fleet_enabled {
+            return Err(apply_refusal(
+                ApplyRefusal::FleetArmed,
+                format!("{config} has `fleet_enabled = true`; disarm the fleet first"),
+            ));
+        }
+        if switches.queue_v2 {
+            return Err(apply_refusal(
+                ApplyRefusal::SwitchIsV2,
+                format!("{config} already says `queue = \"v2\"`; the migration runs before the flip"),
+            ));
+        }
+        let BacklogSnapshot { md: garden, v2_present } = migrate_snapshot(&wt)?;
+        if !v2_present.is_empty() {
+            return Err(apply_refusal(ApplyRefusal::V2FilesPresent, v2_present.join(", ")));
+        }
+        let doc = garden
+            .get(BACKLOG_DOC)
+            .ok_or_else(|| (ErrorKind::NotFound, format!("no {BACKLOG_DOC}")))?;
+        let version = Hash::of(doc.as_bytes()).to_hex();
+        if version != args.expect {
+            return Err(apply_refusal(
+                ApplyRefusal::LegacyChanged,
+                format!("{BACKLOG_DOC} is version {version}, not --expect {}; re-run the dry run", args.expect),
+            ));
+        }
+        let files = migrate::LegacyFiles { garden, batons: args.batons };
+        let legacy =
+            migrate::read_legacy(&files).map_err(|e| apply_refusal(ApplyRefusal::NotApplicable, e))?;
+        let plan = migrate::plan(&legacy, &args.answers, &conventions::now_rfc3339());
+        if !plan.applicable() {
+            return Err(apply_refusal(
+                ApplyRefusal::NotApplicable,
+                format!(
+                    "{} refusal(s), {} open call(s); re-run the dry run until none remain",
+                    plan.refusals.len(),
+                    plan.open_calls().count()
+                ),
+            ));
+        }
+        (plan, version)
+    };
+
+    let toml_err = |e: softfig_ipc::queue_v2::QueueV2Error| (ErrorKind::Internal, e.to_string());
+    let mut files = vec![
+        FileWrite {
+            rel: QUEUE_FILE.to_string(),
+            expected: None,
+            bytes: plan.queue.to_toml().map_err(toml_err)?.into_bytes(),
+        },
+        FileWrite {
+            rel: QUEUE_ARCHIVE_FILE.to_string(),
+            expected: None,
+            bytes: plan.archive.to_toml().map_err(toml_err)?.into_bytes(),
+        },
+    ];
+    let mut views = vec![ViewWrite {
+        host: queue_view_host(),
+        tag: QUEUE_V2_TAG,
+        body: Some(queue_view(&plan.queue)),
+    }];
+    for (milestone, slices) in &plan.slices {
+        files.push(FileWrite {
+            rel: slices_file(milestone),
+            expected: None,
+            bytes: slices.to_toml().map_err(toml_err)?.into_bytes(),
+        });
+        views.push(ViewWrite {
+            host: slices_view_host(milestone),
+            tag: SLICES_V2_TAG,
+            body: Some(slices_view(slices)),
+        });
+    }
+    let (entries, archived, slices) =
+        (plan.queue.entries.len(), plan.archive.entries.len(), plan.slices.len());
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_migrated",
+        serde_json::json!({
+            "version": version,
+            "entries": entries,
+            "archived": archived,
+            "slices": slices,
+        }),
+        &files,
+        &views,
+        &ExtraWrites::NONE,
+    )?;
+
+    Ok(serde_json::to_value(QueueV2MigrateApplyReply {
+        hash: hash.to_string(),
+        entries,
+        archived,
+        slices,
+        batons: plan.batons,
+    })
+    .unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2413,5 +2604,169 @@ mod tests {
         seed_queue_rows(&daemon, vec![entry("a", Lane::Normal, EntryStatus::Queued)]);
         let err = re_record(&daemon, vec![]).unwrap_err();
         assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+    }
+
+    // ---- queue_v2_migrate_apply ------------------------------------------
+
+    /// The converter's fixture (softfig-ipc `tests/fixtures/migrate/`): a
+    /// live-shaped legacy backlog, its runtime batons and the answers that
+    /// settle every call it raises.
+    fn migrate_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../softfig-ipc/tests/fixtures/migrate")
+    }
+
+    fn load_tree(root: &std::path::Path, dir: &std::path::Path, into: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                load_tree(root, &path, into);
+            } else {
+                let key = path.strip_prefix(root).unwrap().to_str().unwrap().to_string();
+                into.insert(key, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    /// Seed the fixture's legacy backlog into the garden as one commit; return
+    /// the backlog doc's version (the dry run's `--expect`).
+    fn seed_legacy(daemon: &Daemon, garden: &std::path::Path) -> String {
+        let mut files = BTreeMap::new();
+        let root = migrate_fixture().join("garden");
+        load_tree(&root, &root, &mut files);
+        for (rel, text) in &files {
+            hand_write(garden, rel, text);
+        }
+        let mut inner = daemon.inner.lock().unwrap();
+        crate::actions::commit_now(&mut inner, softfig_vcs::Intent::init("seed legacy backlog")).unwrap();
+        Hash::of(files[BACKLOG_DOC].as_bytes()).to_hex()
+    }
+
+    fn migrate_args(expect: &str, answers: bool) -> serde_json::Value {
+        let mut batons = BTreeMap::new();
+        let root = migrate_fixture().join("batons");
+        load_tree(&root, &root, &mut batons);
+        let answers: migrate::Answers = match answers {
+            true => toml::from_str(&std::fs::read_to_string(migrate_fixture().join("answers.toml")).unwrap())
+                .unwrap(),
+            false => migrate::Answers {
+                schema: migrate::ANSWERS_SCHEMA_VERSION,
+                class: Default::default(),
+                call: Default::default(),
+            },
+        };
+        serde_json::to_value(QueueV2MigrateApplyArgs { answers, expect: expect.to_string(), batons }).unwrap()
+    }
+
+    fn migrate_apply(daemon: &Daemon, args: serde_json::Value) -> Result<QueueV2MigrateApplyReply, (ErrorKind, String)> {
+        queue_v2_migrate_apply(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    fn backlog_doc(garden: &std::path::Path) -> String {
+        std::fs::read_to_string(garden.join(BACKLOG_DOC)).unwrap()
+    }
+
+    #[test]
+    fn migrate_apply_writes_every_v2_file_in_one_commit_and_leaves_the_legacy_tables() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let before_doc = backlog_doc(garden.path());
+        let before = commit_count(&daemon);
+
+        let reply = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1, "one commit");
+
+        // The commit is the new intent, carrying the CAS version + counts.
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            let tip = repo.tip_of(TIP_REF).unwrap().unwrap();
+            let head = &log::collect(repo.db(), tip).unwrap()[0];
+            assert_eq!(head.intent, "queue_v2_migrated");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&head.payload).unwrap(),
+                serde_json::json!({
+                    "version": expect,
+                    "entries": reply.entries,
+                    "archived": reply.archived,
+                    "slices": reply.slices,
+                })
+            );
+        }
+
+        // The written files are the plan the dry run computes.
+        let fixture = {
+            let mut files = migrate::LegacyFiles::default();
+            let root = migrate_fixture();
+            load_tree(&root.join("garden"), &root.join("garden"), &mut files.garden);
+            load_tree(&root.join("batons"), &root.join("batons"), &mut files.batons);
+            let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
+            migrate::plan(&migrate::read_legacy(&files).unwrap(), &args.answers, "2026-11-01T00:00:00Z")
+        };
+        let (queue, archive) = loaded_queue(&daemon);
+        let ids = |q: &QueueToml| q.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&queue), ids(&fixture.queue));
+        assert_eq!(archive.entries.len(), fixture.archive.entries.len());
+        assert_eq!((reply.entries, reply.archived), (fixture.queue.entries.len(), fixture.archive.entries.len()));
+        assert_eq!(reply.slices, fixture.slices.len());
+        assert!(reply.slices > 0, "the fixture has live milestones");
+        for (milestone, slices) in &fixture.slices {
+            assert_eq!(&loaded_slices(&daemon, milestone).items, &slices.items, "{milestone}");
+            let doc = std::fs::read_to_string(garden.path().join(slices_view_host(milestone))).unwrap();
+            assert!(managed::has_region(&doc, SLICES_V2_TAG), "{milestone}: slices view rendered");
+        }
+        assert_eq!(reply.batons, fixture.batons, "the caller's baton copies");
+
+        // Legacy untouched: the backlog doc only gained the derived queue view.
+        let after_doc = backlog_doc(garden.path());
+        assert_eq!(managed::changed_regions(&before_doc, &after_doc), vec![QUEUE_V2_TAG.to_string()]);
+        assert!(after_doc.starts_with(before_doc.trim_end()), "the legacy text is a prefix, byte for byte");
+        assert!(!garden.path().join("config/growlight.toml").exists(), "the switch is never written");
+
+        // A second apply refuses: the v2 files exist now.
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::PathAlreadyExists);
+        assert!(msg.starts_with("v2_files_present: "), "{msg}");
+        assert_eq!(commit_count(&daemon), before + 1);
+    }
+
+    #[test]
+    fn migrate_apply_refuses_before_any_write() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let config = garden.path().join("config/growlight.toml");
+        let refused = |args: serde_json::Value, code: &str, want: ErrorKind| {
+            let at = commit_count(&daemon);
+            let (kind, msg) = migrate_apply(&daemon, args).unwrap_err();
+            assert_eq!(kind, want, "{code}: {msg}");
+            assert!(msg.starts_with(&format!("{code}: ")), "{msg}");
+            assert_eq!(commit_count(&daemon), at, "{code} mints no commit");
+            assert!(!garden.path().join(QUEUE_FILE).exists(), "{code} stages nothing");
+        };
+
+        hand_write(garden.path(), "config/growlight.toml", "fleet_enabled = true\nqueue = \"legacy\"\n");
+        refused(migrate_args(&expect, true), "fleet_armed", ErrorKind::BadArgs);
+        hand_write(garden.path(), "config/growlight.toml", "queue = \"v2\"\n");
+        refused(migrate_args(&expect, true), "switch_is_v2", ErrorKind::BadArgs);
+        // A config the apply cannot read is refused too, never defaulted.
+        hand_write(garden.path(), "config/growlight.toml", "queue = \"v3\"\n");
+        let (kind, _) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadArgs);
+        std::fs::remove_file(&config).unwrap();
+
+        refused(migrate_args("0000", true), "legacy_changed", ErrorKind::Conflict);
+        refused(migrate_args(&expect, false), "not_applicable", ErrorKind::BadArgs);
+
+        // Any one v2 file — here a lone sub-milestone's slices.toml.
+        let stray = "growlight/backlog/milestones/folder-grants/subs/x/slices.toml";
+        hand_write(garden.path(), stray, "schema = 1\n");
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::PathAlreadyExists);
+        assert_eq!(msg, format!("v2_files_present: {stray}"));
+        std::fs::remove_file(garden.path().join(stray)).unwrap();
+
+        // With every gate clear the same args apply.
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
     }
 }

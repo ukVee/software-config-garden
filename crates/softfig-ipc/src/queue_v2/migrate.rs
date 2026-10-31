@@ -444,7 +444,7 @@ pub struct Refusal {
 
 /// A runtime baton copy: `from` (runtime-relative) → `entries/<entry>/baton.md`.
 /// A copy, never a move: the legacy baton stays where it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatonMove {
     pub from: String,
     pub entry: String,
@@ -490,6 +490,20 @@ pub enum ApplyRefusal {
     LegacyChanged,
     /// The recomputed plan has refusals or open calls.
     NotApplicable,
+}
+
+impl ApplyRefusal {
+    /// The wire code, the serde name: keeperd's error message leads with it
+    /// (`"<code>: <detail>"`) so a caller can match without parsing prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApplyRefusal::FleetArmed => "fleet_armed",
+            ApplyRefusal::SwitchIsV2 => "switch_is_v2",
+            ApplyRefusal::V2FilesPresent => "v2_files_present",
+            ApplyRefusal::LegacyChanged => "legacy_changed",
+            ApplyRefusal::NotApplicable => "not_applicable",
+        }
+    }
 }
 
 /// Map the legacy model to the v2 files under the owner's `answers` (slice
@@ -1406,5 +1420,18 @@ mod tests {
         assert!(keys.contains(&"baton:agents/b/baton.md".to_string()));
         assert_eq!(plan.queue.entries[1].status, EntryStatus::Queued, "the proposal keeps the first active");
         assert_eq!(plan.batons, vec![BatonMove { from: "agents/a/baton.md".into(), entry: "x".into() }]);
+    }
+
+    #[test]
+    fn apply_refusal_code_is_its_serde_name() {
+        for r in [
+            ApplyRefusal::FleetArmed,
+            ApplyRefusal::SwitchIsV2,
+            ApplyRefusal::V2FilesPresent,
+            ApplyRefusal::LegacyChanged,
+            ApplyRefusal::NotApplicable,
+        ] {
+            assert_eq!(serde_json::to_value(&r).unwrap(), serde_json::json!(r.code()));
+        }
     }
 }
