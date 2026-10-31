@@ -149,7 +149,7 @@ pub enum FleetHeader {
     #[default]
     Unknown,
     /// A decoded live growlightd `status` reply.
-    Live(FleetStatusReply),
+    Live(Box<FleetStatusReply>),
     /// The last poll couldn't reach growlightd — render one dim line, keep the
     /// garden-only page fully functional.
     Unreachable,
@@ -1669,7 +1669,7 @@ impl App {
                 // reply degrades to the dim line rather than a splat.
                 Ok(v) => {
                     self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
-                        Ok(reply) => FleetHeader::Live(reply),
+                        Ok(reply) => FleetHeader::Live(Box::new(reply)),
                         Err(_) => FleetHeader::Unreachable,
                     };
                 }
