@@ -478,6 +478,8 @@ fn start(args: StartArgs) -> Result<()> {
             &statusline_path,
             &garden_root,
             &claude_projects,
+            &softfig_bin_path(),
+            &runtime,
         ),
     )?;
     // `--settings` only *permits* softfig-mcp; this *attaches* it, so the
@@ -1303,7 +1305,8 @@ fn seed_if_absent(path: &Path, content: &str) -> Result<bool> {
 /// The isolated settings file the launcher passes to `--settings`. A
 /// SessionStart hook re-injects `inject.sh` on both `startup` and `clear`
 /// (so `/clear` is the roll mechanism, spec §2); the statusLine tees the
-/// budgets to `usage.json` (spec §6).
+/// budgets to `usage.json` (spec §6); the SessionEnd hook ingests the
+/// session's transcript into the telemetry db (spec-token-telemetry §4.2).
 ///
 /// The `permissions` block lets the loop agent actually do its job: a headless
 /// `-p` iteration can't answer a permission prompt, so without an allow-list it
@@ -1328,8 +1331,19 @@ fn loop_json(
     statusline: &Path,
     garden_root: &Path,
     claude_projects: &Path,
+    softfig: &Path,
+    runtime: &Path,
 ) -> String {
     let inject = inject.display().to_string();
+    // The garden root + runtime dir are baked in so the rows are priced from,
+    // and keyed by, the same garden and root baton this launch used, with no
+    // daemon round-trip at session end. The verb always exits 0.
+    let session_end = format!(
+        "{} telemetry ingest-transcript --garden-root {} --config-dir {}",
+        shell_quote(softfig),
+        shell_quote(garden_root),
+        shell_quote(runtime)
+    );
     let session_start_block = |source: &str| {
         serde_json::json!({
             "matcher": source,
@@ -1362,6 +1376,9 @@ fn loop_json(
             "SessionStart": [
                 session_start_block("startup"),
                 session_start_block("clear"),
+            ],
+            "SessionEnd": [
+                { "hooks": [ { "type": "command", "command": session_end } ] }
             ]
         }
     });
@@ -2921,14 +2938,22 @@ mod tests {
     }
 
     #[test]
-    fn loop_json_wires_both_session_starts_and_the_statusline() {
+    fn loop_json_wires_the_session_hooks_and_the_statusline() {
         let inject = Path::new("/run/softfig/growlight/inject.sh");
         let statusline = Path::new("/run/softfig/growlight/statusline.sh");
         let garden = Path::new("/home/ukv/soft-fig_garden");
         let claude_projects = Path::new("/home/ukv/.claude/projects");
-        let json: serde_json::Value =
-            serde_json::from_str(&loop_json(inject, statusline, garden, claude_projects))
-                .expect("valid JSON");
+        let softfig = Path::new("/home/ukv/.local/bin/soft fig");
+        let runtime = Path::new("/home/ukv/.config/softfig/growlight");
+        let json: serde_json::Value = serde_json::from_str(&loop_json(
+            inject,
+            statusline,
+            garden,
+            claude_projects,
+            softfig,
+            runtime,
+        ))
+        .expect("valid JSON");
 
         assert_eq!(json["statusLine"]["type"], "command");
         assert_eq!(
@@ -2947,6 +2972,21 @@ mod tests {
             assert_eq!(cmd["type"], "command");
             assert_eq!(cmd["command"], inject.display().to_string());
         }
+
+        // SessionEnd runs the semi-auto telemetry ingest (spec-token-telemetry
+        // §4.2) on every end reason, so it carries no matcher. Each path is
+        // single-quoted, so a space in one survives the hook's shell.
+        let ends = json["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert!(ends[0].get("matcher").is_none());
+        let cmd = &ends[0]["hooks"][0];
+        assert_eq!(cmd["type"], "command");
+        assert_eq!(
+            cmd["command"],
+            "'/home/ukv/.local/bin/soft fig' telemetry ingest-transcript \
+             --garden-root '/home/ukv/soft-fig_garden' \
+             --config-dir '/home/ukv/.config/softfig/growlight'"
+        );
     }
 
     #[test]
@@ -2962,6 +3002,8 @@ mod tests {
             Path::new("/run/softfig/growlight/statusline.sh"),
             garden,
             claude_projects,
+            Path::new("/usr/bin/softfig"),
+            Path::new("/run/softfig/growlight"),
         ))
         .expect("valid JSON");
 

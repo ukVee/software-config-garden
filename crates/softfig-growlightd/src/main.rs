@@ -248,8 +248,14 @@ fn main() -> Result<()> {
         let _ = drive.join();
     }
     // After the drive loop, so the rows its last spawns recorded are flushed.
+    // The counts go to the journal: the one place a rotted db, or a ring that
+    // overflowed into failed batches, shows up without opening the db.
     if let Some(flush) = telemetry_flush {
-        flush.shutdown();
+        let s = flush.shutdown();
+        eprintln!(
+            "softfig-growlightd: telemetry: {} row(s) in {} batch(es), {} failed; {} rolled up in {} sweep(s)",
+            s.rows_written, s.batches, s.failed_batches, s.rolled, s.sweeps
+        );
     }
     Ok(())
 }
