@@ -150,8 +150,8 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                 ErrorKind::BadArgs,
                 format!(
                     "field_not_allowed: `{field}` carries a `> {key}:` line, and fleet member \
-                     {member} may not write `> Model:`, `> Grants:` or `> Worktree:` into the \
-                     docs queue_add_entry writes (spec-growlight-queue §6.7) — keeperd renders \
+                     {member} may not write `> Model:`, `> Grants:`, `> Worktree:` or \
+                     `> Not before:` into the docs queue_add_entry writes (spec-growlight-queue §6.7) — keeperd renders \
                      the entry's docs from these fields, and a new entry declares no model, so \
                      its slices may declare none"
                 ),
@@ -165,13 +165,14 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
 }
 
 /// §6.7 for a member's `queue_add_entry`: the first text field carrying a
-/// reserved `> Model:` / `> Grants:` / `> Worktree:` line, as `(field, key)`.
+/// reserved `> Model:` / `> Grants:` / `> Worktree:` / `> Not before:` line, as
+/// `(field, key)`.
 /// keeperd renders the entry's docs from these fields through the structured
 /// writer, outside the worktree's member guard, so the guard runs here on the
 /// member's own text — and not on keeperd's generated `001-plan` slice, whose
 /// `> Model:` line is the daemon's. `queue_add_entry` is not one of §6.7's
 /// slice-body exceptions, so a slice body may declare nothing either (the new
-/// milestone declares nothing to take a subset of): all three keys are refused
+/// milestone declares nothing to take a subset of): all four keys are refused
 /// in every field, slice bodies included.
 fn member_reserved_field(args: &QueueAddEntryArgs) -> Option<(String, &'static str)> {
     use softfig_ipc::queue_v2::{reserved_field, SUB_DOC_RESERVED};
@@ -1870,7 +1871,7 @@ mod tests {
     }
 
     /// §6.7 for a member's found work: its text fields may carry no reserved
-    /// `> Model:` / `> Grants:` / `> Worktree:` line (refused
+    /// `> Model:` / `> Grants:` / `> Worktree:` / `> Not before:` line (refused
     /// `field_not_allowed`, nothing committed), but an unplanned milestone still
     /// gets keeperd's own `001-plan` slice with the daemon's `> Model:` line.
     /// A human's identical call is unrestricted.
@@ -1885,6 +1886,7 @@ mod tests {
             ("finish_criteria", milestone_args("m1", "softfig", serde_json::json!({ "finish_criteria": "> model: flash" }))),
             ("title", milestone_args("m1", "softfig", serde_json::json!({ "title": "T\n> Grants: ~/x" }))),
             ("mission", milestone_args("m1", "softfig", serde_json::json!({ "mission": "x\n> Worktree: /tmp/x" }))),
+            ("finish_criteria", milestone_args("m1", "softfig", serde_json::json!({ "finish_criteria": "> Not before: 2026-11-01 02:00Z" }))),
             ("slices[1].title", milestone_args("m1", "softfig", serde_json::json!({ "slices": [
                 { "slug": "a", "title": "A", "body": "plain" },
                 { "slug": "b", "title": "> Worktree: /tmp/x", "body": "work" },
@@ -1896,6 +1898,10 @@ mod tests {
             ("slices[1].body", milestone_args("m1", "softfig", serde_json::json!({ "slices": [
                 { "slug": "a", "title": "A", "body": "plain" },
                 { "slug": "b", "title": "B", "body": "> Grants: ~/x\n\nwork" },
+            ] }))),
+            ("slices[1].body", milestone_args("m1", "softfig", serde_json::json!({ "slices": [
+                { "slug": "a", "title": "A", "body": "plain" },
+                { "slug": "b", "title": "B", "body": "> not before: 2026-11-01 02:00Z\n\nwork" },
             ] }))),
         ];
         {
