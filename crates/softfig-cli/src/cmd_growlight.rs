@@ -2875,16 +2875,16 @@ fn render_migrate_dry_run(plan: &migrate::MigrationPlan, version: &str) -> Strin
     ));
     for c in &plan.calls {
         match &c.settled {
-            Some(answer) => out.push_str(&format!("  [settled] {} = {answer}\n", c.key)),
+            Some(answer) => out.push_str(&format!("  [settled] {} = {}\n", c.key, hang(answer, 6))),
             None => out.push_str(&format!("  [open] {}\n", c.key)),
         }
-        out.push_str(&format!("      evidence: {}\n", c.evidence));
-        out.push_str(&format!("      proposed: {}\n", c.proposed));
+        out.push_str(&format!("      evidence: {}\n", hang(&c.evidence, 16)));
+        out.push_str(&format!("      proposed: {}\n", hang(&c.proposed, 16)));
     }
 
     out.push_str(&format!("\nrefusals: {}\n", plan.refusals.len()));
     for r in &plan.refusals {
-        out.push_str(&format!("  {}: {}\n", r.subject, r.reason));
+        out.push_str(&format!("  {}: {}\n", r.subject, hang(&r.reason, 4)));
     }
 
     out.push('\n');
@@ -2900,6 +2900,18 @@ fn render_migrate_dry_run(plan: &migrate::MigrationPlan, version: &str) -> Strin
         n => format!("{n} calls need you\n"),
     });
     out
+}
+
+/// `text` with every continuation line indented by `indent` spaces, so a
+/// multi-line value (branch-policy prose quoted as evidence) stays inside its
+/// call's block instead of spilling into the list; blank lines stay blank.
+fn hang(text: &str, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| if i == 0 || line.is_empty() { line.to_string() } else { format!("{pad}{line}") })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The `queue pick` rendering: who the pick ran for, the assignment (or its
@@ -5928,7 +5940,8 @@ mod tests {
                    |---|----|------|-------|--------|\n| 1 | 001 | task | First | queued |\n\n\
                    <!-- /softfig:queue -->\n\n<!-- softfig:queue:ghost -->\n<!-- /softfig:queue:ghost -->\n";
         fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
-        fs::write(backlog.join("tasks/001-first.md"), "# First\n").unwrap();
+        let task = "# First\n\n## Branch policy\n\nOff `main`.\n\nSecond paragraph.\n";
+        fs::write(backlog.join("tasks/001-first.md"), task).unwrap();
         fs::write(backlog.join("tasks/.seq"), "1\n").unwrap();
         fs::create_dir_all(runtime.path().join("agents/a")).unwrap();
         let head = "---\nstatus: IN_PROGRESS\nitem: 001\n---\n";
@@ -5958,6 +5971,13 @@ mod tests {
         assert!(out.contains("  [open] project_repo:softfig\n      evidence: "), "{out}");
         assert!(out.contains("\n      proposed: "), "{out}");
         assert!(out.contains("refusals: 1\n  queue:ghost: "), "{out}");
+        // Multi-line policy prose quoted as evidence hangs under its call
+        // instead of spilling into the list (the live dry run's 71 stray lines).
+        assert!(out.contains("Off `main`.\n\n                Second paragraph.\n      proposed: "), "{out}");
+        let calls = &out[out.find("\njudgment calls:").unwrap() + 1..out.find("\nrefusals:").unwrap()];
+        for line in calls.lines().skip(1).filter(|l| !l.is_empty()) {
+            assert!(line.starts_with("  "), "unindented line in the call list: {line:?}\n{out}");
+        }
         let open = plan.open_calls().count();
         assert!(open > 0);
         let last = if open == 1 { "1 call needs you\n".to_string() } else { format!("{open} calls need you\n") };
