@@ -1332,6 +1332,10 @@ pub struct TickReport {
     /// line (`schedule: window <label> opened|closed`). `None` on every other
     /// tick, and always while no schedule is enabled.
     pub schedule_edge: Option<String>,
+    /// Members that went past `close_grace_minutes` after their window closed
+    /// this tick (growlight-schedule slice 006, §3.4) — each raises one
+    /// [`NotifyEvent::ScheduleOverrun`]. Nothing is killed.
+    pub schedule_overrun: Vec<String>,
 }
 
 /// The queue-v2 scheduling seams (slice 006) — the v2 siblings of the legacy
@@ -1619,6 +1623,17 @@ pub struct DriveLoop {
     /// [`with_reserve_view`](Self::with_reserve_view), which skips these while
     /// the pool has a clear slot.
     reserve_held: Arc<Mutex<BTreeSet<String>>>,
+    /// Running members whose window closed on them, and when (slice 006,
+    /// §3.4): the clock behind the `close_grace_minutes` overrun flag. A
+    /// member enters only on the tick its window closes while it runs, so one
+    /// spawned while closed (a due timed item) is never flagged; it leaves when
+    /// it exits or its window reopens.
+    window_closed_at: BTreeMap<String, i64>,
+    /// The members a window held last tick — the close transition's memory.
+    window_held_last: BTreeSet<String>,
+    /// The members past their close grace as of last tick, so each overrun
+    /// notifies once.
+    overrun: BTreeSet<String>,
     /// Per part, whether its item doc declares a `> Not before:` that has
     /// arrived, and when that was read — the `tasks = true` exception (§3.5).
     /// Re-read after [`TIMED_DUE_TTL_SECS`], like a claim hold.
@@ -1710,6 +1725,9 @@ impl DriveLoop {
             zone: Box::new(SystemZone::new()),
             schedule_last: None,
             reserve_held: Arc::default(),
+            window_closed_at: BTreeMap::new(),
+            window_held_last: BTreeSet::new(),
+            overrun: BTreeSet::new(),
             timed_due: BTreeMap::new(),
         }
     }
@@ -2603,6 +2621,7 @@ impl DriveLoop {
         *self.reserve_held.lock().unwrap() = verdict.reserve_held_slots();
         report.schedule_edge = self.schedule_edge(schedule.is_some(), &verdict);
         report.schedule_held = verdict.held.iter().map(|(a, r)| (a.clone(), *r)).collect();
+        report.schedule_overrun = self.track_overrun(schedule.as_ref(), &verdict, &fleet, now);
         let admission = |agent: &str| verdict.admission(agent, tasks);
 
         if v2_mode {
@@ -3399,6 +3418,21 @@ impl DriveLoop {
         // …and the runtime overlay, for `queue pick` (slice 012).
         self.daemon.publish_v2_overlay(self.v2_overlay());
 
+        // The `[schedule]` for `growlight status` (slice 006): this tick's
+        // verdict, the members past their close grace, and the items still
+        // waiting on their `> Not before:`.
+        self.daemon.record_schedule_summary(schedule.as_ref().map(|_| {
+            let held_items = self
+                .announced_holds
+                .iter()
+                .filter_map(|((queue, part), hold)| match hold {
+                    ClaimHold::NotYet(at) => Some(format!("{queue}/{part} at {at}")),
+                    _ => None,
+                })
+                .collect();
+            crate::schedule::summary(&verdict, &self.overrun, held_items)
+        }));
+
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
         //    inspect — dispatch is the live side-effect on top of it.
@@ -3428,7 +3462,7 @@ impl DriveLoop {
             .collect();
         let mut verdict = match self.zone.zone() {
             Ok(zone) => evaluate(cfg, zone, now, &members),
-            Err(_) => ScheduleVerdict::zone_unreadable(&members),
+            Err(why) => ScheduleVerdict::zone_unreadable(&members, &why),
         };
         // The weekly reserve (slice 004, §3.6), over the same admission pools
         // the rate-limit hold reads. No per-slot usage directory means no
@@ -3472,6 +3506,52 @@ impl DriveLoop {
         })
     }
 
+    /// Advance the `close_grace_minutes` clock (slice 006, §3.4) and return the
+    /// members that went past it this tick. A member's clock starts on the tick
+    /// a window closes on it while it runs — a reserve hold or an unreadable
+    /// zone is not a window's close — and it is past the grace once it has run
+    /// more than `close_grace_minutes` since. Information only: nothing here
+    /// touches a member. No enabled schedule clears every clock.
+    fn track_overrun(
+        &mut self,
+        cfg: Option<&crate::schedule::ScheduleConfig>,
+        verdict: &ScheduleVerdict,
+        fleet: &[FleetMember],
+        now: i64,
+    ) -> Vec<String> {
+        let Some(cfg) = cfg else {
+            self.window_closed_at.clear();
+            self.window_held_last.clear();
+            self.overrun.clear();
+            return Vec::new();
+        };
+        let window_held: BTreeSet<String> = verdict
+            .held
+            .iter()
+            .filter(|(_, reason)| crate::schedule::is_window_hold(**reason))
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        for member in fleet {
+            let agent = &member.spec.agent;
+            if !(window_held.contains(agent) && self.supervisor.is_running(agent)) {
+                self.window_closed_at.remove(agent);
+            } else if !self.window_held_last.contains(agent) {
+                self.window_closed_at.entry(agent.clone()).or_insert(now);
+            }
+        }
+        self.window_held_last = window_held;
+        let grace = i64::from(cfg.close_grace_minutes) * 60;
+        let overrun: BTreeSet<String> = self
+            .window_closed_at
+            .iter()
+            .filter(|(_, closed)| now - **closed > grace)
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        let newly = overrun.difference(&self.overrun).cloned().collect();
+        self.overrun = overrun;
+        newly
+    }
+
     /// Whether `part` of `queue` is an item whose `> Not before:` has arrived
     /// ([`QueueSource::timed_due`]), trusted for [`TIMED_DUE_TTL_SECS`].
     fn timed_due_at(&mut self, queue: &str, part: &str, now: i64) -> bool {
@@ -3506,6 +3586,15 @@ impl DriveLoop {
     fn dispatch(&mut self, report: &TickReport, now: i64) {
         for crash in &report.crashes {
             self.dispatcher.notify(crash, now);
+        }
+        if !report.schedule_overrun.is_empty()
+            && let Some(cfg) = self.daemon.schedule()
+        {
+            for agent in &report.schedule_overrun {
+                let grace_minutes = cfg.close_grace_minutes;
+                let event = NotifyEvent::ScheduleOverrun { agent: agent.clone(), grace_minutes };
+                self.dispatcher.notify(&event, now);
+            }
         }
         // A start or re-roll whose backend spawn FAILED is an operator alert, not a
         // silent held-start: a fail-closed pre-approval generation failure (slice
@@ -12364,6 +12453,39 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r = loop_.tick(DAY + OPEN);
         assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
         assert_eq!(backend.spawn_count(), 2);
+    }
+
+    #[test]
+    fn a_member_running_past_its_close_grace_is_flagged_overrun_once_and_never_killed() {
+        let (loop_, d, backend, _claimer, _queues, _probe) =
+            make_claiming(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, &format!("{WINDOW}close_grace_minutes = 30\n"));
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+        let reason = |d: &Daemon| {
+            let summary = d.inner.lock().unwrap().schedule_summary.clone().expect("recorded");
+            summary.held_members.iter().map(|h| (h.agent.clone(), h.reason.clone())).collect::<Vec<_>>()
+        };
+        let mut tick = |at: i64| {
+            backend.set_health("a1", AgentHealth::Alive { last_active: at });
+            loop_.tick(at)
+        };
+        tick(OPEN);
+        assert_eq!(backend.spawn_count(), 1);
+        assert!(reason(&d).is_empty(), "open: nobody held");
+
+        assert!(tick(CLOSE).schedule_overrun.is_empty(), "the close starts the clock");
+        assert!(tick(CLOSE + 30 * 60).schedule_overrun.is_empty(), "the grace itself is not past it");
+        assert_eq!(tick(CLOSE + 30 * 60 + 1).schedule_overrun, vec!["a1".to_string()]);
+        assert_eq!(reason(&d), vec![("a1".to_string(), crate::schedule::OVERRUN.to_string())]);
+        assert!(tick(CLOSE + 3600).schedule_overrun.is_empty(), "one flag per overrun");
+        assert_eq!(backend.kill_count(), 0, "an overrun is information, never a kill");
+
+        // a1 hands off: the clock stops and status shows the window again.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        loop_.tick(CLOSE + 3660);
+        assert_eq!(reason(&d), vec![("a1".to_string(), "outside window".to_string())]);
     }
 
     #[test]

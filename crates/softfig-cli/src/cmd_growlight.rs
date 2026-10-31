@@ -1689,6 +1689,11 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
         }
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    print!("{}", render_schedule(r.schedule.as_ref(), now));
+    print!("{}", render_build_caps(&r.build_caps));
 }
 
 /// One `agents:` row: id, status, the claude-login slot the member's last
@@ -1834,10 +1839,51 @@ fn render_build_caps(c: &BuildCapsSummary) -> String {
         .map(|w| w.to_string())
         .unwrap_or_else(|| "(unset)".to_string());
     let mem = c.memory_high.as_deref().unwrap_or("(unset)");
+    let quota = c.cpu_quota.as_deref().unwrap_or("(unset)");
+    let threads = c
+        .test_threads
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "(unset)".to_string());
     format!(
         "build caps    (live default — the next spawn's throttle)\n  \
-         cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n",
+         cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n  \
+         cpu_quota         {quota}\n  test_threads      {threads}\n",
     )
+}
+
+/// Render the `[schedule]` block of `status` (growlight-schedule slice 006).
+/// `now` (Unix seconds) turns a reserve's reset into "resets in …". Pure, so
+/// it is unit-tested without a daemon.
+fn render_schedule(s: Option<&growlightd::ScheduleSummary>, now: i64) -> String {
+    let Some(s) = s else {
+        return "schedule      (none)\n".to_string();
+    };
+    let state = if s.open { "open" } else { "closed" };
+    let mut out = format!("schedule      {state} (zone {})\n", s.zone);
+    if !s.current_windows.is_empty() {
+        out += &format!("  open now      {}\n", s.current_windows.join(", "));
+    }
+    let edge = s.next_edge_local.as_deref().unwrap_or("(none within a week)");
+    out += &format!("  next edge     {edge}\n");
+    for h in &s.held_members {
+        out += &format!("  held          {:<16} {}\n", h.agent, h.reason);
+    }
+    for item in &s.held_items {
+        out += &format!("  waiting       {item}\n");
+    }
+    for r in &s.reserve {
+        let used = r.used_7d_pct.map_or_else(|| "unknown".to_string(), |p| format!("{p}%"));
+        let state = if r.held { "held" } else { "clear" };
+        let resets = r
+            .resets_at
+            .map(|at| format!(", resets in {}", softfig_ipc::human_age_secs(at.saturating_sub(now).max(0) as u64)))
+            .unwrap_or_default();
+        out += &format!(
+            "  reserve       {:<16} keep {}% · 7d used {used} · {state}{resets}\n",
+            r.slot, r.reserve_pct
+        );
+    }
+    out
 }
 
 /// Render `resources show`: the live default caps + the genuinely-running scope
@@ -3284,10 +3330,57 @@ mod tests {
             cargo_build_jobs: Some(2),
             memory_high: Some("3G".into()),
             cpu_weight: None,
+            cpu_quota: Some("50%".into()),
+            test_threads: Some(2),
         });
         assert!(text.contains("cargo_build_jobs  2"));
         assert!(text.contains("memory_high       3G"));
         assert!(text.contains("cpu_weight        (unset)"), "an unset knob reads (unset): {text}");
+        assert!(text.contains("cpu_quota         50%"));
+        assert!(text.contains("test_threads      2"));
+    }
+
+    #[test]
+    fn render_schedule_shows_the_edge_the_holds_and_the_reserves() {
+        assert_eq!(render_schedule(None, 0), "schedule      (none)\n");
+        let s = growlightd::ScheduleSummary {
+            open: true,
+            current_windows: vec!["daily 23:00-07:00 [claude]".into()],
+            next_edge: Some(1_000),
+            next_edge_local: Some("2026-11-01 07:00 -05:00".into()),
+            zone: "America/New_York".into(),
+            held_members: vec![
+                growlightd::ScheduleHeld { agent: "b1".into(), reason: "backend not in window".into() },
+                growlightd::ScheduleHeld { agent: "a2".into(), reason: "overrun".into() },
+            ],
+            held_items: vec!["default/084 at 2026-11-01 02:00 -04:00".into()],
+            reserve: vec![
+                growlightd::ReserveSummary {
+                    slot: "slot1".into(),
+                    reserve_pct: 20,
+                    used_7d_pct: Some(85),
+                    held: true,
+                    resets_at: Some(7_200),
+                },
+                growlightd::ReserveSummary {
+                    slot: "slot2".into(),
+                    reserve_pct: 20,
+                    used_7d_pct: None,
+                    held: false,
+                    resets_at: None,
+                },
+            ],
+            projection: Vec::new(),
+        };
+        let text = render_schedule(Some(&s), 0);
+        assert!(text.starts_with("schedule      open (zone America/New_York)\n"), "{text}");
+        assert!(text.contains("  open now      daily 23:00-07:00 [claude]\n"));
+        assert!(text.contains("  next edge     2026-11-01 07:00 -05:00\n"));
+        assert!(text.contains("  held          b1               backend not in window\n"));
+        assert!(text.contains("  held          a2               overrun\n"));
+        assert!(text.contains("  waiting       default/084 at 2026-11-01 02:00 -04:00\n"));
+        assert!(text.contains("slot1            keep 20% · 7d used 85% · held, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot2            keep 20% · 7d used unknown · clear\n"), "{text}");
     }
 
     #[test]
@@ -3299,6 +3392,8 @@ mod tests {
                 cargo_build_jobs: Some(2),
                 memory_high: Some("6G".into()),
                 cpu_weight: Some(70),
+                cpu_quota: None,
+                test_threads: Some(2),
             },
             applied_live: vec![],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
@@ -3359,6 +3454,7 @@ mod tests {
             agents: Vec::new(),
             live_scopes: live,
             held: Vec::new(),
+            schedule: None,
         };
 
         // Running scopes: the exact gen-suffixed unit names, verbatim.

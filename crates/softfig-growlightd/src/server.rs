@@ -247,7 +247,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held) = {
+    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held, schedule) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -258,6 +258,7 @@ fn status(daemon: &Daemon) -> Response {
             inner.fleet.members.clone(),
             inner.member_lifecycles.clone(),
             inner.held_parts.clone(),
+            inner.schedule_summary.clone(),
         )
     };
     let roster = members
@@ -290,6 +291,7 @@ fn status(daemon: &Daemon) -> Response {
         // like build_caps above; never reconstructed CLI-side.
         live_scopes: daemon.live_scope_units(),
         held,
+        schedule,
     };
     ok_reply(&reply, "status")
 }
@@ -1417,6 +1419,31 @@ mod tests {
 
         daemon.record_held_parts(Vec::new());
         assert!(status_reply(&daemon).held.is_empty(), "a freed part leaves the list");
+    }
+
+    #[test]
+    fn status_shows_the_schedule_the_loop_last_evaluated_and_the_build_caps() {
+        // Slice 006: the drive loop records its verdict; `status` renders it.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.schedule, None, "no schedule before a tick");
+        assert_eq!(reply.build_caps.test_threads, Some(2), "the default test-thread cap");
+        assert_eq!(reply.build_caps.cpu_quota, None);
+
+        let schedule = softfig_ipc::growlightd::ScheduleSummary {
+            open: false,
+            zone: "UTC".into(),
+            held_members: vec![softfig_ipc::growlightd::ScheduleHeld {
+                agent: "a1".into(),
+                reason: "outside window".into(),
+            }],
+            ..Default::default()
+        };
+        daemon.record_schedule_summary(Some(schedule.clone()));
+        assert_eq!(status_reply(&daemon).schedule, Some(schedule));
+
+        daemon.record_schedule_summary(None);
+        assert_eq!(status_reply(&daemon).schedule, None, "a disabled schedule leaves status");
     }
 
     #[test]

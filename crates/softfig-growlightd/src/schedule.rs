@@ -399,7 +399,11 @@ pub struct ScheduleVerdict {
     pub held: BTreeMap<String, HoldReason>,
     /// The weekly reserve of every slot in a member's admission pool, from
     /// [`apply_reserve`]. Empty until that pass runs.
-    pub reserves: BTreeMap<String, ReserveState>,
+    pub reserves: BTreeMap<String, SlotReserve>,
+    /// The local zone's name, or `unreadable: <why>`. Empty while ungated.
+    pub zone: String,
+    /// [`next_edge`](Self::next_edge) as local time, `YYYY-MM-DD HH:MM ±HH:MM`.
+    pub next_edge_local: Option<String>,
 }
 
 impl ScheduleVerdict {
@@ -436,13 +440,31 @@ impl ScheduleVerdict {
     pub fn reserve_held_slots(&self) -> BTreeSet<String> {
         self.reserves
             .iter()
-            .filter(|(_, state)| **state == ReserveState::Held)
+            .filter(|(_, reserve)| reserve.state == ReserveState::Held)
             .map(|(slot, _)| slot.clone())
             .collect()
     }
 }
 
-/// One slot's weekly reserve this tick (§3.6).
+/// A slot's vouchable 7d reading (§3.6): the used share the reserve compares,
+/// and when that window resets, if the reading said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading7d {
+    pub used_pct: u8,
+    pub resets_at: Option<i64>,
+}
+
+/// One slot's weekly reserve this tick: its state, plus what `status` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotReserve {
+    pub state: ReserveState,
+    /// The share kept back ([`ScheduleConfig::reserve_pct`]).
+    pub reserve_pct: u8,
+    /// The reading, when one vouched. Never read for a slot keeping no reserve.
+    pub reading: Option<Reading7d>,
+}
+
+/// One slot's weekly reserve state this tick (§3.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReserveState {
     /// The vouchable 7d reading is at or past `100 − reserve`: no new spawn on
@@ -488,7 +510,7 @@ pub fn reserve_state(pct: u8, vouchable_7d: Option<u8>) -> ReserveState {
 ///
 /// `pools` is each member's admission pool, as the rate-limit hold reads it
 /// (an opencode member's is empty, so it is never reserve-held). `vouchable_7d`
-/// gives a slot's vouchable 7d percentage, and is asked only for a slot that
+/// gives a slot's vouchable 7d reading, and is asked only for a slot that
 /// keeps a reserve. Every pool slot lands in [`ScheduleVerdict::reserves`]. A
 /// member whose every slot is [`ReserveState::Held`] is held with
 /// [`HoldReason::Reserve`], which replaces a window hold (the reserve holds
@@ -497,18 +519,19 @@ pub fn apply_reserve(
     verdict: &mut ScheduleVerdict,
     cfg: &ScheduleConfig,
     pools: &[(&str, Vec<String>)],
-    mut vouchable_7d: impl FnMut(&str) -> Option<u8>,
+    mut vouchable_7d: impl FnMut(&str) -> Option<Reading7d>,
 ) {
     for (agent, pool) in pools {
         for slot in pool {
             if !verdict.reserves.contains_key(slot) {
-                let pct = cfg.reserve_pct(slot);
-                let reading = if pct == 0 { None } else { vouchable_7d(slot) };
-                verdict.reserves.insert(slot.clone(), reserve_state(pct, reading));
+                let reserve_pct = cfg.reserve_pct(slot);
+                let reading = if reserve_pct == 0 { None } else { vouchable_7d(slot) };
+                let state = reserve_state(reserve_pct, reading.map(|r| r.used_pct));
+                verdict.reserves.insert(slot.clone(), SlotReserve { state, reserve_pct, reading });
             }
         }
         let all_held = !pool.is_empty()
-            && pool.iter().all(|slot| verdict.reserves[slot] == ReserveState::Held);
+            && pool.iter().all(|slot| verdict.reserves[slot].state == ReserveState::Held);
         if all_held && verdict.held.get(*agent) != Some(&HoldReason::ZoneUnreadable) {
             verdict.held.insert((*agent).to_string(), HoldReason::Reserve);
         }
@@ -608,10 +631,11 @@ const DAY: i64 = 86_400;
 const HORIZON_DAYS: i64 = 7;
 
 impl ScheduleVerdict {
-    /// The verdict when the schedule is enabled but no local zone is readable:
-    /// closed, every member held (§3.2, fail-closed).
-    pub fn zone_unreadable(members: &[MemberRef<'_>]) -> Self {
+    /// The verdict when the schedule is enabled but no local zone is readable
+    /// (`why`): closed, every member held (§3.2, fail-closed).
+    pub fn zone_unreadable(members: &[MemberRef<'_>], why: &str) -> Self {
         Self {
+            zone: format!("unreadable: {why}"),
             held: members
                 .iter()
                 .map(|m| (m.agent.to_string(), HoldReason::ZoneUnreadable))
@@ -678,7 +702,77 @@ pub fn evaluate(cfg: &ScheduleConfig, zone: &Zone, now: i64, members: &[MemberRe
         next_edge,
         held,
         reserves: BTreeMap::new(),
+        zone: zone.name().to_string(),
+        next_edge_local: next_edge.map(|edge| local_label(zone, edge)),
     }
+}
+
+/// `unix` as local time in `zone`, `YYYY-MM-DD HH:MM ±HH:MM` — what `status`
+/// shows for the next edge.
+pub fn local_label(zone: &Zone, unix: i64) -> String {
+    let t = zone.local(unix);
+    let sign = if t.offset < 0 { '-' } else { '+' };
+    let off = t.offset.unsigned_abs() / 60;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} {sign}{:02}:{:02}",
+        t.y,
+        t.mo,
+        t.d,
+        t.h,
+        t.mi,
+        off / 60,
+        off % 60
+    )
+}
+
+/// The `status` block for a verdict (§3.8). `overrun` names the members
+/// still running more than `close_grace_minutes` past their window's close;
+/// each shows as `overrun` in place of its window reason. `held_items` are
+/// the items waiting on `> Not before:`.
+pub fn summary(
+    verdict: &ScheduleVerdict,
+    overrun: &BTreeSet<String>,
+    held_items: Vec<String>,
+) -> softfig_ipc::growlightd::ScheduleSummary {
+    use softfig_ipc::growlightd::{ReserveSummary, ScheduleHeld, ScheduleSummary};
+    ScheduleSummary {
+        open: verdict.open,
+        current_windows: verdict.open_windows.clone(),
+        next_edge: verdict.next_edge,
+        next_edge_local: verdict.next_edge_local.clone(),
+        zone: verdict.zone.clone(),
+        held_members: verdict
+            .held
+            .iter()
+            .map(|(agent, reason)| ScheduleHeld {
+                agent: agent.clone(),
+                reason: if overrun.contains(agent) { OVERRUN } else { reason.label() }.to_string(),
+            })
+            .collect(),
+        held_items,
+        reserve: verdict
+            .reserves
+            .iter()
+            .map(|(slot, r)| ReserveSummary {
+                slot: slot.clone(),
+                reserve_pct: r.reserve_pct,
+                used_7d_pct: r.reading.map(|x| x.used_pct),
+                held: r.state == ReserveState::Held,
+                resets_at: r.reading.and_then(|x| x.resets_at),
+            })
+            .collect(),
+        projection: Vec::new(),
+    }
+}
+
+/// The `status` reason for a member past its close grace (§3.4).
+pub const OVERRUN: &str = "overrun";
+
+/// Whether `reason` is a window closing on a member — the holds a running
+/// member can overrun (§3.4). A reserve hold or an unreadable zone is not a
+/// window's close.
+pub fn is_window_hold(reason: HoldReason) -> bool {
+    matches!(reason, HoldReason::OutsideWindow | HoldReason::NotInWindow)
 }
 
 #[cfg(test)]
@@ -760,11 +854,14 @@ mod tests {
             ("metered", Vec::new()),
         ];
         let mut verdict = ScheduleVerdict::ungated();
-        apply_reserve(&mut verdict, &cfg, &pools, |slot| used.get(slot).copied());
+        apply_reserve(&mut verdict, &cfg, &pools, |slot| {
+            used.get(slot).map(|&used_pct| Reading7d { used_pct, resets_at: None })
+        });
         assert_eq!(verdict.held, BTreeMap::from([("one".to_string(), HoldReason::Reserve)]));
         assert_eq!(verdict.reserve_held_slots(), BTreeSet::from(["slot1".to_string()]));
-        assert_eq!(verdict.reserves["slot2"], ReserveState::Clear);
-        assert_eq!(verdict.reserves["slot3"], ReserveState::Clear, "slot3 keeps no reserve");
+        assert_eq!(verdict.reserves["slot2"].state, ReserveState::Clear);
+        assert_eq!(verdict.reserves["slot3"].state, ReserveState::Clear, "slot3 keeps no reserve");
+        assert_eq!(verdict.reserves["slot3"].reading, None, "and its reading is never asked");
         assert_eq!(verdict.admission("one", true), Admission::Held(HoldReason::Reserve));
     }
 
@@ -779,13 +876,13 @@ mod tests {
             ]),
             ..ScheduleVerdict::default()
         };
-        apply_reserve(&mut verdict, &cfg, &pools, |_| Some(95));
+        apply_reserve(&mut verdict, &cfg, &pools, |_| Some(Reading7d { used_pct: 95, resets_at: None }));
         assert_eq!(verdict.held["out"], HoldReason::Reserve);
         assert_eq!(verdict.held["zone"], HoldReason::ZoneUnreadable);
         let mut unknown = ScheduleVerdict::ungated();
         apply_reserve(&mut unknown, &cfg, &pools, |_| None);
         assert!(unknown.held.is_empty());
-        assert_eq!(unknown.reserves["home"], ReserveState::Unknown);
+        assert_eq!(unknown.reserves["home"].state, ReserveState::Unknown);
     }
 
     #[test]
@@ -920,9 +1017,46 @@ mod tests {
         let mut cfg = schedule("windows = [\"01:00-02:00\"]\n");
         cfg.enabled = false;
         assert_eq!(eval(&cfg, at(2026, 10, 28, 12, 0, EDT)), ScheduleVerdict::ungated());
-        let v = ScheduleVerdict::zone_unreadable(&members());
+        let v = ScheduleVerdict::zone_unreadable(&members(), "no /etc/localtime");
         assert!(!v.open && !v.admits("a") && !v.admits("b"));
         assert_eq!(v.held.get("a"), Some(&HoldReason::ZoneUnreadable));
+        assert_eq!(v.zone, "unreadable: no /etc/localtime");
+    }
+
+    #[test]
+    fn the_status_block_names_the_zone_the_local_edge_reserves_and_overruns() {
+        let cfg = schedule(concat!(
+            "windows = [\"23:00-07:00\"]\n",
+            "reserve_weekly_pct = { slot1 = 20 }\n",
+        ));
+        let mut v = eval(&cfg, at(2026, 10, 28, 12, 0, EDT));
+        assert_eq!(v.next_edge_local.as_deref(), Some("2026-10-28 23:00 -04:00"));
+        let pools = vec![("a", vec!["slot1".to_string()]), ("b", vec!["slot2".to_string()])];
+        apply_reserve(&mut v, &cfg, &pools, |_| {
+            Some(Reading7d { used_pct: 50, resets_at: Some(99) })
+        });
+        let s = summary(&v, &BTreeSet::from(["b".to_string()]), vec!["q/084".into()]);
+        assert!(!s.open && s.current_windows.is_empty());
+        assert_eq!(s.zone, v.zone);
+        assert!(!s.zone.is_empty());
+        let held: Vec<(&str, &str)> =
+            s.held_members.iter().map(|h| (h.agent.as_str(), h.reason.as_str())).collect();
+        assert_eq!(held, [("a", "outside window"), ("b", OVERRUN)]);
+        assert_eq!(s.held_items, ["q/084"]);
+        let slot1 = &s.reserve[0];
+        assert_eq!((slot1.slot.as_str(), slot1.reserve_pct, slot1.used_7d_pct), ("slot1", 20, Some(50)));
+        assert_eq!((slot1.held, slot1.resets_at), (false, Some(99)));
+        // slot2 keeps no reserve, so its reading is never taken.
+        assert_eq!((s.reserve[1].reserve_pct, s.reserve[1].used_7d_pct), (0, None));
+        assert!(s.projection.is_empty(), "slice 008");
+    }
+
+    #[test]
+    fn a_local_label_carries_the_offset_in_force() {
+        let ny = ny();
+        assert_eq!(local_label(&ny, at(2026, 11, 1, 1, 30, EDT)), "2026-11-01 01:30 -04:00");
+        assert_eq!(local_label(&Zone::utc(), 0), "1970-01-01 00:00 +00:00");
+        assert!(is_window_hold(HoldReason::NotInWindow) && !is_window_hold(HoldReason::Reserve));
     }
 
     #[test]

@@ -251,6 +251,89 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) for wire back-compat.
     #[serde(default)]
     pub held: Vec<HeldPartSummary>,
+    /// The `[schedule]` as the drive loop last evaluated it (growlight-schedule
+    /// spec §3.8). `None` when no schedule is enabled, or the fleet is
+    /// disarmed (no loop evaluates one). Additive and skipped when absent, so
+    /// an older peer reads and writes the reply it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSummary>,
+}
+
+/// The `[schedule]` block of [`FleetStatusReply`] (growlight-schedule §3.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSummary {
+    /// Is any window open for any member?
+    #[serde(default)]
+    pub open: bool,
+    /// Labels of the windows open now, e.g. `daily 23:00-07:00 [claude]`.
+    #[serde(default)]
+    pub current_windows: Vec<String>,
+    /// The next open or close edge, Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_edge: Option<i64>,
+    /// [`next_edge`](Self::next_edge) in local time, e.g. `2026-10-31 23:00 -04:00`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_edge_local: Option<String>,
+    /// The local zone's name, or `unreadable: <why>` (the schedule is then
+    /// closed to everyone).
+    #[serde(default)]
+    pub zone: String,
+    /// Members the schedule holds, with why.
+    #[serde(default)]
+    pub held_members: Vec<ScheduleHeld>,
+    /// Items waiting on their `> Not before:` time.
+    #[serde(default)]
+    pub held_items: Vec<String>,
+    /// The weekly reserve of every slot in a member's admission pool.
+    #[serde(default)]
+    pub reserve: Vec<ReserveSummary>,
+    /// The budget projection per pool (slice 008). Empty until then.
+    #[serde(default)]
+    pub projection: Vec<PoolProjection>,
+}
+
+/// One member the schedule holds ([`ScheduleSummary::held_members`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleHeld {
+    pub agent: String,
+    /// `outside window`, `backend not in window`, `reserve`,
+    /// `local time unreadable`, or `overrun` — still running more than
+    /// `close_grace_minutes` past its window's close (information only:
+    /// nothing is killed).
+    pub reason: String,
+}
+
+/// One claude-login slot's weekly reserve ([`ScheduleSummary::reserve`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReserveSummary {
+    pub slot: String,
+    /// The share of the week kept back, `0..=100`. `0` keeps nothing.
+    pub reserve_pct: u8,
+    /// The slot's vouchable 7d used percentage. `None` when no reading can
+    /// vouch for one, or the slot keeps no reserve (it is not read then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_7d_pct: Option<u8>,
+    /// No new spawn on this slot until its 7d window resets.
+    #[serde(default)]
+    pub held: bool,
+    /// When the 7d window resets, Unix seconds, if the reading said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// One pool's budget projection ([`ScheduleSummary::projection`], slice 008).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolProjection {
+    pub slot: String,
+    /// The earliest Unix time the pool is projected to reach its cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_at_earliest: Option<i64>,
+    /// The latest Unix time the pool is projected to reach its cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_at_latest: Option<i64>,
+    /// When the pool's 7d window resets, Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
 }
 
 /// One configured roster member echoed in [`FleetStatusReply::roster`] — the
@@ -678,6 +761,14 @@ pub struct BuildCapsSummary {
     /// `CPUWeight` — the deprioritizing CPU weight (1..=10000). Applied live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_weight: Option<u32>,
+    /// `CPUQuota` — the hard CPU-time ceiling (a systemd percentage, e.g.
+    /// `"50%"`). Still a throttle. Read from the config at spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_quota: Option<String>,
+    /// `RUST_TEST_THREADS` — test threads per libtest binary (env var ⇒ next
+    /// spawn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_threads: Option<u32>,
 }
 
 /// Args for `set_resources`: a **partial** adjustment of the live build-resource
@@ -1483,8 +1574,12 @@ mod tests {
             cargo_build_jobs: Some(2),
             memory_high: None,
             cpu_weight: Some(50),
+            cpu_quota: None,
+            test_threads: Some(2),
         };
         let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"test_threads\":2"));
+        assert!(!json.contains("cpu_quota"), "an unset quota is omitted: {json}");
         assert!(json.contains("\"cargo_build_jobs\":2"));
         assert!(!json.contains("memory_high"), "an unset cap is omitted: {json}");
         assert_eq!(serde_json::from_str::<BuildCapsSummary>(&json).unwrap(), s);
@@ -1497,6 +1592,8 @@ mod tests {
                 cargo_build_jobs: Some(4),
                 memory_high: Some("5G".into()),
                 cpu_weight: Some(60),
+                cpu_quota: Some("50%".into()),
+                test_threads: Some(2),
             },
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
@@ -1680,6 +1777,7 @@ mod tests {
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
         assert!(reply.held.is_empty(), "missing held decodes as empty");
+        assert_eq!(reply.schedule, None, "missing schedule decodes as no schedule");
         assert_eq!(
             reply.build_caps,
             BuildCapsSummary::default(),
@@ -1720,9 +1818,11 @@ mod tests {
                 part: "hover-view-sticky".into(),
                 reason: "human-only (> Fleet: no)".into(),
             }],
+            schedule: None,
         };
-        let back: FleetStatusReply =
-            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("schedule"), "no schedule is omitted, as an older peer sends: {json}");
+        let back: FleetStatusReply = serde_json::from_str(&json).unwrap();
         assert!(back.fleet_enabled);
         assert_eq!(back.roster.len(), 2);
         assert_eq!(back.roster[0].agent, "builder");
@@ -1731,6 +1831,41 @@ mod tests {
         assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
         assert_eq!(back.agents, reply.agents, "the live rows round-trip whole");
         assert_eq!(back.held, reply.held, "the held parts round-trip whole");
+    }
+
+    #[test]
+    fn fleet_status_round_trips_the_schedule_block() {
+        let json = r#"{"state":"running","garden_root":"/g","protocol_version":1,
+            "policy":{"max_concurrent_agents":2,"ctx_roll_pct":50,"ctx_handoff_pct":60,
+            "session_5h_halt_pct":85,"session_7d_halt_pct":90}}"#;
+        let mut reply: FleetStatusReply = serde_json::from_str(json).unwrap();
+        reply.schedule = Some(ScheduleSummary {
+            open: false,
+            current_windows: Vec::new(),
+            next_edge: Some(1_793_500_000),
+            next_edge_local: Some("2026-10-31 23:00 -04:00".into()),
+            zone: "America/New_York".into(),
+            held_members: vec![
+                ScheduleHeld { agent: "a".into(), reason: "outside window".into() },
+                ScheduleHeld { agent: "b".into(), reason: "overrun".into() },
+            ],
+            held_items: vec!["default/084 at 2026-11-01 02:00 -04:00".into()],
+            reserve: vec![ReserveSummary {
+                slot: "slot1".into(),
+                reserve_pct: 20,
+                used_7d_pct: None,
+                held: false,
+                resets_at: None,
+            }],
+            projection: Vec::new(),
+        });
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("used_7d_pct"), "an unknown reading is omitted: {json}");
+        let back: FleetStatusReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schedule, reply.schedule);
+        // A bare block (a newer peer that sends only what it knows) decodes too.
+        let bare: ScheduleSummary = serde_json::from_str(r#"{"open":true}"#).unwrap();
+        assert!(bare.open && bare.zone.is_empty() && bare.reserve.is_empty());
     }
 
     #[test]

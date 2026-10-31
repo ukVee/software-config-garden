@@ -324,6 +324,35 @@ held:
   default/hover-view-sticky        human-only (> Fleet: no)
 ```
 
+Below the lists come the **`[schedule]`** block (growlight-schedule spec §3.8) and the
+live **build caps**. The schedule block is the drive loop's last verdict: whether a
+window is open, the next open or close edge in local time, each member the schedule
+holds and why, the items waiting on their `> Not before:`, and every claude-login
+slot's weekly reserve. It reads `schedule (none)` while no schedule is enabled or the
+fleet is disarmed.
+
+```
+schedule      closed (zone America/New_York)
+  next edge     2026-10-31 23:00 -04:00
+  held          a                outside window
+  held          b                overrun
+  waiting       default/084 at 2026-11-01 02:00 -04:00
+  reserve       slot1            keep 20% · 7d used unknown · clear
+build caps    (live default — the next spawn's throttle)
+  cargo_build_jobs  2
+  …
+  test_threads      2
+```
+
+- **`overrun`** replaces a member's window reason once it has kept running more than
+  `close_grace_minutes` past its window's close. It raises one `ScheduleOverrun` alert
+  (GUI and log, not the phone). It is information only: the member still finishes its
+  iteration, and nothing is killed. A member spawned while its window was already closed
+  (a due timed item) is never flagged.
+- **A reserve reads `unknown`** when no reading can vouch for the slot's 7d percentage.
+  A headless capture records no percentage, so this is the usual state until an
+  interactive statusline writes one. An unknown reserve does not hold.
+
 ### Spend accounting is session-scoped, and it is not a cap
 
 - **In memory only.** The counters live in the backend's cells and are lost on a
@@ -345,6 +374,13 @@ kill-handle registries. So `growlight force-stop --hard-kill`, `request_restart`
 `set_resources` throttle and the boot reconciler all address it the same way. The only
 backend-specific parts are argv, the pre-approval it generates, and the wire format it
 parses.
+
+The build caps come from `[build_caps]` in `config/growlight.toml`. `test_threads`
+(default `2`) sets `RUST_TEST_THREADS` on every scope beside `CARGO_BUILD_JOBS`, so a
+member's `cargo test` runs at most that many tests at once per test binary. It
+supersedes the `softfig-growlightd.service.d/50-test-threads.conf` drop-in, which the
+growlight-schedule deploy runbook removes. A `0` disables the fleet at load, because
+libtest refuses it.
 
 Three differences worth knowing when reading logs:
 

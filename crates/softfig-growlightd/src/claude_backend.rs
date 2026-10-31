@@ -2538,10 +2538,12 @@ mod tests {
             .expect("a `--` separates the scope wrapper from the command");
 
         // The GENTLE build caps (slice 002) are `systemd-run` scope options, so
-        // they sit BEFORE the `--`: a low CARGO_BUILD_JOBS + a SOFT MemoryHigh + a
-        // deprioritizing CPUWeight. Never a hard kill cap (MemoryMax/TasksMax).
+        // they sit BEFORE the `--`: low CARGO_BUILD_JOBS + RUST_TEST_THREADS, a SOFT
+        // MemoryHigh and a deprioritizing CPUWeight. Never a hard kill cap
+        // (MemoryMax/TasksMax).
         let scope_opts = &s[..sep];
         assert!(scope_opts.contains(&"--setenv=CARGO_BUILD_JOBS=2".to_string()));
+        assert!(scope_opts.contains(&"--setenv=RUST_TEST_THREADS=2".to_string()));
         assert!(scope_opts.contains(&"--property=MemoryHigh=3G".to_string()));
         assert!(scope_opts.contains(&"--property=CPUWeight=50".to_string()));
         assert!(
@@ -2596,6 +2598,7 @@ mod tests {
                 "--collect",
                 "--unit=growlight-agent-a1-7",
                 "--setenv=CARGO_BUILD_JOBS=2",
+                "--setenv=RUST_TEST_THREADS=2",
                 "--property=MemoryHigh=3G",
                 "--property=CPUWeight=50",
                 "--",

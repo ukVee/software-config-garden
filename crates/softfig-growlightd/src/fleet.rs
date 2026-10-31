@@ -630,6 +630,11 @@ impl FleetConfig {
                  (want a positive percentage like \"50%\")"
             ));
         }
+        // libtest refuses `RUST_TEST_THREADS=0`, so a 0 would fail every agent's
+        // `cargo test`; refuse it at load like the CPUQuota above.
+        if doc.build_caps.test_threads == Some(0) {
+            return Err("[build_caps] test_threads must be >= 1 (libtest refuses 0)".to_string());
+        }
         // Validate each member's backend declaration (slice 005) — an unknown
         // backend, or an opencode-only key on a claude member, is REPORTED AND
         // REFUSED here rather than defaulted, because both mistakes end the same
@@ -1667,6 +1672,7 @@ agent = "reviewer"
                 memory_high: Some("5G".to_string()),
                 cpu_weight: Some(80),
                 cpu_quota: None,
+                test_threads: Some(2),
             }
         );
 
@@ -1685,6 +1691,7 @@ agent = "reviewer"
                 memory_high: Some("6G".to_string()),
                 cpu_weight: Some(50),
                 cpu_quota: None,
+                test_threads: Some(2),
             },
             "an unset field falls back to the conservative default",
         );
@@ -1704,6 +1711,21 @@ agent = "reviewer"
         )
         .unwrap_err();
         assert!(err.contains("cpu_quota"), "names the bad key: {err}");
+    }
+
+    #[test]
+    fn test_threads_parses_and_a_zero_disables_the_fleet() {
+        let cfg = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ntest_threads = 1\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.build_caps.test_threads, Some(1));
+
+        let err = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ntest_threads = 0\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("test_threads"), "names the bad key: {err}");
     }
 
     #[test]

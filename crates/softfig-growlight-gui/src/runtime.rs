@@ -716,6 +716,8 @@ mod tests {
                 cargo_build_jobs: Some(2),
                 memory_high: Some("3G".into()),
                 cpu_weight: Some(50),
+                cpu_quota: None,
+                test_threads: None,
             }),
             last_resources_outcome: Some(ResourcesOutcome {
                 applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
