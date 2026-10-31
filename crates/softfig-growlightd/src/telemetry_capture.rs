@@ -6,11 +6,11 @@
 //!   event carries its `message.{id, model, usage, stop_reason, content[]}`, and
 //!   one response arrives as several `assistant` events sharing one
 //!   `message.id` (one per content block, the latest `usage` the most complete).
-//!   [`ClaudeCapture`] keeps the open request per *lane* and closes it on an id
-//!   change in that lane, on the terminal `result` line, or at
-//!   [`finish`](ClaudeCapture::finish). A lane is the event's
-//!   `parent_tool_use_id`, so a subagent's interleaved requests never split the
-//!   parent's open one into two rows.
+//!   [`ClaudeCapture`] runs softfig-telemetry's [`ClaudeFold`] over them (the
+//!   one `message.id` close rule, shared with the semi-auto transcript
+//!   ingester): the open request per *lane* (`parent_tool_use_id`), closed on
+//!   an id change in that lane, on the terminal `result` line, or at
+//!   [`finish`](ClaudeCapture::finish).
 //! - **opencode** (`opencode run --format json`): one `step_finish` is one model
 //!   call, built by [`opencode_step_row`]; whatever the session ledger settled
 //!   beyond the stream is one [`opencode_ledger_row`] at run end.
@@ -18,12 +18,12 @@
 //! Fail-soft by construction: nothing here returns an error or blocks. A line
 //! that does not parse is skipped, and the [`Recorder`] is a non-blocking ring.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::Value;
 use softfig_telemetry::{
-    Backend, PriceTable, Recorder, RequestRow, SettledFrom, Speed, TokenCounts,
+    Backend, ClaudeFold, ClosedRequest, PriceTable, Recorder, RequestRow, SettledFrom,
+    TokenCounts, request_for_assistant,
 };
 
 /// The backlog coordinates a spawn's rows are keyed by. Filled by the drive
@@ -124,130 +124,10 @@ impl CaptureContext {
     }
 }
 
-/// One claude `assistant` event's view of its request.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AssistantRequest {
-    pub id: String,
-    pub model: String,
-    /// `parent_tool_use_id`: `None` for the main thread, the spawning tool
-    /// call's id for a subagent's request.
-    pub lane: Option<String>,
-    /// `None` when this event carries no `usage` (an earlier one may have).
-    pub tokens: Option<TokenCounts>,
-    pub speed: Option<Speed>,
-    pub stop_reason: Option<String>,
-    /// The `id`s of this event's `tool_use` content blocks.
-    pub tool_use_ids: Vec<String>,
-}
-
-/// An `assistant` stream-json event's request, or `None` for any other line or
-/// one with no `message.id`. Pure, beside
-/// [`deltas_for_line`](crate::claude_backend). claude's `output_tokens`
-/// includes thinking; the row stores them apart (`row.rs` `TokenCounts`).
-pub fn request_for_assistant(ev: &Value) -> Option<AssistantRequest> {
-    if ev.get("type").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-    let msg = ev.get("message")?;
-    let id = msg.get("id").and_then(Value::as_str)?.to_string();
-    let str_at = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-    let usage = msg.get("usage").filter(|u| u.is_object());
-    let tokens = usage.map(|u| {
-        let n = |path: &[&str]| {
-            path.iter()
-                .try_fold(u, |v, k| v.get(*k))
-                .and_then(Value::as_u64)
-        };
-        let output_tokens = n(&["output_tokens"]).unwrap_or(0);
-        let thinking = n(&["output_tokens_details", "thinking_tokens"]);
-        TokenCounts {
-            input: n(&["input_tokens"]).unwrap_or(0),
-            output: output_tokens.saturating_sub(thinking.unwrap_or(0)),
-            cache_read: n(&["cache_read_input_tokens"]).unwrap_or(0),
-            cache_creation: n(&["cache_creation_input_tokens"]).unwrap_or(0),
-            cache_creation_1h: n(&["cache_creation", "ephemeral_1h_input_tokens"]).unwrap_or(0),
-            thinking,
-        }
-    });
-    let speed = usage
-        .and_then(|u| u.get("speed"))
-        .and_then(Value::as_str)
-        .and_then(|s| match s {
-            "fast" => Some(Speed::Fast),
-            "standard" | "normal" => Some(Speed::Standard),
-            _ => None,
-        });
-    let tool_use_ids = msg
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-        .filter_map(|b| str_at(b, "id"))
-        .collect();
-    Some(AssistantRequest {
-        id,
-        model: str_at(msg, "model").unwrap_or_default(),
-        lane: str_at(ev, "parent_tool_use_id"),
-        tokens,
-        speed,
-        stop_reason: str_at(msg, "stop_reason"),
-        tool_use_ids,
-    })
-}
-
-/// A request still receiving `assistant` events.
-#[derive(Debug)]
-struct OpenRequest {
-    id: String,
-    model: String,
-    tokens: TokenCounts,
-    speed: Option<Speed>,
-    stop_reason: Option<String>,
-    tool_use_ids: BTreeSet<String>,
-    /// The arrival time of its latest event: the request's completion time.
-    last_at: i64,
-}
-
-impl OpenRequest {
-    fn new(req: AssistantRequest, at: i64) -> Self {
-        let mut open = Self {
-            id: req.id.clone(),
-            model: String::new(),
-            tokens: TokenCounts::default(),
-            speed: None,
-            stop_reason: None,
-            tool_use_ids: BTreeSet::new(),
-            last_at: at,
-        };
-        open.merge(req, at);
-        open
-    }
-
-    /// Fold a later event of the same request: the latest usage, model, speed
-    /// and stop reason win; tool calls accumulate by id, so a stream that
-    /// repeats earlier blocks counts each once.
-    fn merge(&mut self, req: AssistantRequest, at: i64) {
-        if !req.model.is_empty() {
-            self.model = req.model;
-        }
-        if let Some(tokens) = req.tokens {
-            self.tokens = tokens;
-        }
-        self.speed = req.speed.or(self.speed);
-        if req.stop_reason.is_some() {
-            self.stop_reason = req.stop_reason;
-        }
-        self.tool_use_ids.extend(req.tool_use_ids);
-        self.last_at = at;
-    }
-}
-
 #[derive(Debug, Default)]
 struct ClaudeState {
     session_id: Option<String>,
-    open: BTreeMap<Option<String>, OpenRequest>,
-    turn_index: u32,
+    fold: ClaudeFold,
 }
 
 /// One claude spawn's request fold. Driven line by line from the member's
@@ -285,18 +165,8 @@ impl ClaudeCapture {
         let Some(req) = request_for_assistant(&ev) else {
             return;
         };
-        let lane = req.lane.clone();
-        match state.open.remove(&lane) {
-            Some(mut open) if open.id == req.id => {
-                open.merge(req, at);
-                state.open.insert(lane, open);
-            }
-            prior => {
-                if let Some(prior) = prior {
-                    self.close(&mut state, prior);
-                }
-                state.open.insert(lane, OpenRequest::new(req, at));
-            }
+        if let Some(closed) = state.fold.observe(req, at) {
+            self.emit(&state, closed);
         }
     }
 
@@ -307,28 +177,24 @@ impl ClaudeCapture {
     }
 
     fn close_all(&self, state: &mut ClaudeState) {
-        // Oldest completion first, so turn_index follows the wire order.
-        let mut open: Vec<OpenRequest> = std::mem::take(&mut state.open).into_values().collect();
-        open.sort_by_key(|o| o.last_at);
-        for o in open {
-            self.close(state, o);
+        for closed in state.fold.close_all() {
+            self.emit(state, closed);
         }
     }
 
-    fn close(&self, state: &mut ClaudeState, open: OpenRequest) {
+    fn emit(&self, state: &ClaudeState, closed: ClosedRequest) {
         let mut row = self.ctx.row(
             Backend::Claude,
-            ("anthropic", &open.model),
+            ("anthropic", &closed.model),
             state.session_id.as_deref().unwrap_or_default(),
-            &open.id,
-            open.last_at,
+            &closed.id,
+            closed.at,
         );
-        row.turn_index = state.turn_index;
-        row.tokens = open.tokens;
-        row.speed = open.speed;
-        row.stop_reason = open.stop_reason;
-        row.tool_use_count = u32::try_from(open.tool_use_ids.len()).unwrap_or(u32::MAX);
-        state.turn_index = state.turn_index.saturating_add(1);
+        row.turn_index = closed.turn_index;
+        row.tokens = closed.tokens;
+        row.speed = closed.speed;
+        row.stop_reason = closed.stop_reason;
+        row.tool_use_count = closed.tool_use_count;
         self.ctx.emit(row);
     }
 }
@@ -438,6 +304,7 @@ pub fn opencode_ledger_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use softfig_telemetry::Speed;
 
     #[derive(Default)]
     struct Collect(Mutex<Vec<RequestRow>>);
@@ -467,7 +334,7 @@ mod tests {
     /// A claude 2.x stream-json run built from the slice-001-verified keys
     /// only: `system`/`init`, one response split over two `assistant` events
     /// sharing `msg_01`, a second response `msg_02`, then `result`.
-    const CLAUDE_RUN: &str = include_str!("../tests/fixtures/claude-assistant-usage-run.jsonl");
+    const CLAUDE_RUN: &str = include_str!("../../softfig-telemetry/tests/fixtures/claude-assistant-usage-run.jsonl");
 
     #[test]
     fn two_assistant_events_sharing_a_message_id_make_one_row() {
@@ -599,18 +466,11 @@ mod tests {
 
     #[test]
     fn non_assistant_and_unparseable_lines_are_ignored() {
-        assert_eq!(
-            request_for_assistant(&serde_json::json!({"type": "user"})),
-            None
-        );
-        assert_eq!(
-            request_for_assistant(&serde_json::json!({"type": "assistant", "message": {}})),
-            None,
-            "no message.id, no request"
-        );
         let rec = Arc::new(Collect::default());
         let cap = ClaudeCapture::new(ctx(Arc::clone(&rec), None));
         cap.observe("not json {", 1);
+        cap.observe(r#"{"type":"user","session_id":"s"}"#, 2);
+        cap.observe(r#"{"type":"assistant","message":{}}"#, 3);
         cap.finish();
         assert!(rec.0.lock().unwrap().is_empty());
     }

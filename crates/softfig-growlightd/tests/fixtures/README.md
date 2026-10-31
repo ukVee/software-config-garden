@@ -95,7 +95,9 @@ waits for before trusting the totals.
 
 ## claude stream-json fixture (hand-built)
 
-`claude-assistant-usage-run.jsonl` is **not** a capture. It was built for
+`claude-assistant-usage-run.jsonl` lives in `crates/softfig-telemetry/tests/fixtures/`
+since slice 005 moved the claude fold there; growlightd's tests read it from that path. It
+is **not** a capture. It was built for
 token-telemetry-p1 slice 004 from the keys slice 001 verified against a live claude
 transcript, and nothing else: `session_id`, `parent_tool_use_id`,
 `message.{id, model, stop_reason, content[], usage}`, and `usage.{input_tokens,

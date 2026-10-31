@@ -3344,7 +3344,7 @@ mod tests {
             .with_model(softfig_ipc::model_choice::ModelChoice::claude_on(None, Some("high".into())))
             .with_telemetry(tags.clone());
         let observer = backend.flavor.new_observer(&spec, Arc::new(AgentRateState::default()));
-        for line in include_str!("../tests/fixtures/claude-assistant-usage-run.jsonl").lines() {
+        for line in include_str!("../../softfig-telemetry/tests/fixtures/claude-assistant-usage-run.jsonl").lines() {
             observer.observe(line, 1);
         }
         observer.finish(2);

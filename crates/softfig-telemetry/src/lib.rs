@@ -38,6 +38,7 @@
 //! coalesced (30 s or 1 000 pending, one transaction, no transaction at all
 //! when idle). The constants live in [`schema`].
 
+pub mod claude;
 pub mod flush;
 pub mod pricing;
 pub mod recorder;
@@ -45,11 +46,14 @@ pub mod ring;
 pub mod row;
 pub mod schema;
 pub mod store;
+pub mod transcript;
 pub mod ts;
 
+pub use claude::{AssistantRequest, ClaudeFold, ClosedRequest, request_for_assistant};
 pub use flush::{Clock, FlushHandle, FlushPolicy, FlushStats, Flusher};
 pub use pricing::{ModelPrice, PriceTable, PricingError};
 pub use recorder::{NullRecorder, Recorder};
 pub use ring::RingRecorder;
 pub use row::{Backend, RequestRow, SettledFrom, Speed, TokenCounts};
 pub use store::{Store, StoreError, SweepOutcome, default_db_path};
+pub use transcript::{TranscriptKeys, ingest_transcript, renumber_turns};

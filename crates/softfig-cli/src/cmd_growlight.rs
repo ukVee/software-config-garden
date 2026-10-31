@@ -1121,7 +1121,7 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
 
 /// Ask the daemon where the garden is mounted (so injection paths are derived,
 /// never literal — spec §3/§12). `--garden-root` bypasses the query.
-fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
     }
@@ -1255,7 +1255,7 @@ fn runtime_grant_root(runtime: &Path) -> &Path {
     }
 }
 
-fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
     }
