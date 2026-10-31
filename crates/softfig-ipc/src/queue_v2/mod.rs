@@ -35,6 +35,7 @@
 //! urgent-before-normal, link integrity, …) are validation, not this file —
 //! they live in [`validate`], the milestone's slice 002.
 
+pub mod migrate;
 mod sub_doc;
 mod validate;
 
