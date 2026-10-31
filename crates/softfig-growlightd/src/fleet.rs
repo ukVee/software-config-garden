@@ -541,10 +541,10 @@ pub struct FleetConfig {
     /// before growlightd terminates the session (§6.3 step 4: on exit or after
     /// the grace, whichever comes first). Absent ⇒ [`DEFAULT_ROLL_GRACE_SECS`].
     pub roll_grace_secs: u64,
-    /// `[schedule]` — growlightd's clock (milestone `growlight-schedule`). `None`
-    /// when the table is absent: no schedule gate. Slice 001 carries the raw
-    /// table only; nothing reads it for admission yet.
-    pub schedule: Option<crate::schedule::ScheduleDoc>,
+    /// `[schedule]` — growlightd's clock (milestone `growlight-schedule`),
+    /// validated against the members. `None` when the table is absent: no
+    /// schedule gate. Nothing reads it for admission yet (slice 003).
+    pub schedule: Option<crate::schedule::ScheduleConfig>,
 }
 
 /// §6.3 step 4's default grace between a member's handshake and growlightd
@@ -640,6 +640,13 @@ impl FleetConfig {
             .into_iter()
             .map(FleetMemberDoc::validate)
             .collect::<Result<Vec<_>, _>>()?;
+        // `[schedule]` validates against the members it may name (§3.1): an
+        // out-of-range time, unknown day or member is refused, never widened.
+        let schedule = doc
+            .schedule
+            .as_ref()
+            .map(|s| crate::schedule::ScheduleConfig::from_doc(s, &members))
+            .transpose()?;
         Ok(Self {
             enabled: doc.fleet_enabled,
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
@@ -652,7 +659,7 @@ impl FleetConfig {
             max_iterations: doc.max_iterations,
             queue: doc.queue,
             roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
-            schedule: doc.schedule,
+            schedule,
         })
     }
 
