@@ -49,7 +49,7 @@
 //! [`DriveLoop::tick`] takes `now` (injected Unix seconds), like every pure core;
 //! only [`spawn_drive_loop`]'s live thread reads the wall clock.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,7 +71,10 @@ use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{
     classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
-use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
+use crate::schedule::{
+    evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone, ZoneSource,
+};
+use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
@@ -113,6 +116,17 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
     /// has no markers.
     fn claim_hold(&self, _queue: &str, _part: &str) -> Option<ClaimHold> {
         None
+    }
+
+    /// Does `part`'s item doc declare a `> Not before:` that has arrived?
+    /// (growlight-schedule slice 003, §3.5.) While the schedule is closed with
+    /// `tasks = true`, such an item opens its own window: a member the schedule
+    /// would otherwise hold may claim it. Read fresh like
+    /// [`claim_hold`](Self::claim_hold); an unreadable doc, no line, a future or
+    /// unparseable time all answer `false`. Defaults to `false` — a source with
+    /// no item docs has no timed items.
+    fn timed_due(&self, _queue: &str, _part: &str) -> bool {
+        false
     }
 
     /// The current content of `part`'s item doc (claude-login-pool-wiring slice
@@ -1308,6 +1322,15 @@ pub struct TickReport {
     /// edge-logged by the [`TickLogger`] on the tripping tick. `false` on every tick of
     /// an unbounded (`max_iterations` absent) run — the default.
     pub bounded_run_stopped: bool,
+    /// Members the `[schedule]` holds this tick, with the reason
+    /// (growlight-schedule slice 003, §3.4): no claim, no spawn, no re-roll. A
+    /// member admitted only to due timed items (`tasks = true`, §3.5) is listed
+    /// with its window reason too. Empty while no schedule is enabled.
+    pub schedule_held: Vec<(String, HoldReason)>,
+    /// The schedule's open/close edge crossed this tick, as its one journal
+    /// line (`schedule: window <label> opened|closed`). `None` on every other
+    /// tick, and always while no schedule is enabled.
+    pub schedule_edge: Option<String>,
 }
 
 /// The queue-v2 scheduling seams (slice 006) — the v2 siblings of the legacy
@@ -1581,7 +1604,24 @@ pub struct DriveLoop {
     /// after EXACTLY the configured count and never resumes without a daemon restart
     /// (which re-arms a fresh bounded batch). Never set when `max_iterations` is `None`.
     iteration_bound_reached: bool,
+    /// Where the `[schedule]` reads local time (growlight-schedule slice 003).
+    /// Consulted only while a schedule is enabled; the live [`SystemZone`]
+    /// reloads when `$TZ` or `/etc/localtime` changes.
+    zone: Box<dyn ZoneSource>,
+    /// Whether the schedule was open last tick, and the windows open then —
+    /// the edge memory behind the one `schedule: …` journal line per open/close.
+    /// `None` while no schedule is enabled.
+    schedule_last: Option<(bool, Vec<String>)>,
+    /// Per part, whether its item doc declares a `> Not before:` that has
+    /// arrived, and when that was read — the `tasks = true` exception (§3.5).
+    /// Re-read after [`TIMED_DUE_TTL_SECS`], like a claim hold.
+    timed_due: BTreeMap<(String, String), (bool, i64)>,
 }
+
+/// How long a [`QueueSource::timed_due`] read is trusted — the claim-hold
+/// re-read interval, so a closed schedule with `tasks = true` costs one doc read
+/// per candidate part per minute, not per tick.
+const TIMED_DUE_TTL_SECS: i64 = 60;
 
 impl DriveLoop {
     /// Assemble a drive loop over its seams + fleet. The `health` and `samples`
@@ -1660,7 +1700,20 @@ impl DriveLoop {
             max_iterations: None,
             iterations_completed: 0,
             iteration_bound_reached: false,
+            zone: Box::new(SystemZone::new()),
+            schedule_last: None,
+            timed_due: BTreeMap::new(),
         }
+    }
+
+    /// Install the local-time source the `[schedule]` is evaluated against
+    /// (growlight-schedule slice 003). A builder like
+    /// [`with_max_iterations`](Self::with_max_iterations): the live loop keeps
+    /// the default [`SystemZone`]; a test injects a fixed zone or a failure.
+    #[must_use]
+    pub fn with_zone(mut self, zone: Box<dyn ZoneSource>) -> Self {
+        self.zone = zone;
+        self
     }
 
     /// Set the bounded-run limit (task 040): after `max` completed member work-chunks
@@ -2518,6 +2571,21 @@ impl DriveLoop {
         let bound_reached = self.iteration_bound_reached;
         report.bounded_run_stopped = bound_reached;
 
+        // The `[schedule]` (growlight-schedule slice 003, spec §3.3–3.5): one
+        // verdict per tick, applied beside the per-member rate-limit filter in
+        // both modes' steps 2 + 3. A held member gets no claim, no spawn and no
+        // re-roll; a running member is never touched, so a window's close lets
+        // the current iteration finish. Evaluated from `now` alone, so a wake
+        // from suspend into an open window admits on that tick (a late open, no
+        // catch-up). No schedule, or `enabled = false`, is `ungated`: nobody is
+        // held and every path below is byte-identical to the unscheduled loop.
+        let schedule = self.daemon.schedule().filter(|cfg| cfg.enabled);
+        let tasks = schedule.as_ref().is_some_and(|cfg| cfg.tasks);
+        let verdict = self.schedule_verdict(schedule.as_ref(), &fleet, now);
+        report.schedule_edge = self.schedule_edge(schedule.is_some(), &verdict);
+        report.schedule_held = verdict.held.iter().map(|(a, r)| (a.clone(), *r)).collect();
+        let admission = |agent: &str| verdict.admission(agent, tasks);
+
         if v2_mode {
             let mut snapshot = match self.v2.as_mut().map(|seams| seams.source.load()) {
                 Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
@@ -2559,6 +2627,7 @@ impl DriveLoop {
                                 id: member.spec.agent.clone(),
                                 backend: member.backend.ipc_backend(),
                                 pin: member.pin.clone(),
+                                schedule: v2_schedule_gate(admission(&member.spec.agent)),
                             },
                         )
                     })
@@ -2586,10 +2655,16 @@ impl DriveLoop {
                         {
                             return false;
                         }
+                        // The schedule (slice 003): a held member re-rolls onto
+                        // nothing, not even its own entry — its last iteration
+                        // finished at the close. `pick_v2` applies the same
+                        // gate below, through the member's `ScheduleGate`.
+                        let gate = v2_members.get(agent).map(|m| &m.schedule);
                         let resumes_own = assignments.get(agent).is_some_and(|a| {
-                            snapshot.entries.iter().any(|e| {
-                                e.id == a.entry && e.status == EntryStatus::Active
-                            })
+                            gate.is_some_and(|g| g.admits(&a.entry))
+                                && snapshot.entries.iter().any(|e| {
+                                    e.id == a.entry && e.status == EntryStatus::Active
+                                })
                         });
                         resumes_own
                             || v2_members
@@ -2627,6 +2702,12 @@ impl DriveLoop {
                             .unwrap()
                             .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                         {
+                            continue;
+                        }
+                        // Schedule-held (slice 003): the same skip as the rate-limit
+                        // hold above. A `TimedOnly` member still reaches `pick_v2`,
+                        // which admits only its gate's due entries.
+                        if matches!(admission(agent), Admission::Held(_)) {
                             continue;
                         }
                         // A stopping/stopped agent is never (re-)started; a registered
@@ -2868,6 +2949,22 @@ impl DriveLoop {
                 .iter()
                 .map(|m| (m.spec.agent.as_str(), m.pin.as_deref()))
                 .collect();
+            // The `tasks = true` exception for a re-roll (slice 003, §3.5): a
+            // member the closed schedule admits only to due timed items may
+            // resume its own part only if that part is one. Read before the
+            // closure borrows the loop.
+            let timed_own: Vec<(String, (String, String))> = fleet
+                .iter()
+                .map(|m| &m.spec.agent)
+                .filter(|agent| admission(agent) == Admission::TimedOnly)
+                .filter_map(|agent| self.assignments.get(agent).map(|a| (agent.clone(), a.clone())))
+                .collect();
+            let mut timed_resume = BTreeSet::new();
+            for (agent, (queue, part)) in timed_own {
+                if self.timed_due_at(&queue, &part, now) {
+                    timed_resume.insert(agent);
+                }
+            }
             let snap = &snapshot;
             let assignments = &self.assignments;
             let draining = draining_queues(&draining_at_start, &self.assignments);
@@ -2875,6 +2972,13 @@ impl DriveLoop {
             let holds = Arc::clone(&self.rate_limit_holds);
             let profiles_resolver = self.profiles_resolver.as_ref();
             let workable = |agent: &str| -> bool {
+                // The schedule (slice 003): a held member is not workable —
+                // `HeldNoWork`, like the rate-limit hold below — so an exit
+                // after the close is never re-rolled.
+                let gate = admission(agent);
+                if matches!(gate, Admission::Held(_)) {
+                    return false;
+                }
                 // Per-member rate-limit filter (slice 008): a member whose
                 // every admission profile is held is not workable, emitted as
                 // `HeldNoWork` by `tick_with` — no re-roll, no backoff, no
@@ -2903,6 +3007,11 @@ impl DriveLoop {
                         matches!(classify_queue(q), QueueState::Active(head) if head == *part)
                     })
                 });
+                // Outside its window with `tasks = true`: only its own part, and
+                // only if that part is a due timed item.
+                if gate == Admission::TimedOnly {
+                    return resumes_own && timed_resume.contains(agent);
+                }
                 resumes_own
                     || pins.get(agent).is_some_and(|pin| {
                         let reserved = reserved_queues(&fleet, retiring, stopped, &draining, agent);
@@ -3016,6 +3125,17 @@ impl DriveLoop {
                 {
                     continue;
                 }
+                // Schedule-held (slice 003): skipped exactly like the rate-limit
+                // hold above. A member admitted only to due timed items
+                // (`tasks = true`, §3.5) picks over a private view of the
+                // snapshot, on which every claimable part that isn't one is marked
+                // `OutsideWindow` — never on the shared snapshot, so a member the
+                // schedule admits still sees it.
+                let gate = admission(agent);
+                if matches!(gate, Admission::Held(_)) {
+                    continue;
+                }
+                let mut timed_view = (gate == Admission::TimedOnly).then(|| snapshot.clone());
                 // Fallback leaves a queue to the member pinned to it while that
                 // member is live on it or just exiting it (task 068).
                 let draining = draining_queues(&draining_at_start, &self.assignments);
@@ -3036,14 +3156,15 @@ impl DriveLoop {
                 // `active` head: at most one extra pass.
                 let mut pin = member.pin.as_deref();
                 let picked = loop {
-                    let Some((queue, part)) = pick_for(&snapshot, pin, &reserved) else {
+                    let view = timed_view.as_ref().unwrap_or(&snapshot);
+                    let Some((queue, part)) = pick_for(view, pin, &reserved) else {
                         break None;
                     };
                     let key = (queue.clone(), part.clone());
                     if spoken_for.contains(&key) {
                         break Some((queue, part));
                     }
-                    let fresh = snapshot.queue(&queue).is_some_and(|q| {
+                    let fresh = view.queue(&queue).is_some_and(|q| {
                         q.parts.iter().any(|p| p.id == part && p.status == PartStatus::Queued)
                     });
                     if !fresh {
@@ -3055,6 +3176,12 @@ impl DriveLoop {
                     }
                     let Some(hold) = self.queues.claim_hold(&queue, &part) else {
                         self.announced_holds.remove(&key);
+                        if let Some(view) = timed_view.as_mut()
+                            && !self.timed_due_at(&queue, &part, now)
+                        {
+                            view.mark_held(&queue, &part, ClaimHold::OutsideWindow);
+                            continue;
+                        }
                         break Some((queue, part));
                     };
                     if self.announced_holds.insert(key.clone(), hold.clone()).is_none() {
@@ -3066,6 +3193,9 @@ impl DriveLoop {
                         });
                     }
                     snapshot.mark_held(&queue, &part, hold.clone());
+                    if let Some(view) = timed_view.as_mut() {
+                        view.mark_held(&queue, &part, hold.clone());
+                    }
                     self.holds.insert(key, (hold, now));
                 };
                 let Some((queue, part)) = picked else {
@@ -3076,7 +3206,11 @@ impl DriveLoop {
                     // hold, edge-deduped like the re-roll `HeldNoWork`.
                     report.held_fresh.push(HeldFresh {
                         agent: agent.clone(),
-                        reason: "no workable part",
+                        reason: if timed_view.is_some() {
+                            "outside the schedule window (no due timed item)"
+                        } else {
+                            "no workable part"
+                        },
                     });
                     continue;
                 };
@@ -3256,6 +3390,71 @@ impl DriveLoop {
 
     /// Re-assert `agent`'s legacy claim, if it holds one ([`PartClaimer::reassert`]).
     /// Best-effort: a failure is journaled and the next beat retries.
+    /// The `[schedule]` verdict at `now` for the configured fleet
+    /// (growlight-schedule slice 003). `None` — no schedule, or one with
+    /// `enabled = false` — is [`ScheduleVerdict::ungated`] and reads no zone. A
+    /// zone that can't be read holds every member (§3.2, fail-closed).
+    fn schedule_verdict(
+        &mut self,
+        cfg: Option<&crate::schedule::ScheduleConfig>,
+        fleet: &[FleetMember],
+        now: i64,
+    ) -> ScheduleVerdict {
+        let Some(cfg) = cfg else {
+            return ScheduleVerdict::ungated();
+        };
+        let members: Vec<MemberRef<'_>> = fleet
+            .iter()
+            .map(|m| MemberRef { agent: &m.spec.agent, backend: m.backend.ipc_backend() })
+            .collect();
+        match self.zone.zone() {
+            Ok(zone) => evaluate(cfg, zone, now, &members),
+            Err(_) => ScheduleVerdict::zone_unreadable(&members),
+        }
+    }
+
+    /// The journal line for the schedule's open/close edge, if `verdict`
+    /// crossed one since last tick (slice 003). The first verdict of an
+    /// enabled schedule is an edge too, so the journal says where it starts;
+    /// disabling the schedule clears the memory silently.
+    fn schedule_edge(&mut self, enabled: bool, verdict: &ScheduleVerdict) -> Option<String> {
+        if !enabled {
+            self.schedule_last = None;
+            return None;
+        }
+        let last = self.schedule_last.replace((verdict.open, verdict.open_windows.clone()));
+        let was_open = last.as_ref().map(|(open, _)| *open);
+        if was_open == Some(verdict.open) {
+            return None;
+        }
+        Some(if verdict.open {
+            format!("schedule: window {} opened", verdict.open_windows.join(", "))
+        } else if verdict.held.values().any(|r| *r == HoldReason::ZoneUnreadable) {
+            "schedule: closed (local time unreadable)".to_string()
+        } else {
+            match last {
+                Some((_, windows)) if !windows.is_empty() => {
+                    format!("schedule: window {} closed", windows.join(", "))
+                }
+                _ => "schedule: closed (no window open)".to_string(),
+            }
+        })
+    }
+
+    /// Whether `part` of `queue` is an item whose `> Not before:` has arrived
+    /// ([`QueueSource::timed_due`]), trusted for [`TIMED_DUE_TTL_SECS`].
+    fn timed_due_at(&mut self, queue: &str, part: &str, now: i64) -> bool {
+        let key = (queue.to_string(), part.to_string());
+        if let Some(&(due, read_at)) = self.timed_due.get(&key)
+            && now - read_at < TIMED_DUE_TTL_SECS
+        {
+            return due;
+        }
+        let due = self.queues.timed_due(queue, part);
+        self.timed_due.insert(key, (due, now));
+        due
+    }
+
     fn reassert_claim(&self, agent: &str) {
         if let Some((queue, part)) = self.assignments.get(agent)
             && let Err(e) = self.claimer.reassert(queue, part, agent)
@@ -4000,6 +4199,18 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
     }
 }
 
+/// The v2 eligibility clause for one member's schedule [`Admission`]
+/// (growlight-schedule §3.10). v2 entries carry no `> Not before:` field on this
+/// base — queue-v2-parity adds it — so a `TimedOnly` member has no due entry yet
+/// and takes nothing, the same as a held one.
+fn v2_schedule_gate(admission: Admission) -> ScheduleGate {
+    match admission {
+        Admission::Open => ScheduleGate::Open,
+        Admission::Held(_) => ScheduleGate::Held,
+        Admission::TimedOnly => ScheduleGate::TimedOnly { due: BTreeSet::new() },
+    }
+}
+
 /// Drop the `systemd-run` scope banner from a crash's stderr tail (task 070): a
 /// headless member's stderr typically holds ONLY `Running as unit:
 /// growlight-agent-<id>-<n>.scope; invocation ID: …` — the launch wrapper's line,
@@ -4282,6 +4493,11 @@ impl TickLogger {
                  holding all spawns (restart growlightd to run another bounded batch)"
                     .to_string(),
             );
+        }
+        // The schedule's edge (growlight-schedule slice 003): the loop already
+        // edge-detects it, so this is one line per open/close, not per tick.
+        if let Some(line) = &r.schedule_edge {
+            out.push(line.clone());
         }
         out
     }
@@ -4799,6 +5015,11 @@ mod tests {
         }
         fn read_item_doc(&self, part: &str) -> Option<String> {
             self.item_docs.lock().unwrap().get(part).cloned()
+        }
+        fn timed_due(&self, _queue: &str, part: &str) -> bool {
+            self.item_docs.lock().unwrap().get(part).is_some_and(|doc| {
+                crate::queue_source::doc_timed_due(doc, crate::agent_harness::unix_now())
+            })
         }
     }
 
@@ -12017,6 +12238,203 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             r3.crashes.is_empty(),
             "no second ModelRefused alert while the fresh session is healthy",
+        );
+    }
+
+    // ---- growlight-schedule slice 003: the window gate ----
+
+    /// A fixed local zone for the schedule tests, or a fixed failure.
+    #[derive(Debug)]
+    struct FixedZone(Result<softfig_ipc::tz::Zone, String>);
+    impl ZoneSource for FixedZone {
+        fn zone(&mut self) -> Result<&softfig_ipc::tz::Zone, String> {
+            self.0.as_ref().map_err(Clone::clone)
+        }
+    }
+
+    /// 10:00 and 12:00 UTC on day 0 — the edges of the test window.
+    const OPEN: i64 = 10 * 3600;
+    const CLOSE: i64 = 12 * 3600;
+    const DAY: i64 = 86_400;
+
+    /// Give `d` a fleet config whose `[schedule]` is `body` (on a one-member
+    /// roster `a1`, which only the member filters validate against).
+    fn set_schedule(d: &Daemon, body: &str) {
+        let toml = format!("[[fleet]]\nagent = \"a1\"\n[schedule]\n{body}");
+        d.set_fleet_config(crate::fleet::FleetConfig::from_growlight_toml(&toml).unwrap());
+    }
+
+    /// A one-member loop on `qa = rows`, scheduled `10:00-12:00` daily in UTC.
+    #[allow(clippy::type_complexity)]
+    fn make_scheduled(
+        rows: &[(&str, &str)],
+        body: &str,
+    ) -> (DriveLoop, Arc<FakeFleet>, Arc<FakeClaimer>, Arc<FixedQueues>) {
+        let (loop_, d, backend, claimer, queues, _probe) =
+            make_claiming(vec![member("a1", "qa")], vec![q("qa", rows)], Policy::default());
+        set_schedule(&d, body);
+        let loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+        (loop_, backend, claimer, queues)
+    }
+
+    const WINDOW: &str = "enabled = true\nwindows = [\"10:00-12:00\"]\n";
+
+    #[test]
+    fn a_closed_schedule_holds_a_fresh_start_and_a_late_open_admits_on_wake() {
+        let (mut loop_, backend, claimer, _q) = make_scheduled(&[("p1", "queued")], WINDOW);
+
+        let r0 = loop_.tick(0);
+        assert!(backend.spawns().is_empty(), "closed: no fresh start");
+        assert!(claimer.claims().is_empty(), "closed: no claim");
+        assert_eq!(r0.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert_eq!(r0.schedule_edge.as_deref(), Some("schedule: closed (no window open)"));
+        // `tasks` defaults on (the interim table's meaning), so a1 looked for a
+        // due timed item and found none — narrated as the schedule, not as an
+        // empty queue.
+        assert_eq!(r0.held_fresh.len(), 1);
+        assert_eq!(r0.held_fresh[0].reason, "outside the schedule window (no due timed item)");
+
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.schedule_edge, None, "one line per edge, not per tick");
+
+        // Suspend: the device sleeps through 10:00 and wakes at 11:00. The
+        // window opens late, on that tick — no catch-up, no lost start.
+        let r = loop_.tick(OPEN + 3600);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 opened"));
+    }
+
+    #[test]
+    fn a_running_member_finishes_across_the_close_and_is_not_rerolled_until_reopen() {
+        let (mut loop_, backend, _claimer, _q) = make_scheduled(&[("p1", "queued")], WINDOW);
+        loop_.tick(OPEN);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // The close: a1 is mid-iteration and keeps running — nothing is killed.
+        let r = loop_.tick(CLOSE);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 closed"));
+        assert_eq!(backend.kill_count(), 0, "a close finishes the iteration, it kills nothing");
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 hands off and exits after the close: held, not re-rolled.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::HeldNoWork { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 1, "no re-roll while closed");
+        let r = loop_.tick(CLOSE + 120);
+        assert_eq!(backend.spawn_count(), 1, "still none a tick later");
+        assert!(r.crashes.is_empty());
+
+        // Next day's window: a1 resumes its own part.
+        let r = loop_.tick(DAY + OPEN);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 2);
+    }
+
+    #[test]
+    fn a_disabled_schedule_gates_nothing_and_reads_no_zone() {
+        let (loop_, d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, "enabled = false\nwindows = [\"10:00-12:00\"]\n");
+        // An unreadable zone would hold everyone — if it were read.
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Err("no zone".into()))));
+        let r = loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge, None);
+    }
+
+    #[test]
+    fn an_unreadable_zone_closes_an_enabled_schedule() {
+        let (loop_, d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, "enabled = true\nwindows = [\"00:00-00:00\"]\n");
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Err("no zone".into()))));
+        let r = loop_.tick(OPEN);
+        assert!(backend.spawns().is_empty(), "fail-closed: no start without local time");
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::ZoneUnreadable)]);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: closed (local time unreadable)"));
+    }
+
+    #[test]
+    fn a_due_timed_item_is_admitted_while_closed_only_with_tasks_on() {
+        let rows = [("p0", "queued"), ("p1", "queued")];
+        let timed = "> Not before: 2020-01-01 00:00 Z\n";
+        let future = "> Not before: 2999-01-01 00:00 Z\n";
+
+        // tasks = true: a1 rolls past the untimed p0 to the due timed p1.
+        let (mut loop_, backend, claimer, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = true\n"));
+        queues.set_item_doc("p1", timed);
+        let r = loop_.tick(0);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert!(r.skipped_for_human.is_empty(), "the window view is private, never announced");
+
+        // A timed item that is not yet due opens nothing.
+        let (mut loop_, backend, _c, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = true\n"));
+        queues.set_item_doc("p1", future);
+        let r = loop_.tick(0);
+        assert!(backend.spawns().is_empty());
+        assert_eq!(r.held_fresh.len(), 1, "narrated as a schedule hold");
+        assert_eq!(r.held_fresh[0].reason, "outside the schedule window (no due timed item)");
+
+        // tasks = false: the due timed item waits for the window too.
+        let (mut loop_, backend, claimer, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = false\n"));
+        queues.set_item_doc("p1", timed);
+        loop_.tick(0);
+        assert!(claimer.claims().is_empty());
+        assert!(backend.spawns().is_empty());
+    }
+
+    #[test]
+    fn a_timed_only_member_resumes_its_own_part_only_if_that_part_is_due_timed() {
+        let body = format!("{WINDOW}tasks = true\n");
+        // Its part is a due timed item: the exit after the close re-rolls.
+        let (mut loop_, backend, _c, queues) = make_scheduled(&[("p1", "queued")], &body);
+        queues.set_item_doc("p1", "> Not before: 2020-01-01 00:00 Z\n");
+        loop_.tick(OPEN);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+
+        // An untimed part: held like any closed member.
+        let (mut loop_, backend, _c, _q) = make_scheduled(&[("p1", "queued")], &body);
+        loop_.tick(OPEN);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::HeldNoWork { agent: "a1".into() }]);
+    }
+
+    #[test]
+    fn the_schedule_edge_reaches_the_journal() {
+        let mut logger = TickLogger::default();
+        let r = TickReport {
+            schedule_edge: Some("schedule: window daily 10:00-12:00 opened".into()),
+            ..TickReport::default()
+        };
+        assert!(logger.lines(&r).contains(&"schedule: window daily 10:00-12:00 opened".to_string()));
+        assert!(logger.lines(&TickReport::default()).is_empty());
+    }
+
+    #[test]
+    fn the_v2_schedule_gate_mirrors_the_admission() {
+        assert_eq!(v2_schedule_gate(Admission::Open), ScheduleGate::Open);
+        assert_eq!(v2_schedule_gate(Admission::Held(HoldReason::Reserve)), ScheduleGate::Held);
+        assert_eq!(
+            v2_schedule_gate(Admission::TimedOnly),
+            ScheduleGate::TimedOnly { due: BTreeSet::new() },
         );
     }
 }

@@ -33,7 +33,7 @@ use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
 use crate::member_slices;
 use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
-use crate::scheduler_v2::{self, Member, Unit};
+use crate::scheduler_v2::{self, Member, ScheduleGate, Unit};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
@@ -1063,6 +1063,7 @@ fn resolve_pick_member(
             id: String::new(),
             backend: Backend::Claude,
             pin: None,
+            schedule: ScheduleGate::Open,
         });
     };
     let Some(row) = members.iter().find(|m| m.agent == id) else {
@@ -1084,6 +1085,9 @@ fn resolve_pick_member(
         id: row.agent.clone(),
         backend: row.backend.ipc_backend(),
         pin: row.pin.clone(),
+        // The dry-run answers what the queue would hand the member; the
+        // `[schedule]` is a per-tick admission state, not queue state.
+        schedule: ScheduleGate::Open,
     })
 }
 

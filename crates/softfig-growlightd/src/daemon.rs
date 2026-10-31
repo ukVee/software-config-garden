@@ -411,6 +411,12 @@ impl Daemon {
         self.inner.lock().unwrap().fleet = fleet;
     }
 
+    /// The fleet's `[schedule]` (growlight-schedule slice 003), read by the drive
+    /// loop once per tick. `None` when the table is absent. Brief-lock clone.
+    pub fn schedule(&self) -> Option<crate::schedule::ScheduleConfig> {
+        self.inner.lock().unwrap().fleet.schedule.clone()
+    }
+
     /// The current runtime per-device [`Policy`] — the single source of truth the
     /// `set_policy` verb mutates, `status` echoes, and the drive loop refreshes
     /// its admission governor from each tick. Brief-lock read (`Policy` is `Copy`).

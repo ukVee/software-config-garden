@@ -34,14 +34,19 @@
 //! Slice 002: the raw table validates into a typed [`ScheduleConfig`]
 //! (carried on [`crate::fleet::FleetConfig::schedule`]; errors fail closed at
 //! the loader) and [`evaluate`] computes the verdict against a
-//! [`softfig_ipc::tz::Zone`]. Nothing gates admission yet: slice 003 wires the
-//! verdict in, slice 004 adds the reserve hold, slice 003 the `tasks` exception.
+//! [`softfig_ipc::tz::Zone`]. Slice 003: the drive loop evaluates it every
+//! tick through a [`ZoneSource`] and gates admission on
+//! [`ScheduleVerdict::admission`], including the `tasks` exception; slice 004
+//! adds the reserve hold.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use softfig_ipc::model_choice::Backend;
-use softfig_ipc::tz::Zone;
+use softfig_ipc::tz::{Zone, LOCALTIME_PATH, ZONEINFO_DIR};
 
 use crate::fleet::FleetMemberConfig;
 
@@ -387,6 +392,108 @@ impl ScheduleVerdict {
     pub fn admits(&self, agent: &str) -> bool {
         !self.held.contains_key(agent)
     }
+
+    /// How far the schedule admits `agent` this tick, given the config's
+    /// `tasks` switch (§3.5). A member held only because no window is open to
+    /// it — [`HoldReason::OutsideWindow`] or [`HoldReason::NotInWindow`] — may
+    /// still take an item whose `> Not before:` has arrived when `tasks` is
+    /// on: the item opens its own window, to any member. A reserve hold or an
+    /// unreadable zone holds outright.
+    pub fn admission(&self, agent: &str, tasks: bool) -> Admission {
+        match self.held.get(agent) {
+            None => Admission::Open,
+            Some(HoldReason::OutsideWindow | HoldReason::NotInWindow) if tasks => {
+                Admission::TimedOnly
+            }
+            Some(&reason) => Admission::Held(reason),
+        }
+    }
+}
+
+/// What the schedule lets one member do this tick ([`ScheduleVerdict::admission`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Admitted as if no schedule gated.
+    Open,
+    /// Admitted only to an item whose `> Not before:` has arrived (§3.5).
+    TimedOnly,
+    /// Not admitted: no claim, no spawn, no re-roll (§3.4).
+    Held(HoldReason),
+}
+
+/// The seam the drive loop reads local time through (slice 003). The live
+/// [`SystemZone`] reloads when the zone's source changes; a test injects a
+/// fixed zone or a fixed failure.
+pub trait ZoneSource: Send + fmt::Debug {
+    /// The current local zone, or why it can't be read. Called once per tick,
+    /// and only while a schedule is enabled.
+    fn zone(&mut self) -> Result<&Zone, String>;
+}
+
+/// The system's local zone ([`Zone::load`]), reloaded when its source's
+/// identity changes: `$TZ`, and the file it resolves to (`/etc/localtime`
+/// when `$TZ` is unset) — the symlink target plus the file's inode, size and
+/// mtime. One `stat` per tick; a zone that fails to load is retried only when
+/// the identity changes, and its error is kept until then.
+#[derive(Debug, Default)]
+pub struct SystemZone {
+    identity: Option<ZoneIdentity>,
+    loaded: Option<Result<Zone, String>>,
+}
+
+/// What [`SystemZone`] compares to decide a reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZoneIdentity {
+    tz: Option<String>,
+    link: Option<PathBuf>,
+    file: Option<(u64, u64, Option<SystemTime>)>,
+}
+
+impl ZoneIdentity {
+    fn now() -> Self {
+        let tz = std::env::var("TZ").ok();
+        let path = match tz.as_deref() {
+            None => Some(PathBuf::from(LOCALTIME_PATH)),
+            Some(spec) => {
+                let spec = spec.strip_prefix(':').unwrap_or(spec);
+                if spec.is_empty() {
+                    None
+                } else if spec.starts_with('/') {
+                    Some(PathBuf::from(spec))
+                } else {
+                    Some(PathBuf::from(ZONEINFO_DIR).join(spec))
+                }
+            }
+        };
+        let link = path.as_deref().and_then(|p| std::fs::read_link(p).ok());
+        let file = path.as_deref().and_then(|p| std::fs::metadata(p).ok()).map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.ino(), m.len(), m.modified().ok())
+        });
+        Self { tz, link, file }
+    }
+}
+
+impl SystemZone {
+    /// A source that loads on first use.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ZoneSource for SystemZone {
+    fn zone(&mut self) -> Result<&Zone, String> {
+        let identity = ZoneIdentity::now();
+        if self.loaded.is_none() || self.identity.as_ref() != Some(&identity) {
+            self.loaded = Some(Zone::load());
+            self.identity = Some(identity);
+        }
+        match self.loaded.as_ref() {
+            Some(Ok(zone)) => Ok(zone),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("local zone not loaded".to_string()),
+        }
+    }
 }
 
 const DAY: i64 = 86_400;
@@ -497,6 +604,32 @@ mod tests {
             .expect("valid schedule")
             .schedule
             .expect("a [schedule] table")
+    }
+
+    #[test]
+    fn admission_lets_only_a_window_hold_through_to_timed_items() {
+        let verdict = ScheduleVerdict {
+            held: BTreeMap::from([
+                ("out".to_string(), HoldReason::OutsideWindow),
+                ("filtered".to_string(), HoldReason::NotInWindow),
+                ("reserve".to_string(), HoldReason::Reserve),
+                ("zone".to_string(), HoldReason::ZoneUnreadable),
+            ]),
+            ..ScheduleVerdict::default()
+        };
+        assert_eq!(verdict.admission("free", true), Admission::Open);
+        assert_eq!(verdict.admission("out", true), Admission::TimedOnly);
+        assert_eq!(verdict.admission("filtered", true), Admission::TimedOnly);
+        assert_eq!(verdict.admission("out", false), Admission::Held(HoldReason::OutsideWindow));
+        assert_eq!(verdict.admission("reserve", true), Admission::Held(HoldReason::Reserve));
+        assert_eq!(verdict.admission("zone", true), Admission::Held(HoldReason::ZoneUnreadable));
+    }
+
+    #[test]
+    fn the_system_zone_loads_once_and_keeps_its_answer_while_the_source_is_unchanged() {
+        let mut zone = SystemZone::new();
+        let first = zone.zone().map(|z| z.name().to_string());
+        assert_eq!(zone.zone().map(|z| z.name().to_string()), first);
     }
 
     #[test]
