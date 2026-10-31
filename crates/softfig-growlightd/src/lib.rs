@@ -55,6 +55,7 @@ pub mod scheduler_v2;
 pub mod server;
 pub mod state;
 pub mod supervisor;
+pub mod telemetry_capture;
 pub mod thrash_bridge;
 pub mod usage;
 pub mod usage_file;
