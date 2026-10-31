@@ -109,6 +109,7 @@ impl Store {
                     sql_u64(r.tokens.output),
                     sql_u64(r.tokens.cache_read),
                     sql_u64(r.tokens.cache_creation),
+                    sql_u64(r.tokens.cache_creation_1h),
                     r.tokens.thinking.map(sql_u64),
                     r.effort,
                     r.speed.map(|s| s.as_str()),
@@ -178,10 +179,11 @@ const INSERT_REQUEST: &str = "\
 INSERT OR IGNORE INTO requests (
     ts, backend, provider, model, session_id, request_id, member, profile,
     item_id, slice_id, queue, turn_index, input_tokens, output_tokens,
-    cache_read_input_tokens, cache_creation_input_tokens, thinking_tokens,
-    effort, speed, stop_reason, tool_use_count, latency_ms, cost_usd, settled_from
+    cache_read_input_tokens, cache_creation_input_tokens,
+    cache_creation_1h_input_tokens, thinking_tokens, effort, speed, stop_reason,
+    tool_use_count, latency_ms, cost_usd, settled_from
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)";
+          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)";
 
 /// `ts` is `YYYY-MM-DDTHH:MM:SSZ`, so its first ten characters are the UTC day.
 /// A null `slice_id` rolls up as `''` (the rollup key can't hold null), and an
@@ -190,12 +192,12 @@ const ROLL_UP_AGED: &str = "\
 INSERT INTO daily_rollup (
     day, model, backend, provider, slice_id, requests, input_tokens,
     output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-    thinking_tokens, cost_usd
+    cache_creation_1h_input_tokens, thinking_tokens, cost_usd
 )
 SELECT substr(ts, 1, 10), model, backend, provider, COALESCE(slice_id, ''),
        COUNT(*), SUM(input_tokens), SUM(output_tokens),
        SUM(cache_read_input_tokens), SUM(cache_creation_input_tokens),
-       COALESCE(SUM(thinking_tokens), 0), COALESCE(SUM(cost_usd), 0.0)
+       SUM(cache_creation_1h_input_tokens), COALESCE(SUM(thinking_tokens), 0), COALESCE(SUM(cost_usd), 0.0)
 FROM requests
 WHERE ts < ?1
 GROUP BY 1, 2, 3, 4, 5
@@ -205,6 +207,7 @@ ON CONFLICT (day, model, backend, provider, slice_id) DO UPDATE SET
     output_tokens               = output_tokens + excluded.output_tokens,
     cache_read_input_tokens     = cache_read_input_tokens + excluded.cache_read_input_tokens,
     cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens,
+    cache_creation_1h_input_tokens = cache_creation_1h_input_tokens + excluded.cache_creation_1h_input_tokens,
     thinking_tokens             = thinking_tokens + excluded.thinking_tokens,
     cost_usd                    = cost_usd + excluded.cost_usd";
 
@@ -232,6 +235,7 @@ pub(crate) mod tests {
                 output: 20,
                 cache_read: 300,
                 cache_creation: 40,
+                cache_creation_1h: 15,
                 thinking: Some(5),
             },
             effort: Some("high".into()),
@@ -427,6 +431,16 @@ pub(crate) mod tests {
                 ),
             ]
         );
+        // The 1h breakdown rolls up beside its total: four rows of 15.
+        let one_h: i64 = store
+            .conn()
+            .query_row(
+                "SELECT SUM(cache_creation_1h_input_tokens) FROM daily_rollup",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(one_h, 60);
 
         // Nothing left to age: no transaction, no change.
         assert_eq!(store.sweep_retention(NOW).unwrap(), SweepOutcome::default());

@@ -3848,8 +3848,10 @@ name = "softfig-telemetry"
 version = "1.0.0-alpha.1"
 dependencies = [
  "rusqlite",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

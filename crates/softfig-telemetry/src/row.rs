@@ -81,6 +81,12 @@ pub struct TokenCounts {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// The part of `cache_creation` written at the 1-hour TTL (claude
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`), priced above the
+    /// 5-minute tier. A breakdown *inside* `cache_creation`, not a sixth
+    /// class, so [`total`](Self::total) never adds it; `0` where the wire has
+    /// no TTL split.
+    pub cache_creation_1h: u64,
     pub thinking: Option<u64>,
 }
 

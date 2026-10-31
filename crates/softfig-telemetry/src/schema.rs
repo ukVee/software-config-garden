@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS requests (
     output_tokens               INTEGER NOT NULL,
     cache_read_input_tokens     INTEGER NOT NULL,
     cache_creation_input_tokens INTEGER NOT NULL,
+    cache_creation_1h_input_tokens INTEGER NOT NULL,
     thinking_tokens             INTEGER,
     effort                      TEXT,
     speed                       TEXT,
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS daily_rollup (
     output_tokens               INTEGER NOT NULL,
     cache_read_input_tokens     INTEGER NOT NULL,
     cache_creation_input_tokens INTEGER NOT NULL,
+    cache_creation_1h_input_tokens INTEGER NOT NULL,
     thinking_tokens             INTEGER NOT NULL,
     cost_usd                    REAL    NOT NULL,
     PRIMARY KEY (day, model, backend, provider, slice_id)
@@ -100,6 +102,7 @@ mod tests {
             "output_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
+            "cache_creation_1h_input_tokens",
             "thinking_tokens",
             "cost_usd",
         ] {

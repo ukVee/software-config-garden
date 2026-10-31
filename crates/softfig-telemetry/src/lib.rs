@@ -21,6 +21,12 @@
 //!   batch ([`SettledFrom::Transcript`]), idempotent on
 //!   `(session_id, request_id)`.
 //!
+//! ## Pricing
+//!
+//! A capture point prices each row once with [`PriceTable::price_row`] (the
+//! garden's `config/pricing.toml`, spec §6) before recording it, so
+//! `cost_usd` is fixed at write time. An unknown model stores null, never 0.
+//!
 //! ## What a row never carries
 //!
 //! Message bodies. A row is ids + token counts + a derived cost, so a
@@ -33,6 +39,7 @@
 //! when idle). The constants live in [`schema`].
 
 pub mod flush;
+pub mod pricing;
 pub mod recorder;
 pub mod ring;
 pub mod row;
@@ -41,6 +48,7 @@ pub mod store;
 pub mod ts;
 
 pub use flush::{Clock, FlushHandle, FlushPolicy, FlushStats, Flusher};
+pub use pricing::{ModelPrice, PriceTable, PricingError};
 pub use recorder::{NullRecorder, Recorder};
 pub use ring::RingRecorder;
 pub use row::{Backend, RequestRow, SettledFrom, Speed, TokenCounts};
