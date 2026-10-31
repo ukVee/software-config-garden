@@ -30,7 +30,8 @@ use softfig_ipc::{
         PausedReply, QueueShowEntry, QueueShowReply, ResumeItemArgs, ResumeItemReply,
         SetResourcesArgs, SetResourcesReply, StopLevel, StopReply,
     },
-    queue_v2::{Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
+    backlog_doc::BACKLOG_DOC,
+    queue_v2::{migrate, Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
     verbs::{
         GrowlightInitArgs, GrowlightInitReply, ListReportsArgs, ListReportsReply, PostMessageArgs,
         PostMessageReply, QueueAddEntryReply, QueueAddProjectReply, QueueDropReply, QueueMoveSpec,
@@ -2265,6 +2266,30 @@ pub enum QueueSub {
 
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
     Drop(QueueDropArgs),
+
+    /// Convert the legacy backlog to the v2 files (§11). `--dry-run` reads the
+    /// backlog off the mount and the runtime batons, and prints the plan,
+    /// every judgment call and every refusal. It writes nothing and calls no
+    /// daemon.
+    Migrate(QueueMigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueMigrateArgs {
+    /// Print the plan; write nothing. Required until `--apply` lands.
+    #[arg(long, required = true)]
+    pub dry_run: bool,
+    /// The owner's settlements (`schema = 1`, `[class]`, `[call]`).
+    /// Omitted: every call stays open.
+    #[arg(long, value_name = "TOML")]
+    pub answers: Option<PathBuf>,
+    /// The mounted garden. Defaults to `~/soft-fig_garden`.
+    #[arg(long, value_name = "PATH")]
+    pub garden: Option<PathBuf>,
+    /// The growlight runtime dir the batons live in. Defaults to
+    /// `$XDG_CONFIG_HOME/softfig/growlight`.
+    #[arg(long, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2563,6 +2588,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Fleet(a) => queue_fleet(&socket, a),
         QueueSub::NotBefore(a) => queue_not_before(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
+        QueueSub::Migrate(a) => queue_migrate(a),
     }
 }
 
@@ -2697,6 +2723,183 @@ fn queue_pick(socket: &Path, member: Option<&str>) -> Result<()> {
         growlight_call(socket, growlightd::op::QUEUE_PICK, serde_json::to_value(args)?)?;
     print!("{}", render_queue_pick(&reply));
     Ok(())
+}
+
+/// `queue migrate --dry-run`: snapshot the legacy files, plan, print. Read
+/// only — plain file reads, no daemon call.
+fn queue_migrate(args: QueueMigrateArgs) -> Result<()> {
+    let garden = match args.garden {
+        Some(p) => p,
+        None => home_dir()?.join("soft-fig_garden"),
+    };
+    let runtime = runtime_dir(args.config_dir)?;
+    let answers = match &args.answers {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml::from_str::<migrate::Answers>(&text)
+                .with_context(|| format!("parsing {}", path.display()))?
+        }
+        None => migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: Default::default(),
+        },
+    };
+    let files = migrate_snapshot(&garden, &runtime)?;
+    let doc = files
+        .garden
+        .get(BACKLOG_DOC)
+        .ok_or_else(|| anyhow!("no {BACKLOG_DOC} under {}", garden.display()))?;
+    let version = softfig_store::Hash::of(doc.as_bytes()).to_hex();
+    let legacy = migrate::read_legacy(&files)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let plan = migrate::plan(&legacy, &answers, &crate::cmd_repo::iso8601(now));
+    print!("{}", render_migrate_dry_run(&plan, &version));
+    Ok(())
+}
+
+/// The converter's snapshot: every `.md` under the garden's
+/// `growlight/backlog/` (garden-relative keys), plus the runtime's root
+/// `baton.md` and each `agents/<id>/baton.md` (runtime-relative keys).
+fn migrate_snapshot(garden: &Path, runtime: &Path) -> Result<migrate::LegacyFiles> {
+    fn walk(root: &Path, dir: &Path, into: &mut std::collections::BTreeMap<String, String>) -> Result<()> {
+        let entries = fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(root, &path, into)?;
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "md") {
+                let rel = path.strip_prefix(root).expect("walked under root");
+                let key = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", path.display()))?;
+                let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+                into.insert(key.to_string(), text);
+            }
+        }
+        Ok(())
+    }
+    let mut files = migrate::LegacyFiles::default();
+    let backlog = garden.join(BACKLOG_DOC);
+    let backlog_dir = backlog.parent().expect("BACKLOG_DOC has a parent");
+    walk(garden, backlog_dir, &mut files.garden)?;
+
+    let mut batons = vec![PathBuf::from("baton.md")];
+    if let Ok(agents) = fs::read_dir(runtime.join("agents")) {
+        for agent in agents.flatten() {
+            if agent.file_type().is_ok_and(|k| k.is_dir()) {
+                batons.push(Path::new("agents").join(agent.file_name()).join("baton.md"));
+            }
+        }
+    }
+    for rel in batons {
+        let path = runtime.join(&rel);
+        if path.is_file() {
+            let key = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", path.display()))?;
+            let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            files.batons.insert(key.to_string(), text);
+        }
+    }
+    Ok(files)
+}
+
+/// The `queue migrate --dry-run` rendering: the backlog doc's version, the
+/// counts, the projects, the entries in list order, the slices files, the
+/// baton copies, every call (open and settled), every refusal, and the
+/// `N calls need you` line last.
+fn render_migrate_dry_run(plan: &migrate::MigrationPlan, version: &str) -> String {
+    let mut out = String::from("queue migrate --dry-run — nothing written\n");
+    out.push_str(&format!("backlog doc version: {version}\n"));
+    out.push_str(&format!(
+        "plan: {} projects, {} entries, {} archived, {} slices files, {} baton copies\n",
+        plan.queue.projects.len(),
+        plan.queue.entries.len(),
+        plan.archive.entries.len(),
+        plan.slices.len(),
+        plan.batons.len(),
+    ));
+
+    out.push_str("\nprojects:\n");
+    for p in &plan.queue.projects {
+        out.push_str(&format!("  {}  repo={}  main={}\n", p.name, p.repo, p.main));
+    }
+
+    out.push_str("\nentries (list order):\n");
+    for e in &plan.queue.entries {
+        let mut line = format!("  {} {} {} {} {}", e.id, e.kind, e.project, e.lane, e.status);
+        if !e.fleet {
+            line.push_str(" fleet=false");
+        }
+        if let Some(t) = &e.not_before {
+            line.push_str(&format!(" not_before={t}"));
+        }
+        if !e.after.is_empty() {
+            line.push_str(&format!(" after={}", e.after.join(",")));
+        }
+        if !e.branch.is_empty() {
+            line.push_str(&format!(" branch={}", e.branch));
+        }
+        if !e.base.is_empty() {
+            line.push_str(&format!(" parent={} base={}", e.parent, e.base));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    out.push_str(&format!("\narchived: {} rows\n", plan.archive.entries.len()));
+
+    if !plan.slices.is_empty() {
+        out.push_str("\nslices:\n");
+        for (id, slices) in &plan.slices {
+            let done = slices.items.iter().filter(|s| s.status == SliceStatus::Done).count();
+            out.push_str(&format!("  {id}: {} items, {done} done\n", slices.items.len()));
+        }
+    }
+
+    if !plan.batons.is_empty() {
+        out.push_str("\nbaton copies:\n");
+        for b in &plan.batons {
+            out.push_str(&format!("  {} -> entries/{}/baton.md\n", b.from, b.entry));
+        }
+    }
+
+    let open = plan.open_calls().count();
+    out.push_str(&format!(
+        "\njudgment calls: {} ({open} open, {} settled)\n",
+        plan.calls.len(),
+        plan.calls.len() - open
+    ));
+    for c in &plan.calls {
+        match &c.settled {
+            Some(answer) => out.push_str(&format!("  [settled] {} = {answer}\n", c.key)),
+            None => out.push_str(&format!("  [open] {}\n", c.key)),
+        }
+        out.push_str(&format!("      evidence: {}\n", c.evidence));
+        out.push_str(&format!("      proposed: {}\n", c.proposed));
+    }
+
+    out.push_str(&format!("\nrefusals: {}\n", plan.refusals.len()));
+    for r in &plan.refusals {
+        out.push_str(&format!("  {}: {}\n", r.subject, r.reason));
+    }
+
+    out.push('\n');
+    if !plan.refusals.is_empty() {
+        let n = plan.refusals.len();
+        out.push_str(&match n {
+            1 => "1 refusal blocks the apply\n".to_string(),
+            n => format!("{n} refusals block the apply\n"),
+        });
+    }
+    out.push_str(&match open {
+        1 => "1 call needs you\n".to_string(),
+        n => format!("{n} calls need you\n"),
+    });
+    out
 }
 
 /// The `queue pick` rendering: who the pick ran for, the assignment (or its
@@ -5709,5 +5912,55 @@ mod tests {
             hint.ends_with("--model claude-opus-4-7 --effort high"),
             "hint tail: {hint}",
         );
+    }
+
+    /// `queue migrate --dry-run` (queue-v2-migrate slice 004): the snapshot
+    /// takes the backlog's `.md` files and the root + member batons only, and
+    /// the rendering carries the version, the counts, every call with its
+    /// evidence and proposal, every refusal, and the open-call line last.
+    #[test]
+    fn migrate_dry_run_snapshot_and_rendering() {
+        let garden = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let backlog = garden.path().join("growlight/backlog");
+        fs::create_dir_all(backlog.join("tasks")).unwrap();
+        let doc = "# backlog\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                   |---|----|------|-------|--------|\n| 1 | 001 | task | First | queued |\n\n\
+                   <!-- /softfig:queue -->\n\n<!-- softfig:queue:ghost -->\n<!-- /softfig:queue:ghost -->\n";
+        fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
+        fs::write(backlog.join("tasks/001-first.md"), "# First\n").unwrap();
+        fs::write(backlog.join("tasks/.seq"), "1\n").unwrap();
+        fs::create_dir_all(runtime.path().join("agents/a")).unwrap();
+        let head = "---\nstatus: IN_PROGRESS\nitem: 001\n---\n";
+        fs::write(runtime.path().join("agents/a/baton.md"), head).unwrap();
+        fs::write(runtime.path().join("baton.x.parked.md"), head).unwrap();
+
+        let files = migrate_snapshot(garden.path(), runtime.path()).unwrap();
+        let keys: Vec<_> = files.garden.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["growlight/backlog/CLAUDE.md", "growlight/backlog/tasks/001-first.md"]);
+        let batons: Vec<_> = files.batons.keys().map(String::as_str).collect();
+        assert_eq!(batons, vec!["agents/a/baton.md"]);
+
+        let answers = migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: [("project_main:softfig".to_string(), "main".to_string())].into(),
+        };
+        let legacy = migrate::read_legacy(&files).unwrap();
+        let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        let out = render_migrate_dry_run(&plan, "v123");
+
+        assert!(out.starts_with("queue migrate --dry-run — nothing written\nbacklog doc version: v123\n"));
+        assert!(out.contains("plan: 1 projects, 1 entries, 0 archived, 0 slices files, 1 baton copies\n"));
+        assert!(out.contains("  001 task softfig normal "), "{out}");
+        assert!(out.contains("  agents/a/baton.md -> entries/001/baton.md\n"), "{out}");
+        assert!(out.contains("  [settled] project_main:softfig = main\n"), "{out}");
+        assert!(out.contains("  [open] project_repo:softfig\n      evidence: "), "{out}");
+        assert!(out.contains("\n      proposed: "), "{out}");
+        assert!(out.contains("refusals: 1\n  queue:ghost: "), "{out}");
+        let open = plan.open_calls().count();
+        assert!(open > 0);
+        let last = if open == 1 { "1 call needs you\n".to_string() } else { format!("{open} calls need you\n") };
+        assert!(out.ends_with(&format!("1 refusal blocks the apply\n{last}")), "{out}");
     }
 }
