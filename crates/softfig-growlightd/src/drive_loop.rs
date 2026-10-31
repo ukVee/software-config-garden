@@ -12367,6 +12367,41 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     }
 
     #[test]
+    fn a_claude_only_window_holds_an_opencode_member_with_not_in_window() {
+        let (loop_, d, backend, claimer, _queues, _probe) = make_claiming(
+            vec![
+                member("a1", "qa"),
+                member("b1", "qb").with_backend(crate::fleet::MemberBackend::Opencode(
+                    crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+                )),
+            ],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            Policy::default(),
+        );
+        set_schedule(
+            &d,
+            "enabled = true\n[[schedule.window]]\nstart = \"10:00\"\nend = \"12:00\"\nbackends = [\"claude\"]\n",
+        );
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+
+        let r = loop_.tick(OPEN);
+        assert_eq!(backend.spawns(), vec!["a1"], "only the claude member starts");
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert_eq!(r.schedule_held, vec![("b1".to_string(), HoldReason::NotInWindow)]);
+
+        // Outside the window both are held, for the other reason.
+        let r = loop_.tick(CLOSE);
+        assert_eq!(
+            r.schedule_held,
+            vec![
+                ("a1".to_string(), HoldReason::OutsideWindow),
+                ("b1".to_string(), HoldReason::OutsideWindow),
+            ],
+        );
+        assert_eq!(backend.spawns(), vec!["a1"]);
+    }
+
+    #[test]
     fn a_pool_at_its_weekly_reserve_holds_the_member_even_in_an_open_window() {
         let runtime = tempfile::tempdir().unwrap();
         let by_profile = runtime.path().join("usage.by-profile");

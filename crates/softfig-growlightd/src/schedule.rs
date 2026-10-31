@@ -1011,6 +1011,35 @@ mod tests {
     }
 
     #[test]
+    fn a_window_filter_is_backends_and_members() {
+        let window = |backends: Option<&[Backend]>, ids: Option<&[&str]>| Window {
+            label: String::new(),
+            days: DaySet::ALL,
+            start_min: 0,
+            end_min: 0,
+            backends: backends.map(<[Backend]>::to_vec),
+            members: ids.map(|ids| ids.iter().map(|s| s.to_string()).collect()),
+        };
+        let [a, b] = members();
+        let claude: &[Backend] = &[Backend::Claude];
+        let both: &[Backend] = &[Backend::Claude, Backend::Opencode];
+        // (backends, members) → (admits a [claude], admits b [opencode])
+        let matrix = [
+            (None, None, (true, true)),
+            (Some(claude), None, (true, false)),
+            (Some(both), None, (true, true)),
+            (None, Some(&["b"][..]), (false, true)),
+            (Some(claude), Some(&["a", "b"][..]), (true, false)),
+            (Some(claude), Some(&["b"][..]), (false, false)),
+            (Some(both), Some(&["b"][..]), (false, true)),
+        ];
+        for (backends, ids, want) in matrix {
+            let w = window(backends, ids);
+            assert_eq!((w.matches(&a), w.matches(&b)), want, "{backends:?} {ids:?}");
+        }
+    }
+
+    #[test]
     fn two_windows_union_and_filters_pick_members() {
         let cfg = schedule(concat!(
             "[[schedule.window]]\nstart = \"10:00\"\nend = \"12:00\"\nbackends = [\"claude\"]\n",
