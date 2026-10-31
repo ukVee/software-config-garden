@@ -2137,12 +2137,18 @@ impl DriveLoop {
                             .filter(|e| e.is_model_refused())
                             .map(|e| e.text.clone())
                     };
-                    let repo_probe = &self.repo_probe;
+                    // A v2 member reads the repo its claim resolved (queue-v2-parity
+                    // row 7); the two maps never both hold one agent.
+                    let repo_probe = self.repo_probe.as_ref();
                     let assignment = self.assignments.get(agent);
+                    let v2_assignment = self.v2_assignments.get(agent);
                     let repo_state = || {
-                        repo_read = assignment
-                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part))
-                            .map(|(_, state)| state);
+                        repo_read = match (assignment, v2_assignment) {
+                            (Some((queue, part)), _) => repo_probe.repo_state(queue, part),
+                            (None, Some(assignment)) => v2_repo_read(repo_probe, assignment),
+                            (None, None) => None,
+                        }
+                        .map(|(_, state)| state);
                         repo_read.clone()
                     };
                     self.supervisor.poll_with_progress(
@@ -9116,6 +9122,57 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(repo.v2_reads().is_empty(), "nothing is probed");
         assert!(backend.warns().is_empty());
         assert_eq!(backend.events(), vec!["spawn:c1"]);
+    }
+
+    /// QUEUE-V2-PARITY ROW 7 — the task 069 replay for a v2 member: the spin
+    /// guard reads the repo the claim resolved, so a session that ends with the
+    /// same NEXT ACTION but a moved repo is progress, not a spin. A session
+    /// after it that moves nothing parks the entry.
+    #[test]
+    fn a_v2_member_whose_repo_moves_is_not_parked_as_stuck() {
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let parker = Arc::new(FakeV2Parker::default());
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir("row7"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+
+        loop_.tick(0); // a1 claims m1
+        source.set(snapshot(EntryStatus::Active));
+        let start_reads = repo.v2_reads().len();
+
+        // Session 1 hands off X on a clean tree.
+        repo.set("h1", 0, 0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "wire the booking form");
+        let r1 = loop_.tick(1);
+        assert!(r1.v2_parked.is_empty());
+        assert_eq!(
+            repo.v2_reads()[start_reads..],
+            [PathBuf::from("/garden")],
+            "one read, of the repo the claim resolved",
+        );
+
+        // Session 2 works and ends with no handoff: same NEXT ACTION, 5 files dirty.
+        repo.set("h1", 5, 42);
+        let r2 = loop_.tick(2);
+        assert!(r2.v2_parked.is_empty(), "the repo moved — progress, not a spin");
+        assert!(parker.parked.lock().unwrap().is_empty(), "m1 is not parked");
+        assert_eq!(backend.spawn_count(), 3, "a1 re-rolled onto m1");
+        assert_eq!(repo.v2_reads().len() - start_reads, 2, "one repo read per session exit");
+
+        // Session 3 moves nothing: now it is a spin.
+        let r3 = loop_.tick(3);
+        assert_eq!(r3.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
+        assert_eq!(*parker.parked.lock().unwrap(), ["m1"]);
     }
 
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op

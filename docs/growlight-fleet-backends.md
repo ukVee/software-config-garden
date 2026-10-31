@@ -379,6 +379,10 @@ signal once its doc carries `> Worktree:`, since the default queue has no regist
 The repo is read once per session exit, with `git --no-optional-locks`, never once per
 tick.
 
+Under `queue = "v2"` the guard reads the repo the member's claim resolved, the same one
+the dirty-tree guard below reads (queue-v2-parity row 7). A remote or ambiguous repo gives
+no repo signal, the same as an unprobeable legacy repo.
+
 The repo excuses at most three repeats of one NEXT ACTION, and only a repo state not
 already seen during that NEXT ACTION's run. A tree that churns forever, or flips between
 two states, still trips. On a trip (two exits on the same NEXT ACTION with nothing to
