@@ -36,7 +36,7 @@ use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource}
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::ipc::{IpcClient, ReqId, Reply, Tag};
 use crate::prefs::{self, UiPrefs};
-use crate::queue_v2_view::{self, QueueV2View, V2Action, V2RowKind};
+use crate::queue_v2_view::{self, HumanStatus, QueueV2View, StatusTarget, V2Action, V2RowKind};
 use crate::listpane::ListPane;
 use crate::tree::{
     derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
@@ -283,6 +283,15 @@ pub enum Overlay {
         action: V2Action,
         preview: String,
         error: Option<String>,
+    },
+    /// Pick the human status for the selected entry or slice (`s`). `target`
+    /// is what the picker opened on; `current` its status then; `selected` an
+    /// index into [`HumanStatus::ALL`]. Choosing issues the usual dry-run and
+    /// confirm, so `done` (which archives an entry) is still one `y` away.
+    QueueStatusPick {
+        target: StatusTarget,
+        current: String,
+        selected: usize,
     },
     /// growlight slice 007: collect the comma-separated `after` link list to
     /// replace the selected entry's links (`a`). `buf` is the raw input;
@@ -2005,6 +2014,7 @@ impl App {
             Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
             Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
             Overlay::QueueConfirm { .. } => self.handle_key_queue_confirm(key, ipc),
+            Overlay::QueueStatusPick { .. } => self.handle_key_queue_status_pick(key, ipc),
             Overlay::QueueEditAfter { .. } => self.handle_key_queue_edit_after(key, ipc),
             Overlay::QueueDrop { .. } => self.handle_key_queue_drop(key, ipc),
             Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
@@ -2136,23 +2146,15 @@ impl App {
                 self.toggle_growlight_v2()
             }
             KeyCode::Char('K') if self.in_growlight_v2() => {
-                self.v2_run(ipc, |r, v| queue_v2_view::entry_move(r, v, true))
+                self.v2_run(ipc, |r, v| queue_v2_view::move_selected(r, v, true))
             }
             KeyCode::Char('J') if self.in_growlight_v2() => {
-                self.v2_run(ipc, |r, v| queue_v2_view::entry_move(r, v, false))
+                self.v2_run(ipc, |r, v| queue_v2_view::move_selected(r, v, false))
             }
             KeyCode::Char('t') if self.in_growlight_v2() => {
                 self.v2_run(ipc, queue_v2_view::lane_toggle)
             }
-            KeyCode::Char('s') if self.in_growlight_v2() => {
-                self.v2_run(ipc, queue_v2_view::entry_status_cycle)
-            }
-            KeyCode::Char('M') if self.in_growlight_v2() => {
-                self.v2_run(ipc, queue_v2_view::slice_move)
-            }
-            KeyCode::Char('S') if self.in_growlight_v2() => {
-                self.v2_run(ipc, queue_v2_view::slice_status_cycle)
-            }
+            KeyCode::Char('s') if self.in_growlight_v2() => self.start_status_pick(),
             KeyCode::Char('a') if self.in_growlight_v2() => self.start_edit_after(),
             KeyCode::Char('d') if self.in_growlight_v2() => self.start_queue_drop(),
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
@@ -3919,6 +3921,50 @@ impl App {
         }
     }
 
+    /// `s` — open the status picker on the selected entry or slice.
+    fn start_status_pick(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some((target, current)) = queue_v2_view::status_pick(r, &self.growlight_v2) else {
+            self.status = "that action doesn't apply to this row".into();
+            return;
+        };
+        let selected = HumanStatus::ALL
+            .iter()
+            .position(|s| s.word() == current)
+            .unwrap_or(0);
+        self.overlay = Overlay::QueueStatusPick { target, current, selected };
+    }
+
+    fn handle_key_queue_status_pick(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::QueueStatusPick { selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let n = HumanStatus::ALL.len();
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => *selected = (*selected + n - 1) % n,
+            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1) % n,
+            KeyCode::Enter => {
+                let at = *selected;
+                self.choose_status(at, ipc);
+            }
+            // `1`..`4` pick directly (and are the touch chips' keys).
+            KeyCode::Char(c @ '1'..='4') => self.choose_status(c as usize - '1' as usize, ipc),
+            _ => {}
+        }
+    }
+
+    /// Close the picker and issue the dry-run for status `HumanStatus::ALL[at]`
+    /// on the target the picker captured.
+    fn choose_status(&mut self, at: usize, ipc: &mut IpcClient) {
+        let Overlay::QueueStatusPick { target, .. } = &self.overlay else {
+            return;
+        };
+        let action = queue_v2_view::status_action(target, HumanStatus::ALL[at]);
+        self.overlay = Overlay::None;
+        self.run_v2_action(action, ipc);
+    }
+
     /// `a` — open the `after`-links editor for the selected entry.
     fn start_edit_after(&mut self) {
         let Some(r) = &self.growlight_queue_v2 else { return };
@@ -4081,6 +4127,9 @@ impl App {
                 }
                 if !entry.base.is_empty() {
                     body.push_str(&format!("base: {}\n", entry.base));
+                }
+                if let Some(p) = &entry.pending_status {
+                    body.push_str(&format!("pending status: {p} (applies at the next handshake)\n"));
                 }
                 if !entry.claimed.is_empty() {
                     body.push_str(&format!("claimed: {}\n", entry.claimed));
@@ -7988,6 +8037,7 @@ mod tests {
             branch: String::new(),
             base: String::new(),
             claimed: String::new(),
+            pending_status: None,
             open: false,
         }
     }
@@ -8005,6 +8055,8 @@ mod tests {
             trees: Vec::new(),
         });
         app.growlight_v2.select(1, 2);
+        app.view = View::Growlight;
+        app.growlight_v2_view = true;
         app
     }
 
@@ -8101,5 +8153,45 @@ mod tests {
         assert_eq!(action.target(), "a");
         assert_eq!(preview, "would-be");
         assert!(app.growlight_v2_pending.is_empty());
+    }
+
+    // ---- queue v2 status picker (review 044 V11) ---------------------------
+
+    #[test]
+    fn the_status_picker_sets_the_chosen_status_on_the_captured_entry() {
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2.select(0, 2);
+        let mut ipc = dummy_ipc();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        let Overlay::QueueStatusPick { target, selected, .. } = &app.overlay else {
+            panic!("`s` opens the picker, got {:?}", app.overlay)
+        };
+        assert_eq!(*target, StatusTarget::Entry("a".into()));
+        assert_eq!(*selected, 0, "preselects the current status (queued)");
+        // The cursor moves on; the pick still lands on `a`.
+        app.growlight_v2.select(1, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        let p = only_pending(&app);
+        assert!(p.dry_run);
+        let V2Action::EntryUpdate(args) = &p.action else { panic!("expected an entry update") };
+        assert_eq!(args.id, "a");
+        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Blocked));
+    }
+
+    #[test]
+    fn a_digit_picks_directly_and_esc_sends_nothing() {
+        let mut app = v2_app_cursor_on_b();
+        let mut ipc = dummy_ipc();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.growlight_v2_pending.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &mut ipc);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else { panic!() };
+        assert_eq!(args.id, "b");
+        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Deferred));
     }
 }

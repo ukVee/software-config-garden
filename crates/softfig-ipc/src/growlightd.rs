@@ -1254,6 +1254,13 @@ pub struct QueueShowEntry {
     pub branch: String,
     pub base: String,
     pub claimed: String,
+    /// A human status change recorded on an `active` entry and waiting for the
+    /// session's next handshake (§6.8), as its wire word. Absent when none is
+    /// pending, and on a reply from a daemon that predates the field — so a
+    /// surface that shows only `status` reads a blocked-but-still-`active`
+    /// entry as plain `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_status: Option<String>,
     /// The live git-stack annotation: this entry's branch is an *open* stack
     /// candidate (started and — for a local repo — not yet merged into `main`).
     /// `false` for a never-claimed entry, a restack (no branch), or a local

@@ -18,7 +18,7 @@ use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
-use crate::queue_v2_view::{V2Action, V2RowKind};
+use crate::queue_v2_view::{HumanStatus, StatusTarget, V2Action, V2RowKind};
 use softfig_ipc::{human_age_secs, DeployAction};
 
 /// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
@@ -163,6 +163,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
             preview,
             error,
         } => render_queue_confirm(f, action, preview, error.as_deref(), &mut hits, area),
+        Overlay::QueueStatusPick {
+            target,
+            current,
+            selected,
+        } => render_queue_status_pick(f, target, current, *selected, &mut hits, area),
         Overlay::QueueEditAfter { buf, entry, error } => {
             render_queue_edit_after(f, entry, buf, error.as_deref(), &mut hits, area)
         }
@@ -1541,6 +1546,61 @@ fn render_growlight_v2_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, a
         &mut app.preview_total,
         hits,
     );
+}
+
+/// Pick a human status for one entry or slice. Each option carries a line on
+/// what it does, because `done` on an entry archives it.
+fn render_queue_status_pick(
+    f: &mut Frame,
+    target: &StatusTarget,
+    current: &str,
+    selected: usize,
+    hits: &mut HitMap,
+    area: Rect,
+) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ", target.describe()),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(format!("(now: {current})")),
+        ]),
+        Line::raw(""),
+    ];
+    for (i, status) in HumanStatus::ALL.iter().enumerate() {
+        let style = if i == selected { sel_style() } else { Style::default() };
+        lines.push(Line::styled(
+            format!(
+                "{} {} {:<9} {}",
+                if i == selected { ">" } else { " " },
+                i + 1,
+                status.word(),
+                target.hint(*status)
+            ),
+            style,
+        ));
+    }
+    lines.push(Line::raw(""));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("1 queued", hit::key(KeyCode::Char('1'))),
+            ("2 blocked", hit::key(KeyCode::Char('2'))),
+            ("3 deferred", hit::key(KeyCode::Char('3'))),
+            ("4 done", hit::key(KeyCode::Char('4'))),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("set status"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
 }
 
 /// Confirm a §6.9 mutating action: show the dry-run `view` (capped) and ask y/n.

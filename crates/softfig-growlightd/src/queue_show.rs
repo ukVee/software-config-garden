@@ -121,6 +121,7 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
             branch: entry.branch.clone(),
             base: entry.base.clone(),
             claimed: entry.claimed.clone(),
+            pending_status: entry.pending.map(|s| s.to_string()),
             open: !entry.branch.is_empty()
                 && open.contains(&(entry.project.clone(), entry.branch.clone())),
         });
@@ -167,6 +168,7 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
                 branch: a.row.branch,
                 base: a.row.base,
                 claimed: a.row.claimed,
+                pending_status: None,
                 open: false,
             });
         }
@@ -400,6 +402,27 @@ mod tests {
         assert_eq!(proj.stack.len(), 1);
         assert_eq!(proj.stack[0].branch, "feat/open");
         assert_eq!(proj.stack[0].entry, "open");
+    }
+
+    #[test]
+    fn a_pending_human_status_reaches_the_reply() {
+        // An `active` entry a human has marked `blocked` still reads `active`
+        // until the handshake applies it; the reply must say what is waiting.
+        let repo = seeded_repo();
+        let root = repo.path();
+        let mut waiting = entry("w", "feat/w", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
+        waiting.pending = Some(EntryStatus::Blocked);
+        let plain = entry("p", "feat/p", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
+        let reply = build(&snap(root, vec![waiting, plain], BTreeMap::new()), root, None);
+        let w = reply.entries.iter().find(|e| e.id == "w").unwrap();
+        assert_eq!((w.status.as_str(), w.pending_status.as_deref()), ("active", Some("blocked")));
+        let p = reply.entries.iter().find(|e| e.id == "p").unwrap();
+        assert_eq!(p.pending_status, None);
+        // Absent on the wire when none is pending, and tolerated when absent.
+        let json = serde_json::to_value(p).unwrap();
+        assert!(json.get("pending_status").is_none(), "{json}");
+        let back: softfig_ipc::growlightd::QueueShowEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.pending_status, None);
     }
 
     #[test]

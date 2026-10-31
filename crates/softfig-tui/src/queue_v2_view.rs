@@ -329,6 +329,9 @@ fn push_entry(
     if e.open {
         label.push_str(" (open)");
     }
+    if let Some(p) = &e.pending_status {
+        label.push_str(&format!("  (→ {p} pending)"));
+    }
     if !e.after.is_empty() {
         label.push_str(&format!("  after: {}", e.after.join(", ")));
     }
@@ -429,27 +432,112 @@ pub fn lane_toggle(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Actio
     }))
 }
 
-/// Cycle the selected entry's status through the human statuses
-/// `queued → blocked → deferred → done → queued`.
-pub fn entry_status_cycle(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Action> {
-    let row = selected_entry(reply, view)?;
-    if !matches!(row.kind, V2RowKind::Urgent | V2RowKind::Normal) {
-        return None;
+/// The human statuses a status picker offers, the same four at both levels
+/// (§6.8 entry, §3.3 slice). `active`, `paused` and `split` are daemon-owned
+/// and refused by the verbs, so they are never offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanStatus {
+    Queued,
+    Blocked,
+    Deferred,
+    Done,
+}
+
+impl HumanStatus {
+    pub const ALL: [HumanStatus; 4] = [
+        HumanStatus::Queued,
+        HumanStatus::Blocked,
+        HumanStatus::Deferred,
+        HumanStatus::Done,
+    ];
+
+    /// The wire word, which is also what the rows' `status` carries.
+    pub fn word(self) -> &'static str {
+        match self {
+            HumanStatus::Queued => "queued",
+            HumanStatus::Blocked => "blocked",
+            HumanStatus::Deferred => "deferred",
+            HumanStatus::Done => "done",
+        }
     }
-    let next = match row.status.as_str() {
-        "queued" => QueueStatusArg::Blocked,
-        "blocked" => QueueStatusArg::Deferred,
-        "deferred" => QueueStatusArg::Done,
-        _ => QueueStatusArg::Queued, // done, active, paused, … → queued
-    };
-    Some(V2Action::EntryUpdate(QueueUpdateEntryArgs {
-        id: row.entry_id.clone(),
-        lane: None,
-        move_spec: None,
-        after: None,
-        status: Some(next),
-        dry_run: false,
-    }))
+}
+
+/// What a status pick addresses, captured when the picker opens (never the
+/// cursor row at confirm time — see review 044 V12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusTarget {
+    Entry(String),
+    Slice { milestone: String, id: String },
+}
+
+impl StatusTarget {
+    pub fn describe(&self) -> String {
+        match self {
+            StatusTarget::Entry(id) => format!("entry {id}"),
+            StatusTarget::Slice { milestone, id } => format!("slice {milestone}/{id}"),
+        }
+    }
+
+    /// One line on what picking `status` does, so `done` on an entry is not
+    /// mistaken for a label (it archives the entry).
+    pub fn hint(&self, status: HumanStatus) -> &'static str {
+        match (self, status) {
+            (_, HumanStatus::Queued) => "queue it (also unblocks and un-defers)",
+            (_, HumanStatus::Blocked) => "hold it out of the pick order",
+            (_, HumanStatus::Deferred) => "park it for the human",
+            (StatusTarget::Entry(_), HumanStatus::Done) => {
+                "archive it (a human override; it leaves the list)"
+            }
+            (StatusTarget::Slice { .. }, HumanStatus::Done) => "mark the slice done",
+        }
+    }
+}
+
+/// What `s` would change: the selected entry or slice and its current status,
+/// or `None` for a row with no status verb (an archive row, a `sub` item).
+pub fn status_pick(reply: &QueueShowReply, view: &QueueV2View) -> Option<(StatusTarget, String)> {
+    let row = selected_entry(reply, view)?;
+    match row.kind {
+        V2RowKind::Urgent | V2RowKind::Normal => {
+            Some((StatusTarget::Entry(row.entry_id.clone()), row.status.clone()))
+        }
+        V2RowKind::Slice => {
+            let (milestone, id) = selected_slice(reply, view)?;
+            Some((StatusTarget::Slice { milestone, id }, row.status.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The action that sets `target` to `status` (the caller sets `dry_run`).
+pub fn status_action(target: &StatusTarget, status: HumanStatus) -> V2Action {
+    match target {
+        StatusTarget::Entry(id) => V2Action::EntryUpdate(QueueUpdateEntryArgs {
+            id: id.clone(),
+            lane: None,
+            move_spec: None,
+            after: None,
+            status: Some(match status {
+                HumanStatus::Queued => QueueStatusArg::Queued,
+                HumanStatus::Blocked => QueueStatusArg::Blocked,
+                HumanStatus::Deferred => QueueStatusArg::Deferred,
+                HumanStatus::Done => QueueStatusArg::Done,
+            }),
+            dry_run: false,
+        }),
+        StatusTarget::Slice { milestone, id } => V2Action::SliceUpdate(SliceUpdateArgs {
+            milestone: milestone.clone(),
+            id: id.clone(),
+            move_spec: None,
+            status: Some(match status {
+                HumanStatus::Queued => SliceStatus::Queued,
+                HumanStatus::Blocked => SliceStatus::Blocked,
+                HumanStatus::Deferred => SliceStatus::Deferred,
+                HumanStatus::Done => SliceStatus::Done,
+            }),
+            dry_run: false,
+        }),
+    }
 }
 
 /// The live lane entry `id`, or `None` once a reload has taken it out of the
@@ -503,9 +591,9 @@ fn selected_slice(reply: &QueueShowReply, view: &QueueV2View) -> Option<(String,
     Some((milestone, id))
 }
 
-/// Move the selected slice up one position within its milestone (before its
-/// previous sibling, or `front` when already first).
-pub fn slice_move(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Action> {
+/// Move the selected slice one position up or down within its milestone's
+/// slices (a `sub` item is never a sibling). `None` at either boundary.
+pub fn slice_move(reply: &QueueShowReply, view: &QueueV2View, up: bool) -> Option<V2Action> {
     let (milestone, id) = selected_slice(reply, view)?;
     let tree = tree_for(reply, &milestone)?;
     let slices: Vec<&str> = tree
@@ -515,41 +603,33 @@ pub fn slice_move(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Action
         .map(|s| s.id.as_str())
         .collect();
     let pos = slices.iter().position(|s| *s == id)?;
-    let (to, ref_id) = if pos == 0 {
-        ("front".to_string(), None)
+    let (to, ref_id) = if up {
+        if pos == 0 {
+            return None;
+        }
+        ("before".to_string(), slices[pos - 1].to_string())
     } else {
-        ("before".to_string(), Some(slices[pos - 1].to_string()))
+        if pos + 1 >= slices.len() {
+            return None;
+        }
+        ("after".to_string(), slices[pos + 1].to_string())
     };
     Some(V2Action::SliceUpdate(SliceUpdateArgs {
         milestone,
         id,
-        move_spec: Some(QueueMoveSpec { to, ref_id }),
+        move_spec: Some(QueueMoveSpec { to, ref_id: Some(ref_id) }),
         status: None,
         dry_run: false,
     }))
 }
 
-/// Cycle the selected slice's status through the human statuses
-/// `queued → blocked → deferred → done → queued`.
-pub fn slice_status_cycle(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Action> {
-    let (milestone, id) = selected_slice(reply, view)?;
-    let status = tree_for(reply, &milestone)
-        .and_then(|t| t.slices.iter().find(|s| s.id == id))
-        .map(|s| s.status.as_str())
-        .unwrap_or("queued");
-    let next = match status {
-        "queued" => SliceStatus::Blocked,
-        "blocked" => SliceStatus::Deferred,
-        "deferred" => SliceStatus::Done,
-        _ => SliceStatus::Queued, // done, active, split → queued
-    };
-    Some(V2Action::SliceUpdate(SliceUpdateArgs {
-        milestone,
-        id,
-        move_spec: None,
-        status: Some(next),
-        dry_run: false,
-    }))
+/// `K`/`J`: move the selected row up or down — an entry within its lane, a
+/// slice within its milestone.
+pub fn move_selected(reply: &QueueShowReply, view: &QueueV2View, up: bool) -> Option<V2Action> {
+    match selected_entry(reply, view)?.kind {
+        V2RowKind::Slice => slice_move(reply, view, up),
+        _ => entry_move(reply, view, up),
+    }
 }
 
 #[cfg(test)]
@@ -568,6 +648,7 @@ mod tests {
             branch: if open { format!("feat/{id}") } else { String::new() },
             base: String::new(),
             claimed: String::new(),
+            pending_status: None,
             open,
         }
     }
@@ -667,43 +748,101 @@ mod tests {
     }
 
     #[test]
-    fn lane_and_status_cycle() {
+    fn lane_toggle_flips_the_lane() {
         let r = reply(vec![entry("u1", "urgent", "queued", &[], false)], vec![]);
         let view = QueueV2View::new();
         let V2Action::EntryUpdate(args) = lane_toggle(&r, &view).unwrap() else { panic!() };
         assert_eq!(args.lane, Some(Lane::Normal));
-        let V2Action::EntryUpdate(args) = entry_status_cycle(&r, &view).unwrap() else { panic!() };
-        assert_eq!(args.status, Some(QueueStatusArg::Blocked)); // queued → blocked
-        // A non-human status cycles back to `queued`.
-        let r = reply(vec![entry("u1", "urgent", "active", &[], false)], vec![]);
-        let V2Action::EntryUpdate(args) = entry_status_cycle(&r, &view).unwrap() else { panic!() };
-        assert_eq!(args.status, Some(QueueStatusArg::Queued)); // active → queued
     }
 
     #[test]
-    fn slice_move_and_status_address_the_slice() {
+    fn the_status_picker_sets_the_chosen_status_not_the_next_one_in_a_cycle() {
+        // A blocked entry used to reach `queued` only by passing through
+        // `done`, which archives it.
+        let r = reply(vec![entry("u1", "urgent", "blocked", &[], false)], vec![]);
+        let view = QueueV2View::new();
+        let (target, current) = status_pick(&r, &view).unwrap();
+        assert_eq!(target, StatusTarget::Entry("u1".into()));
+        assert_eq!(current, "blocked");
+        let V2Action::EntryUpdate(args) = status_action(&target, HumanStatus::Queued) else {
+            panic!()
+        };
+        assert_eq!((args.id.as_str(), args.status), ("u1", Some(QueueStatusArg::Queued)));
+        // Every offered status maps to its own wire word.
+        for s in HumanStatus::ALL {
+            let a = status_action(&target, s);
+            assert_eq!(a.change(), format!("status → {}", s.word()));
+        }
+        // An `active` entry is offered the same four; none is `active`.
+        let r = reply(vec![entry("u1", "urgent", "active", &[], false)], vec![]);
+        let (_, current) = status_pick(&r, &view).unwrap();
+        assert_eq!(current, "active");
+        assert!(!HumanStatus::ALL.iter().any(|s| s.word() == "active"));
+    }
+
+    #[test]
+    fn the_status_picker_addresses_slices_and_refuses_sub_items_and_archive_rows() {
+        let r = reply(vec![entry("m", "normal", "active", &[], false)], vec![entry("done1", "", "done", &[], false)]);
+        let mut view = QueueV2View::new();
+        view.expand("m");
+        view.toggle_archive();
+        let rows = view.rows(&r);
+        let at = |key: &str| rows.iter().position(|x| x.key == key).unwrap();
+        view.select(at("m/002"), rows.len());
+        let (target, current) = status_pick(&r, &view).unwrap();
+        assert_eq!(current, "queued");
+        assert_eq!(target, StatusTarget::Slice { milestone: "m".into(), id: "002".into() });
+        let V2Action::SliceUpdate(args) = status_action(&target, HumanStatus::Deferred) else {
+            panic!()
+        };
+        assert_eq!((args.milestone.as_str(), args.id.as_str()), ("m", "002"));
+        assert_eq!(args.status, Some(SliceStatus::Deferred));
+        view.select(at("m/sub-a"), rows.len());
+        assert!(status_pick(&r, &view).is_none(), "a sub item has no slice verb");
+        view.select(at("archive:done1"), rows.len());
+        assert!(status_pick(&r, &view).is_none(), "an archive row is not editable");
+    }
+
+    #[test]
+    fn slices_move_down_as_well_as_up_and_stop_at_the_ends() {
         let r = reply(vec![entry("m", "normal", "active", &[], false)], vec![]);
         let mut view = QueueV2View::new();
         view.expand("m");
         let rows = view.rows(&r);
-        // Select the second slice ("002").
-        let idx = rows.iter().position(|x| x.key == "m/002").unwrap();
-        view.select(idx, rows.len());
-        let V2Action::SliceUpdate(args) = slice_move(&r, &view).unwrap() else { panic!() };
+        let at = |key: &str| rows.iter().position(|x| x.key == key).unwrap();
+        // The fixture's slices are 001, 002 (sub-a is not a sibling).
+        view.select(at("m/002"), rows.len());
+        let V2Action::SliceUpdate(args) = slice_move(&r, &view, true).unwrap() else { panic!() };
         assert_eq!((args.milestone.as_str(), args.id.as_str()), ("m", "002"));
-        assert_eq!(args.move_spec.as_ref().unwrap().ref_id.as_deref(), Some("001"));
-        // A sub item refuses slice verbs.
-        let idx = rows.iter().position(|x| x.key == "m/sub-a").unwrap();
-        view.select(idx, rows.len());
-        assert!(slice_move(&r, &view).is_none());
-        assert!(slice_status_cycle(&r, &view).is_none());
+        let mv = args.move_spec.unwrap();
+        assert_eq!((mv.to.as_str(), mv.ref_id.as_deref()), ("before", Some("001")));
+        assert!(slice_move(&r, &view, false).is_none(), "last slice has no down-move");
+        view.select(at("m/001"), rows.len());
+        assert!(slice_move(&r, &view, true).is_none(), "first slice has no up-move");
+        let V2Action::SliceUpdate(args) = slice_move(&r, &view, false).unwrap() else { panic!() };
+        assert_eq!(args.id, "001");
+        let mv = args.move_spec.unwrap();
+        assert_eq!((mv.to.as_str(), mv.ref_id.as_deref()), ("after", Some("002")));
+        // K/J on a slice row routes to the slice verb, not the entry one.
+        assert!(matches!(move_selected(&r, &view, false), Some(V2Action::SliceUpdate(_))));
+        view.select(at("m"), rows.len());
+        assert!(move_selected(&r, &view, false).is_none(), "a lone entry has no sibling");
+    }
+
+    #[test]
+    fn a_pending_status_is_shown_on_the_row() {
+        let mut e = entry("u1", "urgent", "active", &[], false);
+        e.pending_status = Some("blocked".into());
+        let r = reply(vec![e], vec![]);
+        let rows = QueueV2View::new().rows(&r);
+        assert!(rows[0].label.contains("→ blocked pending"), "{:?}", rows[0].label);
     }
 
     #[test]
     fn the_confirm_overlay_names_the_op_the_target_and_the_change() {
         let r = reply(vec![entry("u1", "urgent", "queued", &[], false)], vec![]);
         let view = QueueV2View::new();
-        let status = entry_status_cycle(&r, &view).unwrap();
+        let status = status_action(&StatusTarget::Entry("u1".into()), HumanStatus::Blocked);
         assert_eq!(status.op(), op::QUEUE_UPDATE_ENTRY);
         assert_eq!(status.target(), "u1");
         assert_eq!(status.change(), "status → blocked");

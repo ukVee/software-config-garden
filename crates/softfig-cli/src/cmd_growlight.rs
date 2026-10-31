@@ -2788,10 +2788,16 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
         } else {
             e.branch.clone()
         };
+        // A recorded human status change on an `active` entry applies at the
+        // session's next handshake; show it rather than a plain `active`.
+        let status = match &e.pending_status {
+            Some(p) => format!("{} (→ {p} pending)", e.status),
+            None => e.status.clone(),
+        };
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} |",
             cell(&e.id),
-            cell(&e.status),
+            cell(&status),
             cell(&e.project),
             cell(&after),
             cell(&branch),
@@ -4751,6 +4757,7 @@ mod tests {
                 branch: "feat/u1".into(),
                 base: String::new(),
                 claimed: "2026-10-11T15:04:00Z".into(),
+                pending_status: Some("blocked".into()),
                 open: true,
             },
             QueueShowEntry {
@@ -4763,6 +4770,7 @@ mod tests {
                 branch: String::new(),
                 base: String::new(),
                 claimed: String::new(),
+                pending_status: None,
                 open: false,
             },
         ];
@@ -4780,7 +4788,7 @@ mod tests {
         assert!(urgent < normal, "urgent lane renders first: {body}");
         // status, project and after links; the open branch carries its flag.
         assert!(
-            body.contains("| u1 | active | softfig | done-x | feat/u1 (open) |"),
+            body.contains("| u1 | active (→ blocked pending) | softfig | done-x | feat/u1 (open) |"),
             "{body}"
         );
         assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
