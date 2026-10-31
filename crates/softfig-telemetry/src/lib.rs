@@ -4,8 +4,8 @@
 //! One [`RequestRow`] per model API request made by a growlight session: a
 //! growlightd-driven claude or opencode member, or a semi-auto `claude`. The
 //! crate owns the row, the [`Recorder`] seam the capture points hand rows to,
-//! and (from slice 002) the bounded ring + batched sqlite flush to
-//! `$XDG_STATE_HOME/softfig/telemetry.db`.
+//! the bounded [`RingRecorder`], and the [`Flusher`] that batches it into the
+//! sqlite [`Store`] at [`default_db_path`] (`$XDG_STATE_HOME/softfig/telemetry.db`).
 //!
 //! ## Where rows come from (spec §4)
 //!
@@ -32,9 +32,16 @@
 //! coalesced (30 s or 1 000 pending, one transaction, no transaction at all
 //! when idle). The constants live in [`schema`].
 
+pub mod flush;
 pub mod recorder;
+pub mod ring;
 pub mod row;
 pub mod schema;
+pub mod store;
+pub mod ts;
 
+pub use flush::{Clock, FlushHandle, FlushPolicy, FlushStats, Flusher};
 pub use recorder::{NullRecorder, Recorder};
+pub use ring::RingRecorder;
 pub use row::{Backend, RequestRow, SettledFrom, Speed, TokenCounts};
+pub use store::{Store, StoreError, SweepOutcome, default_db_path};

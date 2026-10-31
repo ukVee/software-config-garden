@@ -8,3 +8,8 @@ repository.workspace = true
 description = "soft-fig token telemetry: one Layer-1 row per API request from growlight sessions, a bounded ring, and a batched sqlite flush."
 
 [dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

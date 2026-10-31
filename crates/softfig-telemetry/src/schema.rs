@@ -1,5 +1,5 @@
 //! The store's constants: file location, schema DDL, and the ring / flush /
-//! retention policy (spec §5). Pure data — slice 002's store applies it.
+//! retention policy (spec §5). Pure data — [`crate::store`] applies it.
 
 /// The db file under `$XDG_STATE_HOME/softfig/` (state dir, not config dir:
 /// this is not agent runtime scratch).
@@ -104,7 +104,10 @@ mod tests {
             "cost_usd",
         ] {
             assert!(CREATE_REQUESTS.contains(col), "requests lacks {col}");
-            assert!(CREATE_DAILY_ROLLUP.contains(col), "daily_rollup lacks {col}");
+            assert!(
+                CREATE_DAILY_ROLLUP.contains(col),
+                "daily_rollup lacks {col}"
+            );
         }
     }
 }
