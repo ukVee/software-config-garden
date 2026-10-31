@@ -18,6 +18,7 @@ pub mod hit;
 pub mod ipc;
 pub mod listpane;
 pub mod prefs;
+pub mod redraw;
 pub mod textarea;
 pub mod tree;
 pub mod ui;
