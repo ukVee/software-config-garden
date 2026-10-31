@@ -18,10 +18,10 @@ pub const PROJECT_NAME_MAX: usize = 64;
 pub const SEQ_FILE: &str = ".seq";
 
 /// Reserved-name folders that hold numbered single-doc entries (Slice 1 of
-/// the small-files redesign; `code-reviews` added by task 020). The basename
-/// of a `revise_note` `dir` must be one of these; the add verbs gate on the
-/// genre subsets below.
-pub const ACCRETIVE_FOLDERS: [&str; 3] = ["notes", "troubleshooting", "code-reviews"];
+/// the small-files redesign; `code-reviews` added by task 020; `commands`
+/// added with the command-doc genre). The basename of a `revise_note` `dir`
+/// must be one of these; the add verbs gate on the genre subsets below.
+pub const ACCRETIVE_FOLDERS: [&str; 4] = ["notes", "troubleshooting", "code-reviews", "commands"];
 
 /// The note-genre accretive folders `add_note` may write into. A code review
 /// is a distinct genre — `add_code_review` owns `code-reviews/` — so the two
@@ -34,6 +34,12 @@ pub const NOTE_FOLDERS: [&str; 2] = ["notes", "troubleshooting"];
 /// (task 020). Primary home `projects/<project>/code-reviews/`; the name is
 /// reserved garden-wide, so any concept dir may hold one.
 pub const CODE_REVIEW_FOLDERS: [&str; 1] = ["code-reviews"];
+
+/// The command-genre accretive folders `add_command` may write into. A command
+/// doc is a short, copy-pasteable how-to (`NNN-slug.md`), parallel to a note;
+/// primary home `os/commands/`. The name is reserved garden-wide, so any
+/// concept dir may hold one, but the OS hub lives at `os/instructions.md`.
+pub const COMMAND_FOLDERS: [&str; 1] = ["commands"];
 
 // ---- path templates ---------------------------------------------------
 
@@ -74,7 +80,8 @@ pub fn is_accretive_dir(dir_rel: &str) -> bool {
 /// can touch a note's `Last reviewed:` line must re-derive it — keeping that
 /// decision keyed on one list is what stops the next genre from re-opening the
 /// drift.
-pub const INDEXED_FOLDERS: [&str; 4] = ["notes", "troubleshooting", "code-reviews", "slices"];
+pub const INDEXED_FOLDERS: [&str; 5] =
+    ["notes", "troubleshooting", "code-reviews", "commands", "slices"];
 
 /// Whether `dir_rel`'s basename names a folder with a derived index table in
 /// its parent `CLAUDE.md`. See [`INDEXED_FOLDERS`].
@@ -502,6 +509,7 @@ mod tests {
         assert!(is_accretive_dir("notes"));
         assert!(is_accretive_dir("input/controllers/troubleshooting"));
         assert!(is_accretive_dir("projects/demo/code-reviews"));
+        assert!(is_accretive_dir("os/commands"));
         assert!(!is_accretive_dir("services/waydroid"));
         assert!(!is_accretive_dir("notes.md"));
         assert!(!is_accretive_dir("journal/decisions"));
@@ -509,17 +517,25 @@ mod tests {
     }
 
     /// The genre subsets partition the accretive set — every genre folder is
-    /// accretive, and the two add-verb gates never overlap.
+    /// accretive, and the add-verb gates never overlap.
     #[test]
     fn genre_folders_partition_accretive_set() {
-        for name in NOTE_FOLDERS.iter().chain(CODE_REVIEW_FOLDERS.iter()) {
+        let genres = [
+            NOTE_FOLDERS.as_slice(),
+            CODE_REVIEW_FOLDERS.as_slice(),
+            COMMAND_FOLDERS.as_slice(),
+        ];
+        for name in genres.iter().flat_map(|g| g.iter()) {
             assert!(ACCRETIVE_FOLDERS.contains(name), "{name} not accretive");
         }
         assert_eq!(
-            NOTE_FOLDERS.len() + CODE_REVIEW_FOLDERS.len(),
+            NOTE_FOLDERS.len() + CODE_REVIEW_FOLDERS.len() + COMMAND_FOLDERS.len(),
             ACCRETIVE_FOLDERS.len()
         );
-        assert!(!NOTE_FOLDERS.iter().any(|n| CODE_REVIEW_FOLDERS.contains(n)));
+        let mut all: Vec<&str> = genres.iter().flat_map(|g| g.iter()).copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), ACCRETIVE_FOLDERS.len(), "genre folders overlap");
     }
 
     /// Every accretive folder carries a derived index, so the index set is a

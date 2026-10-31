@@ -64,7 +64,22 @@ pub(super) const CODE_REVIEW_GENRE: DocGenre = DocGenre {
     doc: conventions::note_doc,
 };
 
-const GENRES: &[&DocGenre] = &[&NOTE_GENRE, &CODE_REVIEW_GENRE];
+/// The command-doc genre (`add_command` / `update_command`): short,
+/// copy-pasteable how-to records `NNN-slug.md` in a `commands/` folder
+/// (primary home `os/commands/`, hub `os/instructions.md`). Same machinery as
+/// a note — the daemon assigns the number, stamps the `# <title>` + `> Last
+/// reviewed:` header, refreshes the parent index + backlinks — but mints
+/// `command_added` / `command_updated` provenance so a command doc is
+/// distinguishable from a note in the history.
+pub(super) const COMMAND_GENRE: DocGenre = DocGenre {
+    allowed: &conventions::COMMAND_FOLDERS,
+    label: "commands",
+    add_intent: "command_added",
+    revise_intent: "command_updated",
+    doc: conventions::note_doc,
+};
+
+const GENRES: &[&DocGenre] = &[&NOTE_GENRE, &CODE_REVIEW_GENRE, &COMMAND_GENRE];
 
 /// Find the registered genre whose allowed folders own `dir_rel`'s basename —
 /// the revise path's counterpart to the add verbs' explicit genre binding.
@@ -167,10 +182,20 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     Ok(serde_json::to_value(AddNoteReply { path, hash }).unwrap())
 }
 
-pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
-    let args: ReviseNoteArgs = serde_json::from_value(args)
-        .map_err(|e| (ErrorKind::BadArgs, format!("revise_note args: {e}")))?;
-    if args.body.trim().is_empty() {
+/// The shared revise core: validate, gate `dir` on the genre's allowed
+/// basenames, find the numbered doc, swap its body wholesale (re-stamping the
+/// reviewed date), refresh the parent index + backlinks, and mint the genre's
+/// revise intent. `revise_note` derives the genre from the folder; the
+/// command genre's `update_command` pins [`COMMAND_GENRE`]. Kept shared so a
+/// future genre gets correct revise provenance for free.
+pub(super) fn revise_numbered_doc(
+    daemon: &Daemon,
+    dir: &str,
+    id: u32,
+    body: &str,
+    genre: &DocGenre,
+) -> Result<(String, String), (ErrorKind, String)> {
+    if body.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
     }
 
@@ -178,26 +203,32 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
 
-    let dir_abs = validate_repo_path(&garden_root, &args.dir).map_err(|m| (ErrorKind::BadArgs, m))?;
+    let dir_abs = validate_repo_path(&garden_root, dir).map_err(|m| (ErrorKind::BadArgs, m))?;
     let dir_rel = path_to_repo_rel_string(&garden_root, &dir_abs)
         .ok_or((ErrorKind::BadArgs, "dir outside garden root".into()))?;
-    // Derive the genre from the folder (same allowed-folders logic the add
-    // path gates on) so the revise commit mints this genre's revise intent —
-    // not a hardcoded `note_revised` for every accretive folder.
-    let genre = genre_for_dir(&dir_rel).ok_or((
-        ErrorKind::NotAccretiveDir,
-        format!("{dir_rel}: not an accretive note folder"),
-    ))?;
+    // Gate on the passed genre's folders. `revise_note` already picked the
+    // genre from `dir_rel`; a pinned-genre caller (`update_command`) is held
+    // to its own folder here.
+    if !conventions::dir_basename_in(&dir_rel, genre.allowed) {
+        return Err((
+            ErrorKind::NotAccretiveDir,
+            format!(
+                "{dir_rel}: {} live only in an accretive folder ({})",
+                genre.label,
+                genre.allowed.join(" / ")
+            ),
+        ));
+    }
 
     let note_rel = {
         let wt = WorkTree::new(daemon, &inner);
-        let note_rel = numbering::find_by_id(&wt, &dir_rel, args.id).ok_or((
+        let note_rel = numbering::find_by_id(&wt, &dir_rel, id).ok_or((
             ErrorKind::NotFound,
-            format!("{dir_rel}: no note numbered {:03}", args.id),
+            format!("{dir_rel}: no doc numbered {id:03}"),
         ))?;
 
         // Preserve the title (immutable). Re-stamp the reviewed date and swap
-        // the body wholesale — header/slug/number are left untouched. A note
+        // the body wholesale — header/slug/number are left untouched. A doc
         // with inline `<vault>` regions is refused: the caller only ever read
         // them as `[encrypted]`, so a wholesale body swap can only destroy
         // them.
@@ -208,7 +239,7 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             .unwrap_or("note.md");
         let title = conventions::note_title(&existing)
             .unwrap_or_else(|| conventions::slug_from_note_name(filename));
-        let content = (genre.doc)(&title, &conventions::today_hyphen(), &args.body);
+        let content = (genre.doc)(&title, &conventions::today_hyphen(), body);
 
         wt.write(&note_rel, content.as_bytes())?;
 
@@ -222,16 +253,32 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         note_rel
     };
 
-    let payload = serde_json::json!({ "dir": dir_rel, "id": args.id });
+    let payload = serde_json::json!({ "dir": dir_rel, "id": id });
     let intent = Intent::new(genre.revise_intent, payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
 
-    Ok(serde_json::to_value(ReviseNoteReply {
-        path: note_rel,
-        hash: hash.to_string(),
-    })
-    .unwrap())
+    Ok((note_rel, hash.to_string()))
+}
+
+pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReviseNoteArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("revise_note args: {e}")))?;
+
+    // Derive the genre from the folder (same allowed-folders logic the add
+    // path gates on) so the revise commit mints this genre's revise intent —
+    // not a hardcoded `note_revised` for every accretive folder.
+    let dir_abs = validate_repo_path(&daemon.garden_root, &args.dir)
+        .map_err(|m| (ErrorKind::BadArgs, m))?;
+    let dir_rel = path_to_repo_rel_string(&daemon.garden_root, &dir_abs)
+        .ok_or((ErrorKind::BadArgs, "dir outside garden root".into()))?;
+    let genre = genre_for_dir(&dir_rel).ok_or((
+        ErrorKind::NotAccretiveDir,
+        format!("{dir_rel}: not an accretive note folder"),
+    ))?;
+
+    let (path, hash) = revise_numbered_doc(daemon, &args.dir, args.id, &args.body, genre)?;
+    Ok(serde_json::to_value(ReviseNoteReply { path, hash }).unwrap())
 }
 

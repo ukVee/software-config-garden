@@ -29,12 +29,14 @@
 //! ## Whitelist (v1)
 //!
 //! `patch_file`, `edit_section`, `append_to_section`, `add_section`,
-//! `remove_section`, `set_reviewed`, `add_note`, `revise_note`. Deliberately
-//! excluded: `unlink` (a batch that deletes is a different safety review),
-//! `batch` itself (no nesting), the convention-heavy log/archive/add_project
-//! family (their intents are single-file by design), and everything growlight.
-//! `revise_note` is gated to the note folders (`notes`/`troubleshooting`) —
-//! the code-review genre stays out of v1 alongside `add_code_review`.
+//! `remove_section`, `set_reviewed`, `add_note`, `revise_note`, `add_command`,
+//! `update_command`. Deliberately excluded: `unlink` (a batch that deletes is a
+//! different safety review), `batch` itself (no nesting), the convention-heavy
+//! log/archive/add_project family (their intents are single-file by design), and
+//! everything growlight. Each doc genre is gated to its own folders —
+//! `add_note`/`revise_note` to `notes`/`troubleshooting`, `add_command`/
+//! `update_command` to `commands` — and the code-review genre stays out of v1
+//! alongside `add_code_review`.
 //!
 //! Thrash: the batch registers one edit touch per mutated (file, section) for
 //! the op kinds whose standalone verbs do (`patch_file` whole-file,
@@ -44,12 +46,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use softfig_ipc::verbs::{
-    AddNoteArgs, AddSectionArgs, AppendToSectionArgs, BatchArgs, BatchOp, BatchReply,
+    AddCommandArgs, AddNoteArgs, AddSectionArgs, AppendToSectionArgs, BatchArgs, BatchOp, BatchReply,
     EditSectionArgs, PatchFileArgs, RemoveSectionArgs, ReviseNoteArgs, SetReviewedArgs,
+    UpdateCommandArgs,
 };
 use softfig_ipc::ErrorKind;
 use softfig_vcs::Intent;
 
+use super::add_note::{DocGenre, COMMAND_GENRE, NOTE_GENRE};
 use super::sections::{
     cas_check_section, edit, load_unprotected, note_edit_for_thrash, resolve, section_err,
 };
@@ -69,6 +73,8 @@ const WHITELIST: &[&str] = &[
     "set_reviewed",
     "add_note",
     "revise_note",
+    "add_command",
+    "update_command",
 ];
 
 /// A validated, ready-to-stage mutation. The content carried here is exactly
@@ -156,25 +162,154 @@ fn sim_cas_whole_file(
     Ok(())
 }
 
-/// The `add_note`/`revise_note` dir gate + resolution, shared by both sub-ops:
-/// validate `dir` against the garden root and require an accretive note folder
-/// (the code-review genre stays out of batch v1 alongside `add_code_review`).
-fn resolve_note_dir(
+/// The accretive-doc dir gate + resolution, shared by the note- and
+/// command-genre sub-ops: validate `dir` against the garden root and require a
+/// folder the passed genre owns (so `add_note`/`revise_note` stay in
+/// `notes`/`troubleshooting` and `add_command`/`update_command` in `commands`).
+fn resolve_accretive_dir(
     garden_root: &Path,
     dir: &str,
+    genre: &DocGenre,
 ) -> Result<String, (ErrorKind, String)> {
     let dir_abs = validate_repo_path(garden_root, dir).map_err(|m| (ErrorKind::BadArgs, m))?;
     let dir_rel = path_to_repo_rel_string(garden_root, &dir_abs)
         .ok_or((ErrorKind::BadArgs, "dir outside garden root".into()))?;
-    if !conventions::dir_basename_in(&dir_rel, &conventions::NOTE_FOLDERS) {
+    if !conventions::dir_basename_in(&dir_rel, genre.allowed) {
         return Err((
             ErrorKind::NotAccretiveDir,
             format!(
-                "{dir_rel}: notes live only in an accretive folder (notes / troubleshooting)"
+                "{dir_rel}: {} live only in an accretive folder ({})",
+                genre.label,
+                genre.allowed.join(" / ")
             ),
         ));
     }
     Ok(dir_rel)
+}
+
+/// Stage an `add_note`-shaped sub-op (notes or commands): gate `dir` on the
+/// genre, allocate the next simulated number, and stage the stamped doc. The
+/// genre carries only the allowed folder set, the label, and the header
+/// stamper — the mechanics (`.seq` bump, `note_filename`, the simulated
+/// `added` list) are identical across genres.
+#[allow(clippy::too_many_arguments)]
+fn stage_add_doc(
+    daemon: &Daemon,
+    inner: &DaemonInner,
+    garden_root: &Path,
+    sim: &mut Sim,
+    staged: &mut Vec<Staged>,
+    genre: &DocGenre,
+    op_name: &'static str,
+    dir: &str,
+    slug: &str,
+    title: Option<&str>,
+    body: &str,
+) -> Result<(), (ErrorKind, String)> {
+    conventions::validate_slug(slug)?;
+    if body.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
+    }
+    let dir_rel = resolve_accretive_dir(garden_root, dir, genre)?;
+    let wt = WorkTree::new(daemon, inner);
+    // The concept dir must exist (the standalone verb materializes the
+    // accretive folder on demand, but won't fabricate an arbitrary tree).
+    let parent_rel = Path::new(&dir_rel).parent().and_then(|p| p.to_str()).unwrap_or("");
+    if !wt.is_dir(parent_rel) {
+        return Err((
+            ErrorKind::NotFound,
+            format!("{dir_rel}: parent concept dir does not exist"),
+        ));
+    }
+    // Sequential numbering: the first add to a folder seeds from the live
+    // `.seq`/listing, each further add in the batch takes the next.
+    let number = *sim
+        .next
+        .entry(dir_rel.clone())
+        .or_insert_with(|| numbering::next_number(&wt, &dir_rel));
+    *sim.next.get_mut(&dir_rel).unwrap() += 1;
+    let filename = conventions::note_filename(number, slug);
+    let note_rel = format!("{dir_rel}/{filename}");
+    if wt.exists(&note_rel) {
+        return Err((ErrorKind::PathAlreadyExists, format!("{note_rel}: already exists")));
+    }
+    let content = (genre.doc)(title.unwrap_or(slug), &conventions::today_hyphen(), body);
+    sim.added
+        .push((dir_rel.clone(), number, note_rel.clone(), content.clone()));
+    staged.push(Staged {
+        mutation: Mutation::AddNote {
+            dir_rel,
+            number,
+            note_rel: note_rel.clone(),
+            content,
+        },
+        op_name,
+        path: note_rel,
+        thrash: None,
+    });
+    Ok(())
+}
+
+/// Stage a `revise_note`-shaped sub-op (notes or commands): resolve the
+/// numbered doc, preserve its immutable title, re-stamp the reviewed date and
+/// swap the body — exactly the standalone verb's semantics, gated on the
+/// genre's folders.
+#[allow(clippy::too_many_arguments)]
+fn stage_revise_doc(
+    daemon: &Daemon,
+    inner: &DaemonInner,
+    garden_root: &Path,
+    sim: &mut Sim,
+    staged: &mut Vec<Staged>,
+    genre: &DocGenre,
+    op_name: &'static str,
+    dir: &str,
+    id: u32,
+    body: &str,
+) -> Result<(), (ErrorKind, String)> {
+    if body.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
+    }
+    let dir_rel = resolve_accretive_dir(garden_root, dir, genre)?;
+    let wt = WorkTree::new(daemon, inner);
+    // A doc added earlier in the batch resolves from the simulation; anything
+    // else must already be live in the folder.
+    let (note_rel, existing) = match sim
+        .added
+        .iter()
+        .find(|(d, added_id, _, _)| d == &dir_rel && *added_id == id)
+    {
+        Some((_, _, rel, content)) => (rel.clone(), content.clone()),
+        None => {
+            let rel = numbering::find_by_id(&wt, &dir_rel, id).ok_or((
+                ErrorKind::NotFound,
+                format!("{dir_rel}: no doc numbered {id:03}"),
+            ))?;
+            // Same vault refusal as the standalone verb.
+            let existing = super::sections::load_for_body_swap(&wt, inner, &rel)?;
+            (rel, existing)
+        }
+    };
+    // Preserve the title (immutable); the daemon re-stamps the reviewed date
+    // and swaps the body, like the standalone verb.
+    let filename = Path::new(&note_rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("note.md");
+    let title = conventions::note_title(&existing)
+        .unwrap_or_else(|| conventions::slug_from_note_name(filename));
+    let content = (genre.doc)(&title, &conventions::today_hyphen(), body);
+    staged.push(Staged {
+        mutation: Mutation::ReviseNote {
+            dir_rel,
+            note_rel: note_rel.clone(),
+            content,
+        },
+        op_name,
+        path: note_rel,
+        thrash: None,
+    });
+    Ok(())
 }
 
 pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -502,97 +637,68 @@ fn validate_op(
         "add_note" => {
             let a: AddNoteArgs = serde_json::from_value(op.args.clone())
                 .map_err(|e| (ErrorKind::BadArgs, format!("add_note args: {e}")))?;
-            conventions::validate_slug(&a.slug)?;
-            if a.body.trim().is_empty() {
-                return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
-            }
-            let dir_rel = resolve_note_dir(garden_root, &a.dir)?;
-            let wt = WorkTree::new(daemon, inner);
-            // The concept dir must exist (the standalone verb materializes the
-            // accretive folder on demand, but won't fabricate an arbitrary tree).
-            let parent_rel = Path::new(&dir_rel).parent().and_then(|p| p.to_str()).unwrap_or("");
-            if !wt.is_dir(parent_rel) {
-                return Err((
-                    ErrorKind::NotFound,
-                    format!("{dir_rel}: parent concept dir does not exist"),
-                ));
-            }
-            // Sequential numbering: the first add to a folder seeds from the
-            // live `.seq`/listing, each further add in the batch takes the next.
-            let number = *sim
-                .next
-                .entry(dir_rel.clone())
-                .or_insert_with(|| numbering::next_number(&wt, &dir_rel));
-            *sim.next.get_mut(&dir_rel).unwrap() += 1;
-            let filename = conventions::note_filename(number, &a.slug);
-            let note_rel = format!("{dir_rel}/{filename}");
-            if wt.exists(&note_rel) {
-                return Err((ErrorKind::PathAlreadyExists, format!("{note_rel}: already exists")));
-            }
-            let content = conventions::note_doc(
-                a.title.as_deref().unwrap_or(&a.slug),
-                &conventions::today_hyphen(),
+            stage_add_doc(
+                daemon,
+                inner,
+                garden_root,
+                sim,
+                staged,
+                &NOTE_GENRE,
+                "add_note",
+                &a.dir,
+                &a.slug,
+                a.title.as_deref(),
                 &a.body,
-            );
-            sim.added
-                .push((dir_rel.clone(), number, note_rel.clone(), content.clone()));
-            staged.push(Staged {
-                mutation: Mutation::AddNote {
-                    dir_rel,
-                    number,
-                    note_rel: note_rel.clone(),
-                    content,
-                },
-                op_name: "add_note",
-                path: note_rel,
-                thrash: None,
-            });
+            )?;
+        }
+        "add_command" => {
+            let a: AddCommandArgs = serde_json::from_value(op.args.clone())
+                .map_err(|e| (ErrorKind::BadArgs, format!("add_command args: {e}")))?;
+            stage_add_doc(
+                daemon,
+                inner,
+                garden_root,
+                sim,
+                staged,
+                &COMMAND_GENRE,
+                "add_command",
+                &a.dir,
+                &a.slug,
+                a.title.as_deref(),
+                &a.body,
+            )?;
         }
         "revise_note" => {
             let a: ReviseNoteArgs = serde_json::from_value(op.args.clone())
                 .map_err(|e| (ErrorKind::BadArgs, format!("revise_note args: {e}")))?;
-            if a.body.trim().is_empty() {
-                return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
-            }
-            let dir_rel = resolve_note_dir(garden_root, &a.dir)?;
-            let wt = WorkTree::new(daemon, inner);
-            // A note added earlier in the batch resolves from the simulation;
-            // anything else must already be live in the folder.
-            let (note_rel, existing) = match sim
-                .added
-                .iter()
-                .find(|(d, id, _, _)| d == &dir_rel && *id == a.id)
-            {
-                Some((_, _, rel, content)) => (rel.clone(), content.clone()),
-                None => {
-                    let rel = numbering::find_by_id(&wt, &dir_rel, a.id).ok_or((
-                        ErrorKind::NotFound,
-                        format!("{dir_rel}: no note numbered {:03}", a.id),
-                    ))?;
-                    // Same vault refusal as the standalone verb.
-                    let existing = super::sections::load_for_body_swap(&wt, inner, &rel)?;
-                    (rel, existing)
-                }
-            };
-            // Preserve the title (immutable); the daemon re-stamps the reviewed
-            // date and swaps the body, like the standalone verb.
-            let filename = Path::new(&note_rel)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("note.md");
-            let title = conventions::note_title(&existing)
-                .unwrap_or_else(|| conventions::slug_from_note_name(filename));
-            let content = conventions::note_doc(&title, &conventions::today_hyphen(), &a.body);
-            staged.push(Staged {
-                mutation: Mutation::ReviseNote {
-                    dir_rel,
-                    note_rel: note_rel.clone(),
-                    content,
-                },
-                op_name: "revise_note",
-                path: note_rel,
-                thrash: None,
-            });
+            stage_revise_doc(
+                daemon,
+                inner,
+                garden_root,
+                sim,
+                staged,
+                &NOTE_GENRE,
+                "revise_note",
+                &a.dir,
+                a.id,
+                &a.body,
+            )?;
+        }
+        "update_command" => {
+            let a: UpdateCommandArgs = serde_json::from_value(op.args.clone())
+                .map_err(|e| (ErrorKind::BadArgs, format!("update_command args: {e}")))?;
+            stage_revise_doc(
+                daemon,
+                inner,
+                garden_root,
+                sim,
+                staged,
+                &COMMAND_GENRE,
+                "update_command",
+                &a.dir,
+                a.id,
+                &a.body,
+            )?;
         }
         _ => unreachable!("whitelist checked above"),
     }

@@ -200,6 +200,8 @@ fn op_is_local_write(op: &str) -> bool {
             | op::ADD_NOTE
             | op::REVISE_NOTE
             | op::ADD_CODE_REVIEW
+            | op::ADD_COMMAND
+            | op::UPDATE_COMMAND
             | op::ADD_SECTION
             | op::EDIT_SECTION
             | op::APPEND_TO_SECTION
@@ -313,6 +315,8 @@ fn dispatch(daemon: &Daemon, req: Request, connection: Option<&str>) -> Response
         op::ADD_NOTE => crate::actions::add_note(daemon, req.args),
         op::REVISE_NOTE => crate::actions::revise_note(daemon, req.args),
         op::ADD_CODE_REVIEW => crate::actions::add_code_review(daemon, req.args),
+        op::ADD_COMMAND => crate::actions::add_command(daemon, req.args),
+        op::UPDATE_COMMAND => crate::actions::update_command(daemon, req.args),
         op::ADD_SECTION => crate::actions::add_section(daemon, req.args),
         op::EDIT_SECTION => crate::actions::edit_section(daemon, req.args),
         op::APPEND_TO_SECTION => crate::actions::append_to_section(daemon, req.args),

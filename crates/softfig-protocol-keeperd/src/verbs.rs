@@ -74,6 +74,16 @@ pub mod op {
     /// `add_note` (`.seq` numbering, header + reviewed line, parent index +
     /// backlinks); commit `code_review_added`.
     pub const ADD_CODE_REVIEW: &str = "add_code_review";
+    /// Command-doc genre: append a numbered command doc `NNN-slug.md` to a
+    /// `commands/` accretive folder (primary home `os/commands/`; the hub is
+    /// `os/instructions.md`). Same daemon-stamped machinery as `add_note`
+    /// (`.seq` numbering, header + reviewed line, parent index + backlinks);
+    /// commit `command_added`.
+    pub const ADD_COMMAND: &str = "add_command";
+    /// Command-doc genre: replace the body of an existing numbered command doc
+    /// in place, re-stamping the reviewed date. Title, slug, and number are
+    /// immutable; commit `command_updated`.
+    pub const UPDATE_COMMAND: &str = "update_command";
     /// M3a: move a tracked path under `journal/archive/<name>/`, commit
     /// `archive_move`.
     pub const ARCHIVE: &str = "archive";
@@ -989,6 +999,54 @@ pub struct AddCodeReviewArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddCodeReviewReply {
     /// Garden-relative path the daemon wrote (`dir/NNN-slug.md`).
+    pub path: String,
+    pub hash: String,
+}
+
+// ---- command-doc genre: add_command / update_command -------------------
+
+/// `add_command({dir, slug, title?, body}) -> {path, hash}`.
+///
+/// The command-doc genre: `dir` is the garden-relative path of an accretive
+/// folder whose basename must be `commands` (primary home `os/commands/`).
+/// The daemon assigns the next number from the folder's `.seq` high-water
+/// mark, writes `dir/NNN-slug.md`, and stamps the `# <title>` header + `> Last
+/// reviewed:` line — the caller supplies only the slug, an optional title
+/// (defaults to the slug), and the body (a short, copy-pasteable how-to).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCommandArgs {
+    /// Garden-relative `commands/` folder, e.g. `os/commands`.
+    pub dir: String,
+    /// `[a-z0-9-]+`, length 1–64. The terse filename address; immutable.
+    pub slug: String,
+    /// Human title used in the `# <title>` header. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Markdown body written below the daemon-stamped header.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCommandReply {
+    /// Garden-relative path the daemon wrote (`dir/NNN-slug.md`).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `update_command({dir, id, body}) -> {path, hash}`. The command-doc sibling
+/// of `revise_note`: replace the body of `dir/NNN-*.md` (the command doc
+/// numbered `id`), re-stamping the reviewed date. Title, slug, and number are
+/// immutable; commit `command_updated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCommandArgs {
+    pub dir: String,
+    /// The command doc's creation-order number (the `NNN` in its filename).
+    pub id: u32,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCommandReply {
     pub path: String,
     pub hash: String,
 }

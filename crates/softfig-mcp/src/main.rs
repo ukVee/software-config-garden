@@ -29,7 +29,7 @@ use softfig_protocol_growlightd::{
 };
 use softfig_protocol_keeperd::{
     verbs::{
-        op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
+        op, AddBacklogItemArgs, AddCodeReviewArgs, AddCommandArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
         FileReportArgs, ListReportsArgs, LogBatonArgs, LogDecisionArgs, LogIncidentArgs,
@@ -37,7 +37,7 @@ use softfig_protocol_keeperd::{
         QueueUpdateEntryArgs, ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
         SetItemStatusArgs, SetReviewedArgs, SliceInsertArgs, SliceUpdateArgs, UnlinkArgs,
-        UpdateReportArgs,
+        UpdateCommandArgs, UpdateReportArgs,
     },
     Request, Response,
 };
@@ -237,6 +237,47 @@ fn tool_defs() -> Vec<Value> {
                     "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; the terse filename address (immutable). Don't repeat a 'code-review-' prefix — the folder carries that semantic" },
                     "title": { "type": "string", "description": "header title; defaults to slug" },
                     "body": { "type": "string", "description": "markdown review body below the header, following the review template" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_command",
+            "description": "Append a numbered command doc to a commands/ accretive folder \
+                            (primary home os/commands/, the hub is os/instructions.md). A \
+                            command doc is a short, copy-pasteable how-to, parallel to a note. \
+                            The daemon assigns the next number from the folder's hidden .seq \
+                            counter, writes dir/NNN-slug.md, and stamps the '# <title>' header + \
+                            '> Last reviewed:' line — you supply only dir, slug, and body (title \
+                            defaults to slug). Prefer this over replace_file for adding a command \
+                            doc.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["dir", "slug", "body"],
+                "properties": {
+                    "dir": { "type": "string", "description": "garden-relative commands/ folder, e.g. os/commands" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; the terse filename address (immutable)" },
+                    "title": { "type": "string", "description": "header title; defaults to slug" },
+                    "body": { "type": "string", "description": "markdown body below the header" },
+                },
+            },
+        }),
+        json!({
+            "name": "update_command",
+            "description": "Replace the body of an existing numbered command doc in place, \
+                            re-stamping its '> Last reviewed:' date. The command-doc sibling of \
+                            revise_note: title, slug, and number are immutable — to 'rename' a \
+                            command doc, archive it and add_command a new one. Identify it by its \
+                            folder + number. Refused on a doc carrying inline <vault> regions \
+                            (you only ever read them as [encrypted], so a wholesale swap would \
+                            destroy them) — edit around them with patch_file / edit_section \
+                            instead.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["dir", "id", "body"],
+                "properties": {
+                    "dir": { "type": "string", "description": "the command doc's commands/ folder" },
+                    "id": { "type": "integer", "description": "the command doc's number (the NNN in its filename)" },
+                    "body": { "type": "string", "description": "the replacement markdown body" },
                 },
             },
         }),
@@ -1070,7 +1111,8 @@ fn tool_defs() -> Vec<Value> {
                             written; any failure aborts the whole batch with nothing changed and the \
                             error names the failing op index + kind. WHITELIST (v1): patch_file, \
                             edit_section, append_to_section, add_section, remove_section, set_reviewed, \
-                            add_note, revise_note. Refused sub-ops: batch itself (no nesting), unlink, \
+                            add_note, revise_note, add_command, update_command. Refused sub-ops: batch \
+                            itself (no nesting), unlink, \
                             archive, add_project, log_decision, log_incident, and every growlight verb. \
                             Each sub-op may carry its own expected_version (whole-file or section, per \
                             that verb's contract). One batch_applied commit; the reply is the commit \
@@ -1086,7 +1128,7 @@ fn tool_defs() -> Vec<Value> {
                             "type": "object",
                             "required": ["op", "args"],
                             "properties": {
-                                "op": { "type": "string", "description": "patch_file | edit_section | append_to_section | add_section | remove_section | set_reviewed | add_note | revise_note" },
+                                "op": { "type": "string", "description": "patch_file | edit_section | append_to_section | add_section | remove_section | set_reviewed | add_note | revise_note | add_command | update_command" },
                                 "args": { "type": "object", "description": "that verb's own args shape (see its tool description)" },
                             },
                         },
@@ -1294,6 +1336,14 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
         "add_code_review" => {
             let a: AddCodeReviewArgs = serde_json::from_value(args)?;
             (op::ADD_CODE_REVIEW, serde_json::to_value(a)?)
+        }
+        "add_command" => {
+            let a: AddCommandArgs = serde_json::from_value(args)?;
+            (op::ADD_COMMAND, serde_json::to_value(a)?)
+        }
+        "update_command" => {
+            let a: UpdateCommandArgs = serde_json::from_value(args)?;
+            (op::UPDATE_COMMAND, serde_json::to_value(a)?)
         }
         "edit_section" => {
             let a: EditSectionArgs = serde_json::from_value(args)?;
@@ -1726,9 +1776,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_forty_four() {
+    fn tools_list_has_forty_six() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 44);
+        assert_eq!(defs.len(), 46);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1737,6 +1787,8 @@ mod tests {
             "add_note",
             "revise_note",
             "add_code_review",
+            "add_command",
+            "update_command",
             "edit_section",
             "append_to_section",
             "add_section",
@@ -1787,7 +1839,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         );
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 46);
     }
 
     /// A `tools/call` for a tool that doesn't exist: dispatch refuses it before
@@ -1977,7 +2029,7 @@ mod tests {
         assert!(msg.starts_with("softfig-mcp refuses every verb: SOFTFIG_MEMBER="), "{msg}");
         // Listing the tools stays harmless.
         let resp = handle_line(&caller, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 44);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 46);
     }
 
     #[test]
@@ -2007,6 +2059,16 @@ mod tests {
                 "add_code_review",
                 json!({ "dir": "projects/demo/code-reviews", "slug": "fleet-loop-spin", "body": "b" }),
                 op::ADD_CODE_REVIEW,
+            ),
+            (
+                "add_command",
+                json!({ "dir": "os/commands", "slug": "rebuild-activations", "body": "b" }),
+                op::ADD_COMMAND,
+            ),
+            (
+                "update_command",
+                json!({ "dir": "os/commands", "id": 2, "body": "b" }),
+                op::UPDATE_COMMAND,
             ),
             (
                 "edit_section",

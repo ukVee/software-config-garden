@@ -22,6 +22,8 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "note_revised",
     "code_review_added",
     "code_review_revised",
+    "command_added",
+    "command_updated",
     "monolith_split",
     "index_reindexed",
     "section_added",
@@ -136,7 +138,7 @@ impl Intent {
 const KNOWN_INTENTS_LIST: &str =
     "init, memory_edit, manual_edit, snapshot_refresh, decision_logged, \
      incident_logged, note_added, note_revised, code_review_added, \
-     code_review_revised, monolith_split, index_reindexed, section_added, \
+     code_review_revised, command_added, command_updated, monolith_split, index_reindexed, section_added, \
      section_edited, section_appended, reviewed_stamped, text_patched, section_removed, file_unlinked, batch_applied, archive_move, \
      project_added, project_archived, baton_logged, backlog_item_added, \
      queue_added, slice_added, item_status_set, backlog_item_reordered, growlight_initialized, \

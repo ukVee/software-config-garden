@@ -22,6 +22,7 @@
 pub mod conventions;
 
 mod add_code_review;
+mod add_command;
 mod add_note;
 mod add_project;
 mod archive;
@@ -46,6 +47,7 @@ mod unlink;
 pub(crate) mod worktree;
 
 pub use add_code_review::add_code_review;
+pub use add_command::{add_command, update_command};
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
