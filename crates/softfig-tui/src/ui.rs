@@ -3251,7 +3251,7 @@ fn render_help(f: &mut Frame, hits: &mut HitMap, area: Rect) {
 soft-fig TUI — keys
 
   1-7          Browse / History / Vault / Peers / Backup / Deploy / Shares
-  8 9          growlight (read-only, when enabled) · coordination (turns · states · conflicts)
+  8 9          growlight (when enabled) · coordination (turns · states · conflicts)
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -3269,6 +3269,10 @@ soft-fig TUI — keys
   D            unpair / revoke selected (peers / backup view)
   g            grant a backup host (backup view)
   a F          apply / force-apply deploy plan (deploy view)
+  v            growlight: switch to the v2 two-lane queue (when queue.toml exists)
+  K J          growlight v2: move the selected entry or slice up / down
+  s            growlight v2: status picker for the selected entry or slice
+  t a d        growlight v2: toggle lane · edit `after` links · drop an entry
   r            refresh view
   u            unlock (when locked)
   :            command palette

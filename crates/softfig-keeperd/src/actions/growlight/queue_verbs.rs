@@ -1435,8 +1435,8 @@ pub fn slice_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 /// §8 — the children are re-parented in the same write (`parent` := the
 /// dropped entry's parent, `base` := the dropped base) and one restack is
 /// enqueued per distinct project of the whole descendant subtree, not just
-/// the direct children (the restack covers a repo's stack; its doc names
-/// `queue-v2-git` for the rebase steps).
+/// the direct children (the restack covers a repo's stack; its generated doc
+/// carries the rebase steps).
 pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueDropArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_drop args: {e}")))?;

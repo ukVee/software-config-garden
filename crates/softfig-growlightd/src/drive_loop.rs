@@ -9459,8 +9459,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the unit's declared reasoning model overrides the flash roster default",
         );
         // The §3.6 copy: the never-claimed entry was seeded from the template
-        // (with the literal §8 base-line tokens — the concrete values are
-        // queue-v2-git's row) and the SAME contents written to the member path.
+        // (with the literal §8 base-line tokens — the first claim resolved no
+        // branch/base here) and the SAME contents written to the member path.
         let seeded = std::fs::read_to_string(entries_dir.join("m1").join("baton.md"))
             .expect("the entry baton was seeded");
         assert!(
@@ -9469,7 +9469,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         assert!(
             seeded.contains("<branch>") && seeded.contains("<base>"),
-            "the §8 base-line tokens ride the seed until queue-v2-git computes them: {seeded}"
+            "the §8 base-line tokens ride the seed when the first claim resolves none: {seeded}"
         );
         let writes = backend.member_writes();
         assert_eq!(writes.len(), 1, "one member write: {writes:?}");

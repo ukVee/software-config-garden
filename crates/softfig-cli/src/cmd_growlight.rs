@@ -2212,8 +2212,9 @@ pub enum QueueSub {
     /// (default) show the live v2 list from `queue.toml` — both lanes, one row
     /// per entry in file order: id, kind, title, project, lane, status, the
     /// `after` links, and the stack columns (branch/base/claimed) verbatim
-    /// from the TOML. TOML state only — the live git-stack annotations
-    /// (merge-base / restack flags) are queue-v2-git's (finding 3).
+    /// from the TOML. Then, when growlightd answers, the live annotations:
+    /// the open flag per branch, the stack per repo and the session log.
+    /// Best-effort — a stopped or older growlightd just omits them.
     Show,
 
     /// Read-only: what `pick_v2` assigns a member now, and why every skipped
@@ -2699,8 +2700,8 @@ const SHOW_SEPARATOR: &str =
 
 /// The `queue show` rendering (§6.9): both lanes, one row per entry in file
 /// order, with the stack columns verbatim from the TOML. TOML state only — the
-/// live git-stack annotations (merge-base / restack flags) are queue-v2-git's
-/// (finding 3). Same cell rules as the §3.4 derived view (literal `|` escaped,
+/// live git-stack annotations come from growlightd and are rendered after it by
+/// [`render_annotations`]. Same cell rules as the §3.4 derived view (literal `|` escaped,
 /// empty cells an em-dash).
 fn render_queue_show(queue: &QueueToml) -> String {
     let mut out = String::from("queue.toml (schema ");
