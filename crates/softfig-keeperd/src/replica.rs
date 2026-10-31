@@ -26,6 +26,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +42,8 @@ use softfig_store::{
     TreeEntryRow,
 };
 use softfig_vcs::{
-    canonical_tree_bytes, log_collect, reachable_from, reachable_from_tree, verify_commit,
+    canonical_tree_bytes, log_collect, reachable_extend, reachable_from, reachable_from_tree,
+    verify_commit,
     CanonicalCommit, Reachable, Repo, TIP_REF,
 };
 use softfig_vault::VaultSession;
@@ -193,6 +196,69 @@ pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnou
     })
 }
 
+/// The reachable closure of the announced device-chain tip, kept across
+/// reconcile ticks so an up-to-date push costs nothing.
+///
+/// History is append-only, so the closure of a new tip is the previous one plus
+/// the commits added since ([`reachable_extend`]): the same tip is a hit
+/// (no walk at all), a tip that moved forward walks only the new commits, and
+/// only a first use or a tip that does not descend from the cached one
+/// (fork/reset) walks the whole history. One cache belongs to one replica loop
+/// and one chain; it is not shared across chains.
+#[derive(Default)]
+pub struct ClosureCache {
+    last: Mutex<Option<(Hash, Arc<Reachable>)>>,
+    walked: AtomicUsize,
+}
+
+impl std::fmt::Debug for ClosureCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosureCache")
+            .field("commits_walked", &self.commits_walked())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClosureCache {
+    /// Total commits walked by this cache so far. Observability and the
+    /// regression test's counting seam: an up-to-date tick must leave it
+    /// unchanged, a tick with N new commits must advance it by N.
+    pub fn commits_walked(&self) -> usize {
+        self.walked.load(Ordering::Relaxed)
+    }
+
+    fn closure_for(&self, db: &Db, tip: Hash) -> NetResult<Arc<Reachable>> {
+        let mut last = self.last.lock().unwrap();
+        let (closure, walked) = match last.take() {
+            Some((cached_tip, closure)) if cached_tip == tip => (closure, 0),
+            Some((cached_tip, closure)) => {
+                // Sessions run one at a time on the replica loop, so the previous
+                // serve has dropped its handle; a clone is only the fallback.
+                let base = Arc::try_unwrap(closure).unwrap_or_else(|a| clone_reachable(&a));
+                let (next, walked) =
+                    reachable_extend(db, base, cached_tip, tip).map_err(neterr)?;
+                (Arc::new(next), walked)
+            }
+            None => {
+                let full = reachable_from(db, tip).map_err(neterr)?;
+                let walked = full.commits.len();
+                (Arc::new(full), walked)
+            }
+        };
+        self.walked.fetch_add(walked, Ordering::Relaxed);
+        *last = Some((tip, Arc::clone(&closure)));
+        Ok(closure)
+    }
+}
+
+fn clone_reachable(r: &Reachable) -> Reachable {
+    Reachable {
+        commits: r.commits.clone(),
+        trees: r.trees.clone(),
+        blobs: r.blobs.clone(),
+    }
+}
+
 /// [`ReplicaSource`] over a read-only handle to the owner's own VCS store. Open
 /// a fresh `Repo` for the serve thread (sqlite WAL allows a concurrent reader
 /// beside the daemon's writer) and a pre-signed announce snapshotted under the
@@ -200,19 +266,27 @@ pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnou
 ///
 /// **Serve-side scoping (m5c slice 008, finding 6):** the source answers
 /// `get_commit`/`get_tree`/`get_object` **only** for objects in the announced
-/// tip's reachable closure — computed once at construction from
-/// [`reachable_from`]. A chain replicates to exactly its audience *at the
+/// tip's reachable closure. A chain replicates to exactly its audience *at the
 /// source*: a granted backup host that learns some other chain's hash out of
 /// band (e.g. a shared-subtree ciphertext hash) gets `found:false`, so a
 /// legitimate device-chain session can't be turned into an unscoped hash oracle
 /// over the whole `Db`/`ObjectStore`. m5d reuses this serve loop for
 /// `S`-members, so the scoping is enforced here before it becomes load-bearing
 /// for cross-audience isolation.
+///
+/// The closure is built **lazily, on the first request for an object** — a host
+/// that is already at the tip asks for none, so it never pays for one (report
+/// 092) — and through a [`ClosureCache`], so a tip that merely moved forward
+/// walks only what is new.
 pub struct RepoSource {
     repo: Repo,
     announce: TipAnnounce,
+    /// The announced tip; `None` for an empty announce (serves nothing) and for
+    /// a subtree source (closure pre-filled).
+    tip: Option<Hash>,
+    cache: Arc<ClosureCache>,
     /// The reachable closure of the announced tip — the only objects served.
-    served: Reachable,
+    served: OnceLock<Arc<Reachable>>,
 }
 
 impl std::fmt::Debug for RepoSource {
@@ -226,18 +300,31 @@ impl std::fmt::Debug for RepoSource {
 impl RepoSource {
     /// Wrap `repo` + its pre-signed `announce`, scoping the served object set to
     /// the announced tip's reachable closure (finding 6). An empty announce (no
-    /// commits yet) serves nothing. Fallible: computing the closure reads the
-    /// store.
+    /// commits yet) serves nothing. Walks nothing until an object is requested;
+    /// a malformed tip hash is refused here.
     pub fn new(repo: Repo, announce: TipAnnounce) -> NetResult<Self> {
-        let served = if announce.tip_hash.is_empty() {
-            Reachable::default()
+        Self::with_cache(repo, announce, Arc::new(ClosureCache::default()))
+    }
+
+    /// [`new`](Self::new) with the closure kept in `cache`, which the caller
+    /// holds across sessions so the next tick extends it instead of rebuilding.
+    pub fn with_cache(
+        repo: Repo,
+        announce: TipAnnounce,
+        cache: Arc<ClosureCache>,
+    ) -> NetResult<Self> {
+        let served = OnceLock::new();
+        let tip = if announce.tip_hash.is_empty() {
+            let _ = served.set(Arc::new(Reachable::default()));
+            None
         } else {
-            let tip = Hash::from_bytes(h32(&announce.tip_hash)?);
-            reachable_from(repo.db(), tip).map_err(neterr)?
+            Some(Hash::from_bytes(h32(&announce.tip_hash)?))
         };
         Ok(Self {
             repo,
             announce,
+            tip,
+            cache,
             served,
         })
     }
@@ -252,12 +339,37 @@ impl RepoSource {
     /// a tree. The announce is empty: `pull_subtree` never requests a tip or a
     /// commit, so `tip_announce`/`get_commit` are unreachable on this path.
     pub fn for_subtree(repo: Repo, root_tree: [u8; 32]) -> NetResult<Self> {
-        let served = reachable_from_tree(repo.db(), Hash::from_bytes(root_tree)).map_err(neterr)?;
+        let closure = reachable_from_tree(repo.db(), Hash::from_bytes(root_tree)).map_err(neterr)?;
+        let served = OnceLock::new();
+        let _ = served.set(Arc::new(closure));
         Ok(Self {
             repo,
             announce: TipAnnounce::default(),
+            tip: None,
+            cache: Arc::new(ClosureCache::default()),
             served,
         })
+    }
+
+    /// The served closure, built on first use. A store error serves nothing for
+    /// this request — fail-closed, the host reads `found:false` — and is retried
+    /// by the next one.
+    fn served(&self) -> Option<&Reachable> {
+        if let Some(r) = self.served.get() {
+            return Some(r);
+        }
+        let tip = self.tip?;
+        match self.cache.closure_for(self.repo.db(), tip) {
+            Ok(closure) => Some(&**self.served.get_or_init(|| closure)),
+            Err(e) => {
+                eprintln!("keeperd: net: replica closure unavailable, serving nothing: {e}");
+                None
+            }
+        }
+    }
+
+    fn serves(&self, pick: impl Fn(&Reachable) -> bool) -> bool {
+        self.served().is_some_and(pick)
     }
 }
 
@@ -269,7 +381,7 @@ impl ReplicaSource for RepoSource {
     fn get_commit(&self, hash: &[u8; 32]) -> CommitData {
         // Off-closure hashes are refused as if absent — the source serves only
         // the announced tip's reachable set (finding 6), never the whole store.
-        if !self.served.commits.contains(&Hash::from_bytes(*hash)) {
+        if !self.serves(|r| r.commits.contains(&Hash::from_bytes(*hash))) {
             return CommitData {
                 found: false,
                 ..Default::default()
@@ -285,7 +397,7 @@ impl ReplicaSource for RepoSource {
     }
 
     fn get_tree(&self, hash: &[u8; 32]) -> TreeData {
-        if !self.served.trees.contains(&Hash::from_bytes(*hash)) {
+        if !self.serves(|r| r.trees.contains(&Hash::from_bytes(*hash))) {
             return TreeData {
                 found: false,
                 ..Default::default()
@@ -305,7 +417,7 @@ impl ReplicaSource for RepoSource {
     }
 
     fn get_object(&self, hash: &[u8; 32]) -> ObjectData {
-        if !self.served.blobs.contains(&Hash::from_bytes(*hash)) {
+        if !self.serves(|r| r.blobs.contains(&Hash::from_bytes(*hash))) {
             return ObjectData {
                 found: false,
                 ..Default::default()

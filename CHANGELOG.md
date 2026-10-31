@@ -20,6 +20,14 @@ decision record or crate that owns it, rather than at every internal change.
   (`model_not_found` / 404) parks the unit with an alert carrying the reason;
   there is no crash loop and no backoff retry.
 
+### Fixed
+
+- keeperd no longer re-walks the whole commit and tree history on every 20 s
+  replica sync. The served closure is built only when a host actually asks for
+  an object and is kept across ticks, so an up-to-date host costs no walk and a
+  new commit walks only what is new (about 4.5 % of a core around the clock
+  before; growlight report 092).
+
 ## [1.0.0-alpha.1] - 2026-10-17
 
 The first public alpha: everything that exists so far, released as source. Built

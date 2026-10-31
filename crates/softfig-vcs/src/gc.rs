@@ -59,6 +59,53 @@ pub fn reachable_from(db: &Db, tip: Hash) -> Result<Reachable> {
     Ok(r)
 }
 
+/// Advance `base` — the complete closure of `base_tip` — to the closure of `tip`
+/// by walking **only the commits added since `base_tip`**. Returns the extended
+/// closure and how many commits it walked.
+///
+/// History is append-only and a commit hash covers its parent and root tree, so
+/// everything reachable from a commit already in `base` is already in `base`:
+/// the walk from `tip` stops at `base_tip`, and each new root tree stops at any
+/// subtree `base` already holds. `tip == base_tip` walks nothing.
+///
+/// The result is exact — never a superset of `reachable_from(tip)`. If `tip` does
+/// not descend from `base_tip` (a fork or a reset), `base` holds objects `tip`
+/// cannot reach, so this falls back to a fresh [`reachable_from`] rather than
+/// reuse it. `base` is consumed; on error it is gone, not half-extended.
+pub fn reachable_extend(
+    db: &Db,
+    base: Reachable,
+    base_tip: Hash,
+    tip: Hash,
+) -> Result<(Reachable, usize)> {
+    // Collect the new commits first, mutating nothing: the ancestry check must
+    // pass before `base` is touched.
+    let mut added = Vec::new();
+    let mut cur = Some(tip);
+    let mut descends = false;
+    while let Some(ch) = cur {
+        if base.commits.contains(&ch) {
+            descends = ch == base_tip;
+            break;
+        }
+        let commit = db.get_commit(&ch)?;
+        added.push((ch, commit.root_tree));
+        cur = commit.parent;
+    }
+    if !descends {
+        let fresh = reachable_from(db, tip)?;
+        let walked = fresh.commits.len();
+        return Ok((fresh, walked));
+    }
+    let mut r = base;
+    let walked = added.len();
+    for (ch, root_tree) in added {
+        r.commits.insert(ch);
+        walk_tree(db, root_tree, &mut r)?;
+    }
+    Ok((r, walked))
+}
+
 /// The object closure of a single **tree** root — the tree, its subtrees, and
 /// the blobs they name (no commit ancestry). The tree-rooted counterpart of
 /// [`reachable_from`], used by the m5e shared-chain push serve to scope its

@@ -15,6 +15,7 @@
 
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -27,7 +28,9 @@ use softfig_ipc::{
         ReplicaStatusReply, UnlockArgs},
     ErrorKind, Request, Response,
 };
-use softfig_keeperd::replica::{build_announce, mirror_dir, MirrorStore, RepoSource};
+use softfig_keeperd::replica::{
+    build_announce, mirror_dir, ClosureCache, MirrorStore, RepoSource,
+};
 use softfig_keeperd::{Daemon, KeeperConfig};
 use softfig_net::proto::{HelloPayload, TipAnnounce};
 use softfig_net::ring::{ring_path, Ring, RingEntry};
@@ -155,6 +158,28 @@ fn replicate_with(
     announce: TipAnnounce,
     mirror: &mut MirrorStore,
 ) -> Result<PullSummary, NetError> {
+    replicate_with_cache(
+        driver,
+        garden,
+        owner_transport,
+        owner_device_id,
+        announce,
+        mirror,
+        Arc::new(ClosureCache::default()),
+    )
+}
+
+/// [`replicate_with`] serving through `cache`, the closure cache the daemon's
+/// replica loop keeps across ticks.
+fn replicate_with_cache(
+    driver: Driver,
+    garden: &Path,
+    owner_transport: [u8; 32],
+    owner_device_id: [u8; 32],
+    announce: TipAnnounce,
+    mirror: &mut MirrorStore,
+    cache: Arc<ClosureCache>,
+) -> Result<PullSummary, NetError> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap();
     let garden = garden.to_path_buf();
@@ -164,7 +189,7 @@ fn replicate_with(
         let hello = HelloPayload::new(owner_device_id.to_vec(), "owner");
         let mut session = xx_responder(stream, &owner_transport, &hello).unwrap();
         let repo = Repo::open(&garden).unwrap();
-        let source = RepoSource::new(repo, announce).unwrap();
+        let source = RepoSource::with_cache(repo, announce, cache).unwrap();
         let _ = serve_replication(&mut session, &source);
     });
 
@@ -292,6 +317,59 @@ fn incremental_fast_forward_fetches_only_new_commits() {
 
     assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
     assert!(fsck_mirror(replica_root.path(), &owner.device_id).ok());
+}
+
+/// Report 092: an up-to-date host costs no history walk, and a tip that moved
+/// forward walks only the commits added since — across the sessions of one
+/// replica loop, which share a [`ClosureCache`].
+#[test]
+fn up_to_date_sync_walks_no_history_and_new_commits_walk_only_themselves() {
+    let mut owner = new_owner();
+    owner.commit_file("a.md", "alpha");
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+    let cache = Arc::new(ClosureCache::default());
+    let sync = |owner: &Owner, mirror: &mut MirrorStore| {
+        let announce = build_announce(&owner.repo, &owner.session).unwrap();
+        replicate_with_cache(
+            Driver::Sequential,
+            &owner.garden,
+            owner.transport_secret,
+            owner.device_id,
+            announce,
+            mirror,
+            Arc::clone(&cache),
+        )
+        .unwrap()
+    };
+
+    // First sync backfills genesis + a.md: the whole chain is walked, once.
+    let s1 = sync(&owner, &mut mirror);
+    assert_eq!(s1.commits, 2);
+    assert_eq!(cache.commits_walked(), 2);
+
+    // Same tip, host already there: nothing fetched, nothing walked.
+    for _ in 0..3 {
+        let s = sync(&owner, &mut mirror);
+        assert_eq!(s.commits, 0, "host is up to date");
+        assert_eq!(cache.commits_walked(), 2, "an up-to-date sync walked history");
+    }
+
+    // Two new commits: the walk advances by exactly those two.
+    owner.commit_file("b.md", "beta");
+    let tip = owner.commit_file("dir/c.md", "gamma");
+    let s2 = sync(&owner, &mut mirror);
+    assert_eq!(s2.commits, 2);
+    assert_eq!(cache.commits_walked(), 4, "walked more than the new commits");
+    drop(mirror);
+
+    assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
+    let report = fsck_mirror(replica_root.path(), &owner.device_id);
+    assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
+    assert_eq!(report.commits_checked, 4);
 }
 
 #[test]
