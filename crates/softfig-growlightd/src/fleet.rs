@@ -541,6 +541,10 @@ pub struct FleetConfig {
     /// before growlightd terminates the session (§6.3 step 4: on exit or after
     /// the grace, whichever comes first). Absent ⇒ [`DEFAULT_ROLL_GRACE_SECS`].
     pub roll_grace_secs: u64,
+    /// `[schedule]` — growlightd's clock (milestone `growlight-schedule`). `None`
+    /// when the table is absent: no schedule gate. Slice 001 carries the raw
+    /// table only; nothing reads it for admission yet.
+    pub schedule: Option<crate::schedule::ScheduleDoc>,
 }
 
 /// §6.3 step 4's default grace between a member's handshake and growlightd
@@ -561,6 +565,7 @@ impl FleetConfig {
             max_iterations: None,
             queue: QueueMode::Legacy,
             roll_grace_secs: DEFAULT_ROLL_GRACE_SECS,
+            schedule: None,
         }
     }
 
@@ -588,6 +593,9 @@ impl FleetConfig {
             queue: QueueMode,
             /// §6.3 step 4's grace. Absent ⇒ the default.
             roll_grace_secs: Option<u64>,
+            /// `[schedule]`. Absent ⇒ `None`; an unknown key inside it is a
+            /// TOML parse error (fail-closed at the loader).
+            schedule: Option<crate::schedule::ScheduleDoc>,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -644,6 +652,7 @@ impl FleetConfig {
             max_iterations: doc.max_iterations,
             queue: doc.queue,
             roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
+            schedule: doc.schedule,
         })
     }
 

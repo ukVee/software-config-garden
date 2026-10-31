@@ -50,6 +50,7 @@ pub mod queue_source;
 pub mod rate_limit_holds;
 pub mod reconcile;
 pub mod resume;
+pub mod schedule;
 pub mod scheduler;
 pub mod scheduler_v2;
 pub mod server;
