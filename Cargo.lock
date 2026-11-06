@@ -3717,8 +3717,10 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "iced",
  "serde_json",
+ "softfig-client",
  "softfig-growlightd-client",
- "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]

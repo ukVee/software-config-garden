@@ -8,7 +8,9 @@ repository.workspace = true
 description = "soft-fig growlight GUI view-model: the Elm-style app state + reducer + render-model over the growlightd IPC. The iced render binding is the deferred (§7b) live wiring."
 
 [dependencies]
-softfig-ipc.workspace = true
+softfig-protocol-keeperd.workspace = true
+softfig-protocol-growlightd.workspace = true
+softfig-client.workspace = true
 softfig-growlightd-client.workspace = true
 serde_json.workspace = true
 # The iced runtime (window + event loop + renderer) is pulled in ONLY by the

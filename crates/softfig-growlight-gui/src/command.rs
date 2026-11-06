@@ -3,7 +3,7 @@
 //! [`Command`]; [`Command::to_request`] turns it into the exact [`WireRequest`]
 //! (which daemon + op + JSON args) a thin live binding sends. No iced, no socket —
 //! the command→wire mapping is the tested proof. The deferred live send reuses
-//! the already-tested [`softfig_ipc::call_reconnecting`], dialing the socket named
+//! the already-tested [`softfig_client::call_reconnecting`], dialing the socket named
 //! by [`WireRequest::daemon`]; there is no new client helper.
 //!
 //! Routing (LOCKED — spec §13 / the one-way bus bridge): the human input box
@@ -13,19 +13,19 @@
 //!
 //! Bus addressing: the post args keep the sigil form (`from:@human`, `to:@all`),
 //! exactly as keeperd's `post_message` expects; the `@` is stripped only on the
-//! echoed [`softfig_ipc::growlightd::Event::BusMessage`] — and so on the optimistic
+//! echoed [`softfig_protocol_growlightd::Event::BusMessage`] — and so on the optimistic
 //! chat line ([`crate::state::App::push_human_post`]).
 //!
 //! `set_policy` is a wire contract whose daemon handler is deferred to the
-//! admission-governor phase (see [`softfig_ipc::growlightd::op::SET_POLICY`]); the
+//! admission-governor phase (see [`softfig_protocol_growlightd::op::SET_POLICY`]); the
 //! GUI's knobs panel builds the intent now and is ready when the handler lands.
 
 use serde_json::Value;
 
-use softfig_ipc::growlightd::{
+use softfig_protocol_growlightd::{
     op as gop, ForceStopArgs, PolicySummary, SetPolicyArgs, SetResourcesArgs, StopLevel,
 };
-use softfig_ipc::verbs::{op as kop, PostMessageArgs};
+use softfig_protocol_keeperd::verbs::{op as kop, PostMessageArgs};
 
 /// The sender every human bus post carries — the human is a first-class member,
 /// never an agent slug (mirrors the CLI `say` path's `human_say_args`). Its
@@ -42,7 +42,7 @@ pub enum Daemon {
 }
 
 /// A built IPC request: the daemon to dial, the op name, and the JSON args. The
-/// deferred live binding sends it via [`softfig_ipc::call_reconnecting`] against
+/// deferred live binding sends it via [`softfig_client::call_reconnecting`] against
 /// the matching socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireRequest {

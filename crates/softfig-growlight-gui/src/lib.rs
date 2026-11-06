@@ -12,7 +12,7 @@
 //!   binding sends; plus the optimistic-post path in [`update`]/[`state`].
 //! - [`dispatch`] — the live one-shot *send*: route a built [`WireRequest`] to
 //!   its daemon socket and put it on the wire via the already-tested
-//!   [`softfig_ipc::call_reconnecting`] (the write mirror of [`drive_messages`]).
+//!   [`softfig_client::call_reconnecting`] (the write mirror of [`drive_messages`]).
 //! - [`selectors`] — pure derivations (filter/join/order) the panels walk: the
 //!   per-agent thoughts window, the roster⋈leases "who holds what", the fleet rows.
 //! - [`render`] — text-shaped panel content the deferred `view()` maps to widgets.

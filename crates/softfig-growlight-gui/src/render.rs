@@ -4,7 +4,7 @@
 //! the §7b deferred work is only turning these strings into iced `Element`s and
 //! showing a window.
 
-use softfig_ipc::growlightd::{AgentDeltaKind, BuildCapsSummary};
+use softfig_protocol_growlightd::{AgentDeltaKind, BuildCapsSummary};
 
 use crate::state::{App, ChatLine, ConnState, LeaseRow, ResourcesOutcome, ThoughtLine};
 
@@ -121,7 +121,7 @@ pub fn lease_line(l: &LeaseRow) -> String {
 mod tests {
     use super::*;
     use crate::state::App;
-    use softfig_ipc::growlightd::AgentDeltaKind;
+    use softfig_protocol_growlightd::AgentDeltaKind;
 
     #[test]
     fn status_summary_reads_back_the_key_fields() {

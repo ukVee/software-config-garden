@@ -33,7 +33,7 @@ use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Subscription, Task};
 
-use softfig_ipc::growlightd::{SetResourcesReply, StopLevel};
+use softfig_protocol_growlightd::{SetResourcesReply, StopLevel};
 
 use crate::command::{Command, Daemon, WireRequest};
 use crate::dispatch::{load_status, send, socket_for, ReconnectingTransport};
@@ -692,7 +692,7 @@ fn window_settings() -> iced::window::Settings {
 mod tests {
     use super::*;
     use crate::state::{ChatLine, ConnState, ResourcesOutcome, ThoughtLine};
-    use softfig_ipc::growlightd::{AgentDeltaKind, BuildCapsSummary, PolicySummary};
+    use softfig_protocol_growlightd::{AgentDeltaKind, BuildCapsSummary, PolicySummary};
 
     fn policy() -> PolicySummary {
         PolicySummary {
