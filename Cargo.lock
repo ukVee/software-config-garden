@@ -3806,7 +3806,10 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "softfig-client",
  "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]
