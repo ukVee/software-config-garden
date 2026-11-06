@@ -3680,6 +3680,12 @@ dependencies = [
 [[package]]
 name = "softfig-client"
 version = "1.0.0-alpha.1"
+dependencies = [
+ "libc",
+ "serde_json",
+ "softfig-protocol-keeperd",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "softfig-deploy"
@@ -3746,9 +3752,9 @@ name = "softfig-ipc"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
- "libc",
  "serde",
  "serde_json",
+ "softfig-client",
  "softfig-protocol-growlightd",
  "softfig-protocol-keeperd",
  "tempfile",

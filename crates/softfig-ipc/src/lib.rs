@@ -11,7 +11,6 @@
 pub mod backlog_doc;
 pub mod baton;
 pub mod claude_profiles;
-pub mod client;
 pub mod fleet;
 pub mod item_meta;
 pub mod item_repo;
@@ -20,14 +19,10 @@ pub mod model_choice;
 pub mod opencode;
 pub mod queue_v2;
 pub mod slot_name;
-pub mod socket;
 pub mod testing;
 pub mod usage;
 
 pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
-pub use client::{
-    call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
-};
 pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
@@ -41,7 +36,11 @@ pub use queue_v2::{
     QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,
     SlicesToml,
 };
-pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
+pub use softfig_client::{client, socket};
+pub use softfig_client::{
+    call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
+};
+pub use softfig_client::{growlightd_runtime_socket_path, runtime_socket_path};
 pub use softfig_protocol_growlightd::growlightd;
 pub use softfig_protocol_keeperd::{proto, verbs, PROTOCOL_VERSION};
 pub use softfig_protocol_keeperd::proto::{ErrorKind, Request, Response};
