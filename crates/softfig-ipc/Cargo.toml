@@ -8,6 +8,7 @@ repository.workspace = true
 description = "soft-fig IPC: JSON-Lines protocol types + Unix-socket client helpers."
 
 [dependencies]
+softfig-protocol-keeperd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

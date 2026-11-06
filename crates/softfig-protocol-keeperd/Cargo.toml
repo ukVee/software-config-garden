@@ -10,3 +10,5 @@ repository.workspace = true
 description = "soft-fig keeperd wire protocol: the JSON-Lines envelope and the verb types. No IO."
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -3749,6 +3749,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "softfig-protocol-keeperd",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3840,6 +3841,10 @@ version = "0.1.0"
 [[package]]
 name = "softfig-protocol-keeperd"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "softfig-store"
