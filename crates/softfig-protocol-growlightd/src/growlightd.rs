@@ -4,7 +4,9 @@
 //! growlightd is the multi-agent orchestrator daemon
 //! (`meta/spec-growlight-orchestrator.md` §2/§13): a *separate* process from
 //! keeperd that owns the agent fleet. It reuses the shared JSON-Lines envelope
-//! ([`crate::Request`] / [`crate::Response`] / [`crate::ErrorKind`]) — the same
+//! ([`Request`](softfig_protocol_keeperd::Request) /
+//! [`Response`](softfig_protocol_keeperd::Response) /
+//! [`ErrorKind`](softfig_protocol_keeperd::ErrorKind)) — the same
 //! "keeperd-style" framing — but on a distinct socket with its own verbs. These
 //! live here (not in `softfig-keeperd`) for the same reason the keeperd verbs do:
 //! the wire types are shared by the daemon and every client, so neither side has
@@ -15,10 +17,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// growlightd op names. Distinct namespace from the keeperd [`crate::op`]
+/// growlightd op names. Distinct namespace from the keeperd [`op`](softfig_protocol_keeperd::op)
 /// module even where the string coincides (`status`) — they ride different
 /// sockets.
 pub mod op {
+    // Rustdoc only: the op docs below link the sibling arg and reply types by bare name.
+    #[cfg(doc)]
+    use super::*;
+
     /// `status() -> FleetStatusReply`. Fleet + per-agent snapshot. Always
     /// answerable. Phase-1 fleet is empty (no agents yet).
     pub const STATUS: &str = "status";
@@ -26,10 +32,10 @@ pub mod op {
     /// the accept loop winds down (ack-before-teardown, mirroring keeperd).
     pub const SHUTDOWN: &str = "shutdown";
     /// `subscribe() -> stream<`[`Event`]`>`. The one *streaming* verb (spec §13
-    /// Observe): instead of a single [`crate::Response`], the daemon holds the
+    /// Observe): instead of a single [`Response`](softfig_protocol_keeperd::Response), the daemon holds the
     /// connection open and writes newline-framed [`Event`] JSON objects as they
     /// occur, until the client disconnects or the daemon stops. Clients decode
-    /// each line as an [`Event`], not a [`crate::Response`].
+    /// each line as an [`Event`], not a [`Response`](softfig_protocol_keeperd::Response).
     pub const SUBSCRIBE: &str = "subscribe";
     /// `baton(`[`BatonArgs`]`) -> `[`BatonReply`]. Read-only: the LIVE runtime
     /// baton (the loop's carried state). The runtime baton lives OUTSIDE the
@@ -48,7 +54,7 @@ pub mod op {
     pub const BATON: &str = "baton";
 
     // --- Control family (spec §13 Control / §8 pings & control). Every control
-    // verb is ONE-SHOT (a single [`crate::Response`]); only `subscribe` streams.
+    // verb is ONE-SHOT (a single `Response`); only `subscribe` streams.
     // The state they set is *intent* the future drive loop reads at safe
     // handoff boundaries — there is no native mid-session injection (spec §8).
 
@@ -164,9 +170,9 @@ pub mod op {
     // current entry (and a slice body to the subset rule), then issues the
     // human verb to keeperd itself and relays keeperd's reply verbatim.
 
-    /// `member_slice_insert(`[`MemberCall`]`<`[`SliceInsertArgs`](crate::verbs::SliceInsertArgs)`>)`.
+    /// `member_slice_insert(`[`MemberCall`]`<`[`SliceInsertArgs`](softfig_protocol_keeperd::verbs::SliceInsertArgs)`>)`.
     pub const MEMBER_SLICE_INSERT: &str = "member_slice_insert";
-    /// `member_slice_update(`[`MemberCall`]`<`[`SliceUpdateArgs`](crate::verbs::SliceUpdateArgs)`>)`
+    /// `member_slice_update(`[`MemberCall`]`<`[`SliceUpdateArgs`](softfig_protocol_keeperd::verbs::SliceUpdateArgs)`>)`
     /// — `move` only.
     pub const MEMBER_SLICE_UPDATE: &str = "member_slice_update";
 
@@ -199,7 +205,7 @@ pub struct FleetStatusReply {
     /// Garden root growlightd derived from the keeperd `status` handshake
     /// (never a literal path — spec §12).
     pub garden_root: String,
-    /// growlightd's own IPC protocol version (the shared [`crate::PROTOCOL_VERSION`]).
+    /// growlightd's own IPC protocol version (the shared [`PROTOCOL_VERSION`](softfig_protocol_keeperd::PROTOCOL_VERSION)).
     pub protocol_version: u8,
     /// The active per-device policy (budget thresholds + concurrency cap).
     pub policy: PolicySummary,
@@ -422,7 +428,7 @@ impl AgentSpendSummary {
 }
 
 /// The per-device policy growlightd runs under, echoed in `status`. Mirrors
-/// [`crate::PROTOCOL_VERSION`]-stable budget knobs from spec §7 plus the §17
+/// [`PROTOCOL_VERSION`](softfig_protocol_keeperd::PROTOCOL_VERSION)-stable budget knobs from spec §7 plus the §17
 /// concurrency cap; the GUI's tweak panel (spec §11) edits these.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicySummary {
@@ -689,7 +695,7 @@ pub struct BuildCapsSummary {
 /// out-of-range value is rejected by the daemon, never clamped.
 ///
 /// Note (slice 008): `None` here = *leave untouched* — the OPPOSITE of the persist
-/// [`crate::verbs::GrowlightSetResourcesArgs`], where `None` = *remove the key*.
+/// [`GrowlightSetResourcesArgs`](softfig_protocol_keeperd::verbs::GrowlightSetResourcesArgs), where `None` = *remove the key*.
 /// They never cross: growlightd applies this partial live merge, then persists the
 /// FULL merged caps (all `Some`) through that other verb.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -907,7 +913,7 @@ pub struct RestartReply {
 
 /// The envelope every member verb travels in: the caller's identity beside the
 /// model-supplied arguments, never inside them. `member` is filled by
-/// softfig-mcp from `SOFTFIG_MEMBER` ([`crate::MemberIdentity`]); `None` = the
+/// softfig-mcp from `SOFTFIG_MEMBER` (`softfig_ipc::MemberIdentity`); `None` = the
 /// caller is not a member session, which growlightd refuses `not_a_member`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
