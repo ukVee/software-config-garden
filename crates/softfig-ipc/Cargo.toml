@@ -9,6 +9,7 @@ description = "soft-fig IPC: JSON-Lines protocol types + Unix-socket client help
 
 [dependencies]
 softfig-protocol-keeperd.workspace = true
+softfig-protocol-growlightd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -10,3 +10,6 @@ repository.workspace = true
 description = "soft-fig growlightd wire protocol, unstable: any version bump may break. No IO."
 
 [dependencies]
+softfig-protocol-keeperd.workspace = true
+serde.workspace = true
+serde_json.workspace = true

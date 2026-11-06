@@ -13,7 +13,6 @@ pub mod baton;
 pub mod claude_profiles;
 pub mod client;
 pub mod fleet;
-pub mod growlightd;
 pub mod item_meta;
 pub mod item_repo;
 pub mod member;
@@ -43,6 +42,7 @@ pub use queue_v2::{
     SlicesToml,
 };
 pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
+pub use softfig_protocol_growlightd::growlightd;
 pub use softfig_protocol_keeperd::{proto, verbs, PROTOCOL_VERSION};
 pub use softfig_protocol_keeperd::proto::{ErrorKind, Request, Response};
 pub use softfig_protocol_keeperd::verbs::*;

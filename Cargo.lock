@@ -3749,6 +3749,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "softfig-protocol-growlightd",
  "softfig-protocol-keeperd",
  "tempfile",
  "thiserror 2.0.18",
@@ -3837,6 +3838,11 @@ dependencies = [
 [[package]]
 name = "softfig-protocol-growlightd"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "softfig-protocol-keeperd",
+]
 
 [[package]]
 name = "softfig-protocol-keeperd"
