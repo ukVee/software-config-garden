@@ -3743,7 +3743,8 @@ name = "softfig-growlightd-client"
 version = "1.0.0-alpha.1"
 dependencies = [
  "serde_json",
- "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
  "thiserror 2.0.18",
 ]
 
