@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use softfig_ipc::TreeEntry;
+use softfig_protocol_keeperd::TreeEntry;
 
 #[derive(Debug, Clone)]
 pub struct Node {

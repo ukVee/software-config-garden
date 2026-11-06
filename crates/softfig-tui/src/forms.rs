@@ -7,7 +7,7 @@
 //! back. Pure logic; unit-tested without a terminal.
 
 use serde_json::{json, Value};
-use softfig_ipc::op;
+use softfig_protocol_keeperd::op;
 
 use crate::textarea::TextArea;
 

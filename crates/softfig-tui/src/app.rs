@@ -13,8 +13,8 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use serde_json::{json, Value};
-use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
-use softfig_ipc::{
+use softfig_protocol_growlightd::{BatonReply, FleetStatusReply};
+use softfig_protocol_keeperd::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
     DiscoveredDevice, ErrorKind, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply,
@@ -160,7 +160,7 @@ pub enum FleetHeader {
 /// finding #5) — the TUI no longer re-parses the managed
 /// `<!-- softfig:queue -->` table itself, so a piped `|` in a title round-trips
 /// and the active item is always found. Read-only.
-pub type GrowlightRow = softfig_ipc::GrowlightQueueRow;
+pub type GrowlightRow = softfig_protocol_keeperd::GrowlightQueueRow;
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
 /// confirmation, or a nearby device discovered over mDNS (Slice A pick-list).
@@ -440,7 +440,7 @@ pub struct App {
     /// Conflict sidecars (`.conflict-<device>-<ts>.md`, slice 003 output)
     /// discovered by `list_tree`-ing each shared subtree's mount root and keeping
     /// the `.conflict-` entries. Read-only.
-    pub coordination_sidecars: Vec<softfig_ipc::TreeEntry>,
+    pub coordination_sidecars: Vec<softfig_protocol_keeperd::TreeEntry>,
     /// Flattened Coordination selection list (peers, then turns, then sidecars),
     /// rebuilt whenever any of those three change.
     pub coordination_rows: Vec<CoordRow>,
@@ -1235,7 +1235,7 @@ impl App {
             Tag::ListTree { dir } => match reply.result {
                 Ok(v) => {
                     if let Ok(r) =
-                        serde_json::from_value::<softfig_ipc::ListTreeReply>(v)
+                        serde_json::from_value::<softfig_protocol_keeperd::ListTreeReply>(v)
                     {
                         self.tree.set_children(&dir, r.entries);
                         self.tree.clamp_selection();
@@ -1559,7 +1559,7 @@ impl App {
                 Err((_, m)) => self.status = format!("growlight queue: {m}"),
             },
             Tag::GrowlightMilestones => match reply.result {
-                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                Ok(v) => match serde_json::from_value::<softfig_protocol_keeperd::ListTreeReply>(v) {
                     Ok(r) => {
                         self.growlight_milestone_ids = r
                             .entries
@@ -1575,7 +1575,7 @@ impl App {
                 Err((_, m)) => self.status = format!("growlight milestones: {m}"),
             },
             Tag::GrowlightTasks => match reply.result {
-                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                Ok(v) => match serde_json::from_value::<softfig_protocol_keeperd::ListTreeReply>(v) {
                     Ok(r) => {
                         // Seed the resolver's bare-`NNN` → file map, then retry the
                         // selection read (a task selected before this landed had
@@ -1639,7 +1639,7 @@ impl App {
                 Err((_, m)) => self.status = format!("growlight node {path}: {m}"),
             },
             Tag::GrowlightBatonList => match reply.result {
-                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                Ok(v) => match serde_json::from_value::<softfig_protocol_keeperd::ListTreeReply>(v) {
                     Ok(r) => {
                         if let Some(path) = latest_baton_path(&r.entries) {
                             ipc.send(
@@ -1829,7 +1829,7 @@ impl App {
             // just contributes no sidecars, so only the Ok path does work.
             Tag::CoordinationSidecarList => {
                 if let Ok(v) = reply.result
-                    && let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    && let Ok(r) = serde_json::from_value::<softfig_protocol_keeperd::ListTreeReply>(v) {
                         self.coordination_sidecars
                             .extend(r.entries.into_iter().filter(is_conflict_sidecar));
                         self.rebuild_coordination_rows();
@@ -4028,7 +4028,7 @@ pub fn bus_rows(messages: &[ChatMessage]) -> Vec<BusRow> {
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
 /// `list_tree growlight/baton-log` reply. Non-numeric entries (e.g. `CLAUDE.md`)
 /// and directories are ignored; returns the entry's repo-relative path.
-pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
+pub fn latest_baton_path(entries: &[softfig_protocol_keeperd::TreeEntry]) -> Option<String> {
     entries
         .iter()
         .filter(|e| !e.is_dir)
@@ -4044,7 +4044,7 @@ pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
 /// file (slice 003 LWW output)? Matched by name so the Coordination tab can
 /// surface unresolved-tip conflicts discovered under a shared subtree's mount
 /// root. Directories never qualify.
-pub fn is_conflict_sidecar(e: &softfig_ipc::TreeEntry) -> bool {
+pub fn is_conflict_sidecar(e: &softfig_protocol_keeperd::TreeEntry) -> bool {
     !e.is_dir && e.name.contains(".conflict-")
 }
 
@@ -4237,7 +4237,7 @@ mod tests {
         app.view = View::Browse;
         app.tree.set_children(
             "",
-            vec![softfig_ipc::TreeEntry {
+            vec![softfig_protocol_keeperd::TreeEntry {
                 name: "db.toml".into(),
                 path: "config/db.toml".into(),
                 is_dir: false,
@@ -4302,7 +4302,7 @@ mod tests {
         app.view = View::Browse;
         app.tree.set_children(
             "",
-            vec![softfig_ipc::TreeEntry {
+            vec![softfig_protocol_keeperd::TreeEntry {
                 name: "notes.md".into(),
                 path: "notes.md".into(),
                 is_dir: false,
@@ -5009,7 +5009,7 @@ mod tests {
             Reply {
                 id: 1,
                 tag: Tag::PairList,
-                result: Ok(serde_json::to_value(softfig_ipc::PairListReply {
+                result: Ok(serde_json::to_value(softfig_protocol_keeperd::PairListReply {
                     peers: vec![peer("tablet", &"11".repeat(32))],
                     pending: vec![pending("laptop", &"22".repeat(32), "123 456")],
                 })
@@ -5256,7 +5256,7 @@ mod tests {
             Reply {
                 id: 1,
                 tag: Tag::ReplicaStatus,
-                result: Ok(serde_json::to_value(softfig_ipc::ReplicaStatusReply {
+                result: Ok(serde_json::to_value(softfig_protocol_keeperd::ReplicaStatusReply {
                     host: true,
                     push_to: vec![push_target(&"11".repeat(32))],
                     hosted: vec![hosted_chain(&"22".repeat(32), "tablet", 4)],
@@ -5648,8 +5648,8 @@ mod tests {
 
     // ---- slice 004: read-only growlight section ----
 
-    fn tree_entry(name: &str, path: &str, is_dir: bool) -> softfig_ipc::TreeEntry {
-        softfig_ipc::TreeEntry {
+    fn tree_entry(name: &str, path: &str, is_dir: bool) -> softfig_protocol_keeperd::TreeEntry {
+        softfig_protocol_keeperd::TreeEntry {
             name: name.to_string(),
             path: path.to_string(),
             is_dir,
@@ -5701,7 +5701,7 @@ mod tests {
                 state: state.into(),
                 tip: None,
                 garden_root: "/g".into(),
-                protocol_version: softfig_ipc::PROTOCOL_VERSION,
+                protocol_version: softfig_protocol_keeperd::PROTOCOL_VERSION,
                 relock_pending: false,
                 relock_expires_at: None,
                 growlight_enabled,
@@ -6218,7 +6218,7 @@ mod tests {
             Reply {
                 id: 1,
                 tag: Tag::FleetStatus,
-                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+                result: Err((softfig_protocol_keeperd::ErrorKind::Io, "connect: no such file".into())),
             },
             &mut ipc,
         );
@@ -6347,7 +6347,7 @@ mod tests {
             Reply {
                 id: 2,
                 tag: Tag::GrowlightRuntimeBaton,
-                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+                result: Err((softfig_protocol_keeperd::ErrorKind::Io, "connect: no such file".into())),
             },
             &mut ipc,
         );
@@ -6611,7 +6611,7 @@ mod tests {
             Reply {
                 id: 3,
                 tag: Tag::GrowlightBus,
-                result: Err((softfig_ipc::ErrorKind::Io, "boom".into())),
+                result: Err((softfig_protocol_keeperd::ErrorKind::Io, "boom".into())),
             },
             &mut ipc,
         );
@@ -7172,7 +7172,7 @@ mod tests {
         app.locked = false;
         app.tree.set_children(
             "",
-            vec![softfig_ipc::TreeEntry {
+            vec![softfig_protocol_keeperd::TreeEntry {
                 name: "meta".into(),
                 path: "meta".into(),
                 is_dir: true,

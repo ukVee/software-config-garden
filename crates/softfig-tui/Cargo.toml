@@ -12,7 +12,9 @@ name = "softfig-tui"
 path = "src/main.rs"
 
 [dependencies]
-softfig-ipc.workspace = true
+softfig-protocol-keeperd.workspace = true
+softfig-protocol-growlightd.workspace = true
+softfig-client.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

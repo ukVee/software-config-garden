@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use softfig_ipc::TreeEntry;
+use softfig_protocol_keeperd::TreeEntry;
 
 /// A logical growlight artifact the detail pane can display. The file-like
 /// variants below already live in the garden and resolve to garden reads today;

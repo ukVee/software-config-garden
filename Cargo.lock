@@ -3881,7 +3881,9 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "softfig-ipc",
+ "softfig-client",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]

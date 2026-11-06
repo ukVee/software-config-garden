@@ -15,7 +15,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use ratatui::Terminal;
-use softfig_ipc::TreeEntry;
+use softfig_protocol_keeperd::TreeEntry;
 use softfig_tui::app::{App, Overlay, View};
 use softfig_tui::hit::Hit;
 use softfig_tui::ipc::IpcClient;
@@ -79,7 +79,7 @@ fn renders_vault_frame() {
 
 #[test]
 fn renders_peers_frame() {
-    use softfig_ipc::{PairPeer, PendingPairing};
+    use softfig_protocol_keeperd::{PairPeer, PendingPairing};
 
     let mut app = App::new();
     app.locked = false;
@@ -117,7 +117,7 @@ fn renders_peers_frame() {
 
 #[test]
 fn renders_backup_frame() {
-    use softfig_ipc::{HostedChain, PushTarget};
+    use softfig_protocol_keeperd::{HostedChain, PushTarget};
 
     // Task 058: the stale push target must show its ⚠ marker and its reason in
     // the list itself, without the user opening the detail pane.
@@ -325,7 +325,7 @@ fn renders_help_overlay() {
 
 #[test]
 fn renders_deploy_frame() {
-    use softfig_ipc::{DeployAction, DeployPlanEntry};
+    use softfig_protocol_keeperd::{DeployAction, DeployPlanEntry};
 
     let mut app = App::new();
     app.locked = false;
@@ -381,7 +381,7 @@ fn renders_deploy_force_overlay() {
 
 #[test]
 fn renders_shares_frame() {
-    use softfig_ipc::{PendingShareOfferInfo, SharedSubtreeInfo};
+    use softfig_protocol_keeperd::{PendingShareOfferInfo, SharedSubtreeInfo};
 
     let mut app = App::new();
     app.locked = false;
@@ -474,7 +474,7 @@ fn renders_a_membership_disagreement_with_its_age_and_count() {
     let mut app = App::new();
     app.locked = false;
     app.view = softfig_tui::app::View::Shares;
-    app.share_divergences = vec![softfig_ipc::verbs::ChainDivergenceInfo {
+    app.share_divergences = vec![softfig_protocol_keeperd::verbs::ChainDivergenceInfo {
         chain: "chain/personal".into(),
         peer: "ecdde9321122334455667788990011223344556677889900aabbccddeeff0011".into(),
         peer_name: Some("sillyguy76".into()),
@@ -626,7 +626,7 @@ fn renders_live_fleet_header_from_status_poll() {
     app.growlight_enabled = Some(true);
     app.view = softfig_tui::app::View::Growlight;
     // A decoded growlightd `status` reply drives the live header.
-    let reply: softfig_ipc::growlightd::FleetStatusReply = serde_json::from_value(serde_json::json!({
+    let reply: softfig_protocol_growlightd::FleetStatusReply = serde_json::from_value(serde_json::json!({
         "state": "running",
         "garden_root": "/g",
         "protocol_version": 1,
@@ -704,7 +704,7 @@ fn growlight_header_soft_fails_when_growlightd_unreachable() {
 
 #[test]
 fn growlight_header_shows_the_live_runtime_baton_headline() {
-    use softfig_ipc::growlightd::BatonReply;
+    use softfig_protocol_growlightd::BatonReply;
     use softfig_tui::app::FleetHeader;
 
     let mut app = App::new();
@@ -734,7 +734,7 @@ fn growlight_header_shows_the_live_runtime_baton_headline() {
 
 #[test]
 fn selecting_the_live_baton_node_renders_it_from_the_polled_reply() {
-    use softfig_ipc::growlightd::BatonReply;
+    use softfig_protocol_growlightd::BatonReply;
     use softfig_tui::tree::{BacklogItem, BacklogKind};
 
     let mut app = App::new();
@@ -848,7 +848,7 @@ fn selecting_the_bus_node_renders_history_newest_first_with_alerts_loud() {
 
 #[test]
 fn selecting_the_injected_context_node_shows_both_protocol_and_baton_halves() {
-    use softfig_ipc::growlightd::BatonReply;
+    use softfig_protocol_growlightd::BatonReply;
     use softfig_tui::tree::{BacklogItem, BacklogKind};
 
     let mut app = App::new();
