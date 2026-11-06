@@ -33,8 +33,13 @@ impl RedrawGate {
     }
 
     /// An input event arrived. Key releases/repeats and bare pointer motion
-    /// change nothing on screen (`App::pointer` is never rendered), so they
-    /// don't count; everything else, including a resize, does.
+    /// change nothing on screen, so they don't count; everything else,
+    /// including a resize, does.
+    ///
+    /// Bare motion still updates `App::pointer`, which the editor magnifier
+    /// draws — but only while a drag anchor exists (`App::selection_pointer`
+    /// is `None` otherwise), and crossterm reports motion with a held button
+    /// as `Drag`, not `Moved`. So a `Moved` event cannot change the frame.
     pub fn on_event(&mut self, ev: &Event) {
         let visible = match ev {
             Event::Key(k) => k.kind == KeyEventKind::Press,
