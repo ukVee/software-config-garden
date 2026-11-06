@@ -3678,6 +3678,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-client"
+version = "1.0.0-alpha.1"
+
+[[package]]
 name = "softfig-deploy"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -3828,6 +3832,14 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
 ]
+
+[[package]]
+name = "softfig-protocol-growlightd"
+version = "0.1.0"
+
+[[package]]
+name = "softfig-protocol-keeperd"
+version = "0.1.0"
 
 [[package]]
 name = "softfig-store"

@@ -1,0 +1,12 @@
+[package]
+name = "softfig-protocol-growlightd"
+# Its own 0.x, not `version.workspace`: this crate makes no stability promise
+# (spec-softfig-tui-frontend-split §3.2).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig growlightd wire protocol, unstable: any version bump may break. No IO."
+
+[dependencies]
