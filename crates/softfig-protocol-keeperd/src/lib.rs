@@ -1,6 +1,9 @@
 //! soft-fig keeperd wire protocol: the JSON-Lines envelope and the keeperd verb
 //! types, with no IO. `softfig-ipc` re-exports everything here. See
 //! `meta/spec-softfig-tui-frontend-split.md` §3.1 in the soft-fig garden.
+//!
+//! **Not stable yet.** This crate is `0.x` until an alt-client proves the
+//! contract. `docs/protocol-stability.md` says what `1.0` will promise.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
