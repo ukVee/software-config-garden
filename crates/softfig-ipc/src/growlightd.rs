@@ -142,19 +142,20 @@ pub mod op {
 
     /// `growlight_add_follow_up_session(`[`MemberCall`]`<`[`AddFollowUpSessionArgs`]`>)`
     /// — end the session early with a §5 roll reason (§6.1).
-    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str = "growlight_add_follow_up_session";
+    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str =
+        crate::verbs::op::GROWLIGHT_ADD_FOLLOW_UP_SESSION;
     /// `growlight_complete_slice(`[`MemberCall`]`<`[`CompleteSliceArgs`]`>)` —
     /// the current slice is done (§6.2).
-    pub const GROWLIGHT_COMPLETE_SLICE: &str = "growlight_complete_slice";
+    pub const GROWLIGHT_COMPLETE_SLICE: &str = crate::verbs::op::GROWLIGHT_COMPLETE_SLICE;
     /// `growlight_complete_entry(`[`MemberCall`]`<`[`CompleteEntryArgs`]`>)` —
     /// close out a milestone, task or restack, `done` or `deferred` (§6.5).
-    pub const GROWLIGHT_COMPLETE_ENTRY: &str = "growlight_complete_entry";
+    pub const GROWLIGHT_COMPLETE_ENTRY: &str = crate::verbs::op::GROWLIGHT_COMPLETE_ENTRY;
     /// `growlight_block(`[`MemberCall`]`<`[`BlockArgs`]`>)` — park the entry on
     /// a human decision or a stuck end (§6.6).
-    pub const GROWLIGHT_BLOCK: &str = "growlight_block";
+    pub const GROWLIGHT_BLOCK: &str = crate::verbs::op::GROWLIGHT_BLOCK;
     /// `growlight_add_sub_milestone(`[`MemberCall`]`<`[`AddSubMilestoneArgs`]`>)`
     /// — file the slice's remaining work as a sub-milestone (§7).
-    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str = "growlight_add_sub_milestone";
+    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str = crate::verbs::op::GROWLIGHT_ADD_SUB_MILESTONE;
 
     // A member's two §6.8 slice verbs (spec-growlight-queue §6.7), relayed
     // keeperd→growlightd like the member verbs: keeperd forwards a

@@ -345,7 +345,7 @@ pub mod op {
     /// Naming (slice 008, all intentional — NOT a cross-wire): this keeperd op is
     /// `growlight_set_resources`, but its commit *intent* is spelled
     /// `growlight_resources_set` (verb-last); and it is distinct from growlightd's
-    /// own client-facing `set_resources` verb ([`crate::growlightd::op::SET_RESOURCES`])
+    /// own client-facing `set_resources` verb (`growlightd::op::SET_RESOURCES`)
     /// — growlightd handles the live push, then calls THIS to persist.
     pub const GROWLIGHT_SET_RESOURCES: &str = "growlight_set_resources";
     /// growlight Phase 2: post a message to the coordination bus — append a
@@ -405,20 +405,18 @@ pub mod op {
     pub const RELEASE_LEASE: &str = "release_lease";
     /// Queue v2 member verbs (spec-growlight-queue §6.1–§6.6), agent-facing and
     /// forwarded keeperd→growlightd like the leases: keeperd parses the
-    /// [`crate::growlightd::MemberCall`] envelope and relays growlightd's
-    /// [`crate::growlightd::MemberVerbReply`]. growlightd validates (and, with
+    /// `growlightd::MemberCall` envelope and relays growlightd's
+    /// `growlightd::MemberVerbReply`. growlightd validates (and, with
     /// the handshake's execution half, commits through keeperd's v2 ops).
-    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str =
-        crate::growlightd::op::GROWLIGHT_ADD_FOLLOW_UP_SESSION;
+    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str = "growlight_add_follow_up_session";
     /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
-    pub const GROWLIGHT_COMPLETE_SLICE: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_SLICE;
+    pub const GROWLIGHT_COMPLETE_SLICE: &str = "growlight_complete_slice";
     /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
-    pub const GROWLIGHT_COMPLETE_ENTRY: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_ENTRY;
+    pub const GROWLIGHT_COMPLETE_ENTRY: &str = "growlight_complete_entry";
     /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
-    pub const GROWLIGHT_BLOCK: &str = crate::growlightd::op::GROWLIGHT_BLOCK;
+    pub const GROWLIGHT_BLOCK: &str = "growlight_block";
     /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
-    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str =
-        crate::growlightd::op::GROWLIGHT_ADD_SUB_MILESTONE;
+    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str = "growlight_add_sub_milestone";
     /// M4 deploy (TUI Deploy tab): compute the deploy plan — a read-only diff of
     /// `config/deploy.toml` against the live filesystem. The daemon runs
     /// `softfig-deploy`'s `plan` against the unlocked garden mount so a frontend
@@ -2299,7 +2297,7 @@ pub struct QueueAddEntryReply {
 /// the daemon-owned ones as parseable wire values, so `done` reaches the verb
 /// as an explicit archive move and `active`/`paused`/`split` produce the
 /// `daemon_owned` refusal instead of a serde shape error. The live entry
-/// status vocabulary ([`crate::queue_v2::EntryStatus`]) has no `done` or
+/// status vocabulary (`queue_v2::EntryStatus`) has no `done` or
 /// `split` — both exist only on this wire enum, where `done` means "archive
 /// the row" and `split` (a slice-status word) is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2707,7 +2705,7 @@ pub struct GrowlightInitReply {
 /// `claude_bin` / `prompt` / `[[fleet]]` are preserved, and the table is created
 /// if absent. There is deliberately **no** hard-cap field (throttle-not-kill).
 ///
-/// **`None` semantics differ from the live [`crate::growlightd::SetResourcesArgs`]**
+/// **`None` semantics differ from the live `growlightd::SetResourcesArgs`**
 /// (slice 008, intentional): here `None` = *remove the key* (the persisted table
 /// mirrors the desired caps exactly); in the live args `None` = *leave untouched*
 /// (a partial merge). They never cross because growlightd always sends the FULL
