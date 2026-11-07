@@ -19,6 +19,14 @@ decision record or crate that owns it, rather than at every internal change.
   fleet slice 003). A claude member whose model Claude Code refuses
   (`model_not_found` / 404) parks the unit with an alert carrying the reason;
   there is no crash loop and no backoff retry.
+- Token telemetry phase 1 (`token-telemetry-p1`): every model API request a
+  growlight session makes is recorded as one row in a local sqlite db,
+  `$XDG_STATE_HOME/softfig/telemetry.db` (mode 0600, schema v5), with the
+  garden's `config/pricing.toml` pricing each row. `softfig telemetry
+  ingest-transcript` backfills a claude transcript by hand and is what the
+  semi-auto `SessionEnd` hook runs; a repeat run skips a transcript that has
+  not grown. Raw rows are kept 90 days, then rolled into a daily rollup kept
+  forever. See `docs/token-telemetry.md`.
 
 ## [1.0.0-alpha.1] - 2026-10-17
 
