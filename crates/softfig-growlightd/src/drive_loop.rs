@@ -1010,7 +1010,8 @@ pub trait V2ItemParker: Send + Sync + fmt::Debug {
 /// slice 003): keeperd's `queue_v2_enqueue_restack({project, stack})` — growlightd
 /// detected a stale stack (read-only git) and keeperd enqueues ONE urgent restack
 /// row for the project's repo (idempotent per repo) + generates the full doc. Fail-soft
-/// in the drive loop: a failed enqueue is logged, never wedges a claim or handoff.
+/// in the drive loop: a failed enqueue is logged once per edge ([`FailSoftEdges`]),
+/// never wedges a claim or handoff.
 /// The live impl is [`crate::claim::KeeperdV2RestackEnqueuer`] over the keeperd
 /// socket.
 pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
@@ -1025,8 +1026,9 @@ pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
 /// `queue_v2_re_record_bases({entries: [{entry, base}]})` — growlightd
 /// recomputed each branch's base read-only with `git merge-base` after a
 /// restack completed, and keeperd writes them back. Fail-soft in the drive
-/// loop: a failed write leaves the rows due, so the next tick retries it. The
-/// live impl is [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
+/// loop: a failed write is logged once per edge ([`FailSoftEdges`]) and leaves
+/// the rows due, so the next tick retries it. The live impl is
+/// [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
 pub trait V2BaseReRecorder: Send + Sync + fmt::Debug {
     /// Re-record `entries`' bases — `(entry, new base)` pairs — and mark the
     /// archived restack rows `settled` as answered, in one write.
@@ -1293,6 +1295,9 @@ pub struct TickReport {
     /// Restacks withheld because a stack branch tracks an upstream (V1): the
     /// loop never rewrites a pushed branch, so the human is alerted instead.
     pub v2_restack_blocked: Vec<String>,
+    /// v2 fail-soft seams that started failing or recovered this tick (V20),
+    /// already worded for the journal.
+    pub v2_fail_soft: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
     /// v2 first-claim/claim failures this tick (V3): the reason, so the journal
@@ -1552,6 +1557,8 @@ pub struct DriveLoop {
     /// stays due and retries every tick, so the alert goes out once per project
     /// until that project has nothing due.
     v2_re_record_alerted: std::collections::BTreeSet<String>,
+    /// Which v2 fail-soft seams are failing, so each logs once per edge (V20).
+    v2_fail_soft: FailSoftEdges,
     /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
     /// of `assignments`, recorded on the member's v2 fresh start and carried
     /// across re-rolls (a re-roll re-spawns on the same spec, model included).
@@ -1754,6 +1761,7 @@ impl DriveLoop {
             git_probes: ProbeCache::new(),
             v2_handoff_scans: std::collections::BTreeSet::new(),
             v2_re_record_alerted: std::collections::BTreeSet::new(),
+            v2_fail_soft: FailSoftEdges::default(),
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
@@ -2670,6 +2678,7 @@ impl DriveLoop {
                 // renders the new bases rather than the pre-rebase ones.
                 let re_records_due = snapshot.re_records_due.clone();
                 self.v2_re_record_alerted.retain(|p| re_records_due.contains_key(p));
+                self.v2_fail_soft.retain_re_records(|p| re_records_due.contains_key(p));
                 for (project, restacks) in &re_records_due {
                     self.re_record_restack(snapshot, project, restacks, &mut report.v2_restack_blocked);
                 }
@@ -3485,6 +3494,7 @@ impl DriveLoop {
         //    inspect — dispatch is the live side-effect on top of it.
         self.dispatch(&report, now);
 
+        report.v2_fail_soft = std::mem::take(&mut self.v2_fail_soft.lines);
         report
     }
 
@@ -3870,7 +3880,7 @@ impl DriveLoop {
     /// withheld and `blocked` gets an alert for the human instead; a git error
     /// while checking withholds it too (fail closed, re-checked next scan).
     fn scan_restacks(
-        &self,
+        &mut self,
         snapshot: &scheduler_v2::V2Snapshot,
         project: Option<&str>,
         blocked: &mut Vec<String>,
@@ -3927,17 +3937,19 @@ impl DriveLoop {
             probes.push((proj.name.clone(), probe));
         }
         for (name, probe) in probes {
-            match probe.wait() {
-                Ok(Some((stack, None))) => {
-                    let _ = seams.restacker.enqueue_restack(&name, &stack);
+            // Fail-soft / fail closed: on an error nothing is enqueued, and the
+            // next scan re-detects (a timed-out repo is held, not re-probed
+            // every tick).
+            let scan = probe.wait().map_err(|e| e.to_string());
+            match self.v2_fail_soft.note(FailSoft::RestackScan(name.clone()), scan) {
+                Some(Some((stack, None))) => {
+                    let enqueued = seams.restacker.enqueue_restack(&name, &stack);
+                    self.v2_fail_soft.note(FailSoft::RestackEnqueue(name), enqueued);
                 }
-                Ok(Some((_, Some(branch)))) => {
+                Some(Some((_, Some(branch)))) => {
                     blocked.push(restack_blocked_alert(&name, &branch));
                 }
-                Ok(None) => {}
-                // Fail-soft / fail closed: nothing is enqueued, and the next scan
-                // re-detects (a timed-out repo is held, not re-probed every tick).
-                Err(_) => {}
+                Some(None) | None => {}
             }
         }
     }
@@ -3972,8 +3984,9 @@ impl DriveLoop {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
+        let seam = FailSoft::ReRecord(project.to_string());
         let Some(proj) = snapshot.projects.iter().find(|p| p.name == project) else {
-            let _ = seams.re_recorder.re_record_bases(&[], restacks);
+            self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
             return;
         };
         if snapshot.entries_in_repo(&proj.repo).any(|e| e.kind == EntryKind::Restack) {
@@ -3985,7 +3998,7 @@ impl DriveLoop {
             Repo::Local(path) => path.clone(),
             // A remote repo has no commit to resolve: the human re-records (§8).
             Repo::Remote => {
-                let _ = seams.re_recorder.re_record_bases(&[], restacks);
+                self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
                 return;
             }
         };
@@ -4007,12 +4020,14 @@ impl DriveLoop {
         let probe = self.git_probes.spawn_fresh(&repo_path, move |git| {
             git_stack::re_record_bases(&repo, &main, &entries, &archived, git)
         });
-        let bases = match probe.wait() {
-            Ok(git_stack::ReRecord::Bases(bases)) => bases,
+        let probed = probe.wait().map_err(|e| e.to_string());
+        // Fail-soft: on an error the rows stay due, so the next tick retries.
+        let bases = match self.v2_fail_soft.note(FailSoft::ReRecordProbe(project.to_string()), probed) {
+            Some(git_stack::ReRecord::Bases(bases)) => bases,
             // A branch tracks an upstream: the loop never rewrites it, so the
             // bases stay as recorded and the human is told.
-            Ok(git_stack::ReRecord::Upstream { branch }) => {
-                let _ = seams.re_recorder.re_record_bases(&[], restacks);
+            Some(git_stack::ReRecord::Upstream { branch }) => {
+                self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
                 if self.v2_re_record_alerted.insert(project.to_string()) {
                     blocked.push(restack_blocked_alert(project, &branch));
                 }
@@ -4020,19 +4035,20 @@ impl DriveLoop {
             }
             // A stack worktree is mid-rebase (a killed restack session): the
             // branch has not moved yet, so record nothing and tell the human.
-            Ok(git_stack::ReRecord::Rebasing { worktree }) => {
+            Some(git_stack::ReRecord::Rebasing { worktree }) => {
                 if self.v2_re_record_alerted.insert(project.to_string()) {
                     blocked.push(restack_rebasing_alert(project, &worktree));
                 }
                 return;
             }
-            Err(_) => return, // fail-soft: still due, so the next tick retries
+            None => return,
         };
         let pairs: Vec<(String, String)> = bases
             .iter()
             .map(|b| (b.entry.clone(), b.base.clone()))
             .collect();
-        if seams.re_recorder.re_record_bases(&pairs, restacks).is_err() {
+        let written = seams.re_recorder.re_record_bases(&pairs, restacks);
+        if self.v2_fail_soft.note(seam, written).is_none() {
             return;
         }
         for (id, base) in pairs {
@@ -4117,13 +4133,14 @@ impl DriveLoop {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
-        match seams.parker.pause_entry_v2(entry) {
-            Ok(()) => {
+        let paused = seams.parker.pause_entry_v2(entry);
+        match self.v2_fail_soft.note(FailSoft::Pause(entry.to_string()), paused) {
+            Some(()) => {
                 self.v2_to_pause.remove(entry);
                 self.v2_paused_by.insert(entry.to_string(), agent.to_string());
                 report.v2_paused.push((agent.to_string(), entry.to_string()));
             }
-            Err(_) => {
+            None => {
                 self.v2_to_pause.insert(entry.to_string(), agent.to_string());
             }
         }
@@ -4142,6 +4159,7 @@ impl DriveLoop {
             .collect();
         for (entry, agent) in landed {
             self.v2_to_pause.remove(&entry);
+            self.v2_fail_soft.clear(&FailSoft::Pause(entry.clone()));
             self.v2_paused_by.insert(entry, agent);
         }
     }
@@ -4463,6 +4481,83 @@ fn filter_systemd_banner(tail: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// A v2 seam the loop keeps going past when it fails, and what it was doing:
+/// the project (or, for a pause, the entry) it failed for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FailSoft {
+    RestackScan(String),
+    RestackEnqueue(String),
+    ReRecordProbe(String),
+    ReRecord(String),
+    Pause(String),
+}
+
+impl fmt::Display for FailSoft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RestackScan(project) => write!(f, "restack scan of {project}"),
+            Self::RestackEnqueue(project) => write!(f, "restack enqueue for {project}"),
+            Self::ReRecordProbe(project) => write!(f, "base re-record probe for {project}"),
+            Self::ReRecord(project) => write!(f, "base re-record for {project}"),
+            Self::Pause(entry) => write!(f, "pause of v2 {entry}"),
+        }
+    }
+}
+
+/// The journal voice of the v2 fail-soft seams (V20). They retry on their own
+/// schedule, the re-record and the pause every tick, so a seam logs when it
+/// starts failing and when it recovers, never per attempt. The latch lives here
+/// and not in [`TickLogger`] because a restack scan runs only at boot and at a
+/// handoff: a tick without one says nothing about whether it still fails.
+#[derive(Debug, Default)]
+struct FailSoftEdges {
+    failing: BTreeSet<FailSoft>,
+    /// Edges not yet handed to a [`TickReport`].
+    lines: Vec<String>,
+}
+
+impl FailSoftEdges {
+    /// Record how `seam` went, and hand back its value when it worked.
+    fn note<T>(&mut self, seam: FailSoft, result: Result<T, String>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.clear(&seam);
+                Some(value)
+            }
+            Err(reason) => {
+                let line = format!("{seam} failed ({reason}); will retry");
+                if self.failing.insert(seam) {
+                    self.lines.push(line);
+                }
+                None
+            }
+        }
+    }
+
+    fn clear(&mut self, seam: &FailSoft) {
+        if self.failing.remove(seam) {
+            self.lines.push(format!("{seam} recovered"));
+        }
+    }
+
+    /// Clear the re-record of every project `due` no longer holds. A write can
+    /// land with its reply lost, and the row then leaves `due` with no success
+    /// to clear it, which would mute that project's next failure.
+    fn retain_re_records(&mut self, due: impl Fn(&str) -> bool) {
+        let settled: Vec<FailSoft> = self
+            .failing
+            .iter()
+            .filter(|seam| {
+                matches!(seam, FailSoft::ReRecordProbe(p) | FailSoft::ReRecord(p) if !due(p))
+            })
+            .cloned()
+            .collect();
+        for seam in &settled {
+            self.clear(seam);
+        }
+    }
+}
+
 /// The drive loop's journal voice (task 033's diagnosability half): render one
 /// terse line per fleet lifecycle event so a silent stall is debuggable from the
 /// systemd journal — before this, growlightd logged nothing after "drive loop
@@ -4538,6 +4633,10 @@ impl TickLogger {
             out.push(format!(
                 "fleet: {what}; the loop never rewrites a pushed branch, so no restack was enqueued"
             ));
+        }
+        // Already edge-deduped, by `FailSoftEdges`.
+        for what in &r.v2_fail_soft {
+            out.push(format!("fleet: {what}"));
         }
         // Not edge-deduped: the claim backoff already spaces these out, and each
         // carries a new streak and reason (V3).
@@ -9281,6 +9380,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     struct FakeV2RestackEnqueuer {
         enqueued: Mutex<Vec<(String, usize)>>,
         stacks: Mutex<Vec<Vec<RestackBranch>>>,
+        refuse: std::sync::atomic::AtomicBool,
     }
 
     impl V2RestackEnqueuer for FakeV2RestackEnqueuer {
@@ -9289,6 +9389,9 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             project: &str,
             stack: &[RestackBranch],
         ) -> Result<Option<String>, String> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("refused".into());
+            }
             self.enqueued
                 .lock()
                 .unwrap()
@@ -9814,7 +9917,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         git_in(dir.path(), &["branch", "feat/two", "feat/one"]);
         let snapshot = two_project_snapshot(dir.path(), &base, "feat/two");
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
 
         let mut blocked = Vec::new();
         loop_.scan_restacks(&snapshot, None, &mut blocked);
@@ -9888,7 +9991,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     fn v2_mode_withholds_a_restack_over_an_upstream_branch_and_alerts() {
         let (dir, base) = stale_stack_repo(true);
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
 
         let mut blocked = Vec::new();
         loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
@@ -9906,13 +10009,111 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// V20: a failed enqueue says so when it starts and when it ends, however
+    /// many scans it fails in between.
+    #[test]
+    fn v2_mode_a_failing_restack_enqueue_logs_once_per_edge() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        enq.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        let mut blocked = Vec::new();
+
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["restack enqueue for softfig failed (refused); will retry"],
+        );
+
+        enq.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(loop_.v2_fail_soft.lines, ["restack enqueue for softfig recovered"]);
+    }
+
+    /// V20: a repo git can't read fails its scan, and the tick's report carries
+    /// that to the journal, once.
+    #[test]
+    fn v2_mode_a_failing_restack_scan_reaches_the_journal_once() {
+        let nowhere = tempfile::tempdir().unwrap();
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(restack_snapshot(nowhere.path(), "base")),
+            std::env::temp_dir().join(format!("v2-entries-failsoft-{}", std::process::id())),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let report = loop_.tick(500);
+        assert_eq!(report.v2_fail_soft.len(), 1, "{:?}", report.v2_fail_soft);
+        assert!(report.v2_fail_soft[0].starts_with("restack scan of softfig failed ("));
+        let lines = TickLogger::default().lines(&report);
+        assert!(lines.contains(&format!("fleet: {}", report.v2_fail_soft[0])), "{lines:?}");
+
+        loop_.restack_boot_done = false; // the next scan, as a handoff would ask for
+        assert!(loop_.tick(501).v2_fail_soft.is_empty());
+    }
+
+    /// V20: the re-record retries every tick, so it can't log every tick.
+    #[test]
+    fn v2_mode_a_failing_re_record_logs_once_per_edge() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        rec.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        let due = vec!["r1".to_string()];
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["base re-record for softfig failed (refused); will retry"],
+        );
+
+        // The write landed but its reply was lost: nothing is due, and nothing
+        // reported success. The project's next failure must still be heard.
+        loop_.v2_fail_soft.retain_re_records(|_| false);
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["base re-record for softfig recovered"],
+        );
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(loop_.v2_fail_soft.lines.len(), 1, "{:?}", loop_.v2_fail_soft.lines);
+    }
+
+    /// V20: a pause that failed is retried every tick, silently until it lands.
+    #[test]
+    fn v2_mode_a_failing_pause_logs_once_per_edge() {
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let parker = Arc::new(FakeV2Parker::default());
+        loop_.v2.as_mut().unwrap().parker = Box::new(Arc::clone(&parker));
+        parker.fail_pause.store(true, Ordering::SeqCst);
+
+        loop_.pause_v2_entry("m1", "a1", &mut TickReport::default());
+        loop_.retry_v2_pauses();
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["pause of v2 m1 failed (keeperd unreachable); will retry"],
+        );
+
+        parker.fail_pause.store(false, Ordering::SeqCst);
+        loop_.retry_v2_pauses();
+        assert_eq!(loop_.v2_fail_soft.lines, ["pause of v2 m1 recovered"]);
+    }
+
     /// V13: restack scans of one repo within a tick share git's answers — the
     /// scan at claim and the scan at a handshake do not each re-run the probe.
     #[test]
     fn v2_mode_scans_of_one_repo_in_a_tick_spawn_git_once() {
         let (dir, base) = stale_stack_repo(false);
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
         let snapshot = restack_snapshot(dir.path(), &base);
         loop_.git_probes.begin_tick(500);
 
@@ -9960,7 +10161,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     fn v2_mode_still_enqueues_a_restack_over_local_branches() {
         let (dir, base) = stale_stack_repo(false);
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
 
         let mut blocked = Vec::new();
         loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
