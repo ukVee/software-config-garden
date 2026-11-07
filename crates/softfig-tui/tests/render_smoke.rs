@@ -649,7 +649,7 @@ fn renders_live_fleet_header_from_status_poll() {
         ]
     }))
     .unwrap();
-    app.fleet = FleetHeader::Live(reply);
+    app.fleet = FleetHeader::Live(Box::new(reply));
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
