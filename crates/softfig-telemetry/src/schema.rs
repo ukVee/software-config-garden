@@ -7,7 +7,7 @@ pub const DB_FILE: &str = "telemetry.db";
 
 /// `PRAGMA user_version`. Bumped by a migration, never by editing the v1 DDL
 /// in place (the softfig-store `SCHEMA_V1` rule).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The ring's capacity. Full → the oldest row is dropped and counted.
 pub const RING_CAPACITY: usize = 10_000;
@@ -114,6 +114,17 @@ pub const CREATE_ROLLUP_WATERMARK: &str = "\
 CREATE TABLE IF NOT EXISTS rollup_watermark (
     session_id TEXT PRIMARY KEY,
     through    TEXT NOT NULL
+)";
+
+/// Schema v5: how many bytes of each transcript file `ingest-transcript` has
+/// already folded in. A repeat `SessionEnd` over a file no longer than its mark
+/// has nothing new, so it is skipped before it is parsed or priced; a file that
+/// has grown is read again whole (a request can span lines, and the insert's
+/// key drops what is already there).
+pub const CREATE_TRANSCRIPT_MARKS: &str = "\
+CREATE TABLE IF NOT EXISTS transcript_marks (
+    path  TEXT PRIMARY KEY,
+    bytes INTEGER NOT NULL
 )";
 
 #[cfg(test)]

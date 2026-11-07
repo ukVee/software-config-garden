@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::row::RequestRow;
 use crate::schema::{
-    CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, CREATE_ROLLUP_WATERMARK, DB_FILE,
+    CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, CREATE_ROLLUP_WATERMARK,
+    CREATE_TRANSCRIPT_MARKS, DB_FILE,
     RAW_RETENTION_DAYS, REQUESTS_ADD_VENDOR_COST, ROLLUP_ADD_UNPRICED, SCHEMA_VERSION,
 };
 use crate::ts::iso8601_utc;
@@ -44,6 +45,7 @@ const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[
     migrate_v1_to_v2,
     migrate_v2_to_v3,
     migrate_v3_to_v4,
+    migrate_v4_to_v5,
 ];
 
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
@@ -66,6 +68,10 @@ fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(REQUESTS_ADD_VENDOR_COST)
+}
+
+fn migrate_v4_to_v5(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CREATE_TRANSCRIPT_MARKS)
 }
 
 /// What one [`Store::sweep_retention`] did.
@@ -148,6 +154,29 @@ impl Store {
         }
         tx.commit()?;
         Ok(new)
+    }
+
+    /// The bytes of the transcript at `path` already ingested, if any.
+    pub fn transcript_mark(&self, path: &Path) -> Result<Option<u64>> {
+        let bytes: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT bytes FROM transcript_marks WHERE path = ?1",
+                [path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(|b| u64::try_from(b).unwrap_or(0)))
+    }
+
+    /// Record that the first `bytes` of the transcript at `path` are in.
+    pub fn set_transcript_mark(&self, path: &Path, bytes: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO transcript_marks (path, bytes) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET bytes = excluded.bytes",
+            params![path.to_string_lossy(), sql_u64(bytes)],
+        )?;
+        Ok(())
     }
 
     /// Roll every raw row older than [`RAW_RETENTION_DAYS`] before `now` (unix
@@ -753,5 +782,33 @@ pub(crate) mod tests {
             .unwrap()
             .execute_batch(REQUESTS_ADD_VENDOR_COST)
             .is_err());
+    }
+
+    #[test]
+    fn a_v4_db_migrates_to_v5_and_a_mark_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            // A db as the v4 build left it: steps 0 to 3, user_version 4, one raw row.
+            let conn = Connection::open(&path).unwrap();
+            for step in &MIGRATIONS[..4] {
+                step(&conn).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let v: u32 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        store.insert_batch(&[row("s", "r1", NOW)]).unwrap();
+        let t = Path::new("/x/sess.jsonl");
+        assert_eq!(store.transcript_mark(t).unwrap(), None);
+        store.set_transcript_mark(t, 120).unwrap();
+        store.set_transcript_mark(t, 480).unwrap();
+        assert_eq!(store.transcript_mark(t).unwrap(), Some(480), "a later mark replaces");
+        assert_eq!(store.transcript_mark(Path::new("/x/other.jsonl")).unwrap(), None);
+        assert_eq!(count(&store, "requests"), 1, "history kept");
     }
 }

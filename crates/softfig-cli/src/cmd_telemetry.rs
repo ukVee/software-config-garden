@@ -110,10 +110,25 @@ fn ingest(args: IngestArgs, now: i64) -> Result<usize> {
         slice_id: baton.and_then(|b| b.slice).map(|s| s.trim_matches('"').to_string()),
         queue: None,
     };
-    let mut rows = Vec::new();
+    let db = args
+        .db
+        .or_else(default_db_path)
+        .ok_or_else(|| anyhow!("no telemetry db path ($XDG_STATE_HOME / $HOME unset)"))?;
+    let mut store = Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
+    // Each file's length goes in before it is read, and a mark is written only
+    // once the rows are in, so a run that dies midway re-reads and loses
+    // nothing. When no file is longer than its mark there is nothing the last
+    // run did not take, and the transcript is skipped before it is read or
+    // priced (the sweep below still runs), so a roll that ends many sessions over one growing transcript
+    // costs one pass, not one per end. Any growth re-reads the whole set, which
+    // keeps `turn_index` numbered over the whole session.
+    let mut files: Vec<(PathBuf, File, u64)> = Vec::new();
     for file in transcript_files(&transcript) {
         match File::open(&file) {
-            Ok(f) => rows.extend(ingest_transcript(BufReader::new(f), &keys, now)),
+            Ok(f) => {
+                let len = f.metadata().map_or(0, |m| m.len());
+                files.push((file, f, len));
+            }
             // The main transcript must be there; a subagent file that vanished
             // under us costs only its own rows.
             Err(e) if file == transcript => {
@@ -122,14 +137,25 @@ fn ingest(args: IngestArgs, now: i64) -> Result<usize> {
             Err(e) => eprintln!("telemetry: skipping {}: {e}", file.display()),
         }
     }
-    renumber_turns(&mut rows);
-    price(&mut rows, args.garden_root);
-    let db = args
-        .db
-        .or_else(default_db_path)
-        .ok_or_else(|| anyhow!("no telemetry db path ($XDG_STATE_HOME / $HOME unset)"))?;
-    let mut store = Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
-    let new = store.insert_batch(&rows)?;
+    let mut grown = false;
+    for (file, _, len) in &files {
+        grown |= store.transcript_mark(file)?.is_none_or(|mark| *len > mark);
+    }
+    let mut new = 0;
+    if grown {
+        let mut rows = Vec::new();
+        let mut marks: Vec<(PathBuf, u64)> = Vec::new();
+        for (file, f, len) in files {
+            rows.extend(ingest_transcript(BufReader::new(f), &keys, now));
+            marks.push((file, len));
+        }
+        renumber_turns(&mut rows);
+        price(&mut rows, args.garden_root);
+        new = store.insert_batch(&rows)?;
+        for (file, len) in &marks {
+            store.set_transcript_mark(file, *len)?;
+        }
+    }
     // This verb is the only writer on a device whose fleet is disarmed, so it
     // carries the retention sweep the flush thread would run: a backfill's old
     // rows roll up now, and a long-lived db keeps to its 90 days. The rows are
@@ -289,6 +315,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!((raw, rolled), (0, 3), "all three requests are in the rollup, once");
+    }
+
+    #[test]
+    fn a_repeat_ingest_of_an_unchanged_transcript_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess-t.jsonl");
+        std::fs::write(&transcript, TRANSCRIPT).unwrap();
+        let db = dir.path().join("telemetry.db");
+        let args = || IngestArgs {
+            path: Some(transcript.clone()),
+            session_id: None,
+            db: Some(db.clone()),
+            garden_root: Some(dir.path().to_path_buf()),
+            config_dir: Some(dir.path().to_path_buf()),
+        };
+        assert_eq!(ingest(args(), NOW).unwrap(), 3);
+        // Empty the table: a run that parsed the transcript again would put the
+        // three rows back, so a zero here and an empty table prove it did not.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM requests", []).unwrap();
+        assert_eq!(ingest(args(), NOW).unwrap(), 0);
+        let rows = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(rows(), 0, "an unchanged transcript was not read again");
+        // A transcript that has grown is read again, whole.
+        let mut grown = TRANSCRIPT.to_string();
+        grown.push('\n');
+        std::fs::write(&transcript, grown).unwrap();
+        assert_eq!(ingest(args(), NOW).unwrap(), 3);
+        assert_eq!(rows(), 3);
     }
 
     #[test]
