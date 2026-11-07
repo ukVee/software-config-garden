@@ -132,7 +132,7 @@ impl<'a> WorkTree<'a> {
         if crate::caller::member().is_none() {
             return Ok(());
         }
-        guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
+        self.guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
     }
 
     /// [`check_write_bytes`](Self::check_write_bytes) against a known prior
@@ -142,7 +142,7 @@ impl<'a> WorkTree<'a> {
     pub fn check_write_bytes_over(&self, rel: &str, old: Option<&[u8]>, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
-        guard_member_change(rel, old, Some(bytes), Bytes::Caller)
+        self.guard_member_change(rel, old, Some(bytes), Bytes::Caller)
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
@@ -164,7 +164,9 @@ impl<'a> WorkTree<'a> {
         if let Some((doc, text)) = self.first_reserved_doc(&scope) {
             return Err(reserved_refusal(&member, &doc, Some(&text), None));
         }
-        if let Some((doc, text)) = self.first_fleet_doc(&scope) {
+        if self.fleet_lines_hold()
+            && let Some((doc, text)) = self.first_fleet_doc(&scope)
+        {
             return Err(fleet_refusal(&member, &doc, Some(&text), None));
         }
         if let Some((doc, text)) = self.first_doc_with(&scope, |t| !super::managed::regions(t).is_empty()) {
@@ -203,7 +205,66 @@ impl<'a> WorkTree<'a> {
         if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_queue_state_path(l)) {
             return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, &landing, "rename lands on")));
         }
+        if self.landings(from, to).iter().any(|l| *l == growlight_config_rel()) {
+            return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "rename lands on")));
+        }
         self.guard_member_removal(to)
+    }
+
+    /// The member guards for replacing canonical `rel` from `old` to `new` (`None`
+    /// = absent / removed) — see [`guard_member_write`](Self::guard_member_write).
+    /// A no-op for a request that runs for no fleet member.
+    fn guard_member_change(&self, rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
+        let Some(member) = crate::caller::member() else {
+            return Ok(());
+        };
+        if old != new && is_queue_state_path(rel) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, "write changes")));
+        }
+        if old != new && rel == growlight_config_rel() {
+            return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "write changes")));
+        }
+        let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
+        let (old, new) = (text(old), text(new));
+        if bytes == Bytes::Caller
+            && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
+        {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if !is_backlog_rel(rel) {
+            return Ok(());
+        }
+        if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if self.fleet_lines_hold()
+            && let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref())
+        {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if old.is_none() && new.is_some() && is_item_doc_path(rel) {
+            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
+        }
+        Ok(())
+    }
+
+    /// Whether an item doc's `> Fleet:` line is a hold, so the member guard must
+    /// keep a member from loosening it: under `queue = "legacy"` it is the claim
+    /// hold; under `queue = "v2"` the TOML is the only source of a hold and the
+    /// line holds nothing, so it is the member's to edit like any other line
+    /// (owner ruling 2026-11-07; `queue show` warns when one disagrees with its
+    /// entry). The switch is read from `config/growlight.toml` through this
+    /// worktree, so it is mount-safe under the daemon lock; one that can't be
+    /// read keeps the guard ([`crate::growlight_unit::queue_v2`]).
+    ///
+    /// A member can't move the switch: [`member_growlight_config_refusal`].
+    /// Removing the file reads as legacy, which keeps the guard, so only a write
+    /// or a rename onto it is refused.
+    fn fleet_lines_hold(&self) -> bool {
+        !self.read_to_string(&growlight_config_rel()).is_some_and(|raw| crate::growlight_unit::queue_v2(&raw))
     }
 
     /// Where each file at or under `from` lands when `from` is renamed to
@@ -474,41 +535,6 @@ impl<'a> WorkTree<'a> {
     }
 }
 
-/// The member guards for replacing canonical `rel` from `old` to `new` (`None`
-/// = absent / removed) — see [`WorkTree::guard_member_write`]. A no-op for a
-/// request that runs for no fleet member.
-fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
-    let Some(member) = crate::caller::member() else {
-        return Ok(());
-    };
-    if old != new && is_queue_state_path(rel) {
-        return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, "write changes")));
-    }
-    let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
-    let (old, new) = (text(old), text(new));
-    if bytes == Bytes::Caller
-        && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
-    {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if !is_backlog_rel(rel) {
-        return Ok(());
-    }
-    if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if old.is_none() && new.is_some() && is_item_doc_path(rel) {
-        return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
-    }
-    Ok(())
-}
-
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree
 /// §6.7's reserved-line and `> Fleet:` guards cover.
 fn is_backlog_rel(rel: &str) -> bool {
@@ -716,6 +742,29 @@ fn is_queue_state_path(rel: &str) -> bool {
         || rel
             .strip_prefix(MILESTONES_DIR)
             .is_some_and(|rest| rest.starts_with('/') && rest.ends_with("/slices.toml"))
+}
+
+/// `config/growlight.toml`, garden-relative: the fleet config growlightd runs
+/// from, and the §11 `queue` switch the `> Fleet:` guard reads
+/// ([`WorkTree::fleet_lines_hold`]).
+fn growlight_config_rel() -> String {
+    format!("{}/{}", softfig_ipc::GARDEN_CONFIG_DIR, softfig_ipc::GROWLIGHT_CONFIG_FILE)
+}
+
+/// queue-v2-parity-fixes slice 003: a member may not write or rename onto
+/// `config/growlight.toml`. The `> Fleet:` guard stands down under `queue =
+/// "v2"`, so a member that could set the switch could free a legacy hold — set
+/// `v2`, strip the line, set it back — while growlightd, which reads the switch
+/// at boot, still schedules from the doc lines. The fleet config is the human's
+/// (`set_resources` is a human verb). The refusal text leads with the wire code,
+/// `member_not_allowed`.
+fn member_growlight_config_refusal(member: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {}, and fleet member {member} may not edit the fleet \
+         config — growlightd runs from it, and its `queue` switch decides which holds the \
+         member guards keep. If it needs a change, post_message @human.",
+        growlight_config_rel()
+    )
 }
 
 /// queue-v2-parity row 5 (the v2 counterpart of the legacy queue-table
@@ -1558,5 +1607,58 @@ Example:
         assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "op 1 unstaged");
         drop(inner);
         super::super::batch(&daemon, args).expect("a human's batch lands");
+    }
+
+    /// Owner ruling 2026-11-07 (slice 003): under `queue = "v2"` a doc's
+    /// `> Fleet:` line holds nothing, so a member may loosen or remove it —
+    /// by write, pre-check, batch-style `check_write_bytes_over` or unlink.
+    /// Under legacy, with no config, and with a switch growlightd would refuse,
+    /// the guard stays. A member can't move the switch: a write or a rename
+    /// onto `config/growlight.toml` is refused, and a human's still lands.
+    #[test]
+    fn the_fleet_guard_stands_down_under_queue_v2_only() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let config = growlight_config_rel();
+        let loosened = FLEET_HELD.replace("> Fleet: no", "> Fleet: yes");
+        let switches = [
+            (None, true),
+            (Some("fleet_enabled = true\nqueue = \"legacy\"\n"), true),
+            (Some("queue = \"v3\"\n"), true),
+            (Some("fleet_enabled = true\nqueue = \"v2\"\n"), false),
+        ];
+        for (switch, guarded) in switches {
+            if let Some(raw) = switch {
+                wt.write(&config, raw.as_bytes()).expect("a human sets the switch");
+            }
+            wt.write(SLICE, FLEET_HELD.as_bytes()).expect("reset");
+            let _member = caller::enter(Some("c".into()));
+            let refused = [
+                wt.check_write_bytes(SLICE, b"# slice\n\nbody\n").is_err(),
+                wt.check_write_bytes_over(SLICE, Some(FLEET_HELD.as_bytes()), loosened.as_bytes()).is_err(),
+                wt.write(SLICE, loosened.as_bytes()).is_err(),
+            ];
+            assert_eq!(refused, [guarded; 3], "{switch:?}");
+            if guarded {
+                let err = wt.remove(SLICE).unwrap_err();
+                assert!(err.1.contains("loosens or removes"), "{switch:?}: {err:?}");
+            } else {
+                wt.write(SLICE, b"# slice\n\nbody\n").expect("v2: the line is the member's");
+                wt.remove(SLICE).expect("v2: unlinking a doc that still says `> Fleet: no`");
+            }
+        }
+
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(&config, b"queue = \"legacy\"\n").unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs);
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("config/growlight.toml"), "{err:?}");
+        wt.write("projects/p/notes/001-g.md", b"queue = \"legacy\"\n").expect("seed outside");
+        let err = wt.rename("projects/p/notes/001-g.md", &config).unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:"), "rename onto the config: {err:?}");
+        assert!(wt.read_to_string(&config).is_some_and(|raw| raw.contains("\"v2\"")), "switch untouched");
+        drop(_member);
+        wt.write(&config, b"queue = \"legacy\"\n").expect("the human's write lands");
     }
 }
