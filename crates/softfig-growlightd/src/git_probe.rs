@@ -21,12 +21,17 @@
 //!   the repo is then held, doubling per consecutive timeout like a failing
 //!   claim ([`crate::drive_loop`]'s claim backoff), and probes of a held repo
 //!   fail without spawning anything. A probe that completes clears the hold.
+//! - **Bounded when parked.** A hold only spaces the retries out, and a worker
+//!   stuck for good would still leave a thread and a git behind per retry. Once
+//!   [`MAX_PARKED`] of a repo's workers have outlived their deadline, probes of
+//!   that repo fail without spawning until one of them exits, wherever in the
+//!   chain it is stuck: in a git's kill, or on the hung mount itself.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::drive_loop::v2_claim_backoff_secs;
@@ -38,6 +43,13 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// How long past its deadline a probe is waited for, so a worker that reports
 /// its own timeout is heard before the caller gives up on it.
 const WAIT_SLACK: Duration = Duration::from_millis(500);
+
+/// How many of one repo's workers may sit past their deadline before the repo
+/// stops getting new ones. Two, not one: the retry after a backoff tells one
+/// stuck git from a stuck repo. Workers still inside their deadline don't count,
+/// so a scan's probes of projects that share a repo are never refused, and the
+/// most a repo can park is this minus one plus the probes of one such scan.
+const MAX_PARKED: usize = 2;
 
 /// Per-repo probe state, shared by the drive loop and every claim closure it
 /// builds (clones are handles to one state).
@@ -62,6 +74,16 @@ struct Slot {
     /// held (probes fail without spawning).
     streak: u32,
     hold_until: i64,
+    /// The workers started for this repo and not yet known to have exited.
+    workers: Vec<Worker>,
+}
+
+#[derive(Debug)]
+struct Worker {
+    /// Dead once the worker thread has exited, however it got there.
+    alive: Weak<()>,
+    /// Still alive past this, the worker is parked.
+    until: Instant,
 }
 
 impl Default for ProbeCache {
@@ -129,13 +151,25 @@ impl ProbeCache {
         let shared = &self.shared;
         let now = shared.now.load(Ordering::Relaxed);
         let secs = shared.deadline.as_secs_f64().ceil() as u64;
+        let started = Instant::now();
+        let until = started + shared.deadline + WAIT_SLACK;
+        let alive = Arc::new(());
         let memo = {
             let mut repos = self.repos();
             let slot = repos.entry(repo.to_path_buf()).or_default();
-            if slot.hold_until > now {
+            slot.workers.retain(|w| w.alive.strong_count() > 0);
+            let parked = slot.workers.iter().filter(|w| w.until <= started).count();
+            let refused = if slot.hold_until > now {
+                Some("probe (held after an earlier timeout)")
+            } else if parked >= MAX_PARKED {
+                Some("probe (refused: earlier workers are still parked on this repo)")
+            } else {
+                None
+            };
+            if let Some(cmd) = refused {
                 return Probe {
                     state: State::Done(Some(Err(GitError::Timeout {
-                        cmd: "probe (held after an earlier timeout)".into(),
+                        cmd: cmd.into(),
                         repo: repo.to_path_buf(),
                         secs,
                     }))),
@@ -144,9 +178,9 @@ impl ProbeCache {
                     memo: slot.memo.clone(),
                 };
             }
+            slot.workers.push(Worker { alive: Arc::downgrade(&alive), until });
             slot.memo.clone()
         };
-        let started = Instant::now();
         let mut git = Git::new(repo)
             .with_program(shared.program.clone())
             .with_deadline(started + shared.deadline);
@@ -155,10 +189,11 @@ impl ProbeCache {
         }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let _alive = alive;
             let _ = tx.send(f(&git));
         });
         Probe {
-            state: State::Running { rx, until: started + shared.deadline + WAIT_SLACK },
+            state: State::Running { rx, until },
             cache: self.clone(),
             repo: repo.to_path_buf(),
             memo,
@@ -368,5 +403,64 @@ pub(crate) mod tests {
         cache.begin_tick(10 + v2_claim_backoff_secs(1));
         cache.spawn(dir.path(), |g| g.rev_parse("main")).wait().unwrap();
         assert_eq!(cache.repos().get(dir.path()).unwrap().streak, 0);
+    }
+
+    #[test]
+    fn a_worker_stuck_outside_git_counts_as_parked() {
+        // No git at all: a chain can block on the hung mount itself (the rebase
+        // state `rebasing_worktrees` reads), and that parks the worker just the same.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ProbeCache::with(Duration::from_millis(50), "/nonexistent/git");
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let started = Arc::new(AtomicI64::new(0));
+        let mut now = 0;
+        let mut errors = Vec::new();
+        for _ in 0..6 {
+            now += 1_000; // past any backoff
+            cache.begin_tick(now);
+            let (gate, started) = (gate.clone(), started.clone());
+            let probe = cache.spawn(dir.path(), move |_| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = gate.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                Ok(())
+            });
+            errors.push(probe.wait().unwrap_err().to_string());
+        }
+        assert_eq!(started.load(Ordering::SeqCst), MAX_PARKED as i64, "{errors:?}");
+        assert!(errors[MAX_PARKED].contains("still parked"), "{errors:?}");
+        // A refusal is not another timeout: the backoff doesn't grow behind it.
+        assert_eq!(cache.repos().get(dir.path()).unwrap().streak, MAX_PARKED as u32);
+
+        // The workers exit, and the repo is probed again.
+        drop(release);
+        let give_up = Instant::now() + Duration::from_secs(10);
+        loop {
+            now += 1_000;
+            cache.begin_tick(now);
+            if cache.spawn(dir.path(), |_| Ok(())).wait().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < give_up, "the repo stayed refused");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(cache.repos().get(dir.path()).unwrap().streak, 0);
+    }
+
+    #[test]
+    fn probes_inside_their_deadline_are_never_refused() {
+        // A scan spawns one probe per project before waiting on any, and projects
+        // can share a repo: more of them than the cap must all run.
+        let dir = tempfile::tempdir().unwrap();
+        let (git, log) = fake_git(dir.path(), "0.2");
+        let cache = ProbeCache::with(Duration::from_secs(5), git);
+        cache.begin_tick(100);
+        let probes: Vec<_> = (0..MAX_PARKED + 3)
+            .map(|_| cache.spawn_fresh(dir.path(), |g| g.rev_parse("main")))
+            .collect();
+        for probe in probes {
+            assert_eq!(probe.wait().unwrap(), "deadbeef");
+        }
+        assert_eq!(calls(&log), MAX_PARKED + 3);
     }
 }

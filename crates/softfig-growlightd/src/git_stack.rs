@@ -371,7 +371,8 @@ impl Git {
                 }
                 Ok(None) => {
                     // Runs on a probe worker, never the drive loop: a git in
-                    // D-state that outlives this kill only parks the worker.
+                    // D-state that outlives this kill only parks the worker, and
+                    // `git_probe` caps how many of those a repo can have.
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = reader.join();
