@@ -2691,6 +2691,7 @@ fn render_queue_pick(reply: &growlightd::QueuePickReply) -> String {
         }
         None => out.push_str("picked: nothing workable for this member\n"),
     }
+    out.push_str("schedule: not applied — a member the [schedule] holds is not handed this\n");
 
     if reply.skips.is_empty() {
         out.push_str("skipped: none\n");
@@ -4665,6 +4666,7 @@ mod tests {
         assert!(out.contains("model: reasoning, flash"), "{out}");
         assert!(out.contains("skipped: 1"), "{out}");
         assert!(out.contains("  - n: blocked_walk — its walk stops"), "{out}");
+        assert!(out.contains("schedule: not applied"), "the dry-run says it ignores the schedule: {out}");
     }
 
     #[test]
