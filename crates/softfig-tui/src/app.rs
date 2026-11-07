@@ -4101,6 +4101,7 @@ impl App {
                     self.growlight_v2.expand(&row.entry_id);
                 }
             }
+            V2RowKind::Slice if row.expandable => self.growlight_v2.toggle(&row.key),
             _ => {}
         }
         self.growlight_v2.clamp(self.growlight_v2.rows(r).len());
@@ -4154,7 +4155,7 @@ impl App {
                 if !entry.after.is_empty() {
                     body.push_str(&format!("after: {}\n", entry.after.join(", ")));
                 }
-                push_v2_sessions(&mut body, reply, &entry.id, None);
+                push_v2_sessions(&mut body, reply, &entry.id, &entry.id, None);
                 ("queue v2 entry (read-only)".into(), body)
             }
             V2RowKind::Slice => {
@@ -4168,7 +4169,13 @@ impl App {
                     "slice {} of {}\nkind: {}\nstatus: {}\n",
                     s.id, tree.milestone, s.kind, s.status
                 );
-                push_v2_sessions(&mut body, reply, &row.entry_id, Some(&s.id));
+                // A sub item's log is its own close-out, keyed by its tree.
+                let (log_tree, unit) = if s.kind == "sub" {
+                    (row.key.as_str(), None)
+                } else {
+                    (tree.milestone.as_str(), Some(s.id.as_str()))
+                };
+                push_v2_sessions(&mut body, reply, &row.entry_id, log_tree, unit);
                 ("queue v2 slice (read-only)".into(), body)
             }
             V2RowKind::ArchiveEntry => {
@@ -4199,9 +4206,10 @@ impl App {
             V2RowKind::Urgent | V2RowKind::Normal if row.expanded => {
                 self.growlight_v2.collapse(&row.entry_id);
             }
+            V2RowKind::Slice if row.expanded => self.growlight_v2.collapse(&row.key),
             V2RowKind::Slice => {
-                // collapse the parent milestone
-                self.growlight_v2.collapse(&row.entry_id);
+                // collapse the tree this row sits in: the entry, or its sub
+                self.growlight_v2.collapse(row.milestone.as_deref().unwrap_or(&row.entry_id));
             }
             _ => {}
         }
@@ -4614,13 +4622,24 @@ pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
         .map(|(_, path)| path)
 }
 
-/// Append an entry's (or, with `unit`, a slice's) §3.5 session-log lines to a
-/// queue-v2 detail body. Pure — no IO.
-fn push_v2_sessions(body: &mut String, reply: &QueueShowReply, entry: &str, unit: Option<&str>) {
+/// Append an entry's (or, with `unit`, a slice of `tree`'s) §3.5 session-log
+/// lines to a queue-v2 detail body. `tree` is the entry id for its own tree, so
+/// a sub's `001` and its parent's `001` stay apart. Pure — no IO.
+fn push_v2_sessions(
+    body: &mut String,
+    reply: &QueueShowReply,
+    entry: &str,
+    tree: &str,
+    unit: Option<&str>,
+) {
     let lines: Vec<&str> = reply
         .sessions
         .iter()
-        .filter(|s| s.entry == entry && s.unit.as_deref() == unit)
+        .filter(|s| {
+            s.entry == entry
+                && s.tree.as_deref().unwrap_or(entry) == tree
+                && s.unit.as_deref() == unit
+        })
         .flat_map(|s| s.lines.iter().map(|l| l.as_str()))
         .collect();
     if !lines.is_empty() {
@@ -8076,6 +8095,77 @@ mod tests {
         app.view = View::Growlight;
         app.growlight_v2_view = true;
         app
+    }
+
+    /// `m` holding sub `m/s`, both with a slice `001` that has its own log line.
+    fn v2_app_with_a_sub() -> App {
+        let mut app = v2_app_cursor_on_b();
+        let reply = app.growlight_queue_v2.as_mut().unwrap();
+        reply.entries = vec![v2_entry("m")];
+        let slice = |id: &str, kind: &str| softfig_ipc::growlightd::QueueShowSlice {
+            id: id.into(),
+            kind: kind.into(),
+            status: "queued".into(),
+        };
+        reply.trees = vec![
+            softfig_ipc::growlightd::QueueShowTree {
+                milestone: "m".into(),
+                slices: vec![slice("001", "slice"), slice("s", "sub")],
+            },
+            softfig_ipc::growlightd::QueueShowTree {
+                milestone: "m/s".into(),
+                slices: vec![slice("001", "slice")],
+            },
+        ];
+        let log = |tree: Option<&str>, line: &str| softfig_ipc::growlightd::QueueShowSession {
+            entry: "m".into(),
+            tree: tree.map(str::to_string),
+            unit: Some("001".into()),
+            path: "doc.md".into(),
+            lines: vec![line.into()],
+        };
+        let mut close = log(Some("m/s"), "- sub close-out");
+        close.unit = None;
+        reply.sessions = vec![log(None, "- parent line"), log(Some("m/s"), "- sub line"), close];
+        app.growlight_v2.select(0, 1);
+        app
+    }
+
+    fn select_v2_row(app: &mut App, key: &str) {
+        let rows = app.growlight_v2.rows(app.growlight_queue_v2.as_ref().unwrap());
+        let at = rows.iter().position(|r| r.key == key).unwrap();
+        app.growlight_v2.select(at, rows.len());
+    }
+
+    #[test]
+    fn enter_opens_a_sub_and_each_slice_shows_only_its_own_tree_s_sessions() {
+        let mut app = v2_app_with_a_sub();
+        app.activate_growlight_v2();
+        select_v2_row(&mut app, "m/s");
+        app.activate_growlight_v2();
+
+        select_v2_row(&mut app, "m/001");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- parent line") && !body.contains("- sub line"), "{body}");
+
+        select_v2_row(&mut app, "m/s/001");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- sub line") && !body.contains("- parent line"), "{body}");
+
+        select_v2_row(&mut app, "m/s");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- sub close-out") && !body.contains("- sub line"), "{body}");
+    }
+
+    #[test]
+    fn collapsing_inside_a_sub_closes_the_sub_and_not_the_entry() {
+        let mut app = v2_app_with_a_sub();
+        app.growlight_v2.expand("m");
+        app.growlight_v2.expand("m/s");
+        select_v2_row(&mut app, "m/s/001");
+        app.collapse_growlight_v2();
+        assert!(!app.growlight_v2.is_expanded("m/s"));
+        assert!(app.growlight_v2.is_expanded("m"));
     }
 
     #[test]

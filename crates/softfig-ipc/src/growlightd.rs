@@ -1317,6 +1317,11 @@ pub struct QueueProjectStack {
 pub struct QueueShowSession {
     /// The top-level entry id.
     pub entry: String,
+    /// The sub-milestone identity (`<entry>/<sub>`) when the unit sits in a
+    /// sub-tree, where a slice NNN can repeat one in the parent. `None` for the
+    /// entry's own tree, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     /// The slice NNN, or `None` for the entry's own close-out / task / restack
     /// doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -144,7 +144,7 @@ pub enum V2RowKind {
     Urgent,
     /// A normal-lane entry row.
     Normal,
-    /// A slice (or sub-milestone) child of an expanded milestone.
+    /// A slice (or sub-milestone) child of an expanded milestone or sub.
     Slice,
     /// The collapsed/expanded archive section header.
     Archive,
@@ -156,7 +156,8 @@ pub enum V2RowKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2Row {
     pub kind: V2RowKind,
-    /// Stable key: the entry id, `"<milestone>/<slice-id>"` for a slice,
+    /// Stable key: the entry id, `"<tree>/<slice-id>"` for a slice (for a sub
+    /// item that is also its tree's identity),
     /// `"archive"` for the header, `"archive:<id>"` for an archive entry.
     pub key: String,
     /// The owning entry id (empty for the archive header).
@@ -169,7 +170,7 @@ pub struct V2Row {
     pub depth: usize,
     pub expandable: bool,
     pub expanded: bool,
-    /// Slice rows: the owning milestone identity + the slice id (`NNN` or the
+    /// Slice rows: the owning tree's identity + the slice id (`NNN` or the
     /// sub-milestone slug) — the `slice_update` verb's `(milestone, id)`.
     pub milestone: Option<String>,
     pub slice_id: Option<String>,
@@ -264,9 +265,11 @@ fn wrapping_step(selected: usize, len: usize, forward: bool) -> usize {
     }
 }
 
-/// The live entry ids (for [`QueueV2View::retain`]).
+/// The ids an expansion can name: live entries and every tree, sub-trees
+/// included (for [`QueueV2View::retain`]).
 pub fn live_entry_ids(reply: &QueueShowReply) -> HashSet<String> {
-    reply.entries.iter().map(|e| e.id.clone()).collect()
+    let entries = reply.entries.iter().map(|e| e.id.clone());
+    entries.chain(reply.trees.iter().map(|t| t.milestone.clone())).collect()
 }
 
 /// The slice tree for a top-level milestone entry, if any.
@@ -353,26 +356,40 @@ fn push_entry(
     if expanded.contains(&e.id)
         && let Some(tree) = tree_for(reply, &e.id)
     {
-        for s in &tree.slices {
-            let kind_label = if s.kind == "sub" { "sub" } else { "" };
-            let label = if kind_label.is_empty() {
-                s.id.clone()
-            } else {
-                format!("{} ({})", s.id, kind_label)
-            };
-            out.push(V2Row {
-                kind: V2RowKind::Slice,
-                key: format!("{}/{}", e.id, s.id),
-                entry_id: e.id.clone(),
-                label,
-                status: s.status.clone(),
-                depth: 1,
-                expandable: false,
-                expanded: false,
-                milestone: Some(e.id.clone()),
-                slice_id: Some(s.id.clone()),
-                is_milestone: false,
-            });
+        push_tree(out, reply, expanded, &e.id, tree, 1);
+    }
+}
+
+/// `tree`'s items as rows under `entry_id`, walking into each expanded sub. A
+/// sub item's own tree is keyed `<tree>/<id>`, the same string as its row key.
+fn push_tree(
+    out: &mut Vec<V2Row>,
+    reply: &QueueShowReply,
+    expanded: &HashSet<String>,
+    entry_id: &str,
+    tree: &QueueShowTree,
+    depth: usize,
+) {
+    for s in &tree.slices {
+        let is_sub = s.kind == "sub";
+        let key = format!("{}/{}", tree.milestone, s.id);
+        let sub_tree = if is_sub { tree_for(reply, &key) } else { None };
+        let open = sub_tree.is_some() && expanded.contains(&key);
+        out.push(V2Row {
+            kind: V2RowKind::Slice,
+            key: key.clone(),
+            entry_id: entry_id.to_string(),
+            label: if is_sub { format!("{} (sub)", s.id) } else { s.id.clone() },
+            status: s.status.clone(),
+            depth,
+            expandable: sub_tree.is_some(),
+            expanded: open,
+            milestone: Some(tree.milestone.clone()),
+            slice_id: Some(s.id.clone()),
+            is_milestone: false,
+        });
+        if open && let Some(sub) = sub_tree {
+            push_tree(out, reply, expanded, entry_id, sub, depth + 1);
         }
     }
 }
@@ -815,6 +832,58 @@ mod tests {
         assert!(status_pick(&r, &view).is_none(), "a sub item has no slice verb");
         view.select(at("archive:done1"), rows.len());
         assert!(status_pick(&r, &view).is_none(), "an archive row is not editable");
+    }
+
+    /// A reply whose `m` holds a sub `m/sub-a`, which repeats slice `001`.
+    fn reply_with_a_sub() -> QueueShowReply {
+        let mut r = reply(vec![entry("m", "normal", "active", &[], false)], vec![]);
+        r.trees.push(QueueShowTree {
+            milestone: "m/sub-a".into(),
+            slices: vec![slice("001", "slice", "queued"), slice("002", "slice", "queued")],
+        });
+        r
+    }
+
+    #[test]
+    fn a_sub_expands_to_its_own_slices_and_they_address_its_tree() {
+        let r = reply_with_a_sub();
+        let mut view = QueueV2View::new();
+        view.expand("m");
+        let rows = view.rows(&r);
+        let sub = rows.iter().find(|x| x.key == "m/sub-a").unwrap();
+        assert!(sub.expandable && !sub.expanded, "{sub:?}");
+        assert!(!rows.iter().any(|x| x.key == "m/sub-a/001"), "collapsed");
+
+        view.expand("m/sub-a");
+        let rows = view.rows(&r);
+        let at = |key: &str| rows.iter().position(|x| x.key == key).unwrap();
+        let child = &rows[at("m/sub-a/001")];
+        assert_eq!(child.depth, 2);
+        assert_eq!(child.entry_id, "m");
+        assert_eq!(child.milestone.as_deref(), Some("m/sub-a"));
+
+        view.select(at("m/sub-a/002"), rows.len());
+        let V2Action::SliceUpdate(args) = slice_move(&r, &view, true).unwrap() else { panic!() };
+        assert_eq!((args.milestone.as_str(), args.id.as_str()), ("m/sub-a", "002"));
+    }
+
+    #[test]
+    fn a_sub_with_no_tree_in_the_reply_is_not_expandable() {
+        let r = reply(vec![entry("m", "normal", "active", &[], false)], vec![]);
+        let mut view = QueueV2View::new();
+        view.expand("m");
+        let rows = view.rows(&r);
+        assert!(!rows.iter().find(|x| x.key == "m/sub-a").unwrap().expandable);
+    }
+
+    #[test]
+    fn a_reload_keeps_an_open_sub_open() {
+        let r = reply_with_a_sub();
+        let mut view = QueueV2View::new();
+        view.expand("m");
+        view.expand("m/sub-a");
+        view.retain(&live_entry_ids(&r));
+        assert!(view.is_expanded("m/sub-a"));
     }
 
     #[test]

@@ -257,8 +257,9 @@ impl StackRead {
 
 /// Collect one entry's §3.5 session-log lines: the entry's own doc (a
 /// milestone's `CLAUDE.md` close-out, a task/restack doc), plus — for a
-/// milestone — every slice doc in its tree and sub-trees. A missing doc (or a
-/// missing `## Sessions` section) contributes nothing.
+/// milestone — every slice doc in its tree and sub-trees, and each sub's own
+/// close-out. A missing doc (or a missing `## Sessions` section) contributes
+/// nothing.
 fn collect_sessions(
     snapshot: &V2Snapshot,
     entry: &EntryView,
@@ -268,17 +269,22 @@ fn collect_sessions(
     match entry.kind {
         EntryKind::Milestone => {
             let close = format!("{}/CLAUDE.md", milestone_path(&entry.id));
-            push_session(root, &close, &entry.id, None, out);
+            push_session(root, &close, &entry.id, None, None, out);
             // The entry's own tree and every sub-milestone tree under it.
             let prefix = format!("{}/", entry.id);
             for (identity, tree) in &snapshot.trees {
                 if identity == &entry.id || identity.starts_with(&prefix) {
+                    let sub = (identity != &entry.id).then_some(identity.as_str());
+                    if sub.is_some() {
+                        let close = format!("{}/CLAUDE.md", milestone_path(identity));
+                        push_session(root, &close, &entry.id, sub, None, out);
+                    }
                     let dir = format!("{}/slices", milestone_path(identity));
                     for item in &tree.items {
                         if item.kind == SliceKind::Slice
                             && let Some(doc) = find_by_number(root, &dir, &item.id)
                         {
-                            push_session(root, &doc, &entry.id, Some(&item.id), out);
+                            push_session(root, &doc, &entry.id, sub, Some(&item.id), out);
                         }
                     }
                 }
@@ -286,7 +292,7 @@ fn collect_sessions(
         }
         EntryKind::Task | EntryKind::Restack => {
             if let Some(doc) = find_by_number(root, TASKS_DIR, &entry.id) {
-                push_session(root, &doc, &entry.id, None, out);
+                push_session(root, &doc, &entry.id, None, None, out);
             }
         }
     }
@@ -294,7 +300,14 @@ fn collect_sessions(
 
 /// Read `rel`'s `## Sessions` section and append one [`QueueShowSession`] when
 /// it carries lines.
-fn push_session(root: &Path, rel: &str, entry: &str, unit: Option<&str>, out: &mut Vec<QueueShowSession>) {
+fn push_session(
+    root: &Path,
+    rel: &str,
+    entry: &str,
+    tree: Option<&str>,
+    unit: Option<&str>,
+    out: &mut Vec<QueueShowSession>,
+) {
     let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
         return;
     };
@@ -302,6 +315,7 @@ fn push_session(root: &Path, rel: &str, entry: &str, unit: Option<&str>, out: &m
     if !lines.is_empty() {
         out.push(QueueShowSession {
             entry: entry.to_string(),
+            tree: tree.map(str::to_string),
             unit: unit.map(str::to_string),
             path: rel.to_string(),
             lines,
@@ -809,6 +823,48 @@ mod tests {
         let slice = reply.sessions.iter().find(|s| s.unit.as_deref() == Some("001")).unwrap();
         assert!(slice.path.ends_with("001-first.md"), "{slice:?}");
         assert!(slice.lines[0].contains("context_full"));
+    }
+
+    #[test]
+    fn a_sub_s_session_lines_carry_its_tree_and_stay_apart_from_the_parent_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut entries = vec![entry(
+            "m",
+            "feat/m",
+            Lane::Normal,
+            EntryStatus::Active,
+            "2026-10-01T00:00:00Z",
+        )];
+        entries[0].kind = EntryKind::Milestone;
+        let mut trees = BTreeMap::new();
+        for identity in ["m", "m/rest"] {
+            trees.insert(
+                identity.to_string(),
+                TreeView { items: vec![item(SliceKind::Slice, "001")], models: None },
+            );
+        }
+        let snapshot = snap(root, entries, trees);
+
+        let parent = root.join("growlight/backlog/milestones/m");
+        let sub = parent.join("subs/rest");
+        for d in [&parent, &sub] {
+            fs::create_dir_all(d.join("slices")).unwrap();
+        }
+        fs::write(parent.join("slices/001-a.md"), "## Sessions\n\n- parent slice\n").unwrap();
+        fs::write(sub.join("slices/001-b.md"), "## Sessions\n\n- sub slice\n").unwrap();
+        fs::write(sub.join("CLAUDE.md"), "## Sessions\n\n- sub close-out\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_sessions(&snapshot, &snapshot.entries[0], root, &mut out);
+        let of = |line: &str| out.iter().find(|s| s.lines == [line]).unwrap();
+        let parent_slice = of("- parent slice");
+        assert_eq!((parent_slice.tree.as_deref(), parent_slice.unit.as_deref()), (None, Some("001")));
+        let sub_slice = of("- sub slice");
+        assert_eq!((sub_slice.tree.as_deref(), sub_slice.unit.as_deref()), (Some("m/rest"), Some("001")));
+        let close = of("- sub close-out");
+        assert_eq!((close.tree.as_deref(), close.unit.as_deref()), (Some("m/rest"), None));
+        assert!(out.iter().all(|s| s.entry == "m"), "{out:?}");
     }
 
     #[test]

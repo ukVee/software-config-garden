@@ -2839,7 +2839,8 @@ fn render_annotations(view: &QueueShowReply) -> String {
             Some(u) => format!("/{u}"),
             None => String::new(),
         };
-        out.push_str(&format!("{}{} ({})\n", s.entry, unit, s.path));
+        let tree = s.tree.as_deref().unwrap_or(&s.entry);
+        out.push_str(&format!("{tree}{unit} ({})\n", s.path));
         for line in &s.lines {
             out.push_str(&format!("  {line}\n"));
         }
@@ -4871,6 +4872,7 @@ mod tests {
             archived: Vec::new(),
             sessions: vec![QueueShowSession {
                 entry: "one".into(),
+                tree: None,
                 unit: None,
                 path: "growlight/backlog/milestones/one/CLAUDE.md".into(),
                 lines: vec!["- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04".into()],
