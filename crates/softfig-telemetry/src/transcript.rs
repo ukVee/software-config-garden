@@ -122,6 +122,7 @@ fn row(keys: &TranscriptKeys, c: ClosedRequest, meta: Option<LineMeta>) -> Reque
         tool_use_count: c.tool_use_count,
         latency_ms: None,
         cost_usd: None,
+        vendor_cost_usd: None,
         settled_from: SettledFrom::Transcript,
     }
 }

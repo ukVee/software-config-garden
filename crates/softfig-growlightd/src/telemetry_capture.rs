@@ -104,6 +104,7 @@ impl CaptureContext {
             tool_use_count: 0,
             latency_ms: None,
             cost_usd: None,
+            vendor_cost_usd: None,
             settled_from: SettledFrom::Stream,
         }
     }
@@ -273,6 +274,7 @@ pub fn opencode_step_row(
     if row.cost_usd.is_none() {
         row.cost_usd = wire_cost;
     }
+    row.vendor_cost_usd = wire_cost;
     row
 }
 
@@ -298,6 +300,7 @@ pub fn opencode_ledger_row(
     row.turn_index = turn_index;
     row.tokens.input = unseen_tokens;
     row.cost_usd = Some(cost_usd.max(0.0));
+    row.vendor_cost_usd = row.cost_usd;
     row
 }
 
@@ -506,6 +509,7 @@ mod tests {
         assert_eq!(row.tokens.output, 167);
         assert_eq!(row.tokens.total(), tokens.total());
         assert_eq!(row.cost_usd, Some(0.0002));
+        assert_eq!(row.vendor_cost_usd, Some(0.0002), "the wire total is kept apart");
         assert_eq!(row.turn_index, 3);
         assert_eq!(row.stop_reason.as_deref(), Some("tool-calls"));
     }

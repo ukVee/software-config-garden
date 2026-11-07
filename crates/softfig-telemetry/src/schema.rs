@@ -7,7 +7,7 @@ pub const DB_FILE: &str = "telemetry.db";
 
 /// `PRAGMA user_version`. Bumped by a migration, never by editing the v1 DDL
 /// in place (the softfig-store `SCHEMA_V1` rule).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The ring's capacity. Full → the oldest row is dropped and counted.
 pub const RING_CAPACITY: usize = 10_000;
@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS daily_rollup (
 /// `ALTER` rather than an edit to [`CREATE_DAILY_ROLLUP`], which is v1's DDL.
 pub const ROLLUP_ADD_UNPRICED: &str = "\
 ALTER TABLE daily_rollup ADD COLUMN unpriced_requests INTEGER NOT NULL DEFAULT 0";
+
+/// Schema v4: the vendor's own cost for a request, stored apart from
+/// `cost_usd` (the garden price table's figure, the one basis every sum uses).
+/// It is a cross-check, so it is null where the wire carries none, and it is
+/// not rolled up. A separate `ALTER` rather than an edit to [`CREATE_REQUESTS`],
+/// which is v1's DDL.
+pub const REQUESTS_ADD_VENDOR_COST: &str = "\
+ALTER TABLE requests ADD COLUMN vendor_cost_usd REAL";
 
 /// How far each session has been rolled up. A raw row is gone once it is in
 /// `daily_rollup`, so the `(session_id, request_id)` key no longer recognises

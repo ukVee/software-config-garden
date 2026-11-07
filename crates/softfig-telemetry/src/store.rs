@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use crate::row::RequestRow;
 use crate::schema::{
     CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, CREATE_ROLLUP_WATERMARK, DB_FILE,
-    RAW_RETENTION_DAYS, ROLLUP_ADD_UNPRICED, SCHEMA_VERSION,
+    RAW_RETENTION_DAYS, REQUESTS_ADD_VENDOR_COST, ROLLUP_ADD_UNPRICED, SCHEMA_VERSION,
 };
 use crate::ts::iso8601_utc;
 
@@ -43,6 +43,7 @@ const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[
     migrate_v0_to_v1,
     migrate_v1_to_v2,
     migrate_v2_to_v3,
+    migrate_v3_to_v4,
 ];
 
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
@@ -61,6 +62,10 @@ fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(ROLLUP_ADD_UNPRICED)
+}
+
+fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(REQUESTS_ADD_VENDOR_COST)
 }
 
 /// What one [`Store::sweep_retention`] did.
@@ -131,6 +136,7 @@ impl Store {
                     r.tool_use_count,
                     r.latency_ms.map(sql_u64),
                     r.cost_usd,
+                    r.vendor_cost_usd,
                     r.settled_from.as_str(),
                 ])?;
             }
@@ -196,10 +202,10 @@ INSERT OR IGNORE INTO requests (
     item_id, slice_id, queue, turn_index, input_tokens, output_tokens,
     cache_read_input_tokens, cache_creation_input_tokens,
     cache_creation_1h_input_tokens, thinking_tokens, effort, speed, stop_reason,
-    tool_use_count, latency_ms, cost_usd, settled_from
+    tool_use_count, latency_ms, cost_usd, vendor_cost_usd, settled_from
 )
 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
 WHERE NOT EXISTS (
     SELECT 1 FROM rollup_watermark w WHERE w.session_id = ?5 AND ?1 <= w.through
 )";
@@ -273,6 +279,7 @@ pub(crate) mod tests {
             tool_use_count: 1,
             latency_ms: None,
             cost_usd: Some(0.5),
+            vendor_cost_usd: None,
             settled_from: SettledFrom::Stream,
         }
     }
@@ -621,7 +628,7 @@ pub(crate) mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION, "v2 steps through v3 to the current schema");
         let (requests, cost, unpriced): (i64, f64, i64) = store
             .conn()
             .query_row(
@@ -635,5 +642,58 @@ pub(crate) mod tests {
         drop(store);
         Store::open(&path).unwrap();
         assert!(Connection::open(&path).unwrap().execute_batch(ROLLUP_ADD_UNPRICED).is_err());
+    }
+
+    #[test]
+    fn a_v3_db_migrates_to_v4_keeping_its_requests_with_a_null_vendor_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            // A db as the v3 build left it: steps 0 to 2, user_version 3, one raw row.
+            let conn = Connection::open(&path).unwrap();
+            migrate_v0_to_v1(&conn).unwrap();
+            migrate_v1_to_v2(&conn).unwrap();
+            migrate_v2_to_v3(&conn).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO requests (
+                     ts, backend, provider, model, session_id, request_id, member, turn_index,
+                     input_tokens, output_tokens, cache_read_input_tokens,
+                     cache_creation_input_tokens, cache_creation_1h_input_tokens,
+                     tool_use_count, cost_usd, settled_from
+                 ) VALUES ('2026-07-23T00:00:00Z', 'opencode', 'deepseek', 'm', 's', 'r', 'a', 0,
+                           1, 1, 1, 0, 0, 0, 0.25, 'stream')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let (cost, vendor): (f64, Option<f64>) = store
+            .conn()
+            .query_row("SELECT cost_usd, vendor_cost_usd FROM requests", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((cost, vendor), (0.25, None), "history kept; no vendor figure to invent");
+        // A new row stores its vendor figure beside the table's.
+        let mut r = row("s2", "r1", NOW);
+        r.vendor_cost_usd = Some(0.125);
+        store.insert_batch(&[r]).unwrap();
+        let vendor: Option<f64> = store
+            .conn()
+            .query_row(
+                "SELECT vendor_cost_usd FROM requests WHERE session_id = 's2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vendor, Some(0.125));
+        // The column is not re-added on the next open.
+        drop(store);
+        Store::open(&path).unwrap();
+        assert!(Connection::open(&path)
+            .unwrap()
+            .execute_batch(REQUESTS_ADD_VENDOR_COST)
+            .is_err());
     }
 }

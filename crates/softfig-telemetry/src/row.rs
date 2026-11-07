@@ -141,5 +141,10 @@ pub struct RequestRow {
     /// price change never rewrites history (spec §3.1). `None` when the
     /// `(provider, model)` has no price row.
     pub cost_usd: Option<f64>,
+    /// The vendor's own total for this request, kept beside `cost_usd` as a
+    /// cross-check and never summed into it. opencode's `part.cost` (a step)
+    /// or the ledger's difference (the remainder row); `None` for claude,
+    /// whose wire carries no cost.
+    pub vendor_cost_usd: Option<f64>,
     pub settled_from: SettledFrom,
 }
