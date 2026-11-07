@@ -30,6 +30,7 @@ use crate::daemon::{Daemon, DaemonInner};
 
 /// One v2 file to write: the path, the CAS token from the load, and the
 /// serialized bytes.
+#[derive(Clone)]
 pub struct FileWrite {
     pub rel: String,
     /// [`LoadedFile::version`](super::state::LoadedFile::version) from the

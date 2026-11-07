@@ -169,7 +169,7 @@ fn load_entry_row(
 /// `CLAUDE.md` for a close-out, its `slices/NNN-<slug>.md` for a unit (the
 /// NNN resolves through the folder, since `slices.toml` carries no slug), a
 /// task's or restack's `tasks/NNN-<slug>.md` otherwise.
-fn unit_doc_rel(
+pub(in crate::actions::growlight) fn unit_doc_rel(
     wt: &WorkTree,
     kind: EntryKind,
     entry: &str,

@@ -2712,9 +2712,9 @@ pub struct QueueV2AddSubReply {
 /// auto-restack enqueue (`queue-v2-git` slice 003), keeperd↔growlightd only.
 /// growlightd detected a stale stack (read-only git) and passes the ordered
 /// stack; keeperd enqueues ONE urgent restack row for `project` and generates
-/// the full restack doc from `stack`. Idempotent per project: if a live restack
-/// row for `project` already exists, `id`/`path` are `None` and nothing is
-/// written.
+/// the full restack doc from `stack`, or merges `stack` into the live row's doc.
+/// Idempotent per project: if that doc already carries the stack, or a session
+/// holds it, `id`/`path` are `None` and nothing is written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2EnqueueRestackArgs {
     /// The project whose repo needs a restack.
@@ -2726,11 +2726,11 @@ pub struct QueueV2EnqueueRestackArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2EnqueueRestackReply {
-    /// The new restack entry's id (`NNN`); `None` when a live restack row for
-    /// `project` already existed (idempotent no-op).
+    /// The restack entry's id (`NNN`), new or merged into; `None` on the
+    /// idempotent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// The new restack doc (garden-relative); `None` on the idempotent no-op.
+    /// The restack doc (garden-relative); `None` on the idempotent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// The commit hash, or the untouched tip on the idempotent no-op.

@@ -56,7 +56,8 @@ use super::{
 pub enum QueueRefusal {
     /// The id or name is already taken. Verb: `queue_add_project` /
     /// `queue_add_entry` on an existing id. Validation: an id appears twice
-    /// (in the live file, in the archive, or across the two).
+    /// (in the live file, in the archive, or across the two), or a project has
+    /// a second restack row (§3.1).
     Exists {
         /// The id (or name) that already exists.
         id: String,
@@ -228,7 +229,8 @@ impl QueueToml {
     ///    only — an archived row's own links are history);
     /// 4. every entry's project exists in the projects table;
     /// 5. at most one normal-lane entry per repo carries `active` or `paused`;
-    /// 6. an `active` restack shares its repo with no other `active` entry.
+    /// 6. an `active` restack shares its repo with no other `active` entry;
+    /// 7. a project has at most one restack row, whatever its status.
     ///
     /// Invariant 6 (remote entries never get an opencode member) is not file
     /// state — see the module docs.
@@ -324,6 +326,15 @@ impl QueueToml {
                 e.id != restack.id && repo_of.get(e.project.as_str()) == repo_of.get(restack.project.as_str())
             }) {
                 return Err(QueueRefusal::Started { id: other.id.clone() });
+            }
+        }
+
+        // 7. One restack row per project: a second enqueue merges into the
+        // live row, and this is the backstop for a hand edit.
+        let mut restacked: HashSet<&str> = HashSet::new();
+        for e in self.entries.iter().filter(|e| e.kind == EntryKind::Restack) {
+            if !restacked.insert(e.project.as_str()) {
+                return Err(QueueRefusal::Exists { id: e.id.clone() });
             }
         }
 
@@ -778,6 +789,22 @@ mod tests {
         queue(vec![softfig_project()], vec![b, a])
             .validate(&archive(vec![]))
             .expect("urgent + normal active ok");
+    }
+
+    #[test]
+    fn a_project_has_one_restack_row_whatever_its_status() {
+        let two = vec![restack("001", EntryStatus::Blocked), restack("002", EntryStatus::Queued)];
+        let err = queue(vec![softfig_project()], two).validate(&archive(vec![])).unwrap_err();
+        assert_eq!(err, QueueRefusal::Exists { id: "002".into() });
+
+        let mut other = restack("002", EntryStatus::Queued);
+        other.project = "mirror".into();
+        queue(
+            vec![softfig_project(), project("mirror", "~/elsewhere")],
+            vec![restack("001", EntryStatus::Queued), other],
+        )
+        .validate(&archive(vec![]))
+        .expect("one row each");
     }
 
     #[test]
