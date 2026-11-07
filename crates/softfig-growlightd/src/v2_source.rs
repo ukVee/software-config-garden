@@ -460,7 +460,10 @@ fn read_v2_file(
 ) -> Result<Option<String>, V2SourceError> {
     match reads.read(&root.join(rel)) {
         Ok(text) => Ok(Some(text)),
-        Err(ReadError { kind, .. }) if kind == std::io::ErrorKind::NotFound => Ok(None),
+        Err(ReadError {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => Ok(None),
         Err(ReadError { cause, .. }) => Err(V2SourceError::Unreadable {
             rel: rel.to_string(),
             cause,
