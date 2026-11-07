@@ -306,6 +306,10 @@ backends = ["opencode"]            # and/or members = ["b"]
 - **The weekly reserve** is per claude-login slot. A slot is held once its vouchable 7d
   reading reaches `100 − reserve`, until the window resets. opencode members are never
   reserve-held, because they draw on no weekly window.
+- **Restart after an edit.** growlightd reads `[schedule]` once, at start, so an edit
+  takes effect after `systemctl --user restart softfig-growlightd`. There is no reload.
+  Each open or close edge is one line in the journal (`schedule: window <label> opened`),
+  not on the coordination bus.
 - **Fail-closed.** An unknown key, a bad time or day, or a `members` id with no `[[fleet]]`
   agent disables the fleet at load. An unreadable local zone closes the schedule for
   everyone.
@@ -366,7 +370,8 @@ live **build caps**. The schedule block is the drive loop's last verdict: whethe
 window is open, the next open or close edge in local time, each member the schedule
 holds and why, the items waiting on their `> Not before:`, and every claude-login
 slot's weekly reserve and budget projection. It reads `schedule (none)` while no
-schedule is enabled or the fleet is disarmed.
+`[schedule] enabled = true` is loaded; a disarmed fleet isn't the cause, because with no
+growlightd running `status` has nothing to answer it.
 
 ```
 schedule      closed (zone America/New_York)
