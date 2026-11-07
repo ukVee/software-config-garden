@@ -2199,7 +2199,8 @@ pub struct QueueArgs {
     #[arg(long)]
     pub socket: Option<PathBuf>,
     /// growlightd socket, for `show`'s live git-stack + session annotations
-    /// (growlightd runs the read-only git). Defaults to
+    /// (growlightd runs the read-only git) and for `pick`. Goes before the
+    /// subcommand, like `--socket`. Defaults to
     /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
     #[arg(long, value_name = "SOCKET")]
     pub growlightd_socket: Option<PathBuf>,
@@ -2219,16 +2220,12 @@ pub enum QueueSub {
 
     /// Read-only: what `pick_v2` assigns a member now, and why every skipped
     /// entry was skipped (§6.9). This form is **growlightd's** verb (the pick
-    /// lives there, not in keeperd), so it takes its own socket flag.
+    /// lives there, not in keeperd), so it answers on `--growlightd-socket`.
     Pick {
         /// A roster member id. Omitted: an unpinned member on the default
         /// backend.
         #[arg(long)]
         member: Option<String>,
-        /// growlightd's socket. Defaults to
-        /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
-        #[arg(long, value_name = "SOCKET")]
-        growlightd_socket: Option<PathBuf>,
     },
 
     /// Append a `[[project]]` row — `queue project add`.
@@ -2499,12 +2496,10 @@ pub struct SliceStatusArgs {
 
 fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let growlightd_socket = growlight_socket(args.growlightd_socket);
     match args.cmd.unwrap_or(QueueSub::Show) {
-        QueueSub::Show => queue_show(&socket, &growlight_socket(args.growlightd_socket)),
-        QueueSub::Pick {
-            member,
-            growlightd_socket,
-        } => queue_pick(&growlight_socket(growlightd_socket), member.as_deref()),
+        QueueSub::Show => queue_show(&socket, &growlightd_socket),
+        QueueSub::Pick { member } => queue_pick(&growlightd_socket, member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
         },
@@ -4815,6 +4810,32 @@ mod tests {
         assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
         // A branch whose repo couldn't be read is not shown as merged.
         assert!(body.contains("| w1 | active | wedged | — | feat/w1 (stack unknown) |"), "{body}");
+    }
+
+    /// One flag, one place: `pick` reads the `queue`-level socket, and the old
+    /// per-`pick` spelling is refused rather than beating it silently (V21).
+    #[test]
+    fn queue_pick_answers_on_the_queue_level_growlightd_socket() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.sock");
+        let gone_str = gone.to_str().unwrap();
+        let cli = TestCli::try_parse_from(["g", "queue", "--growlightd-socket", gone_str, "pick"])
+            .unwrap();
+        let GrowlightCmd::Queue(args) = cli.cmd else { panic!("expected Queue") };
+        let err = client_queue(args).unwrap_err().to_string();
+        assert!(err.contains(gone_str), "{err}");
+
+        assert!(
+            TestCli::try_parse_from(["g", "queue", "pick", "--growlightd-socket", gone_str]).is_err(),
+            "a second spelling of the flag must not parse"
+        );
     }
 
     #[test]
