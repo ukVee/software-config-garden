@@ -707,6 +707,24 @@ pub fn evaluate(cfg: &ScheduleConfig, zone: &Zone, now: i64, members: &[MemberRe
     }
 }
 
+/// The farthest back a clock may step and still be held to the last close. A
+/// step past this is a clock reset (a wrong RTC corrected at boot, say), not
+/// an NTP slew, and the memory is dropped rather than closing the schedule
+/// until the clock catches up.
+pub const MAX_CLOCK_STEP_BACK_SECS: i64 = 6 * 3600;
+
+/// The instant to [`evaluate`] at: `now`, unless the clock has stepped back
+/// from the instant a window was last seen to close (`closed_at`), in which
+/// case that instant. A close is therefore final: a backward step across it
+/// cannot re-open the window and respawn the members it held (review 056 F2).
+/// Forward jumps are untouched.
+pub fn clamp_to_last_close(closed_at: Option<i64>, now: i64) -> i64 {
+    match closed_at {
+        Some(at) if at > now && at - now <= MAX_CLOCK_STEP_BACK_SECS => at,
+        _ => now,
+    }
+}
+
 /// `unix` as local time in `zone`, `YYYY-MM-DD HH:MM ±HH:MM` — what `status`
 /// shows for the next edge.
 pub fn local_label(zone: &Zone, unix: i64) -> String {
@@ -1179,6 +1197,26 @@ mod tests {
             let w = window(backends, ids);
             assert_eq!((w.matches(&a), w.matches(&b)), want, "{backends:?} {ids:?}");
         }
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_reopen_a_closed_window() {
+        let cfg = schedule("windows = [\"23:00-07:00\"]\n");
+        let members = [MemberRef { agent: "a", backend: Backend::Claude }];
+        let z = Zone::from_posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let (t0720, t0650) = (at(2026, 10, 28, 7, 20, EDT), at(2026, 10, 28, 6, 50, EDT));
+        assert!(!evaluate(&cfg, &z, t0720, &members).open, "closed at 07:20");
+        assert!(evaluate(&cfg, &z, t0650, &members).open, "the bare clock re-opens at 06:50");
+        // With the close remembered, the stepped-back clock reads the close.
+        let held = clamp_to_last_close(Some(t0720), t0650);
+        assert_eq!(held, t0720);
+        assert!(!evaluate(&cfg, &z, held, &members).open);
+        // Once the clock passes the close, and with no memory, nothing changes.
+        assert_eq!(clamp_to_last_close(Some(t0720), t0720 + 60), t0720 + 60);
+        assert_eq!(clamp_to_last_close(None, t0650), t0650);
+        // A step past the bound is a clock reset: the memory is dropped.
+        let far = t0720 - MAX_CLOCK_STEP_BACK_SECS - 1;
+        assert_eq!(clamp_to_last_close(Some(t0720), far), far);
     }
 
     #[test]

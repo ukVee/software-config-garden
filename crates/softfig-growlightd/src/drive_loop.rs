@@ -1617,6 +1617,11 @@ pub struct DriveLoop {
     /// the edge memory behind the one `schedule: …` journal line per open/close.
     /// `None` while no schedule is enabled.
     schedule_last: Option<(bool, Vec<String>)>,
+    /// The instant the schedule was last seen to close (open last tick, closed
+    /// this one). The clock is read no earlier than this, so a backward step
+    /// across a close cannot re-open the window ([`clamp_to_last_close`]).
+    /// `None` while no schedule is enabled.
+    schedule_closed_at: Option<i64>,
     /// The claude-login slots at or past their weekly reserve this tick
     /// (growlight-schedule slice 004), rewritten from every verdict. Shared
     /// with the claude backend's pool-slot picker through
@@ -1728,6 +1733,7 @@ impl DriveLoop {
             iteration_bound_reached: false,
             zone: Box::new(SystemZone::new()),
             schedule_last: None,
+            schedule_closed_at: None,
             reserve_held: Arc::default(),
             window_closed_at: BTreeMap::new(),
             window_held_last: BTreeSet::new(),
@@ -3460,14 +3466,23 @@ impl DriveLoop {
         now: i64,
     ) -> ScheduleVerdict {
         let Some(cfg) = cfg else {
+            self.schedule_closed_at = None;
             return ScheduleVerdict::ungated();
         };
         let members: Vec<MemberRef<'_>> = fleet
             .iter()
             .map(|m| MemberRef { agent: &m.spec.agent, backend: m.backend.ipc_backend() })
             .collect();
+        let at = crate::schedule::clamp_to_last_close(self.schedule_closed_at, now);
+        let was_open = self.schedule_last.as_ref().is_some_and(|(open, _)| *open);
         let mut verdict = match self.zone.zone() {
-            Ok(zone) => evaluate(cfg, zone, now, &members),
+            Ok(zone) => {
+                let verdict = evaluate(cfg, zone, at, &members);
+                if was_open && !verdict.open {
+                    self.schedule_closed_at = Some(at);
+                }
+                verdict
+            }
             Err(why) => ScheduleVerdict::zone_unreadable(&members, &why),
         };
         // The weekly reserve (slice 004, §3.6), over the same admission pools
@@ -12442,6 +12457,23 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r = loop_.tick(OPEN + 3600);
         assert_eq!(backend.spawns(), vec!["a1"]);
         assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 opened"));
+    }
+
+    #[test]
+    fn a_backward_clock_step_across_a_close_does_not_reopen_the_window() {
+        let (mut loop_, _backend, _claimer, _q) = make_scheduled(&[], WINDOW);
+        assert_eq!(loop_.tick(OPEN + 60).schedule_held, vec![]);
+        let r = loop_.tick(CLOSE + 1200);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 closed"));
+        // NTP pulls the clock back to 11:50, inside the window it just closed:
+        // the close stands, and the journal sees no second edge.
+        let r = loop_.tick(CLOSE - 600);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert_eq!(r.schedule_edge, None);
+        // The next day's window opens as usual.
+        let r = loop_.tick(DAY + OPEN);
         assert!(r.schedule_held.is_empty());
         assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 opened"));
     }
