@@ -11519,6 +11519,30 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
     }
 
+    /// The boot scan has passed and no entry has handed off, so only the claim
+    /// can see a stack that went stale since (review 044 V22).
+    #[test]
+    fn v2_a_claim_scans_the_claimed_entrys_repo() {
+        let garden = TestGarden::new("claim-scan");
+        garden.queue(vec![]);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let r = loop_.tick(0);
+        assert!(r.v2_started.is_empty(), "{r:?}");
+        assert!(enq.enqueued.lock().unwrap().is_empty(), "the boot scan found nothing");
+
+        let (rows, _) = stale_garden_stack(&garden);
+        let mut list = vec![row("071", EntryKind::Task, Lane::Normal, EntryStatus::Queued)];
+        list.extend(rows);
+        garden.queue(list);
+        let r = loop_.tick(1);
+
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+    }
+
     /// A live restack row holds a due re-record back: a drop's child keeps a base
     /// it needs until the rewrite lands, and it already contains `main`.
     #[test]
