@@ -50,14 +50,19 @@ toml and thiserror, and on no other workspace crate.
   kept forever.
 - **Retention:** raw rows live 90 days (`RAW_RETENTION_DAYS`). Once a day the
   sweep rolls older rows into `daily_rollup` and deletes them, in one
-  transaction.
+  transaction. `ingest-transcript` runs the same sweep after its insert, so a
+  device with no flush thread still rolls up and prunes, and a backfill of old
+  history lands in the rollup instead of being dropped. A per-session
+  `rollup_watermark` (schema v2) keeps a resumed session's already-rolled-up
+  history from being counted twice.
 - **Wear:** the tablet's eMMC is wear-sensitive.
   - The ring holds up to 10 000 rows. On overflow it drops the oldest and
-    counts the drop.
+    counts the drop (`FlushStats::dropped`). A flush that saw new drops logs one
+    `telemetry: ring overflowed, N row(s) dropped` line.
   - The flush runs every 30 s, or as soon as 1 000 rows are pending.
   - Each flush is one transaction, and an idle flush opens none.
   - growlightd's shutdown journals the flush thread's totals:
-    `softfig-growlightd: telemetry: N row(s) in B batch(es), F failed; R rolled up in S sweep(s)`.
+    `softfig-growlightd: telemetry: N row(s) in B batch(es), F failed; D dropped by the ring; R rolled up in S sweep(s)`.
 
 Telemetry never blocks a member or the daemon. Any of these logs a line and
 drops rows rather than failing the session:

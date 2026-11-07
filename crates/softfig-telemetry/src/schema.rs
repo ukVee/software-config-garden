@@ -7,7 +7,7 @@ pub const DB_FILE: &str = "telemetry.db";
 
 /// `PRAGMA user_version`. Bumped by a migration, never by editing the v1 DDL
 /// in place (the softfig-store `SCHEMA_V1` rule).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The ring's capacity. Full → the oldest row is dropped and counted.
 pub const RING_CAPACITY: usize = 10_000;
@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS daily_rollup (
     thinking_tokens             INTEGER NOT NULL,
     cost_usd                    REAL    NOT NULL,
     PRIMARY KEY (day, model, backend, provider, slice_id)
+)";
+
+/// How far each session has been rolled up. A raw row is gone once it is in
+/// `daily_rollup`, so the `(session_id, request_id)` key no longer recognises
+/// it: a resumed session's transcript re-offers history the sweep already
+/// counted. The insert skips any row at or before its session's `through`, so
+/// that history is never counted twice.
+pub const CREATE_ROLLUP_WATERMARK: &str = "\
+CREATE TABLE IF NOT EXISTS rollup_watermark (
+    session_id TEXT PRIMARY KEY,
+    through    TEXT NOT NULL
 )";
 
 #[cfg(test)]

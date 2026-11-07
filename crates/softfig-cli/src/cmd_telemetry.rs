@@ -129,7 +129,15 @@ fn ingest(args: IngestArgs, now: i64) -> Result<usize> {
         .or_else(default_db_path)
         .ok_or_else(|| anyhow!("no telemetry db path ($XDG_STATE_HOME / $HOME unset)"))?;
     let mut store = Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
-    Ok(store.insert_batch(&rows)?)
+    let new = store.insert_batch(&rows)?;
+    // This verb is the only writer on a device whose fleet is disarmed, so it
+    // carries the retention sweep the flush thread would run: a backfill's old
+    // rows roll up now, and a long-lived db keeps to its 90 days. The rows are
+    // in; a failed sweep is reported and never fails the ingest.
+    if let Err(e) = store.sweep_retention(now) {
+        eprintln!("telemetry: retention sweep failed: {e}");
+    }
+    Ok(new)
 }
 
 /// The main transcript, then its subagents' (`<dir>/<stem>/subagents/*.jsonl`,
@@ -252,6 +260,35 @@ mod tests {
             (member.as_str(), item.as_str(), slice.as_str(), settled.as_str()),
             ("semi-auto", "token-telemetry-p1", "005", "transcript")
         );
+    }
+
+    #[test]
+    fn a_backfill_past_retention_rolls_up_and_a_re_ingest_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess-t.jsonl");
+        std::fs::write(&transcript, TRANSCRIPT).unwrap();
+        let db = dir.path().join("telemetry.db");
+        let args = || IngestArgs {
+            path: Some(transcript.clone()),
+            session_id: None,
+            db: Some(db.clone()),
+            garden_root: Some(dir.path().to_path_buf()),
+            config_dir: Some(dir.path().to_path_buf()),
+        };
+        // No flusher runs here, as on a disarmed device: the verb sweeps.
+        let later = NOW + 100 * 86_400;
+        assert_eq!(ingest(args(), later).unwrap(), 3);
+        assert_eq!(ingest(args(), later).unwrap(), 0, "rolled-up history is not re-counted");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let (raw, rolled): (i64, i64) = conn
+            .query_row(
+                "select (select count(*) from requests),
+                        (select coalesce(sum(requests), 0) from daily_rollup)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((raw, rolled), (0, 3), "all three requests are in the rollup, once");
     }
 
     #[test]

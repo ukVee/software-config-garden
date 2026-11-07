@@ -7,8 +7,8 @@ use rusqlite::{Connection, params};
 
 use crate::row::RequestRow;
 use crate::schema::{
-    CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, DB_FILE, RAW_RETENTION_DAYS,
-    SCHEMA_VERSION,
+    CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, CREATE_ROLLUP_WATERMARK, DB_FILE,
+    RAW_RETENTION_DAYS, SCHEMA_VERSION,
 };
 use crate::ts::iso8601_utc;
 
@@ -39,7 +39,7 @@ pub fn default_db_path() -> Option<PathBuf> {
 /// One migration step per schema version: `MIGRATIONS[i]` takes a db from
 /// `user_version` `i` to `i + 1`. Layer 2 appends a step; nothing edits one in
 /// place.
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_v0_to_v1];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_v0_to_v1, migrate_v1_to_v2];
 
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 
@@ -49,6 +49,10 @@ fn migrate_v0_to_v1(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(ddl)?;
     }
     conn.execute_batch(CREATE_DAILY_ROLLUP)
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CREATE_ROLLUP_WATERMARK)
 }
 
 /// What one [`Store::sweep_retention`] did.
@@ -81,8 +85,10 @@ impl Store {
     }
 
     /// Insert `rows` in one transaction. `INSERT OR IGNORE` on the
-    /// `(session_id, request_id)` key, so a re-ingest is a no-op; returns how
-    /// many rows were new. An empty batch opens no transaction.
+    /// `(session_id, request_id)` key, so a re-ingest is a no-op. A row at or
+    /// before its session's `rollup_watermark` is skipped too, so history the
+    /// sweep already rolled up is not counted twice; returns how many rows were
+    /// new. An empty batch opens no transaction.
     pub fn insert_batch(&mut self, rows: &[RequestRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
@@ -144,6 +150,7 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         tx.execute(ROLL_UP_AGED, [&cutoff])?;
+        tx.execute(ADVANCE_WATERMARKS, [&cutoff])?;
         let rolled = tx.execute("DELETE FROM requests WHERE ts < ?1", [&cutoff])?;
         tx.commit()?;
         Ok(SweepOutcome { rolled })
@@ -182,8 +189,19 @@ INSERT OR IGNORE INTO requests (
     cache_read_input_tokens, cache_creation_input_tokens,
     cache_creation_1h_input_tokens, thinking_tokens, effort, speed, stop_reason,
     tool_use_count, latency_ms, cost_usd, settled_from
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)";
+)
+SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+WHERE NOT EXISTS (
+    SELECT 1 FROM rollup_watermark w WHERE w.session_id = ?5 AND ?1 <= w.through
+)";
+
+/// Run in the roll-up's transaction, before the delete: each session's
+/// watermark moves to the newest of its rows being rolled up.
+const ADVANCE_WATERMARKS: &str = "\
+INSERT INTO rollup_watermark (session_id, through)
+SELECT session_id, MAX(ts) FROM requests WHERE ts < ?1 GROUP BY session_id
+ON CONFLICT (session_id) DO UPDATE SET through = MAX(through, excluded.through)";
 
 /// `ts` is `YYYY-MM-DDTHH:MM:SSZ`, so its first ten characters are the UTC day.
 /// A null `slice_id` rolls up as `''` (the rollup key can't hold null), and an
@@ -444,6 +462,31 @@ pub(crate) mod tests {
 
         // Nothing left to age: no transaction, no change.
         assert_eq!(store.sweep_retention(NOW).unwrap(), SweepOutcome::default());
+    }
+
+    #[test]
+    fn history_already_rolled_up_is_not_counted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+        let old = NOW - 100 * DAY;
+        let history = [row("s", "r1", old), row("s", "r2", old + 60)];
+        // A backfill of old history is kept, then rolled up by the sweep.
+        assert_eq!(store.insert_batch(&history).unwrap(), 2);
+        assert_eq!(store.sweep_retention(NOW).unwrap().rolled, 2);
+
+        // A resumed session's transcript offers the same history again, beside
+        // a request that is new.
+        let resumed = [history[0].clone(), history[1].clone(), row("s", "r3", NOW)];
+        assert_eq!(store.insert_batch(&resumed).unwrap(), 1, "only r3 is new");
+        assert_eq!(store.sweep_retention(NOW).unwrap(), SweepOutcome::default());
+        let requests: i64 = store
+            .conn()
+            .query_row("SELECT SUM(requests) FROM daily_rollup", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(requests, 2, "the rollup counted each request once");
+
+        // Another session's history of the same age is its own.
+        assert_eq!(store.insert_batch(&[row("t", "r1", old)]).unwrap(), 1);
     }
 
     #[test]

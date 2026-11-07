@@ -16,7 +16,6 @@ use serde_json::Value;
 
 use crate::claude::{ClaudeFold, ClosedRequest, request_for_assistant};
 use crate::row::{Backend, RequestRow, SettledFrom};
-use crate::schema::RAW_RETENTION_DAYS;
 use crate::ts::parse_iso8601_utc;
 
 /// The identity every row from one ingest carries.
@@ -42,9 +41,9 @@ struct LineMeta {
 
 /// One row per closed request in `reader`, in completion order, numbered per
 /// session. Pure: a line that does not parse is skipped, a line with no
-/// readable `timestamp` takes the previous line's (or `now`), and a request
-/// completed more than [`RAW_RETENTION_DAYS`] before `now` is dropped — the
-/// retention sweep would only roll it up again.
+/// readable `timestamp` takes the previous line's (or `now`). Every request
+/// is kept however old: a backfill's history belongs in `daily_rollup`, and
+/// the retention sweep that follows the insert puts it there.
 pub fn ingest_transcript(reader: impl BufRead, keys: &TranscriptKeys, now: i64) -> Vec<RequestRow> {
     let mut fold = ClaudeFold::default();
     let mut meta: HashMap<String, LineMeta> = HashMap::new();
@@ -73,10 +72,8 @@ pub fn ingest_transcript(reader: impl BufRead, keys: &TranscriptKeys, now: i64) 
     }
     closed.extend(fold.close_all());
 
-    let horizon = now - i64::from(RAW_RETENTION_DAYS) * 86_400;
     let mut rows: Vec<RequestRow> = closed
         .into_iter()
-        .filter(|c| c.at >= horizon)
         .map(|c| {
             let m = meta.remove(&c.id);
             row(keys, c, m)
@@ -201,14 +198,12 @@ mod tests {
     }
 
     #[test]
-    fn requests_past_the_retention_horizon_are_dropped() {
-        let day = 86_400;
-        let t2 = at("2026-10-31T18:00:12Z");
-        let just_inside = t2 + i64::from(RAW_RETENTION_DAYS) * day;
-        let rows = ingest_transcript(TRANSCRIPT.as_bytes(), &keys(), just_inside);
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].request_id.as_str(), rows[0].turn_index), ("msg_t2", 0));
-        assert!(ingest_transcript(TRANSCRIPT.as_bytes(), &keys(), just_inside + 1).is_empty());
+    fn requests_older_than_the_retention_horizon_are_kept() {
+        // The sweep rolls them up after the insert; dropping them here would
+        // lose a backfill's history.
+        let rows = ingest_transcript(TRANSCRIPT.as_bytes(), &keys(), at(NOW) + 400 * 86_400);
+        let ids: Vec<_> = rows.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(ids, ["msg_t1", "msg_s1", "msg_t2"]);
     }
 
     #[test]
