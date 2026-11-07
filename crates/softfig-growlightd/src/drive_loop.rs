@@ -2652,7 +2652,28 @@ impl DriveLoop {
         // on the NEXT tick (not the one that parked it); step 2 below is
         // where a cleared park actually re-rolls. The slice-003 alert is
         // not re-emitted here — the reconcile keeps the single alert single.
-        self.reconcile_model_refused(now, &fleet);
+        //
+        // This tick's one v2 read (F7), shared with the v2 scheduling pass
+        // below. Read when that pass runs or a v2 park needs its chain;
+        // nothing between here and that pass writes the queue.
+        let any_v2_park = self.supervisor.agents_in_model_refused_park().iter().any(|agent| {
+            matches!(
+                self.model_refused_items.get(agent),
+                Some(ModelRefusedPart::V2 { .. }),
+            )
+        });
+        let v2_load = if v2_mode || any_v2_park {
+            self.v2.as_mut().map(|seams| seams.source.load())
+        } else {
+            None
+        };
+        let mut v2_snapshot = match v2_load {
+            Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
+            // Schedule nothing from v2 this tick (the source alerted already,
+            // once), and a v2 park resolves its member default.
+            Some(V2Load::Absent) | Some(V2Load::Failed { .. }) | None => None,
+        };
+        self.reconcile_model_refused(now, &fleet, v2_snapshot.as_ref());
 
         // A live hold gates spawns this tick (steps 2 + 3), the pre-spawn HOLD twin
         // of `offline`: no re-roll, no fresh start, no backoff, no crash count — the
@@ -2693,15 +2714,10 @@ impl DriveLoop {
         report.bounded_run_stopped = bound_reached;
 
         if v2_mode {
-            let mut snapshot = match self.v2.as_mut().map(|seams| seams.source.load()) {
-                Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
-                Some(V2Load::Absent) | Some(V2Load::Failed { .. }) | None => {
-                    // Schedule nothing this tick (the source alerted already, once).
-                    // Health/control (step 1) still ran — exits and boundary stops
-                    // are observed; only the v2 spawns are held.
-                    None
-                }
-            };
+            // No snapshot schedules nothing this tick. Health/control (step 1)
+            // still ran — exits and boundary stops are observed; only the v2
+            // spawns are held.
+            let mut snapshot = v2_snapshot.take();
             if let Some(snapshot) = snapshot.as_mut() {
                 // The `not_before` hold reads the loop's own clock (§2 Holds).
                 snapshot.now_unix = now;
@@ -3761,7 +3777,7 @@ impl DriveLoop {
     ///    source:
     ///    - `Legacy { queue, part }` — [`QueueSource::read_item_doc`] against
     ///      the latched part, same shape as the semi-auto launcher.
-    ///    - `V2 { entry }` — fresh [`V2QueueSource::load`] + the entry's
+    ///    - `V2 { entry }` — the tick's one [`V2QueueSource::load`] + the entry's
     ///      [`crate::scheduler_v2::next_unit`] walk, mirroring the admission
     ///      path's [`resolve_v2_model`] over a live snapshot.
     ///
@@ -3794,33 +3810,20 @@ impl DriveLoop {
     /// Keeps the slice-003 single alert exactly single: no event is pushed
     /// onto `report.crashes` here, so a park whose refused model is still
     /// refused does NOT re-page.
-    fn reconcile_model_refused(&mut self, now: i64, fleet: &[FleetMember]) {
+    fn reconcile_model_refused(
+        &mut self,
+        now: i64,
+        fleet: &[FleetMember],
+        v2_snapshot: Option<&scheduler_v2::V2Snapshot>,
+    ) {
         let parked = self.supervisor.agents_in_model_refused_park();
         if parked.is_empty() {
             return;
         }
-        // Load the v2 snapshot once per tick, shared across every V2-latched
-        // member. Skipped when nothing V2 is parked (the common path on a
-        // legacy loop). A separate `source.load()` from the v2-mode branch's
-        // own load the same tick is a per-tick file read on the v2 TOML; the
-        // in-source alert-once memory stays quiet on a repeated-same error, so
-        // the second load doesn't double-alert. Absent / Failed falls through
-        // as `None` here, and each V2-latched park then resolves its member
-        // default (same shape as an unreadable legacy item doc).
-        let any_v2 = parked.iter().any(|agent| {
-            matches!(
-                self.model_refused_items.get(agent),
-                Some(ModelRefusedPart::V2 { .. }),
-            )
-        });
-        let v2_snapshot = if any_v2 {
-            self.v2.as_mut().and_then(|seams| match seams.source.load() {
-                V2Load::Snapshot(snapshot) => Some(snapshot),
-                V2Load::Absent | V2Load::Failed { .. } => None,
-            })
-        } else {
-            None
-        };
+        // `v2_snapshot` is the tick's one v2 read (F7), taken whenever a v2
+        // park exists, before any overlay. `None` (absent / failed / no
+        // seams) makes each V2-latched park resolve its member default (same
+        // shape as an unreadable legacy item doc).
         for agent in parked {
             // The latched identity. On a miss, keep the park alive (slice
             // 005): the silent defensive un-park is what masked review 049
@@ -3872,7 +3875,7 @@ impl DriveLoop {
                     // 007, code-review 050 F1). Slice 005 `continue`d here,
                     // which stranded the park at `not_before = i64::MAX` even
                     // after a roster edit moved the default off the refusal.
-                    match v2_snapshot.as_ref() {
+                    match v2_snapshot {
                         None => {
                             eprintln!(
                                 "growlightd: reconcile model-refused: v2 snapshot unavailable \
@@ -9381,22 +9384,25 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         cell: Arc<Mutex<Option<V2Snapshot>>>,
         absent: Arc<AtomicBool>,
         failed: Arc<AtomicBool>,
+        /// How many times the loop read the source.
+        loads: Arc<AtomicUsize>,
     }
 
     impl FakeV2Source {
         fn with(snapshot: V2Snapshot) -> Self {
             Self {
                 cell: Arc::new(Mutex::new(Some(snapshot))),
-                absent: Arc::new(AtomicBool::new(false)),
-                failed: Arc::new(AtomicBool::new(false)),
+                ..Self::default()
             }
         }
         fn absent() -> Self {
             Self {
-                cell: Arc::new(Mutex::new(None)),
                 absent: Arc::new(AtomicBool::new(true)),
-                failed: Arc::new(AtomicBool::new(false)),
+                ..Self::default()
             }
+        }
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
         }
         /// Replace the scripted snapshot (the next `load`s read it) — the test's
         /// stand-in for the committed state a claim produces.
@@ -9409,6 +9415,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
     impl V2QueueSource for FakeV2Source {
         fn load(&mut self) -> V2Load {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             if self.failed.load(Ordering::SeqCst) {
                 V2Load::Failed {
                     error: crate::v2_source::V2SourceError::Unreadable {
@@ -13701,6 +13708,38 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             spawns_after_park,
             "no re-spawn while the snapshot is absent",
         );
+    }
+
+    /// F7: a tick with a v2 park reads the v2 source once, shared by the
+    /// park's reconcile and the v2 scheduling pass.
+    #[test]
+    fn v2_mode_a_tick_with_a_v2_park_reads_the_source_once() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-f7-one-read-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let source = FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+
+        let before = source.loads();
+        loop_.tick(2);
+        assert_eq!(source.loads() - before, 1, "one read per tick");
     }
 
     /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape

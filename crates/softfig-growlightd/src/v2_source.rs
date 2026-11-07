@@ -54,6 +54,18 @@
 //!   nesting deeper than two levels is an invalid file, refused here rather
 //!   than walked past.
 //!
+//! ## Each file once per tick
+//!
+//! One assembly reads each file at most once ([`Reads`]): a milestone's
+//! `CLAUDE.md` closes every undeclared slice's chain and the close-out's, so
+//! a per-unit read would fetch it once per slice through FUSE. Nothing is
+//! kept between calls. The mount stamps every `stat` with the current time
+//! (`softfig-fuse`'s `attr_for_path`), so an mtime key would never match
+//! there, and a cache held across ticks could only serve a stale file. The
+//! mount already keeps decrypted bytes per tip; what one tick saves is the
+//! repeated round-trips. The drive loop reads the source once per tick and
+//! shares the result between its passes.
+//!
 //! ## What is deliberately not here
 //!
 //! No scheduling (slice 002), no keeperd socket, and no wiring into the drive
@@ -198,7 +210,16 @@ impl crate::drive_loop::V2QueueSource for V2Source {
 /// whose `slices.toml` is absent contributes no tree — the unit walk then
 /// reports `NoUnit` for it (never a guessed close-out).
 pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError> {
-    let Some(queue_raw) = read_v2_file(garden_root, QUEUE_FILE)? else {
+    let mut read = |path: &Path| std::fs::read_to_string(path);
+    assemble_with(garden_root, &mut Reads::new(&mut read))
+}
+
+/// [`assemble`] over a given set of reads, so a test can count them.
+fn assemble_with(
+    garden_root: &Path,
+    reads: &mut Reads<'_>,
+) -> Result<Option<V2Snapshot>, V2SourceError> {
+    let Some(queue_raw) = read_v2_file(reads, garden_root, QUEUE_FILE)? else {
         return Ok(None);
     };
     let queue = QueueToml::parse(&queue_raw).map_err(|source| V2SourceError::InvalidToml {
@@ -208,7 +229,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
 
     // The archive is optional on disk: no file means nothing has left the
     // list yet, which is an empty archive (and validates as one).
-    let archive = match read_v2_file(garden_root, QUEUE_ARCHIVE_FILE)? {
+    let archive = match read_v2_file(reads, garden_root, QUEUE_ARCHIVE_FILE)? {
         Some(text) => QueueArchiveToml::parse(&text).map_err(|source| {
             V2SourceError::InvalidToml {
                 rel: QUEUE_ARCHIVE_FILE.to_string(),
@@ -244,12 +265,12 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             // A task or restack is its own unit (§4): its allowed list is
             // just its doc's chain.
             EntryKind::Task | EntryKind::Restack => {
-                resolve_chain(garden_root, &entry.id, None)?
+                resolve_chain(reads, garden_root, &entry.id, None)?
             }
             // A milestone's units resolve inside its tree; the entry itself
             // carries no list.
             EntryKind::Milestone => {
-                load_tree(garden_root, &entry.id, &mut trees)?;
+                load_tree(reads, garden_root, &entry.id, &mut trees)?;
                 None
             }
         };
@@ -330,12 +351,13 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
 /// deeper sub is an invalid file, refused. An absent `slices.toml` inserts
 /// nothing — `NoUnit` territory, not a close-out.
 fn load_tree(
+    reads: &mut Reads<'_>,
     garden_root: &Path,
     milestone: &str,
     trees: &mut BTreeMap<String, TreeView>,
 ) -> Result<(), V2SourceError> {
     let rel = slices_file(milestone);
-    let Some(raw) = read_v2_file(garden_root, &rel)? else {
+    let Some(raw) = read_v2_file(reads, garden_root, &rel)? else {
         return Ok(());
     };
     let slices = SlicesToml::parse(&raw).map_err(|source| V2SourceError::InvalidToml {
@@ -351,7 +373,7 @@ fn load_tree(
     for item in &slices.items {
         match item.kind {
             SliceKind::Slice => {
-                let models = resolve_chain(garden_root, milestone, Some(&item.id))?;
+                let models = resolve_chain(reads, garden_root, milestone, Some(&item.id))?;
                 items.push(ItemView {
                     kind: SliceKind::Slice,
                     id: item.id.clone(),
@@ -366,7 +388,7 @@ fn load_tree(
                     rel: rel.clone(),
                     refusal,
                 })?;
-                load_tree(garden_root, &sub_identity, trees)?;
+                load_tree(reads, garden_root, &sub_identity, trees)?;
                 items.push(ItemView {
                     kind: SliceKind::Sub,
                     id: item.id.clone(),
@@ -379,7 +401,7 @@ fn load_tree(
         }
     }
     // The close-out unit's allowed list: the milestone's own chain.
-    let models = resolve_chain(garden_root, milestone, None)?;
+    let models = resolve_chain(reads, garden_root, milestone, None)?;
     trees.insert(milestone.to_string(), TreeView { items, models });
     Ok(())
 }
@@ -391,6 +413,7 @@ fn load_tree(
 /// readable doc is fail-closed, because treating it as "undeclared" would
 /// silently drop the backend gate it was meant to be.
 fn resolve_chain(
+    reads: &mut Reads<'_>,
     garden_root: &Path,
     item: &str,
     slice: Option<&str>,
@@ -413,7 +436,7 @@ fn resolve_chain(
                 .and_then(|name| name.to_str())
                 .unwrap_or("<unnamed>")
                 .to_string();
-            let content = std::fs::read_to_string(&path).ok();
+            let content = reads.read(&path).ok();
             (label, content)
         })
         .collect();
@@ -430,14 +453,55 @@ fn resolve_chain(
 /// Read one v2 file through the mount. `Ok(None)` only when the file is
 /// genuinely absent (no v2 state, or no slices yet); any other read failure
 /// is [`V2SourceError::Unreadable`] — fail-closed, never skipped.
-fn read_v2_file(root: &Path, rel: &str) -> Result<Option<String>, V2SourceError> {
-    match std::fs::read_to_string(root.join(rel)) {
+fn read_v2_file(
+    reads: &mut Reads<'_>,
+    root: &Path,
+    rel: &str,
+) -> Result<Option<String>, V2SourceError> {
+    match reads.read(&root.join(rel)) {
         Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(V2SourceError::Unreadable {
+        Err(ReadError { kind, .. }) if kind == std::io::ErrorKind::NotFound => Ok(None),
+        Err(ReadError { cause, .. }) => Err(V2SourceError::Unreadable {
             rel: rel.to_string(),
-            cause: e.to_string(),
+            cause,
         }),
+    }
+}
+
+/// A failed read as one assembly remembers it: `std::io::Error` is not
+/// `Clone`, and its kind and text are all a second reader of the path uses.
+#[derive(Clone, Debug)]
+struct ReadError {
+    kind: std::io::ErrorKind,
+    cause: String,
+}
+
+/// The reads of one [`assemble_with`] call: each path goes to `read` once,
+/// and a second ask gets the first answer, failures included, so one
+/// assembly never sees two versions of a file. Lives for one call only.
+struct Reads<'r> {
+    read: &'r mut dyn FnMut(&Path) -> std::io::Result<String>,
+    seen: BTreeMap<PathBuf, Result<String, ReadError>>,
+}
+
+impl<'r> Reads<'r> {
+    fn new(read: &'r mut dyn FnMut(&Path) -> std::io::Result<String>) -> Self {
+        Self {
+            read,
+            seen: BTreeMap::new(),
+        }
+    }
+
+    fn read(&mut self, path: &Path) -> Result<String, ReadError> {
+        if let Some(answer) = self.seen.get(path) {
+            return answer.clone();
+        }
+        let answer = (self.read)(path).map_err(|e| ReadError {
+            kind: e.kind(),
+            cause: e.to_string(),
+        });
+        self.seen.insert(path.to_path_buf(), answer.clone());
+        answer
     }
 }
 
@@ -969,5 +1033,71 @@ mod tests {
         // Breaking again later alerts again.
         garden.write(QUEUE_FILE, "schema = 99");
         assert!(matches!(src.load(), V2Load::Failed { alert: true, .. }));
+    }
+
+    // -- the per-tick read cost (F7) ---------------------------------------------
+
+    /// A milestone of three undeclared slices: each slice's chain and the
+    /// close-out's all end at the milestone's `CLAUDE.md`.
+    fn three_undeclared_slices(garden: &TempGarden, model: &str, first: SliceStatus) {
+        garden.write(QUEUE_FILE, &queue_toml(vec![softfig_project()], vec![entry("m")]));
+        garden.write(
+            &slices_file("m"),
+            &slices_toml(
+                "m",
+                vec![
+                    item(SliceKind::Slice, "001", first),
+                    item(SliceKind::Slice, "002", SliceStatus::Queued),
+                    item(SliceKind::Slice, "003", SliceStatus::Queued),
+                ],
+            ),
+        );
+        garden.write(
+            "growlight/backlog/milestones/m/CLAUDE.md",
+            &format!("# m\n\n> Model: {model}\n"),
+        );
+    }
+
+    #[test]
+    fn one_assembly_reads_each_file_once() {
+        let garden = TempGarden::new();
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+
+        let mut asked: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        let mut read = |path: &Path| {
+            *asked.entry(path.to_path_buf()).or_default() += 1;
+            std::fs::read_to_string(path)
+        };
+        let snapshot = assemble_with(garden.root(), &mut Reads::new(&mut read))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.trees["m"].items[2].models, Some(list("claude")));
+
+        let doc = garden.root().join("growlight/backlog/milestones/m/CLAUDE.md");
+        assert_eq!(asked.get(&doc), Some(&1), "four chains, one read: {asked:?}");
+        assert!(
+            asked.values().all(|&n| n == 1),
+            "every file read once, the absent archive too: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_changed_file_is_seen_on_the_next_load() {
+        let garden = TempGarden::new();
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+        let mut src = source(garden.root());
+        let V2Load::Snapshot(before) = src.load() else {
+            panic!("a valid garden loads");
+        };
+        assert_eq!(before.trees["m"].items[0].status, SliceStatus::Queued);
+        assert_eq!(before.trees["m"].models, Some(list("claude")));
+
+        // `queued` → `active` keeps slices.toml's length: a size key would miss it.
+        three_undeclared_slices(&garden, "flash", SliceStatus::Active);
+        let V2Load::Snapshot(after) = src.load() else {
+            panic!("the edited garden loads");
+        };
+        assert_eq!(after.trees["m"].items[0].status, SliceStatus::Active);
+        assert_eq!(after.trees["m"].models, Some(list("flash")));
     }
 }
