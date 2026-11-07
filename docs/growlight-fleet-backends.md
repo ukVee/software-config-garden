@@ -439,6 +439,11 @@ held with a doubling backoff across ticks. A probe that cannot answer is "unknow
 "stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
 detection skips the repo until it answers.
 
+`queue show` and `growlight status` read the stack the same way, on a probe cache of their
+own, so a human reading the list never holds a repo for the scheduler. A repo that can't
+answer shows "stack unknown" with the reason, and its started branches show the same, never
+an empty stack or a merged branch.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent

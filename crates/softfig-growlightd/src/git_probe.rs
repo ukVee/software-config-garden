@@ -1,4 +1,5 @@
-//! Bounded git probes for the drive loop (queue-v2-git V13).
+//! Bounded git probes for the drive loop (queue-v2-git V13) and for `queue_show`,
+//! which keeps its own [`ProbeCache`] ([`crate::daemon::Daemon::surface_probes`]).
 //!
 //! The §8 stack model ([`crate::git_stack`]) runs several read-only git calls
 //! per decision: about k+1 in a first claim, about 2k in a restack scan, and a

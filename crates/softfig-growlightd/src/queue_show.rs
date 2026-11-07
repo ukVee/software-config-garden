@@ -16,10 +16,19 @@
 //!
 //! Unlike the scheduling path, a surface must not fail because one repo is not
 //! a git repo yet (a member claimed a branch it has not cut) or a doc is
-//! missing. [`build`] therefore collapses a git error to an empty stack for
-//! that repo, and a missing doc to no session lines — it shows what it can.
-//! A v2 file that does not *parse* is still a hard error, because the writer
-//! owns that invariant; the caller (`server::queue_show`) surfaces it.
+//! missing. [`build`] therefore reports a git error as that repo's
+//! `stack_unknown`, and a missing doc as no session lines — it shows what it
+//! can. It never reports a failed read as an empty stack: that renders every
+//! started branch as merged. A v2 file that does not *parse* is still a hard
+//! error, because the writer owns that invariant; the caller
+//! (`server::queue_show`) surfaces it.
+//!
+//! ## Bounded
+//!
+//! The git runs through [`crate::git_probe`]: one probe per repo, all started
+//! before any is waited on, so wedged repos cost one deadline between them and
+//! not one each, and a repo that missed its deadline is held instead of being
+//! waited on again by the next `queue show`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -32,8 +41,9 @@ use softfig_ipc::queue_v2::{
     milestone_path, EntryKind, QueueArchiveToml, SliceKind, QUEUE_ARCHIVE_FILE,
 };
 
-use crate::git_stack::{self, Git, Repo, StackEntry};
-use crate::scheduler_v2::{EntryView, V2Snapshot};
+use crate::git_probe::{Probe, ProbeCache};
+use crate::git_stack::{self, Git, GitError, Repo, Stack, StackEntry};
+use crate::scheduler_v2::{EntryView, ProjectView, V2Snapshot};
 
 /// `growlight/backlog/tasks/` — a task or restack doc lives here as
 /// `NNN-<slug>.md` (§8; the keeperd v2 writer's `paths::tasks_dir`).
@@ -43,8 +53,15 @@ const TASKS_DIR: &str = "growlight/backlog/tasks";
 /// the live open/merged annotation), the entries in file order, and the §3.5
 /// session-log lines. Pure over the snapshot + the read-only git surface + the
 /// garden files it reads (`garden_root`, the mount in production; a temp garden
-/// in tests). `home` expands `~` repo paths ([`Repo::classify`]).
-pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> QueueShowReply {
+/// in tests). `home` expands `~` repo paths ([`Repo::classify`]). `probes` runs
+/// the git, and `now` (Unix seconds) is the time its holds are judged by.
+pub fn build(
+    snapshot: &V2Snapshot,
+    garden_root: &Path,
+    home: Option<&Path>,
+    probes: &ProbeCache,
+    now: i64,
+) -> QueueShowReply {
     let mut reply = QueueShowReply {
         list: true,
         projects: Vec::new(),
@@ -58,29 +75,29 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
     // rows and the per-repo stacks share, computed once per repo.
     let mut open: HashSet<(String, String)> = HashSet::new();
 
-    for project in &snapshot.projects {
-        let repo_kind = Repo::classify(&project.repo, home);
-        let local = matches!(repo_kind, Repo::Local(_));
-        let git = match &repo_kind {
-            Repo::Local(path) => Git::new(path.clone()),
-            Repo::Remote => Git::new(PathBuf::new()),
+    // The projects whose stack could not be read: their started branches are
+    // unknown, not closed.
+    let mut unknown: HashSet<String> = HashSet::new();
+
+    probes.begin_tick(now);
+    let reads: Vec<StackRead> = snapshot
+        .projects
+        .iter()
+        .map(|project| StackRead::start(snapshot, project, home, probes))
+        .collect();
+
+    for (project, read) in snapshot.projects.iter().zip(reads) {
+        let local = matches!(read, StackRead::Probing(_));
+        // A real git error (not-a-repo, a hung mount) is that repo's unknown: the
+        // surface shows what it can, never fails. (A not-yet-cut branch is not an
+        // error — `stack_candidates` just skips it.)
+        let (stack, stack_unknown) = match read.wait() {
+            Ok(stack) => (stack, None),
+            Err(e) => {
+                unknown.insert(project.name.clone());
+                (Stack::default(), Some(e.to_string()))
+            }
         };
-        let stack_entries: Vec<StackEntry> = snapshot
-            .entries
-            .iter()
-            .filter(|e| e.project == project.name)
-            .map(|e| StackEntry {
-                id: e.id.clone(),
-                branch: e.branch.clone(),
-                lane: e.lane,
-                claimed: e.claimed.clone(),
-            })
-            .collect();
-        // A real git error (not-a-repo, a hung mount) collapses to an empty
-        // stack: the surface shows what it can, never fails. (A not-yet-cut
-        // branch is not an error — `stack_candidates` just skips it.)
-        let stack = git_stack::stack_candidates(&repo_kind, &project.main, &stack_entries, &git)
-            .unwrap_or_default();
 
         // Record each candidate's parent/base from the snapshot (the fields the
         // §8 first claim wrote), and mark its branch open.
@@ -107,6 +124,7 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
             main: project.main.clone(),
             local,
             stack: branches,
+            stack_unknown,
         });
     }
 
@@ -124,6 +142,9 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
             pending_status: entry.pending.map(|s| s.to_string()),
             open: !entry.branch.is_empty()
                 && open.contains(&(entry.project.clone(), entry.branch.clone())),
+            open_unknown: !entry.branch.is_empty()
+                && !entry.claimed.is_empty()
+                && unknown.contains(&entry.project),
         });
     }
 
@@ -170,11 +191,61 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
                 claimed: a.row.claimed,
                 pending_status: None,
                 open: false,
+                open_unknown: false,
             });
         }
     }
 
     reply
+}
+
+/// One project's stack on its way: a local repo's bounded probe, or a remote
+/// repo's list-state answer, which runs no git.
+enum StackRead {
+    Probing(Probe<Stack>),
+    Remote(Result<Stack, GitError>),
+}
+
+impl StackRead {
+    fn start(
+        snapshot: &V2Snapshot,
+        project: &ProjectView,
+        home: Option<&Path>,
+        probes: &ProbeCache,
+    ) -> Self {
+        let entries: Vec<StackEntry> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.project == project.name)
+            .map(|e| StackEntry {
+                id: e.id.clone(),
+                branch: e.branch.clone(),
+                lane: e.lane,
+                claimed: e.claimed.clone(),
+            })
+            .collect();
+        let main = project.main.clone();
+        let repo = Repo::classify(&project.repo, home);
+        match &repo {
+            Repo::Local(path) => {
+                let path = path.clone();
+                Self::Probing(probes.spawn(&path, move |git| {
+                    git_stack::stack_candidates(&repo, &main, &entries, git)
+                }))
+            }
+            Repo::Remote => {
+                let nowhere = Git::new(PathBuf::new());
+                Self::Remote(git_stack::stack_candidates(&repo, &main, &entries, &nowhere))
+            }
+        }
+    }
+
+    fn wait(self) -> Result<Stack, GitError> {
+        match self {
+            Self::Probing(probe) => probe.wait(),
+            Self::Remote(stack) => stack,
+        }
+    }
 }
 
 /// Collect one entry's §3.5 session-log lines: the entry's own doc (a
@@ -280,7 +351,9 @@ mod tests {
     use softfig_ipc::queue_v2::{ArchivedEntry, Entry, EntryStatus, FinalStatus, Lane};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     fn sh_git(repo: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -303,10 +376,19 @@ mod tests {
         assert!(ok, "git {args:?}");
     }
 
+    /// [`build`] over real git, with no hold in play.
+    fn show(snapshot: &V2Snapshot, root: &Path) -> QueueShowReply {
+        build(snapshot, root, None, &ProbeCache::new(), 0)
+    }
+
     /// A repo on `main`, plus an open branch and a merged branch.
     fn seeded_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
+        seed(dir.path());
+        dir
+    }
+
+    fn seed(repo: &Path) {
         sh_git(repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join("a.txt"), "base\n").unwrap();
         sh_git(repo, &["add", "."]);
@@ -326,7 +408,6 @@ mod tests {
         sh_git(repo, &["checkout", "-q", "main"]);
         sh_git(repo, &["merge", "--ff-only", "-q", "feat/merged"]);
         sh_git(repo, &["checkout", "-q", "main"]);
-        dir
     }
 
     fn entry(id: &str, branch: &str, lane: Lane, status: EntryStatus, claimed: &str) -> EntryView {
@@ -382,7 +463,7 @@ mod tests {
             entry("queued", "feat/queued", Lane::Normal, EntryStatus::Queued, ""),
         ];
         let snapshot = snap(root, entries, BTreeMap::new());
-        let reply = build(&snapshot, root, None);
+        let reply = show(&snapshot, root);
 
         assert!(reply.list);
         assert_eq!(reply.entries.len(), 3, "file order is list order");
@@ -413,7 +494,7 @@ mod tests {
         let mut waiting = entry("w", "feat/w", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
         waiting.pending = Some(EntryStatus::Blocked);
         let plain = entry("p", "feat/p", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
-        let reply = build(&snap(root, vec![waiting, plain], BTreeMap::new()), root, None);
+        let reply = show(&snap(root, vec![waiting, plain], BTreeMap::new()), root);
         let w = reply.entries.iter().find(|e| e.id == "w").unwrap();
         assert_eq!((w.status.as_str(), w.pending_status.as_deref()), ("active", Some("blocked")));
         let p = reply.entries.iter().find(|e| e.id == "p").unwrap();
@@ -445,7 +526,7 @@ mod tests {
             done_ids: Default::default(),
             done_branches: Default::default(),
         };
-        let reply = build(&snapshot, Path::new("/nonexistent"), None);
+        let reply = show(&snapshot, Path::new("/nonexistent"));
         assert_eq!(reply.projects.len(), 1);
         assert!(!reply.projects[0].local);
         assert_eq!(reply.projects[0].stack.len(), 2, "list state: every claimed entry");
@@ -474,12 +555,156 @@ mod tests {
             entry("real", "feat/real", Lane::Normal, EntryStatus::Active, "2026-10-02T00:00:00Z"),
         ];
         let snapshot = snap(repo.path(), entries, BTreeMap::new());
-        let reply = build(&snapshot, repo.path(), None);
+        let reply = show(&snapshot, repo.path());
         assert_eq!(reply.projects[0].stack.len(), 1, "only the cut branch is in the stack");
         assert_eq!(reply.projects[0].stack[0].entry, "real");
         let open = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap().open;
         assert!(!open("ghost"));
         assert!(open("real"));
+    }
+
+    /// A `git` that hangs on any repo whose path says `wedged`, until `thawed`
+    /// appears in `dir`, and is the real one everywhere else. Logs each call.
+    /// Returns `(script, log)`.
+    fn wedging_git(dir: &Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let script = dir.join("fake-git");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in *wedged*) [ -e '{thawed}' ] || exec sleep 30 ;; esac\nexec git \"$@\"\n",
+                log = log.display(),
+                thawed = dir.join("thawed").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    fn wedged_repo() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new().prefix("wedged").tempdir().unwrap();
+        seed(dir.path());
+        dir
+    }
+
+    fn project(name: &str, repo: &Path) -> ProjectView {
+        ProjectView {
+            name: name.into(),
+            repo: repo.display().to_string(),
+            main: "main".into(),
+        }
+    }
+
+    /// A started entry of `project`, on `branch`.
+    fn started(id: &str, project: &str, branch: &str) -> EntryView {
+        let mut e = entry(id, branch, Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
+        e.project = project.into();
+        e
+    }
+
+    fn snapshot_of(projects: Vec<ProjectView>, entries: Vec<EntryView>) -> V2Snapshot {
+        V2Snapshot {
+            projects,
+            entries,
+            trees: BTreeMap::new(),
+            done_ids: Default::default(),
+            done_branches: Default::default(),
+        }
+    }
+
+    #[test]
+    fn wedged_repos_answer_within_one_deadline_with_an_explicit_unknown() {
+        let bin = tempfile::tempdir().unwrap();
+        let (git, _) = wedging_git(bin.path());
+        let probes = ProbeCache::with(Duration::from_secs(1), git);
+        let (one, two, three) = (wedged_repo(), wedged_repo(), wedged_repo());
+        let healthy = seeded_repo();
+        let mut never_claimed = started("queued", "one", "feat/queued");
+        never_claimed.claimed = String::new();
+        let snapshot = snapshot_of(
+            vec![
+                project("one", one.path()),
+                project("two", two.path()),
+                project("three", three.path()),
+                project("healthy", healthy.path()),
+            ],
+            vec![
+                started("a", "one", "feat/open"),
+                never_claimed,
+                started("b", "two", "feat/open"),
+                started("c", "three", "feat/open"),
+                started("open", "healthy", "feat/open"),
+                started("merged", "healthy", "feat/merged"),
+            ],
+        );
+
+        let begun = Instant::now();
+        let reply = build(&snapshot, bin.path(), None, &probes, 1000);
+        // One after another, these would cost three deadlines.
+        assert!(begun.elapsed() < Duration::from_secs(2), "{:?}", begun.elapsed());
+
+        let wire = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap();
+        for p in &reply.projects[..3] {
+            let why = p.stack_unknown.as_deref().unwrap_or_default();
+            assert!(why.contains("timed out"), "{p:?}");
+            assert!(p.stack.is_empty() && p.local, "{p:?}");
+        }
+        for id in ["a", "b", "c"] {
+            assert!(wire(id).open_unknown && !wire(id).open, "{:?}", wire(id));
+        }
+        assert!(!wire("queued").open_unknown, "a never-claimed entry has no branch to be unsure of");
+
+        // The wedged repos don't touch their healthy neighbour's answer.
+        assert_eq!(reply.projects[3].stack_unknown, None);
+        assert_eq!(reply.projects[3].stack.len(), 1);
+        assert!(wire("open").open && !wire("open").open_unknown);
+        assert!(!wire("merged").open && !wire("merged").open_unknown);
+    }
+
+    #[test]
+    fn a_repo_that_missed_the_deadline_is_held_then_read_again() {
+        let bin = tempfile::tempdir().unwrap();
+        let (git, log) = wedging_git(bin.path());
+        let probes = ProbeCache::with(Duration::from_millis(300), git);
+        let repo = wedged_repo();
+        let snapshot = snapshot_of(
+            vec![project("one", repo.path())],
+            vec![started("a", "one", "feat/open")],
+        );
+        let unknown = |reply: &QueueShowReply| reply.projects[0].stack_unknown.clone();
+
+        let first = build(&snapshot, bin.path(), None, &probes, 1000);
+        assert!(unknown(&first).is_some_and(|why| why.contains("timed out")), "{first:?}");
+        let spawned = fs::read_to_string(&log).unwrap().lines().count();
+
+        // The next `queue show` doesn't wait the deadline out again, and spawns nothing.
+        let begun = Instant::now();
+        let held = build(&snapshot, bin.path(), None, &probes, 1001);
+        assert!(begun.elapsed() < Duration::from_millis(250), "{:?}", begun.elapsed());
+        assert!(unknown(&held).is_some_and(|why| why.contains("held")), "{held:?}");
+        assert!(held.entries[0].open_unknown, "{held:?}");
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), spawned);
+
+        // Past the hold, a repo that recovered reads as it is.
+        fs::write(bin.path().join("thawed"), "").unwrap();
+        let back = 1000 + crate::drive_loop::v2_claim_backoff_secs(1);
+        let reply = build(&snapshot, bin.path(), None, &probes, back);
+        assert_eq!(unknown(&reply), None, "{reply:?}");
+        assert_eq!(reply.projects[0].stack.len(), 1);
+        assert!(reply.entries[0].open && !reply.entries[0].open_unknown, "{reply:?}");
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_repo_is_unknown_not_an_empty_stack() {
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_of(
+            vec![project("one", not_a_repo.path())],
+            vec![started("a", "one", "feat/a")],
+        );
+        let reply = show(&snapshot, not_a_repo.path());
+        assert!(reply.projects[0].stack_unknown.is_some(), "{reply:?}");
+        assert!(reply.entries[0].open_unknown, "{reply:?}");
     }
 
     #[test]
@@ -524,7 +749,7 @@ mod tests {
         )
         .unwrap();
 
-        let reply = build(&snapshot, root, None);
+        let reply = show(&snapshot, root);
         // The slice tree is carried too — a sessionless slice (002) is still
         // visible in `trees`, so the TUI can address its `slice_update` by id.
         assert_eq!(reply.trees.len(), 1, "{:?}", reply.trees);
@@ -596,7 +821,7 @@ mod tests {
         )
         .unwrap();
 
-        let reply = build(&snapshot, root, None);
+        let reply = show(&snapshot, root);
         assert_eq!(reply.archived.len(), 2, "archive order is exit order");
         let done = &reply.archived[0];
         assert_eq!(done.id, "done-one");
@@ -613,7 +838,7 @@ mod tests {
     fn a_missing_archive_contributes_no_rows() {
         let repo = tempfile::tempdir().unwrap();
         let snapshot = snap(repo.path(), vec![], BTreeMap::new());
-        let reply = build(&snapshot, repo.path(), None);
+        let reply = show(&snapshot, repo.path());
         assert!(reply.archived.is_empty(), "no archive file → empty archive");
     }
 }

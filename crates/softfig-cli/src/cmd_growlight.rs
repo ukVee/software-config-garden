@@ -2784,7 +2784,9 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
         } else {
             e.after.join(", ")
         };
-        let branch = if e.open {
+        let branch = if e.open_unknown {
+            format!("{} (stack unknown)", e.branch)
+        } else if e.open {
             format!("{} (open)", e.branch)
         } else {
             e.branch.clone()
@@ -2819,7 +2821,9 @@ fn render_annotations(view: &QueueShowReply) -> String {
     for p in &view.projects {
         let kind = if p.local { "local" } else { "remote" };
         out.push_str(&format!("- {} ({}, main = {}) {}\n", p.name, kind, p.main, p.repo));
-        if p.stack.is_empty() {
+        if let Some(reason) = &p.stack_unknown {
+            out.push_str(&format!("  (stack unknown — {reason})\n"));
+        } else if p.stack.is_empty() {
             out.push_str("  (empty — the next branch cuts from main)\n");
         } else {
             for b in &p.stack {
@@ -4760,6 +4764,7 @@ mod tests {
                 claimed: "2026-10-11T15:04:00Z".into(),
                 pending_status: Some("blocked".into()),
                 open: true,
+                open_unknown: false,
             },
             QueueShowEntry {
                 id: "n1".into(),
@@ -4773,6 +4778,21 @@ mod tests {
                 claimed: String::new(),
                 pending_status: None,
                 open: false,
+                open_unknown: false,
+            },
+            QueueShowEntry {
+                id: "w1".into(),
+                kind: "milestone".into(),
+                project: "wedged".into(),
+                lane: "normal".into(),
+                status: "active".into(),
+                after: vec![],
+                branch: "feat/w1".into(),
+                base: String::new(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                pending_status: None,
+                open: false,
+                open_unknown: true,
             },
         ];
         let view = QueueShowReply {
@@ -4793,6 +4813,8 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
+        // A branch whose repo couldn't be read is not shown as merged.
+        assert!(body.contains("| w1 | active | wedged | — | feat/w1 (stack unknown) |"), "{body}");
     }
 
     #[test]
@@ -4800,19 +4822,30 @@ mod tests {
         use softfig_ipc::growlightd::{QueueProjectStack, QueueShowSession, QueueStackBranch};
         let view = QueueShowReply {
             list: true,
-            projects: vec![QueueProjectStack {
-                name: "softfig".into(),
-                repo: "~/p".into(),
-                main: "main".into(),
-                local: true,
-                stack: vec![QueueStackBranch {
-                    entry: "one".into(),
-                    branch: "feat/one".into(),
-                    parent: String::new(),
-                    base: "abc123".into(),
-                    claimed: "2026-10-11T15:04:00Z".into(),
-                }],
-            }],
+            projects: vec![
+                QueueProjectStack {
+                    name: "softfig".into(),
+                    repo: "~/p".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: vec![QueueStackBranch {
+                        entry: "one".into(),
+                        branch: "feat/one".into(),
+                        parent: String::new(),
+                        base: "abc123".into(),
+                        claimed: "2026-10-11T15:04:00Z".into(),
+                    }],
+                    stack_unknown: None,
+                },
+                QueueProjectStack {
+                    name: "wedged".into(),
+                    repo: "~/w".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: Vec::new(),
+                    stack_unknown: Some("git probe in ~/w: timed out after 10s".into()),
+                },
+            ],
             entries: Vec::new(),
             archived: Vec::new(),
             sessions: vec![QueueShowSession {
@@ -4831,6 +4864,11 @@ mod tests {
         );
         assert!(
             body.contains("- feat/one  parent=main  base=abc123  claimed=2026-10-11T15:04:00Z"),
+            "{body}"
+        );
+        // An unread stack says so, with the reason, and never reads as empty.
+        assert!(
+            body.contains("- wedged (local, main = main) ~/w\n  (stack unknown — git probe in ~/w: timed out after 10s)\n"),
             "{body}"
         );
         assert!(body.contains("### Sessions"), "{body}");

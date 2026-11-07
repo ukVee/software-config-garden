@@ -15,6 +15,7 @@ use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs}
 use crate::backend_router::BackendRouter;
 use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::{Control, LiveKill};
+use crate::git_probe::ProbeCache;
 use crate::hub::EventHub;
 use crate::leases::{DrainOutcome, LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 use crate::persist::ResourcePersister;
@@ -92,6 +93,12 @@ pub struct Daemon {
     /// never has to take the daemon lock to publish — and so `publish` can't
     /// contend with anything holding `inner` (the hub has its own brief lock).
     pub hub: EventHub,
+    /// The bounded git probes behind `queue_show` (F7). Its own cache, not the
+    /// drive loop's: that one's clock and answers advance only when the loop
+    /// ticks, and a human reading the list must not put a repo on hold for the
+    /// scheduler. Lives *outside* `inner` (like `hub`) so a probe's deadline is
+    /// waited out without the daemon lock.
+    pub surface_probes: ProbeCache,
     /// The §4d rung-2 thrash hook, invoked when a lease is granted over a
     /// contended target. Lives *outside* `inner` (like `hub`) so it is called
     /// without the daemon lock held — the production impl reaches keeperd over
@@ -208,6 +215,7 @@ impl Daemon {
         Self {
             inner: Arc::new(Mutex::new(DaemonInner::new(config))),
             hub: EventHub::new(),
+            surface_probes: ProbeCache::new(),
             thrash_clear: None,
             resumer: None,
             persister: None,

@@ -8039,6 +8039,7 @@ mod tests {
             claimed: String::new(),
             pending_status: None,
             open: false,
+            open_unknown: false,
         }
     }
 

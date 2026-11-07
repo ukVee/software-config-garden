@@ -1266,6 +1266,12 @@ pub struct QueueShowEntry {
     /// `false` for a never-claimed entry, a restack (no branch), or a local
     /// branch already fast-forwarded into `main`.
     pub open: bool,
+    /// This entry has a started branch in a repo whose stack could not be read
+    /// ([`QueueProjectStack::stack_unknown`]), so `open` says nothing about it:
+    /// a surface must not render that `false` as merged. Absent when `open` is
+    /// an answer, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_unknown: bool,
 }
 
 /// One branch of a repo's open stack, in claim order (oldest first) — the §8
@@ -1295,6 +1301,12 @@ pub struct QueueProjectStack {
     /// The still-open branches in claim order; empty when the stack is empty
     /// (the next branch cuts from `main`).
     pub stack: Vec<QueueStackBranch>,
+    /// Why this repo's stack could not be read (a wedged repo past the probe
+    /// deadline, a path that isn't a repo). An empty `stack` then means "not
+    /// known", not "empty". Absent when the stack was read, and on a reply from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_unknown: Option<String>,
 }
 
 /// One unit's §3.5 session-log lines, verbatim (`- <ts> · …`).
@@ -1445,6 +1457,26 @@ impl MemberVerbReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read stack leaves the unknown fields off the wire, and a reply from a
+    /// daemon that predates them still decodes as "the answer is known".
+    #[test]
+    fn stack_unknown_fields_are_absent_when_known_and_tolerated_when_missing() {
+        let project: QueueProjectStack = serde_json::from_value(serde_json::json!({
+            "name": "p", "repo": "~/p", "main": "main", "local": true, "stack": [],
+        }))
+        .unwrap();
+        assert_eq!(project.stack_unknown, None);
+        assert!(serde_json::to_value(&project).unwrap().get("stack_unknown").is_none());
+
+        let entry: QueueShowEntry = serde_json::from_value(serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "active",
+            "after": [], "branch": "feat/e", "base": "", "claimed": "", "open": false,
+        }))
+        .unwrap();
+        assert!(!entry.open_unknown);
+        assert!(serde_json::to_value(&entry).unwrap().get("open_unknown").is_none());
+    }
 
     /// The closed lists' wire names are serde's names (no drift between the
     /// `as_str` the messages print and the JSON a client decodes), and a

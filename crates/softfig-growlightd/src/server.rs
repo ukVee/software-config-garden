@@ -1080,7 +1080,13 @@ fn queue_show(daemon: &Daemon) -> Response {
         }
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let reply = crate::queue_show::build(&snapshot, &daemon.garden_root(), home.as_deref());
+    let reply = crate::queue_show::build(
+        &snapshot,
+        &daemon.garden_root(),
+        home.as_deref(),
+        &daemon.surface_probes,
+        crate::profile_pin::now_unix(),
+    );
     ok_reply(&reply, "queue_show")
 }
 
@@ -1239,6 +1245,65 @@ mod tests {
     fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
             .with_resource_persister(persister)
+    }
+
+    /// `queue_show` reads the stack through the daemon's bounded probes: a wedged
+    /// repo answers by the deadline, as an unknown, and the hold it earns spares
+    /// the next call the wait.
+    #[test]
+    fn queue_show_answers_a_wedged_repo_through_the_bounded_probes() {
+        use softfig_ipc::queue_v2::{Entry, EntryKind, EntryStatus, Lane, Project, QueueToml, QUEUE_FILE};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (garden, repo, bin) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let queue = QueueToml::new(
+            vec![Project {
+                name: "softfig".into(),
+                repo: repo.path().display().to_string(),
+                main: "main".into(),
+            }],
+            vec![Entry {
+                id: "m".into(),
+                kind: EntryKind::Milestone,
+                title: "m".into(),
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Blocked,
+                after: vec![],
+                added: "2026-10-11T15:04:00Z".into(),
+                branch: "feat/m".into(),
+                parent: String::new(),
+                base: "abc123".into(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                follow_ups: 0,
+                pending_status: None,
+            }],
+        );
+        let path = garden.path().join(QUEUE_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, queue.to_toml().unwrap()).unwrap();
+        let git = bin.path().join("fake-git");
+        std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut daemon = Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), garden.path().into()));
+        daemon.surface_probes = crate::git_probe::ProbeCache::with(Duration::from_millis(300), git);
+        let show = || -> QueueShowReply {
+            serde_json::from_value(queue_show(&daemon).into_result().unwrap()).unwrap()
+        };
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("timed out"), "{reply:?}");
+        assert!(reply.entries[0].open_unknown, "{reply:?}");
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("held"), "{reply:?}");
     }
 
     /// A member's relayed slice verb (§6.7): identity, then the member's own

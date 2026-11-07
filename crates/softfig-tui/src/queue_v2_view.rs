@@ -326,7 +326,9 @@ fn push_entry(
 ) {
     let is_milestone = tree_for(reply, &e.id).is_some();
     let mut label = format!("{} [{}]", e.id, e.project);
-    if e.open {
+    if e.open_unknown {
+        label.push_str(" (stack unknown)");
+    } else if e.open {
         label.push_str(" (open)");
     }
     if let Some(p) = &e.pending_status {
@@ -650,6 +652,7 @@ mod tests {
             claimed: String::new(),
             pending_status: None,
             open,
+            open_unknown: false,
         }
     }
 
@@ -676,6 +679,16 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_in_an_unread_repo_is_labelled_unknown_not_closed() {
+        let mut wedged = entry("w", "normal", "active", &[], false);
+        wedged.branch = "feat/w".into();
+        wedged.open_unknown = true;
+        let r = reply(vec![wedged], vec![]);
+        let rows = QueueV2View::new().rows(&r);
+        assert!(rows[0].label.contains("(stack unknown)"), "{:?}", rows[0].label);
+    }
+
+    #[test]
     fn rows_flatten_lanes_then_archive_with_expansion() {
         // `m` matches the fixture's tree milestone, so it is expandable.
         let r = reply(
@@ -692,6 +705,7 @@ mod tests {
         assert_eq!(rows[0].key, "u1");
         assert_eq!(rows[0].kind, V2RowKind::Urgent);
         assert!(rows[0].label.contains("(open)"), "{:?}", rows[0].label);
+        assert!(!rows[0].label.contains("stack unknown"), "{:?}", rows[0].label);
         assert_eq!(rows[1].key, "m");
         assert!(rows[1].label.contains("after: done-x"), "{:?}", rows[1].label);
         assert!(rows[1].expandable, "m is a milestone");
