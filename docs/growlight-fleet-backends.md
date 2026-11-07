@@ -287,6 +287,10 @@ exactly when the human reaches for opencode.
   nothing is assembled then, so there is no runtime state to report and inventing a
   roster echo here would claim liveness the daemon cannot observe.
 
+Its `queue` line is the §11 switch as growlightd read it at boot, `legacy` or `v2`, armed or
+not. `protocol` is the wire version and stays `v1` under either, so read `queue` to see that a
+flip took. A growlightd older than the field prints no `queue` line.
+
 ```
 roster:
   a                pin=queue:default

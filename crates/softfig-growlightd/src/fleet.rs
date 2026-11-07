@@ -500,6 +500,16 @@ pub enum QueueMode {
     V2,
 }
 
+impl QueueMode {
+    /// The switch's value as `config/growlight.toml` spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueMode::Legacy => "legacy",
+            QueueMode::V2 => "v2",
+        }
+    }
+}
+
 /// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
 /// gate, the shared-backend `bin`/`prompt`, and the configured `members`. The
 /// keys are top-level (this is a dedicated file, not a table inside a shared one).

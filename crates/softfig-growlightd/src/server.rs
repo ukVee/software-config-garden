@@ -248,7 +248,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held) = {
+    let (state, garden_root, policy, paused, fleet_enabled, queue, members, lifecycles, held) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -256,6 +256,7 @@ fn status(daemon: &Daemon) -> Response {
             inner.config.policy.summary(),
             inner.control.paused,
             inner.fleet.enabled,
+            inner.fleet.queue.label().to_string(),
             inner.fleet.members.clone(),
             inner.member_lifecycles.clone(),
             inner.held_parts.clone(),
@@ -285,6 +286,7 @@ fn status(daemon: &Daemon) -> Response {
         build_caps: daemon.build_caps().summary(),
         paused,
         fleet_enabled,
+        queue,
         roster,
         agents,
         // The genuinely-running scope units (slice 006) — independent leaf lock,
@@ -1495,6 +1497,22 @@ mod tests {
         assert!(!reply.fleet_enabled);
         assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
         assert_eq!(reply.roster.len(), 4, "the configured roster still reports");
+    }
+
+    #[test]
+    fn status_reports_the_queue_switch_armed_or_not() {
+        // V23: the smoke checks a flip took by reading this, and `protocol` can't
+        // show it: that is the wire version, the same under either queue.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        assert_eq!(status_reply(&daemon).queue, "legacy");
+
+        let mut config = mixed_fleet();
+        config.enabled = false;
+        config.queue = crate::fleet::QueueMode::V2;
+        daemon.set_fleet_config(config);
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.queue, "v2");
+        assert!(!reply.fleet_enabled, "the switch reads the same on a disarmed fleet");
     }
 
     #[test]

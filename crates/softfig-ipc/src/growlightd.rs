@@ -230,6 +230,12 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) so a pre-field decoder reads it back as `false`.
     #[serde(default)]
     pub fleet_enabled: bool,
+    /// Which queue model the §11 switch selects (`config/growlight.toml` `queue`):
+    /// `legacy` or `v2`, as read at boot. Reported whether or not the fleet is
+    /// armed. Additive (`#[serde(default)]`): an older growlightd sends nothing,
+    /// and a pre-field decoder reads it back as empty, not as `legacy`.
+    #[serde(default)]
+    pub queue: String,
     /// The configured roster from `config/growlight.toml` (`[[fleet]]` members),
     /// in config order — surfaced so `growlight status` lists the fleet even when
     /// the gate is off (the agents haven't spawned). Additive/defaulted for wire
@@ -1854,6 +1860,7 @@ mod tests {
         let reply: FleetStatusReply = serde_json::from_str(json).unwrap();
         assert!(!reply.paused, "missing paused decodes as not-paused");
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
+        assert!(reply.queue.is_empty(), "missing queue decodes as unknown, not legacy");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
         assert!(reply.held.is_empty(), "missing held decodes as empty");
@@ -1880,6 +1887,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: true,
+            queue: "legacy".into(),
             roster: vec![
                 FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },

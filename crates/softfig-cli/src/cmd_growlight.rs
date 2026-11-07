@@ -1684,6 +1684,14 @@ fn fetch_queue_view(socket: &Path) -> Result<Option<QueueShowReply>> {
     }
 }
 
+/// The §11 switch's status line. `protocol` above is the wire version and stays
+/// `v1` under either queue, so this is the line that shows a flip took. A
+/// growlightd older than the field sends nothing, which says nothing about which
+/// queue it runs, so no line is printed.
+fn queue_switch_line(r: &FleetStatusReply) -> Option<String> {
+    (!r.queue.is_empty()).then(|| format!("queue         {}", r.queue))
+}
+
 /// Render a [`FleetStatusReply`] for the terminal.
 fn print_fleet_status(r: &FleetStatusReply) {
     println!("state         {}", r.state);
@@ -1692,6 +1700,9 @@ fn print_fleet_status(r: &FleetStatusReply) {
     // The config-level arm/disarm gate (`config/growlight.toml fleet_enabled`),
     // distinct from `paused` (the runtime admission gate over an armed fleet).
     println!("fleet         {}", if r.fleet_enabled { "enabled" } else { "disabled" });
+    if let Some(line) = queue_switch_line(r) {
+        println!("{line}");
+    }
     println!("paused        {}", r.paused);
     println!(
         "policy        max_agents={} ctx_roll={}% ctx_handoff={}% 5h_halt={}% 7d_halt={}%",
@@ -3509,6 +3520,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: enabled,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: Vec::new(),
             live_scopes: live,
@@ -3528,6 +3540,36 @@ mod tests {
         // Armed but nothing running vs disarmed read differently.
         assert!(render_resources_show(&base(true, vec![])).contains("scopes        (none running)"));
         assert!(render_resources_show(&base(false, vec![])).contains("(none — fleet disarmed)"));
+    }
+
+    /// V23: the status line names the switch's value, and an older growlightd
+    /// that sends none gets no line rather than a guess.
+    #[test]
+    fn status_names_the_queue_switch_and_guesses_nothing() {
+        let reply = |queue: Option<&str>| {
+            let mut json = serde_json::json!({
+                "state": "running",
+                "garden_root": "/g",
+                "protocol_version": 1,
+                "policy": {
+                    "max_concurrent_agents": 2,
+                    "ctx_roll_pct": 50,
+                    "ctx_handoff_pct": 60,
+                    "session_5h_halt_pct": 85,
+                    "session_7d_halt_pct": 90
+                }
+            });
+            if let Some(queue) = queue {
+                json["queue"] = serde_json::json!(queue);
+            }
+            serde_json::from_value::<FleetStatusReply>(json).unwrap()
+        };
+        assert_eq!(queue_switch_line(&reply(Some("v2"))).as_deref(), Some("queue         v2"));
+        assert_eq!(
+            queue_switch_line(&reply(Some("legacy"))).as_deref(),
+            Some("queue         legacy")
+        );
+        assert_eq!(queue_switch_line(&reply(None)), None);
     }
 
     #[test]
