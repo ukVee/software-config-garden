@@ -1287,8 +1287,8 @@ mod tests {
                 claimed: "2026-10-11T15:04:00Z".into(),
                 follow_ups: 0,
                 pending_status: None,
-                fleet: true,
-                not_before: None,
+                fleet: false,
+                not_before: Some("2026-11-08 09:00Z".into()),
             }],
         );
         let path = garden.path().join(QUEUE_FILE);
@@ -1308,6 +1308,10 @@ mod tests {
         let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
         assert!(why.contains("timed out"), "{reply:?}");
         assert!(reply.entries[0].open_unknown, "{reply:?}");
+        // The holds come straight from `queue.toml` through `assemble` — no
+        // runtime overlay is needed for them to reach the surfaces.
+        let e = &reply.entries[0];
+        assert_eq!((e.fleet, e.not_before.as_deref()), (false, Some("2026-11-08 09:00Z")), "{e:?}");
 
         let reply = show();
         let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();

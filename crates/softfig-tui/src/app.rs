@@ -8077,6 +8077,10 @@ mod tests {
             pending_status: None,
             open: false,
             open_unknown: false,
+            fleet: true,
+            not_before: None,
+            doc_fleet: None,
+            doc_not_before: None,
         }
     }
 

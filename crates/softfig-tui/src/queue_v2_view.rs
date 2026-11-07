@@ -337,6 +337,8 @@ fn push_entry(
     if let Some(p) = &e.pending_status {
         label.push_str(&format!("  (→ {p} pending)"));
     }
+    // The §2 holds, worded as `queue show` words them.
+    label.push_str(&e.hold_annotation());
     if !e.after.is_empty() {
         label.push_str(&format!("  after: {}", e.after.join(", ")));
     }
@@ -684,6 +686,10 @@ mod tests {
             pending_status: None,
             open,
             open_unknown: false,
+            fleet: true,
+            not_before: None,
+            doc_fleet: None,
+            doc_not_before: None,
         }
     }
 
@@ -717,6 +723,25 @@ mod tests {
         let r = reply(vec![wedged], vec![]);
         let rows = QueueV2View::new().rows(&r);
         assert!(rows[0].label.contains("(stack unknown)"), "{:?}", rows[0].label);
+    }
+
+    /// A v2 hold shows on the entry's row, worded as `queue show` words it;
+    /// an entry with none carries neither marker.
+    #[test]
+    fn a_held_entry_s_row_shows_its_holds() {
+        let mut held = entry("h", "normal", "queued", &[], false);
+        held.fleet = false;
+        held.not_before = Some("2026-11-08 09:00Z".into());
+        let mut timed = entry("t", "urgent", "queued", &[], false);
+        timed.not_before = Some("2026-11-09 09:00Z".into());
+        let plain = entry("p", "normal", "queued", &[], false);
+        let r = reply(vec![timed, held, plain], vec![]);
+        let rows = QueueV2View::new().rows(&r);
+        let label = |id: &str| rows.iter().find(|x| x.key == id).unwrap().label.clone();
+        assert!(label("h").ends_with(" (human-only) (not before 2026-11-08 09:00Z)"), "{:?}", label("h"));
+        assert!(label("t").ends_with(" (not before 2026-11-09 09:00Z)"), "{:?}", label("t"));
+        assert!(!label("t").contains("human-only"), "{:?}", label("t"));
+        assert!(!label("p").contains("human-only") && !label("p").contains("not before"), "{:?}", label("p"));
     }
 
     #[test]

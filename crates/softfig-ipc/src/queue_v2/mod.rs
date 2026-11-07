@@ -284,12 +284,28 @@ pub struct Entry {
 }
 
 /// [`Entry::fleet`]'s default: an entry the fleet may claim.
-fn fleet_default() -> bool {
+pub(crate) fn fleet_default() -> bool {
     true
 }
 
-fn is_fleet_default(fleet: &bool) -> bool {
+pub(crate) fn is_fleet_default(fleet: &bool) -> bool {
     *fleet
+}
+
+/// The §2 holds as a surface prints them beside an entry's status:
+/// ` (human-only)` for `fleet = false`, and ` (not before <at>)` for a start
+/// time as written, whether or not it is still ahead. Empty when neither is
+/// set. The one wording, so `queue show`, the `growlight status` lanes and the
+/// TUI can't drift about the same hold.
+pub fn hold_annotation(fleet: bool, not_before: Option<&str>) -> String {
+    let mut out = String::new();
+    if !fleet {
+        out.push_str(" (human-only)");
+    }
+    if let Some(at) = not_before {
+        out.push_str(&format!(" (not before {at})"));
+    }
+    out
 }
 
 /// One branch in a restack's ordered stack (§8): what to rebase, and onto what.

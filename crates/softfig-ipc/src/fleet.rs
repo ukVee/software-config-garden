@@ -13,7 +13,15 @@
 /// or an empty value fails closed. See `growlight/backlog/CLAUDE.md` "Marking an item
 /// human-only".
 pub fn fleet_marker(doc: &str) -> Option<&str> {
-    crate::item_meta::field(doc, crate::item_meta::FLEET).filter(|v| !v.eq_ignore_ascii_case("yes"))
+    crate::item_meta::field(doc, crate::item_meta::FLEET).filter(|v| holds(v))
+}
+
+/// Whether a `> Fleet:` line's value holds the item: anything but `yes`,
+/// case-insensitive (an empty value or a typo fails closed). The one value
+/// rule, so a surface comparing a doc's line with a v2 entry reads the line as
+/// [`fleet_marker`] does.
+pub fn holds(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("yes")
 }
 
 /// Whether `doc` is held human-only: [`fleet_marker`] returned a non-`yes`

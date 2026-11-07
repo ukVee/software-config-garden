@@ -140,6 +140,7 @@ pub fn build(
     }
 
     for entry in &snapshot.entries {
+        let (doc_fleet, doc_not_before) = doc_hold_lines(garden_root, entry);
         reply.entries.push(QueueShowEntry {
             id: entry.id.clone(),
             kind: entry.kind.to_string(),
@@ -155,6 +156,10 @@ pub fn build(
             open_unknown: !entry.branch.is_empty()
                 && !entry.claimed.is_empty()
                 && unknown.contains(&entry.project),
+            fleet: entry.fleet,
+            not_before: entry.not_before.clone(),
+            doc_fleet,
+            doc_not_before,
         });
     }
 
@@ -202,6 +207,10 @@ pub fn build(
                 pending_status: None,
                 open: false,
                 open_unknown: false,
+                fleet: a.row.fleet,
+                not_before: a.row.not_before,
+                doc_fleet: None,
+                doc_not_before: None,
             });
         }
     }
@@ -268,10 +277,11 @@ fn collect_sessions(
     root: &Path,
     out: &mut Vec<QueueShowSession>,
 ) {
+    if let Some(doc) = entry_doc(root, entry) {
+        push_session(root, &doc, &entry.id, None, None, out);
+    }
     match entry.kind {
         EntryKind::Milestone => {
-            let close = format!("{}/CLAUDE.md", milestone_path(&entry.id));
-            push_session(root, &close, &entry.id, None, None, out);
             // The entry's own tree and every sub-milestone tree under it.
             let prefix = format!("{}/", entry.id);
             for (identity, tree) in &snapshot.trees {
@@ -292,12 +302,32 @@ fn collect_sessions(
                 }
             }
         }
-        EntryKind::Task | EntryKind::Restack => {
-            if let Some(doc) = find_by_number(root, TASKS_DIR, &entry.id) {
-                push_session(root, &doc, &entry.id, None, None, out);
-            }
-        }
+        EntryKind::Task | EntryKind::Restack => {}
     }
+}
+
+/// The garden-relative path of `entry`'s own doc: a milestone's `CLAUDE.md`
+/// (its close-out), or a task's / restack's `tasks/NNN-<slug>.md`. `None` when
+/// a task doc isn't there.
+fn entry_doc(root: &Path, entry: &EntryView) -> Option<String> {
+    match entry.kind {
+        EntryKind::Milestone => Some(format!("{}/CLAUDE.md", milestone_path(&entry.id))),
+        EntryKind::Task | EntryKind::Restack => find_by_number(root, TASKS_DIR, &entry.id),
+    }
+}
+
+/// The `> Fleet:` and `> Not before:` line values in `entry`'s own doc, read
+/// through the scanner the legacy hold reader uses (fenced examples don't
+/// count). Under v2 these lines hold nothing; they are carried so `queue show`
+/// can warn when one disagrees with the entry. A missing or unreadable doc
+/// carries neither.
+fn doc_hold_lines(root: &Path, entry: &EntryView) -> (Option<String>, Option<String>) {
+    let Some(text) = entry_doc(root, entry).and_then(|doc| std::fs::read_to_string(root.join(doc)).ok())
+    else {
+        return (None, None);
+    };
+    let line = |key| softfig_ipc::item_meta::field(&text, key).map(str::to_string);
+    (line(softfig_ipc::item_meta::FLEET), line(softfig_ipc::item_meta::NOT_BEFORE))
 }
 
 /// Read `rel`'s `## Sessions` section and append one [`QueueShowSession`] when
@@ -533,6 +563,53 @@ mod tests {
         assert!(json.get("pending_status").is_none(), "{json}");
         let back: softfig_ipc::growlightd::QueueShowEntry = serde_json::from_value(json).unwrap();
         assert_eq!(back.pending_status, None);
+    }
+
+    /// The TOML holds reach the reply, and so do the entry's own doc lines —
+    /// a milestone's `CLAUDE.md` and a task's `tasks/NNN-*.md` — read as the
+    /// legacy reader reads them (a fenced example doesn't count), so `queue
+    /// show` can warn when a line disagrees with the entry. A doc without the
+    /// lines, or no doc at all, carries none.
+    #[test]
+    fn the_holds_and_the_entry_s_own_doc_lines_reach_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut held = entry("m", "feat/m", Lane::Normal, EntryStatus::Queued, "");
+        held.fleet = false;
+        held.not_before = Some("2026-11-08 09:00Z".into());
+        let habit = entry("h", "feat/h", Lane::Normal, EntryStatus::Queued, "");
+        let mut task = entry("007", "fix/007", Lane::Urgent, EntryStatus::Queued, "");
+        task.kind = EntryKind::Task;
+        let bare = entry("b", "feat/b", Lane::Normal, EntryStatus::Queued, "");
+        let gone = entry("g", "feat/g", Lane::Normal, EntryStatus::Queued, "");
+        let milestones = root.join("growlight/backlog/milestones");
+        for (id, doc) in [
+            ("m", "# m\n\n> Fleet: no\n> Not before: 2026-11-08 09:00 +00:00\n"),
+            ("h", "# h\n\n```\n> Fleet: yes\n```\n> Fleet: no\n"),
+            ("b", "# b\n\n> Model: flash\n"),
+        ] {
+            fs::create_dir_all(milestones.join(id)).unwrap();
+            fs::write(milestones.join(id).join("CLAUDE.md"), doc).unwrap();
+        }
+        fs::create_dir_all(root.join(TASKS_DIR)).unwrap();
+        fs::write(root.join(TASKS_DIR).join("007-fix.md"), "# 007\n\n> Not before: 2026-12-01 00:00Z\n").unwrap();
+
+        let reply = show(&snap(root, vec![held, habit, task, bare, gone], BTreeMap::new()), root);
+        let row = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap();
+        let m = row("m");
+        assert_eq!((m.fleet, m.not_before.as_deref()), (false, Some("2026-11-08 09:00Z")));
+        assert_eq!(m.doc_fleet.as_deref(), Some("no"));
+        assert_eq!(m.doc_not_before.as_deref(), Some("2026-11-08 09:00 +00:00"));
+        assert_eq!(m.doc_hold_warning(), None, "the doc agrees with the entry");
+        let h = row("h");
+        assert_eq!((h.fleet, h.doc_fleet.as_deref()), (true, Some("no")), "the fenced line is skipped");
+        assert!(h.doc_hold_warning().is_some(), "a habit `> Fleet: no` holds nothing under v2");
+        let t = row("007");
+        assert_eq!((t.doc_fleet.as_deref(), t.doc_not_before.as_deref()), (None, Some("2026-12-01 00:00Z")));
+        assert!(t.doc_hold_warning().is_some());
+        for id in ["b", "g"] {
+            assert_eq!((row(id).doc_fleet.as_deref(), row(id).doc_not_before.as_deref()), (None, None), "{id}");
+        }
     }
 
     #[test]

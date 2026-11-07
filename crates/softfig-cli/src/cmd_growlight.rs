@@ -2664,6 +2664,7 @@ fn queue_show(socket: &Path, growlightd_socket: &Path) -> Result<()> {
             if let Some(view) = fetch_queue_view(growlightd_socket)?
                 && view.list
             {
+                print!("{}", render_doc_hold_warnings(&view));
                 print!("{}", render_annotations(&view));
             }
             Ok(())
@@ -2796,13 +2797,11 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         // The §2 Holds beside the status: a human-only entry (`fleet = false`)
         // is left for the human whatever the status reads, and a start time
         // (`not_before`) is shown as written, whether or not it is still ahead.
-        let mut status = e.status.to_string();
-        if !e.fleet {
-            status.push_str(" (human-only)");
-        }
-        if let Some(at) = &e.not_before {
-            status.push_str(&format!(" (not before {at})"));
-        }
+        let status = format!(
+            "{}{}",
+            e.status,
+            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref())
+        );
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -2857,11 +2856,13 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
             e.branch.clone()
         };
         // A recorded human status change on an `active` entry applies at the
-        // session's next handshake; show it rather than a plain `active`.
-        let status = match &e.pending_status {
+        // session's next handshake; show it rather than a plain `active`. The
+        // §2 holds follow, as `queue show` prints them.
+        let mut status = match &e.pending_status {
             Some(p) => format!("{} (→ {p} pending)", e.status),
             None => e.status.clone(),
         };
+        status.push_str(&e.hold_annotation());
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} |",
             cell(&e.id),
@@ -2872,6 +2873,19 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
         ));
     }
     out.push('\n');
+}
+
+/// `queue show`'s doc-line warnings: one line per entry whose doc carries a
+/// `> Fleet:` or `> Not before:` line that disagrees with the entry
+/// ([`QueueShowEntry::doc_hold_warning`]). Under v2 those lines hold nothing,
+/// so a human who wrote one by habit learns it here. Empty when none disagree.
+/// The doc lines come from growlightd, so a stopped growlightd shows none.
+fn render_doc_hold_warnings(view: &QueueShowReply) -> String {
+    let lines: Vec<String> = view.entries.iter().filter_map(QueueShowEntry::doc_hold_warning).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\n{}\n", lines.join("\n"))
 }
 
 /// The §6.9 live annotations layered onto both surfaces (queue-v2-git slice
@@ -4990,6 +5004,10 @@ mod tests {
                 pending_status: Some("blocked".into()),
                 open: true,
                 open_unknown: false,
+                fleet: true,
+                not_before: None,
+                doc_fleet: None,
+                doc_not_before: None,
             },
             QueueShowEntry {
                 id: "n1".into(),
@@ -5004,6 +5022,10 @@ mod tests {
                 pending_status: None,
                 open: false,
                 open_unknown: false,
+                fleet: false,
+                not_before: Some("2026-11-08 09:00Z".into()),
+                doc_fleet: None,
+                doc_not_before: None,
             },
             QueueShowEntry {
                 id: "w1".into(),
@@ -5018,6 +5040,10 @@ mod tests {
                 pending_status: None,
                 open: false,
                 open_unknown: true,
+                fleet: true,
+                not_before: None,
+                doc_fleet: Some("no".into()),
+                doc_not_before: None,
             },
         ];
         let view = QueueShowReply {
@@ -5037,9 +5063,24 @@ mod tests {
             body.contains("| u1 | active (→ blocked pending) | softfig | done-x | feat/u1 (open) |"),
             "{body}"
         );
-        assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
+        // The §2 holds, worded as `queue show` words them.
+        assert!(
+            body.contains("| n1 | queued (human-only) (not before 2026-11-08 09:00Z) | softfig | — | — |"),
+            "{body}"
+        );
         // A branch whose repo couldn't be read is not shown as merged.
         assert!(body.contains("| w1 | active | wedged | — | feat/w1 (stack unknown) |"), "{body}");
+
+        // `queue show` warns once for the entry whose doc line disagrees (w1's
+        // `> Fleet: no` on a claimable entry), and not for n1, whose doc has no
+        // lines. The lanes themselves don't carry the warning.
+        assert!(!body.contains("warning"), "{body}");
+        let warnings = render_doc_hold_warnings(&view);
+        let lines: Vec<&str> = warnings.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{warnings}");
+        assert!(lines[0].starts_with("warning: w1: its doc says `> Fleet: no`"), "{warnings}");
+        let quiet = QueueShowReply { entries: view.entries[..2].to_vec(), ..view };
+        assert_eq!(render_doc_hold_warnings(&quiet), "", "no disagreement, no output");
     }
 
     /// One flag, one place: `pick` reads the `queue`-level socket, and the old
