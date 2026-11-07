@@ -1620,7 +1620,7 @@ pub struct DriveLoop {
     v2_paused_by: std::collections::BTreeMap<String, String>,
     /// Entries whose claim failed closed, with the consecutive-failure streak and
     /// the time before which the entry is not picked again (V3). Cleared when the
-    /// entry claims. Without it one entry whose claim keeps failing is re-picked
+    /// entry claims or leaves the list. Without it one entry whose claim keeps failing is re-picked
     /// and re-failed every ~1 s tick, head-of-line blocking its member.
     v2_claim_backoff: std::collections::BTreeMap<String, (u32, i64)>,
     /// Entries whose §4 walk stops at a `blocked` item, already alerted (§2
@@ -1634,8 +1634,8 @@ pub struct DriveLoop {
     v2_to_pause: std::collections::BTreeMap<String, String>,
     /// Accepted model changes (§6.4): the next session of `(entry, unit)` runs
     /// on this model, overlaid as the unit's allowed list until that unit is
-    /// spawned again — so the backend match routes it to a member that can
-    /// run it, and the spawn resolves to it.
+    /// spawned again or its entry leaves the list — so the backend match routes
+    /// it to a member that can run it, and the spawn resolves to it.
     v2_model_overrides: Vec<(String, Unit, ModelChoice)>,
     /// Claim holds the claim-time marker read found (task 068), each with the tick
     /// it was read: re-applied to every snapshot so a held part is rolled past
@@ -2735,6 +2735,13 @@ impl DriveLoop {
                         .iter()
                         .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
                 });
+                // An entry that left the list (archived or dropped) is never
+                // picked or spawned again: drop its backoff and model rows (F7).
+                let live: BTreeSet<&str> =
+                    snapshot.entries.iter().map(|e| e.id.as_str()).collect();
+                self.v2_claim_backoff.retain(|entry, _| live.contains(entry.as_str()));
+                self.v2_model_overrides
+                    .retain(|(entry, _, _)| live.contains(entry.as_str()));
                 apply_v2_overlay(snapshot, &self.v2_overlay());
                 // Publish the v2 holds to `growlight status` (parity row 2): the
                 // same `held` list the legacy pass fills, read off the one hold
@@ -10642,6 +10649,52 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r = loop_.tick(1_000);
         assert_eq!(r.v2_started.len(), 1, "{r:?}");
         assert!(loop_.v2_claim_backoff.is_empty(), "success clears the backoff");
+    }
+
+    /// F7: an entry that leaves the list takes its backoff and model-override
+    /// rows with it; a live entry's rows stay.
+    #[test]
+    fn v2_mode_an_archived_entry_leaves_no_side_table_rows() {
+        let claimer = Arc::new(FakeV2Claimer::default());
+        claimer.fail.store(true, Ordering::SeqCst);
+        let source = FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            std::env::temp_dir().join(format!("v2-entries-prune-{}", std::process::id())),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        assert!(loop_.v2_claim_backoff.contains_key("m1"), "preamble: m1 backs off");
+        let unit = Unit::Slice {
+            milestone: "m1".into(),
+            slice: "001".into(),
+        };
+        let model = ModelChoice::claude();
+        for entry in ["m1", "m2"] {
+            loop_
+                .v2_model_overrides
+                .push((entry.into(), unit.clone(), model.clone()));
+        }
+
+        // m1 is archived: the list now carries only m2.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+        loop_.tick(1);
+        assert!(
+            !loop_.v2_claim_backoff.contains_key("m1"),
+            "{:?}",
+            loop_.v2_claim_backoff
+        );
+        assert_eq!(
+            loop_
+                .v2_model_overrides
+                .iter()
+                .map(|(entry, _, _)| entry.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m2"],
+        );
     }
 
     /// SLICE 006 — an `Absent` v2 source (no `queue.toml`) schedules nothing,
