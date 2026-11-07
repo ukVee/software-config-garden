@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use crate::row::RequestRow;
 use crate::schema::{
     CREATE_DAILY_ROLLUP, CREATE_INDEXES, CREATE_REQUESTS, CREATE_ROLLUP_WATERMARK, DB_FILE,
-    RAW_RETENTION_DAYS, SCHEMA_VERSION,
+    RAW_RETENTION_DAYS, ROLLUP_ADD_UNPRICED, SCHEMA_VERSION,
 };
 use crate::ts::iso8601_utc;
 
@@ -39,7 +39,11 @@ pub fn default_db_path() -> Option<PathBuf> {
 /// One migration step per schema version: `MIGRATIONS[i]` takes a db from
 /// `user_version` `i` to `i + 1`. Layer 2 appends a step; nothing edits one in
 /// place.
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_v0_to_v1, migrate_v1_to_v2];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[
+    migrate_v0_to_v1,
+    migrate_v1_to_v2,
+    migrate_v2_to_v3,
+];
 
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 
@@ -53,6 +57,10 @@ fn migrate_v0_to_v1(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CREATE_ROLLUP_WATERMARK)
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(ROLLUP_ADD_UNPRICED)
 }
 
 /// What one [`Store::sweep_retention`] did.
@@ -204,18 +212,20 @@ SELECT session_id, MAX(ts) FROM requests WHERE ts < ?1 GROUP BY session_id
 ON CONFLICT (session_id) DO UPDATE SET through = MAX(through, excluded.through)";
 
 /// `ts` is `YYYY-MM-DDTHH:MM:SSZ`, so its first ten characters are the UTC day.
-/// A null `slice_id` rolls up as `''` (the rollup key can't hold null), and an
-/// unpriced row adds nothing to `cost_usd`.
+/// A null `slice_id` rolls up as `''` (the rollup key can't hold null). An
+/// unpriced row adds nothing to `cost_usd` but is counted in
+/// `unpriced_requests`, so the rollup never reads an unknown cost as zero.
 const ROLL_UP_AGED: &str = "\
 INSERT INTO daily_rollup (
     day, model, backend, provider, slice_id, requests, input_tokens,
     output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-    cache_creation_1h_input_tokens, thinking_tokens, cost_usd
+    cache_creation_1h_input_tokens, thinking_tokens, cost_usd, unpriced_requests
 )
 SELECT substr(ts, 1, 10), model, backend, provider, COALESCE(slice_id, ''),
        COUNT(*), SUM(input_tokens), SUM(output_tokens),
        SUM(cache_read_input_tokens), SUM(cache_creation_input_tokens),
-       SUM(cache_creation_1h_input_tokens), COALESCE(SUM(thinking_tokens), 0), COALESCE(SUM(cost_usd), 0.0)
+       SUM(cache_creation_1h_input_tokens), COALESCE(SUM(thinking_tokens), 0), COALESCE(SUM(cost_usd), 0.0),
+       COALESCE(SUM(cost_usd IS NULL), 0)
 FROM requests
 WHERE ts < ?1
 GROUP BY 1, 2, 3, 4, 5
@@ -227,7 +237,8 @@ ON CONFLICT (day, model, backend, provider, slice_id) DO UPDATE SET
     cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens,
     cache_creation_1h_input_tokens = cache_creation_1h_input_tokens + excluded.cache_creation_1h_input_tokens,
     thinking_tokens             = thinking_tokens + excluded.thinking_tokens,
-    cost_usd                    = cost_usd + excluded.cost_usd";
+    cost_usd                    = cost_usd + excluded.cost_usd,
+    unpriced_requests           = unpriced_requests + excluded.unpriced_requests";
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -512,5 +523,117 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!((requests, cost), (2, 1.0));
         assert_eq!(count(&store, "daily_rollup"), 1);
+    }
+
+    #[test]
+    fn an_unpriced_row_stays_unpriced_in_the_rollup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+        let day_start = (NOW - 100 * DAY).div_euclid(DAY) * DAY;
+        let mut unpriced = row("s", "u1", day_start + 60);
+        unpriced.model = "mystery".into();
+        unpriced.cost_usd = None;
+        let mut also = row("s", "u2", day_start + 120);
+        also.model = "mystery".into();
+        also.cost_usd = None;
+        // A priced model on the same day, and a model with one of each.
+        let mut mixed = row("s", "m2", day_start + 240);
+        mixed.model = "mixed".into();
+        let mut mixed_unpriced = row("s", "m1", day_start + 180);
+        mixed_unpriced.model = "mixed".into();
+        mixed_unpriced.cost_usd = None;
+        store
+            .insert_batch(&[
+                unpriced,
+                also,
+                mixed,
+                mixed_unpriced,
+                row("s", "priced", day_start + 300),
+            ])
+            .unwrap();
+        store.sweep_retention(NOW).unwrap();
+
+        let by_model: Vec<(String, i64, f64, i64)> = store
+            .conn()
+            .prepare(
+                "SELECT model, requests, cost_usd, unpriced_requests
+                 FROM daily_rollup ORDER BY model",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            by_model,
+            vec![
+                ("claude-opus-5-5".into(), 1, 0.5, 0),
+                ("mixed".into(), 2, 0.5, 1),
+                // Every request unpriced: the count says so, and cost_usd is not a price.
+                ("mystery".into(), 2, 0.0, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn unpriced_counts_add_across_sweeps_of_one_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+        let day_start = (NOW - 100 * DAY).div_euclid(DAY) * DAY;
+        let mut a = row("s", "morning", day_start + 3600);
+        a.cost_usd = None;
+        let mut b = row("s", "evening", day_start + 20 * 3600);
+        b.cost_usd = None;
+        store.insert_batch(&[a, b]).unwrap();
+        let first_now = day_start + 12 * 3600 + i64::from(RAW_RETENTION_DAYS) * DAY;
+        store.sweep_retention(first_now).unwrap();
+        store.sweep_retention(first_now + DAY).unwrap();
+        let (requests, unpriced): (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT requests, unpriced_requests FROM daily_rollup",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((requests, unpriced), (2, 2));
+    }
+
+    #[test]
+    fn a_v2_db_migrates_to_v3_keeping_its_rollup_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            // A db as the v2 build left it: steps 0 and 1, user_version 2.
+            let conn = Connection::open(&path).unwrap();
+            migrate_v0_to_v1(&conn).unwrap();
+            migrate_v1_to_v2(&conn).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO daily_rollup VALUES
+                 ('2026-07-23', 'm', 'claude', 'anthropic', '', 3, 1, 1, 1, 1, 1, 0, 1.5)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let v: u32 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        let (requests, cost, unpriced): (i64, f64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT requests, cost_usd, unpriced_requests FROM daily_rollup",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((requests, cost, unpriced), (3, 1.5, 0), "history kept, none marked unpriced");
+        // The column is not re-added on the next open.
+        drop(store);
+        Store::open(&path).unwrap();
+        assert!(Connection::open(&path).unwrap().execute_batch(ROLLUP_ADD_UNPRICED).is_err());
     }
 }

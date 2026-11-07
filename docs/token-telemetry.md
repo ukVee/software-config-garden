@@ -47,7 +47,10 @@ toml and thiserror, and on no other workspace crate.
     `cache_creation_input_tokens`, priced at the 1-hour cache-write rate.
   - `settled_from` is `stream`, `ledger` or `transcript`.
 - **`daily_rollup`:** per `(day, model, backend, provider, slice_id)` sums,
-  kept forever.
+  kept forever. `cost_usd` sums only the priced rows; `unpriced_requests`
+  (schema v3) counts the rest. A rollup row is exact only where
+  `unpriced_requests = 0`, and a row with `unpriced_requests = requests` has no
+  cost known at all, never a free one.
 - **Retention:** raw rows live 90 days (`RAW_RETENTION_DAYS`). Once a day the
   sweep rolls older rows into `daily_rollup` and deletes them, in one
   transaction. `ingest-transcript` runs the same sweep after its insert, so a
