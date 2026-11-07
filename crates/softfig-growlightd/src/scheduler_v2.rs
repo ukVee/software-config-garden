@@ -2581,6 +2581,46 @@ mod tests {
         );
     }
 
+    /// Parity's §2 holds and hardening's restack rule both keep an entry back,
+    /// and they are checked one after the other: an entry under both is held
+    /// by whichever fires first, and stays held when either one lifts alone.
+    #[test]
+    fn a_held_entry_stays_held_whichever_rule_fires_first() {
+        let human_only = |id: &str| {
+            let mut e = entry(id);
+            e.fleet = false;
+            e
+        };
+        let not_yet = |id: &str| starting(id, START);
+        for (held, hold) in [
+            (human_only("n"), SkipReason::HumanOnly),
+            (not_yet("n"), SkipReason::NotYet),
+        ] {
+            let both = repo_snapshot(vec![restack("r", EntryStatus::Blocked), held.clone()]);
+            assert_eq!(eligible(&both, &member("m"), &both.entries[1]), Err(hold));
+            assert!(
+                held_entries(&both).iter().any(|(e, _)| e.id == "n"),
+                "{hold:?}: listed held while a restack is live too",
+            );
+
+            let restack_lifted = repo_snapshot(vec![held.clone()]);
+            assert_eq!(
+                eligible(&restack_lifted, &member("m"), &restack_lifted.entries[0]),
+                Err(hold),
+                "{hold:?}: the hold outlasts the restack",
+            );
+
+            let hold_lifted = repo_snapshot(vec![restack("r", EntryStatus::Blocked), entry("n")]);
+            assert_eq!(
+                eligible(&hold_lifted, &member("m"), &hold_lifted.entries[1]),
+                Err(SkipReason::RestackLive),
+                "{hold:?}: the restack outlasts the hold",
+            );
+
+            assert_eq!(pick_v2(&both, &member("m")).picked, None);
+        }
+    }
+
     #[test]
     fn the_restack_skips_have_stable_slugs_and_say_what_they_mean() {
         assert_eq!(SkipReason::RestackLive.as_str(), "restack_live");
