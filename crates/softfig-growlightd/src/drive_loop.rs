@@ -60,7 +60,7 @@ use softfig_ipc::item_repo::{boot_signal, Handoff, RepoState};
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
-use crate::baton_store::FsEntryBatonStore;
+use crate::baton_store::{with_base_line, FsEntryBatonStore};
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
@@ -2908,7 +2908,8 @@ impl DriveLoop {
                                 // computed from the stack here, its baton seeded
                                 // with the concrete `create <branch> from <base>`
                                 // line, and those values passed to the claim op.
-                                // A resume or re-claim (`claimed` already set)
+                                // A resume or re-claim (`claimed` already set, or
+                                // an `active` row, where keeperd records nothing)
                                 // computes nothing and passes `None`, so an
                                 // already-recorded base is never overwritten. A
                                 // git failure here fails the claim closed — no
@@ -2918,7 +2919,10 @@ impl DriveLoop {
                                     .iter()
                                     .find(|e| e.id == entry_top)
                                 {
-                                    Some(ev) if ev.claimed.is_empty() => {
+                                    Some(ev)
+                                        if ev.claimed.is_empty()
+                                            && ev.status != EntryStatus::Active =>
+                                    {
                                         let home =
                                             std::env::var_os("HOME").map(std::path::PathBuf::from);
                                         first_claim::first_claim(
@@ -2931,19 +2935,14 @@ impl DriveLoop {
                                     }
                                     _ => None,
                                 };
-                                let (branch, base) = match &first {
-                                    Some(fc) => {
-                                        (Some(fc.branch.as_str()), Some(fc.base.as_str()))
-                                    }
-                                    None => (None, None),
-                                };
+                                let base_line =
+                                    first.as_ref().map(|fc| (fc.branch.as_str(), fc.base.as_str()));
                                 copy_entry_baton(
                                     entries,
                                     &**member_writer,
                                     entry_top,
                                     agent,
-                                    branch,
-                                    base,
+                                    base_line,
                                 )?;
                                 v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref(), first.as_ref())
                             },
@@ -4334,22 +4333,29 @@ fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
 /// boots stateless and a claim never lands behind a failed baton.
 ///
 /// The §8 base line (queue-v2-git slice 002): a first claim passes the CONCRETE
-/// `branch`/`base` (computed by [`crate::first_claim`]) so the seeded baton
+/// `(branch, base)` (computed by [`crate::first_claim`]) so the seeded baton
 /// reads `create <branch> from <base>`. A resume or a branchless entry (a
-/// restack) passes `None` and the seed renders the literal `<branch>`/`<base>`
-/// tokens, exactly as the store documents.
+/// restack) passes `None` and a seed carries no line. A first claim that finds a
+/// baton is a retry: the earlier attempt's seed gets this attempt's values,
+/// because they are what this claim records (V18).
 fn copy_entry_baton(
     entries: &FsEntryBatonStore,
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
-    branch: Option<&str>,
-    base: Option<&str>,
+    base_line: Option<(&str, &str)>,
 ) -> Result<(), String> {
     let baton = match entries.read(entry_top) {
-        Some(baton) => baton,
+        Some(stored) => match base_line {
+            Some((branch, base)) => {
+                let baton = with_base_line(&stored, branch, base);
+                entries.write(entry_top, &baton)?;
+                baton
+            }
+            None => stored,
+        },
         None => {
-            entries.seed(entry_top, branch, base)?;
+            entries.seed(entry_top, base_line)?;
             entries
                 .read(entry_top)
                 .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?
@@ -9200,6 +9206,9 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     #[derive(Debug, Default)]
     struct FakeV2Claimer {
         claims: Mutex<Vec<(String, Option<String>)>>,
+        /// The `base` each claim asked keeperd to record, `None` when it asked
+        /// for none.
+        bases: Mutex<Vec<Option<String>>>,
         fail: AtomicBool,
     }
 
@@ -9208,12 +9217,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             &self,
             entry: &str,
             unit: Option<&str>,
-            _first: Option<&FirstClaim>,
+            first: Option<&FirstClaim>,
         ) -> Result<(), String> {
             self.claims
                 .lock()
                 .unwrap()
                 .push((entry.to_string(), unit.map(str::to_string)));
+            self.bases.lock().unwrap().push(first.map(|f| f.base.clone()));
             if self.fail.load(Ordering::SeqCst) {
                 Err("claim refused".into())
             } else {
@@ -9482,8 +9492,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the unit's declared reasoning model overrides the flash roster default",
         );
         // The §3.6 copy: the never-claimed entry was seeded from the template
-        // (with the literal §8 base-line tokens — the first claim resolved no
-        // branch/base here) and the SAME contents written to the member path.
+        // (with no §8 base line — the first claim resolved no branch/base here)
+        // and the SAME contents written to the member path.
         let seeded = std::fs::read_to_string(entries_dir.join("m1").join("baton.md"))
             .expect("the entry baton was seeded");
         assert!(
@@ -9491,8 +9501,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the seed is the entry's baton: {seeded}"
         );
         assert!(
-            seeded.contains("<branch>") && seeded.contains("<base>"),
-            "the §8 base-line tokens ride the seed when the first claim resolves none: {seeded}"
+            !seeded.contains("FIRST STEP"),
+            "no §8 base line rides the seed when the first claim resolves none: {seeded}"
         );
         let writes = backend.member_writes();
         assert_eq!(writes.len(), 1, "one member write: {writes:?}");
@@ -10432,6 +10442,28 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             git(&["commit", "-q", "-m", "base"]);
             Self { root, repo }
         }
+        fn main_tip(&self) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["rev-parse", "main"])
+                .output()
+                .expect("run git");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        /// Commit on `main` and return the new tip.
+        fn advance_main(&self) -> String {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["commit", "-q", "--allow-empty", "-m", "moved"])
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git commit");
+            self.main_tip()
+        }
         fn write(&self, rel: &str, content: &str) {
             let path = self.root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -10760,6 +10792,97 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the urgent task runs",
         );
         assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("070".to_string(), None)));
+    }
+
+    /// V18: a first claim failed and left its seed behind, then the stack moved
+    /// before the retry. The baton the member boots from names the base the
+    /// landing claim records, and nothing else in the stored seed changes.
+    #[test]
+    fn v2_a_retried_first_claim_rewrites_the_seeds_base_line() {
+        let garden = TestGarden::new("retry-base");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let stored = garden.root.join("entries/m1/baton.md");
+
+        claimer.fail.store(true, Ordering::SeqCst);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let old = garden.main_tip();
+        let seeded = std::fs::read_to_string(&stored).expect("the failed attempt seeded");
+        assert!(seeded.contains(&format!("create feat/m1 from {old}")), "{seeded}");
+
+        let new = garden.advance_main();
+        claimer.fail.store(false, Ordering::SeqCst);
+        let r = loop_.tick(1_000);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+
+        assert_eq!(
+            claimer.bases.lock().unwrap().last(),
+            Some(&Some(new.clone())),
+            "the landing claim records the moved base",
+        );
+        let baton = std::fs::read_to_string(&stored).unwrap();
+        assert_eq!(baton, seeded.replace(&old, &new), "only the line changes");
+        let writes = backend.member_writes();
+        assert_eq!(writes.last().unwrap().1, baton, "the member boots from the rewritten baton");
+    }
+
+    /// V18: a restack has no branch, so its seed tells the session to create
+    /// none. The store and the member's copy both go without the line.
+    #[test]
+    fn v2_a_restack_seed_names_no_branch_to_create() {
+        let mut restack = row("072", EntryKind::Restack, Lane::Urgent, EntryStatus::Queued);
+        restack.branch = String::new();
+        let garden = TestGarden::new("restack-seed");
+        garden.queue(vec![restack]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(*claimer.bases.lock().unwrap(), vec![None], "a restack records no base");
+        let baton = std::fs::read_to_string(garden.root.join("entries/072/baton.md")).unwrap();
+        assert!(baton.contains("item: 072"), "{baton}");
+        for gone in ["create ", "<branch>", "<base>", "# FIRST STEP"] {
+            assert!(!baton.contains(gone), "{gone:?} in {baton}");
+        }
+        assert_eq!(backend.member_writes().last().unwrap().1, baton);
+    }
+
+    /// V18's other half: keeperd records a base only on a `queued` or `paused`
+    /// row with no `claimed`, so no other claim may touch the baton's line, even
+    /// though main moved. A resume keeps it, and so does an `active` row that
+    /// never recorded a claim, which also asks keeperd to record nothing.
+    #[test]
+    fn v2_a_claim_that_records_no_base_leaves_the_baton_alone() {
+        let unclaimed_active = {
+            let mut r = milestone_row("m1", EntryStatus::Active);
+            r.claimed = String::new();
+            r
+        };
+        for (tag, entry, slice) in [
+            ("resume", milestone_row("m1", EntryStatus::Paused), SliceStatus::Queued),
+            ("active", unclaimed_active, SliceStatus::Active),
+        ] {
+            let garden = TestGarden::new(&format!("keep-base-{tag}"));
+            garden.queue(vec![entry]);
+            garden.slices("m1", &[("001", slice, 0)]);
+            let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+                make_handshake(vec![opencode_member("a1")], &garden);
+            let stored = "---\nstatus: IN_PROGRESS\nitem: m1\n---\n# NEXT ACTION\ngo\n\n\
+                          # FIRST STEP\ncreate feat/m1 from recorded\n";
+            garden.write("entries/m1/baton.md", stored);
+            garden.advance_main();
+
+            let r = loop_.tick(0);
+            assert_eq!(r.v2_started.len(), 1, "{tag}: {r:?}");
+            assert_eq!(*claimer.bases.lock().unwrap(), vec![None], "{tag}");
+            let baton = std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap();
+            assert_eq!(baton, stored, "{tag}");
+            assert_eq!(backend.member_writes().last().unwrap().1, stored, "{tag}");
+        }
     }
 
     /// F2 + V8, over a real two-member loop: the restack a drop leaves is not
