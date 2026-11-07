@@ -89,11 +89,16 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Create the file 0600 ourselves: sqlite gives the `-wal` and `-shm`
+        // files the main db's mode, so they are born 0600 too, whatever the
+        // umask. An older, looser db is tightened below.
+        create_private(path)?;
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
         migrate(&mut conn)?;
+        restrict_modes(path)?;
         Ok(Self { conn })
     }
 
@@ -174,6 +179,31 @@ impl Store {
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// Create `path` empty with mode 0600 if it is absent. An existing file is
+/// left alone (sqlite opens an empty file as a new db).
+fn create_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Set the db and whichever `-wal` / `-shm` sidecars exist to 0600. A db a
+/// build before this one made is 0644, and its sidecars follow it.
+fn restrict_modes(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        match std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -314,6 +344,34 @@ pub(crate) mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(count(&store, "requests"), 1, "reopen kept the row");
+    }
+
+    #[test]
+    fn the_db_and_its_sidecars_are_0600_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let sidecar = |s: &str| {
+            let mut f = path.as_os_str().to_owned();
+            f.push(s);
+            PathBuf::from(f)
+        };
+        // A db an older build left world-readable is tightened on open.
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE x (a)").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        store.insert_batch(&[row("s", "r1", NOW)]).unwrap();
+        // The sidecars exist while the connection is open.
+        for s in ["", "-wal", "-shm"] {
+            assert_eq!(mode(&sidecar(s)), 0o600, "{path:?}{s}");
+        }
+        drop(store);
+        // A fresh db is created 0600 from the start.
+        let fresh = dir.path().join("fresh.db");
+        let store = Store::open(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o600);
+        drop(store);
     }
 
     #[test]
