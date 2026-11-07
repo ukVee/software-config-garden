@@ -1863,7 +1863,13 @@ fn render_schedule(s: Option<&growlightd::ScheduleSummary>, now: i64) -> String 
     if !s.current_windows.is_empty() {
         out += &format!("  open now      {}\n", s.current_windows.join(", "));
     }
-    let edge = s.next_edge_local.as_deref().unwrap_or("(none within a week)");
+    // No edge in the week ahead: an open schedule stays open throughout, a
+    // closed one has no window that opens.
+    let edge = s.next_edge_local.as_deref().unwrap_or(if s.open {
+        "(none within a week — open throughout)"
+    } else {
+        "(none within a week — no window opens)"
+    });
     out += &format!("  next edge     {edge}\n");
     for h in &s.held_members {
         out += &format!("  held          {:<16} {}\n", h.agent, h.reason);
@@ -3413,6 +3419,16 @@ mod tests {
         assert!(text.contains("slot1            reserve 80%  cap in 1h at the earliest, or resets first, resets in 2h\n"), "{text}");
         assert!(text.contains("slot1            5h           resets first, resets in 2h\n"), "{text}");
         assert!(text.contains("projection    slot2            7d           unknown\n"), "{text}");
+    }
+
+    #[test]
+    fn render_schedule_says_why_there_is_no_next_edge() {
+        let mut s = growlightd::ScheduleSummary { open: true, zone: "UTC".into(), ..Default::default() };
+        let open = render_schedule(Some(&s), 0);
+        assert!(open.contains("  next edge     (none within a week — open throughout)\n"), "{open}");
+        s.open = false;
+        let closed = render_schedule(Some(&s), 0);
+        assert!(closed.contains("  next edge     (none within a week — no window opens)\n"), "{closed}");
     }
 
     fn projection(
