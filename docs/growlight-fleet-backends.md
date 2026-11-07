@@ -461,6 +461,15 @@ own, so a human reading the list never holds a repo for the scheduler. A repo th
 answer shows "stack unknown" with the reason, and its started branches show the same, never
 an empty stack or a merged branch.
 
+Under v2 a hold lives only in the entry's `fleet` / `not_before` fields. Both surfaces and the
+TUI print them beside the status as `(human-only)` and `(not before …)`. An item doc's
+`> Fleet:` or `> Not before:` line holds nothing, so `queue show` prints one `warning:` line
+per entry whose doc line disagrees with the entry, along with the `queue fleet` / `queue
+not-before` command that would make the entry match. For the same reason, keeperd's member
+guard stops protecting the `> Fleet:` line once `config/growlight.toml` says `queue = "v2"`.
+Under legacy, or with a switch it can't read, the guard stays on. A member may not write
+`config/growlight.toml`.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
