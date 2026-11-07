@@ -70,6 +70,9 @@ pub struct FlushStats {
     pub sweeps: u64,
     /// Raw rows rolled up and deleted.
     pub rolled: u64,
+    /// Rows the ring overflowed and dropped, read live from the ring, so a
+    /// flusher stalled in the db still shows its losses here.
+    pub dropped: u64,
 }
 
 pub struct Flusher;
@@ -99,6 +102,7 @@ impl Flusher {
 
 fn run(mut store: Store, ring: RingRecorder, policy: FlushPolicy, stats: Arc<Mutex<FlushStats>>) {
     let mut last_sweep: Option<i64> = None;
+    let mut reported_drops = 0;
     loop {
         let now = (policy.clock)();
         if last_sweep.is_none_or(|t| now - t >= policy.sweep_every_secs) {
@@ -115,6 +119,15 @@ fn run(mut store: Store, ring: RingRecorder, policy: FlushPolicy, stats: Arc<Mut
 
         let closed = ring.wait_for_batch(policy.interval);
         let rows = ring.drain();
+        // One line per flush that saw drops, never per row (spec §5).
+        let dropped = ring.dropped();
+        if dropped > reported_drops {
+            eprintln!(
+                "telemetry: ring overflowed, {} row(s) dropped since the last flush ({dropped} in all)",
+                dropped - reported_drops
+            );
+            reported_drops = dropped;
+        }
         if !rows.is_empty() {
             match store.insert_batch(&rows) {
                 Ok(n) => update(&stats, |s| {
@@ -147,7 +160,10 @@ pub struct FlushHandle {
 
 impl FlushHandle {
     pub fn stats(&self) -> FlushStats {
-        *self.stats.lock().unwrap_or_else(PoisonError::into_inner)
+        FlushStats {
+            dropped: self.ring.dropped(),
+            ..*self.stats.lock().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
     /// Wake the thread for a final flush of whatever is pending, join it, and
@@ -251,6 +267,29 @@ mod tests {
         });
         assert_eq!(rows_in(&path), 1);
         drop(handle);
+    }
+
+    #[test]
+    fn rows_the_ring_dropped_reach_the_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        // Overfill before the flusher starts, so what it drains is fixed: the
+        // newest three of five.
+        let ring = RingRecorder::with_limits(3, 3);
+        for i in 0..5 {
+            ring.record(row("s", &format!("r{i}"), NOW));
+        }
+        let handle = Flusher::spawn(
+            Store::open(&path).unwrap(),
+            ring,
+            policy(LONG, fixed(NOW)),
+        )
+        .unwrap();
+        eventually("the flush", || handle.stats().batches == 1);
+        assert_eq!(handle.stats().dropped, 2);
+        let stats = handle.shutdown();
+        assert_eq!((stats.rows_written, stats.dropped), (3, 2));
+        assert_eq!(rows_in(&path), 3);
     }
 
     #[test]
