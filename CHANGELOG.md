@@ -11,6 +11,11 @@ decision record or crate that owns it, rather than at every internal change.
 
 ### Added
 
+- keeperd refuses a write that grows a routing `CLAUDE.md` past 8 KB of hand-written
+  text. Managed regions don't count, and an over-limit doc may always shrink.
+  `growlight/backlog/` is exempt for now. See `decision-claude-md-lazy-pointers`.
+- The growlight reports index and tag reference now live in `growlight/reports/index.md`,
+  and an existing garden's `reports/CLAUDE.md` migrates at its first report or edit.
 - `claude:<alias|id>[1m] [effort=<low|medium|high|xhigh|max>]` grammar across
   `softfig growlight start --model`, the interactive picker, `> Model:` lines
   and `[[fleet]] model` entries, so the claude backend's model and effort are

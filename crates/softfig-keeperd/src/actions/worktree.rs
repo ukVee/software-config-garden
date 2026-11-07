@@ -117,6 +117,9 @@ impl<'a> WorkTree<'a> {
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
+        if is_budgeted_claude_md(rel) {
+            claude_md_budget(rel, self.read(rel).as_deref(), bytes)?;
+        }
         self.guard_member_write(rel, Some(bytes), Bytes::Caller)
     }
 
@@ -142,6 +145,9 @@ impl<'a> WorkTree<'a> {
     pub fn check_write_bytes_over(&self, rel: &str, old: Option<&[u8]>, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
+        if is_budgeted_claude_md(rel) {
+            claude_md_budget(rel, old, bytes)?;
+        }
         guard_member_change(rel, old, Some(bytes), Bytes::Caller)
     }
 
@@ -458,6 +464,39 @@ impl<'a> WorkTree<'a> {
             }
         }
     }
+}
+
+/// The limit on hand-written text in a routing `CLAUDE.md`. These docs auto-load
+/// once a session reads a file under their dir, so every byte is charged to
+/// every session passing through (`meta/conventions.md`).
+const CLAUDE_MD_PROSE_LIMIT: usize = 8 * 1024;
+
+/// Whether the budget covers `rel`. `growlight/backlog/` is out for now: item
+/// docs are where the protocol still tells agents to write, and `add_queue`
+/// grows the queue doc's prose.
+fn is_budgeted_claude_md(rel: &str) -> bool {
+    Path::new(rel).file_name().is_some_and(|n| n == "CLAUDE.md") && !is_backlog_rel(rel)
+}
+
+/// Refuse a caller's write that leaves `rel` over the limit and larger than it
+/// was. Managed regions don't count, and a doc already over the limit may
+/// always shrink. Daemon upkeep (`write_derived`, `write_structured`) never
+/// reaches this.
+fn claude_md_budget(rel: &str, old: Option<&[u8]>, new: &[u8]) -> ActionResult {
+    let prose = |b: &[u8]| super::managed::prose_len(&String::from_utf8_lossy(b));
+    let after = prose(new);
+    if after <= CLAUDE_MD_PROSE_LIMIT || after <= old.map_or(0, prose) {
+        return Ok(());
+    }
+    Err((
+        ErrorKind::BadArgs,
+        format!(
+            "{rel} would hold {after} bytes of hand-written text, over the \
+             {CLAUDE_MD_PROSE_LIMIT}-byte limit for a CLAUDE.md, and this write grows it. \
+             A CLAUDE.md routes: put the content in notes/ or state.md and leave a pointer \
+             (meta/conventions.md)."
+        ),
+    ))
 }
 
 /// The member guards for replacing canonical `rel` from `old` to `new` (`None`
@@ -882,6 +921,39 @@ mod tests {
                 .expect("a rename outside the backlog is not the guard's");
             wt.write_structured(SLICE, b"# a\n").expect("keeperd's own structured write");
         }
+    }
+
+    /// The `CLAUDE.md` budget: a caller's write may not grow a routing doc's
+    /// hand-written text past the limit. Managed regions don't count, an
+    /// over-limit doc may shrink, and daemon upkeep and other docs are exempt.
+    #[test]
+    fn a_write_may_not_grow_a_claude_md_past_the_budget() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let over = "x".repeat(CLAUDE_MD_PROSE_LIMIT + 1);
+
+        let err = wt.write("a/CLAUDE.md", over.as_bytes()).unwrap_err();
+        assert!(err.1.contains("A CLAUDE.md routes"), "{}", err.1);
+        wt.check_write_bytes_over("a/CLAUDE.md", None, over.as_bytes()).unwrap_err();
+        wt.write("a/CLAUDE.md", b"short\n").expect("under the limit");
+
+        let region = format!(
+            "<!-- softfig:index notes -->\n{}\n<!-- /softfig:index notes -->\n",
+            "r".repeat(CLAUDE_MD_PROSE_LIMIT * 2)
+        );
+        wt.write("b/CLAUDE.md", format!("short\n\n{region}").as_bytes())
+            .expect("a managed region doesn't count");
+
+        wt.write_derived("c/CLAUDE.md", over.as_bytes()).expect("daemon upkeep is exempt");
+        let longer = format!("{over}y");
+        wt.write("c/CLAUDE.md", longer.as_bytes()).unwrap_err();
+        wt.write("c/CLAUDE.md", &over.as_bytes()[1..]).expect("an over-limit doc may shrink");
+
+        wt.write("c/notes.md", over.as_bytes()).expect("only CLAUDE.md is budgeted");
+        wt.write("growlight/backlog/milestones/m/CLAUDE.md", over.as_bytes())
+            .expect("the backlog is out for now");
     }
 
     /// The same worktree-level guard refuses a member's add, change and remove
