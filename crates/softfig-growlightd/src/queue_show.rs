@@ -71,22 +71,32 @@ pub fn build(
         trees: Vec::new(),
     };
 
-    // The open branches per (project, branch) — the live annotation the entry
-    // rows and the per-repo stacks share, computed once per repo.
-    let mut open: HashSet<(String, String)> = HashSet::new();
+    // The entries whose branch is open — the live annotation the entry rows and
+    // the per-repo stacks share, computed once per repo.
+    let mut open: HashSet<String> = HashSet::new();
 
     // The projects whose stack could not be read: their started branches are
     // unknown, not closed.
     let mut unknown: HashSet<String> = HashSet::new();
 
+    // One row per repo (§8): the projects naming a repo share its stack, so one
+    // read answers them all, judged against the first one's `main`.
+    let mut repos: Vec<Vec<&ProjectView>> = Vec::new();
+    for project in &snapshot.projects {
+        match repos.iter_mut().find(|group| group[0].repo == project.repo) {
+            Some(group) => group.push(project),
+            None => repos.push(vec![project]),
+        }
+    }
+
     probes.begin_tick(now);
-    let reads: Vec<StackRead> = snapshot
-        .projects
+    let reads: Vec<StackRead> = repos
         .iter()
-        .map(|project| StackRead::start(snapshot, project, home, probes))
+        .map(|group| StackRead::start(snapshot, group[0], home, probes))
         .collect();
 
-    for (project, read) in snapshot.projects.iter().zip(reads) {
+    for (group, read) in repos.iter().zip(reads) {
+        let project = group[0];
         let local = matches!(read, StackRead::Probing(_));
         // A real git error (not-a-repo, a hung mount) is that repo's unknown: the
         // surface shows what it can, never fails. (A not-yet-cut branch is not an
@@ -94,7 +104,7 @@ pub fn build(
         let (stack, stack_unknown) = match read.wait() {
             Ok(stack) => (stack, None),
             Err(e) => {
-                unknown.insert(project.name.clone());
+                unknown.extend(group.iter().map(|p| p.name.clone()));
                 (Stack::default(), Some(e.to_string()))
             }
         };
@@ -106,10 +116,10 @@ pub fn build(
             let (parent, base) = snapshot
                 .entries
                 .iter()
-                .find(|e| e.project == project.name && e.branch == candidate.branch)
+                .find(|e| e.id == candidate.id)
                 .map(|e| (e.parent.clone(), e.base.clone()))
                 .unwrap_or_default();
-            open.insert((project.name.clone(), candidate.branch.clone()));
+            open.insert(candidate.id.clone());
             branches.push(QueueStackBranch {
                 entry: candidate.id.clone(),
                 branch: candidate.branch.clone(),
@@ -119,7 +129,7 @@ pub fn build(
             });
         }
         reply.projects.push(QueueProjectStack {
-            name: project.name.clone(),
+            name: group.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "),
             repo: project.repo.clone(),
             main: project.main.clone(),
             local,
@@ -140,8 +150,7 @@ pub fn build(
             base: entry.base.clone(),
             claimed: entry.claimed.clone(),
             pending_status: entry.pending.map(|s| s.to_string()),
-            open: !entry.branch.is_empty()
-                && open.contains(&(entry.project.clone(), entry.branch.clone())),
+            open: open.contains(&entry.id),
             open_unknown: !entry.branch.is_empty()
                 && !entry.claimed.is_empty()
                 && unknown.contains(&entry.project),
@@ -199,7 +208,7 @@ pub fn build(
     reply
 }
 
-/// One project's stack on its way: a local repo's bounded probe, or a remote
+/// One repo's stack on its way: a local repo's bounded probe, or a remote
 /// repo's list-state answer, which runs no git.
 enum StackRead {
     Probing(Probe<Stack>),
@@ -214,9 +223,7 @@ impl StackRead {
         probes: &ProbeCache,
     ) -> Self {
         let entries: Vec<StackEntry> = snapshot
-            .entries
-            .iter()
-            .filter(|e| e.project == project.name)
+            .entries_in_repo(&project.repo)
             .map(|e| StackEntry {
                 id: e.id.clone(),
                 branch: e.branch.clone(),
@@ -699,6 +706,33 @@ mod tests {
         assert_eq!(unknown(&reply), None, "{reply:?}");
         assert_eq!(reply.projects[0].stack.len(), 1);
         assert!(reply.entries[0].open && !reply.entries[0].open_unknown, "{reply:?}");
+    }
+
+    /// §8: `queue show` lists the stack per repo, so two projects on one repo
+    /// are one row, and each one's entry reads as open from it.
+    #[test]
+    fn two_projects_on_one_repo_show_one_stack() {
+        let repo = seeded_repo();
+        sh_git(repo.path(), &["checkout", "-q", "-b", "feat/two"]);
+        fs::write(repo.path().join("two.txt"), "two\n").unwrap();
+        sh_git(repo.path(), &["add", "."]);
+        sh_git(repo.path(), &["commit", "-q", "-m", "two"]);
+        sh_git(repo.path(), &["checkout", "-q", "main"]);
+        let mut two = started("two", "mirror", "feat/two");
+        two.claimed = "2026-10-02T00:00:00Z".into();
+        let snapshot = snapshot_of(
+            vec![project("softfig", repo.path()), project("mirror", repo.path())],
+            vec![started("one", "softfig", "feat/open"), two],
+        );
+
+        let reply = show(&snapshot, repo.path());
+
+        assert_eq!(reply.projects.len(), 1, "{:?}", reply.projects);
+        assert_eq!(reply.projects[0].name, "softfig, mirror");
+        let branches: Vec<&str> =
+            reply.projects[0].stack.iter().map(|b| b.branch.as_str()).collect();
+        assert_eq!(branches, ["feat/open", "feat/two"]);
+        assert!(reply.entries.iter().all(|e| e.open), "{:?}", reply.entries);
     }
 
     #[test]

@@ -230,7 +230,7 @@ impl QueueToml {
     /// 4. every entry's project exists in the projects table;
     /// 5. at most one normal-lane entry per repo carries `active` or `paused`;
     /// 6. an `active` restack shares its repo with no other `active` entry;
-    /// 7. a project has at most one restack row, whatever its status.
+    /// 7. a repo has at most one restack row, whatever its status.
     ///
     /// Invariant 6 (remote entries never get an opencode member) is not file
     /// state — see the module docs.
@@ -329,11 +329,12 @@ impl QueueToml {
             }
         }
 
-        // 7. One restack row per project: a second enqueue merges into the
-        // live row, and this is the backstop for a hand edit.
+        // 7. One restack row per repo: a second enqueue merges into the live
+        // row, and this is the backstop for a hand edit. Grouped by repo path,
+        // as 5 is, and 4 proved every project is in the table.
         let mut restacked: HashSet<&str> = HashSet::new();
         for e in self.entries.iter().filter(|e| e.kind == EntryKind::Restack) {
-            if !restacked.insert(e.project.as_str()) {
+            if repo_of.get(e.project.as_str()).is_some_and(|repo| !restacked.insert(repo)) {
                 return Err(QueueRefusal::Exists { id: e.id.clone() });
             }
         }
@@ -808,6 +809,22 @@ mod tests {
         )
         .validate(&archive(vec![]))
         .expect("one row each");
+    }
+
+    #[test]
+    fn two_projects_sharing_a_repo_share_the_restack_row() {
+        let mut other = restack("002", EntryStatus::Queued);
+        other.project = "mirror".into();
+        let err = queue(
+            vec![
+                softfig_project(),
+                project("mirror", "~/projects/software-config_garden/codebase/main"),
+            ],
+            vec![restack("001", EntryStatus::Queued), other],
+        )
+        .validate(&archive(vec![]))
+        .unwrap_err();
+        assert_eq!(err, QueueRefusal::Exists { id: "002".into() });
     }
 
     #[test]

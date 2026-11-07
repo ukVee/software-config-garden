@@ -315,6 +315,15 @@ pub enum WalkOutcome {
     NoUnit,
 }
 
+impl V2Snapshot {
+    /// The entries on `repo`, whichever project each belongs to: the stack is
+    /// per repo (§8). Repos compare as the strings the projects record, as
+    /// [`repo_of`]'s other callers and the §3.1 per-repo invariants do.
+    pub fn entries_in_repo<'a>(&'a self, repo: &'a str) -> impl Iterator<Item = &'a EntryView> {
+        self.entries.iter().filter(move |e| repo_of(self, e) == Some(repo))
+    }
+}
+
 /// The repo an entry works on, joined from the snapshot's projects. A
 /// validated snapshot guarantees every entry's project exists (writer
 /// invariant 4); `None` is the defensive, fail-closed case.

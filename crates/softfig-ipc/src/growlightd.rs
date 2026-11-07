@@ -1288,9 +1288,12 @@ pub struct QueueStackBranch {
     pub claimed: String,
 }
 
-/// One project's stack, as [`QueueShowReply`] carries it.
+/// One repo's stack, as [`QueueShowReply`] carries it (§8: the stack is per
+/// repo).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueProjectStack {
+    /// The project naming this repo, or all of them, comma-joined in table
+    /// order. `main` is the first one's.
     pub name: String,
     pub repo: String,
     pub main: String,

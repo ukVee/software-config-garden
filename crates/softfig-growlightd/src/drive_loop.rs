@@ -1009,7 +1009,7 @@ pub trait V2ItemParker: Send + Sync + fmt::Debug {
 /// The seam the loop enqueues an auto-detected §8 restack through (queue-v2-git
 /// slice 003): keeperd's `queue_v2_enqueue_restack({project, stack})` — growlightd
 /// detected a stale stack (read-only git) and keeperd enqueues ONE urgent restack
-/// row for the project (idempotent per project) + generates the full doc. Fail-soft
+/// row for the project's repo (idempotent per repo) + generates the full doc. Fail-soft
 /// in the drive loop: a failed enqueue is logged, never wedges a claim or handoff.
 /// The live impl is [`crate::claim::KeeperdV2RestackEnqueuer`] over the keeperd
 /// socket.
@@ -3861,7 +3861,7 @@ impl DriveLoop {
     /// repos (read-only git) for a stack whose `main` moved under an open
     /// branch, and enqueue one restack per affected repo through the restacker
     /// seam. `project: None` scans every local project (daemon start);
-    /// `Some(p)` scans just `p` (a claim or handshake in that repo). Fail-soft:
+    /// `Some(p)` scans just `p`'s repo (a claim or handshake in it). Fail-soft:
     /// a detection or enqueue error is skipped — the next scan re-detects it,
     /// and a restack row already enqueued is an idempotent no-op in keeperd.
     ///
@@ -3879,12 +3879,18 @@ impl DriveLoop {
             return;
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let want_repo = project.map(|want| {
+            snapshot.projects.iter().find(|p| p.name == want).map(|p| p.repo.as_str())
+        });
         // One bounded probe per repo (V13), all started before any is waited on,
-        // so a boot scan over every project costs one deadline, not one each.
+        // so a boot scan over every project costs one deadline, not one each. The
+        // stack is per repo (§8), so the first project naming a repo speaks for
+        // it, and keeperd merges into a live row that another project holds.
+        let mut scanned = std::collections::HashSet::new();
         let mut probes = Vec::new();
         for proj in &snapshot.projects {
-            if let Some(want) = project
-                && proj.name != want
+            if want_repo.is_some_and(|want| want != Some(proj.repo.as_str()))
+                || !scanned.insert(proj.repo.as_str())
             {
                 continue;
             }
@@ -3894,9 +3900,7 @@ impl DriveLoop {
                 Repo::Remote => continue, // a remote repo never auto-enqueues (§8)
             };
             let entries: Vec<git_stack::RestackEntry> = snapshot
-                .entries
-                .iter()
-                .filter(|e| e.project == proj.name)
+                .entries_in_repo(&proj.repo)
                 .map(|e| git_stack::RestackEntry {
                     id: e.id.clone(),
                     branch: e.branch.clone(),
@@ -3946,7 +3950,7 @@ impl DriveLoop {
     ///
     /// The rows stay due, and the next tick retries, on anything that can still
     /// come right: a git error, a failed write, a worktree mid-rebase, or a live
-    /// restack row in the project. That last one is the drop's case: its child
+    /// restack row on the repo. That last one is the drop's case: its child
     /// keeps a `base` it needs until the rewrite lands, and it contains `main`
     /// beforehand, so a pass now would move that base. The later row's own
     /// completion settles both.
@@ -3968,17 +3972,13 @@ impl DriveLoop {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
-        if snapshot
-            .entries
-            .iter()
-            .any(|e| e.project == project && e.kind == EntryKind::Restack)
-        {
-            return;
-        }
         let Some(proj) = snapshot.projects.iter().find(|p| p.name == project) else {
             let _ = seams.re_recorder.re_record_bases(&[], restacks);
             return;
         };
+        if snapshot.entries_in_repo(&proj.repo).any(|e| e.kind == EntryKind::Restack) {
+            return;
+        }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let repo = Repo::classify(&proj.repo, home.as_deref());
         let repo_path = match &repo {
@@ -3990,9 +3990,7 @@ impl DriveLoop {
             }
         };
         let entries: Vec<git_stack::RestackEntry> = snapshot
-            .entries
-            .iter()
-            .filter(|e| e.project == project)
+            .entries_in_repo(&proj.repo)
             .map(|e| git_stack::RestackEntry {
                 id: e.id.clone(),
                 branch: e.branch.clone(),
@@ -9774,6 +9772,114 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(enq));
         loop_
+    }
+
+    /// [`restack_snapshot`] with a second project on the same repo, whose entry
+    /// `two` is on `branch`, recorded on top of `feat/one`.
+    fn two_project_snapshot(repo: &std::path::Path, base: &str, branch: &str) -> V2Snapshot {
+        let mut snapshot = restack_snapshot(repo, base);
+        snapshot.projects.push(ProjectView {
+            name: "mirror".into(),
+            repo: repo.display().to_string(),
+            main: "main".into(),
+        });
+        let mut two = snapshot.entries[0].clone();
+        two.id = "two".into();
+        two.project = "mirror".into();
+        two.branch = branch.into();
+        two.parent = "one".into();
+        two.claimed = "2026-10-15T00:00Z".into();
+        snapshot.entries.push(two);
+        snapshot
+    }
+
+    fn git_in(repo: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// §8: two projects on one repo are one stack, whichever one the scan
+    /// starts from, so they get one restack that covers both.
+    #[test]
+    fn v2_two_projects_on_one_repo_share_one_restack() {
+        let (dir, base) = stale_stack_repo(false);
+        git_in(dir.path(), &["branch", "feat/two", "feat/one"]);
+        let snapshot = two_project_snapshot(dir.path(), &base, "feat/two");
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+
+        enq.enqueued.lock().unwrap().clear();
+        loop_.scan_restacks(&snapshot, Some("mirror"), &mut blocked);
+        assert_eq!(
+            *enq.enqueued.lock().unwrap(),
+            vec![("softfig".to_string(), 2)],
+            "a scan from the second project is the same stack",
+        );
+    }
+
+    /// A row in the sibling project holds a due re-record back, as one in the
+    /// project itself does: it is the repo's one row, and its doc still needs the
+    /// bases.
+    #[test]
+    fn v2_a_due_re_record_waits_for_a_restack_row_of_a_project_on_the_same_repo() {
+        let (dir, base) = stale_stack_repo(false);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        snapshot.projects.push(ProjectView {
+            name: "mirror".into(),
+            repo: dir.path().display().to_string(),
+            main: "main".into(),
+        });
+        let mut restack = snapshot.entries[0].clone();
+        restack.id = "073".into();
+        restack.kind = EntryKind::Restack;
+        restack.project = "mirror".into();
+        restack.lane = Lane::Urgent;
+        restack.status = EntryStatus::Blocked;
+        restack.branch = String::new();
+        restack.claimed = String::new();
+        snapshot.entries.insert(0, restack);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &["072".to_string()], &mut Vec::new());
+
+        assert!(rec.settled.lock().unwrap().is_empty(), "the live row holds it back");
+    }
+
+    /// The re-record of a restack covers the repo's stack: a branch of the
+    /// sibling project moved with it, so its base moves too.
+    #[test]
+    fn v2_a_re_record_moves_the_base_of_a_project_on_the_same_repo() {
+        let (dir, base) = stale_stack_repo(false);
+        let repo = dir.path();
+        git_in(repo, &["checkout", "-q", "-b", "feat/two"]);
+        std::fs::write(repo.join("two.txt"), "two\n").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "two"]);
+        git_in(repo, &["checkout", "-q", "main"]);
+        let mut snapshot = two_project_snapshot(repo, &base, "feat/two");
+        snapshot.entries[1].parent = String::new();
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &["072".to_string()], &mut Vec::new());
+
+        let recorded = rec.recorded.lock().unwrap();
+        assert!(recorded.iter().any(|(id, _)| id == "two"), "{recorded:?}");
     }
 
     /// V1: a stale stack whose branch tracks an upstream is NOT auto-enqueued —

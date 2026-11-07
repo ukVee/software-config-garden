@@ -45,8 +45,8 @@ pub struct FirstClaim {
 /// as one probe on a worker thread under `probes` (V13): bounded by a deadline,
 /// sharing this tick's answers, and backed off after a timeout.
 ///
-/// The stack candidates are the snapshot's live entries in the same project,
-/// in claim order. An **urgent** entry skips the stack entirely — it branches
+/// The stack candidates are the snapshot's live entries on the same repo,
+/// whichever project names it, in claim order. An **urgent** entry skips the stack entirely — it branches
 /// from `main`, so its base never depends on it and the probes are saved. A
 /// sibling whose branch is not cut yet is not a candidate (see
 /// [`git_stack::stack_candidates`]), so it never blocks a normal claim either.
@@ -66,9 +66,7 @@ pub fn first_claim(
     };
     let repo = Repo::classify(&project.repo, home);
     let stack_entries: Vec<StackEntry> = snapshot
-        .entries
-        .iter()
-        .filter(|e| e.project == entry.project)
+        .entries_in_repo(&project.repo)
         .map(|e| StackEntry {
             id: e.id.clone(),
             branch: e.branch.clone(),
@@ -230,6 +228,40 @@ mod tests {
         assert_eq!(fc.branch, "feat/three");
         assert_eq!(fc.parent, "two", "cut from the newest-claimed candidate");
         assert_eq!(fc.base, two_tip, "local base is the cut-from commit");
+    }
+
+    /// §8: the stack is per repo. A project sharing the repo is in it, and one
+    /// on another repo isn't, however new its claim.
+    #[test]
+    fn a_first_claim_stacks_across_the_projects_that_share_its_repo() {
+        let (dir, _main) = seeded_repo();
+        let (elsewhere, _) = seeded_repo();
+        let one_tip = rev_parse(dir.path(), "feat/one");
+        let repo = dir.path().display().to_string();
+        let mut one =
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z");
+        one.project = "mirror".into();
+        let mut other =
+            entry("two", "feat/two", Lane::Normal, EntryStatus::Blocked, "2026-10-02T00:00:00Z");
+        other.project = "elsewhere".into();
+        let project = |name: &str, repo: &str| ProjectView {
+            name: name.into(),
+            repo: repo.into(),
+            main: "main".into(),
+        };
+        let snapshot = snap(
+            vec![
+                project("softfig", &repo),
+                project("mirror", &repo),
+                project("elsewhere", &elsewhere.path().display().to_string()),
+            ],
+            vec![one, other, entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, "")],
+        );
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one", "the sibling project's branch is the stack top");
+        assert_eq!(fc.base, one_tip);
     }
 
     /// Owner ruling (V19): an urgent branch lands alone, so the newest live

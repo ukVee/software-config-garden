@@ -399,6 +399,21 @@ impl QueueToml {
         }
     }
 
+    /// The repo `project` names, `None` for a project not in the table.
+    pub fn repo_of(&self, project: &str) -> Option<&str> {
+        self.projects
+            .iter()
+            .find(|p| p.name == project)
+            .map(|p| p.repo.as_str())
+    }
+
+    /// Whether two projects work on one repo, so they share one stack and one
+    /// restack row (§8). Repos compare as the strings the projects record, as the
+    /// §3.1 per-repo invariants do.
+    pub fn same_repo(&self, a: &str, b: &str) -> bool {
+        a == b || (self.repo_of(a).is_some() && self.repo_of(a) == self.repo_of(b))
+    }
+
     /// Parse fail-closed: malformed TOML, a missing or unknown field, and any
     /// `schema != 1` are all typed errors — never a partial read.
     pub fn parse(raw: &str) -> Result<Self, QueueV2Error> {

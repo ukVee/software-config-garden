@@ -498,8 +498,8 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
                             names it, running for an active entry; if a stacked branch was cut from \
-                            it, one restack is enqueued per child project, or merged into that \
-                            project's live one, and the drop is refused started while a session holds \
+                            it, one restack is enqueued per child repo, or merged into that \
+                            repo's live one, and the drop is refused started while a session holds \
                             that restack. A HUMAN verb: a fleet \
                             member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
                             from keeperd.",

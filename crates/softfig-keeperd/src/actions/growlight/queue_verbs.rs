@@ -590,12 +590,13 @@ struct RestackStaged {
     number: Option<u32>,
 }
 
-/// The project's live restack row: at most one, whatever its status (§3.1).
+/// The live restack row of `project`'s repo: at most one, whatever its status
+/// (§3.1), and it may belong to another project on that repo.
 fn live_restack<'q>(queue: &'q QueueToml, project: &str) -> Option<&'q Entry> {
     queue
         .entries
         .iter()
-        .find(|e| e.kind == EntryKind::Restack && e.project == project)
+        .find(|e| e.kind == EntryKind::Restack && queue.same_repo(&e.project, project))
 }
 
 /// Whether a session holds this row's doc (§8): it read the steps at its start
@@ -607,13 +608,13 @@ fn session_holds_doc(restack: &Entry) -> bool {
 
 /// The restack-creation core (§8), shared by `add_restack` (slice 005),
 /// `queue_drop`'s drop→restack path (slice 006), and the daemon's auto-enqueue
-/// (`queue_v2_enqueue_restack`, slice 003), so one project never has two rows.
+/// (`queue_v2_enqueue_restack`, slice 003), so one repo never has two rows.
 /// With no live row, build the urgent no-branch row for `project` at the urgent
 /// lane's back, numbered `*next` (the caller reads the high water, so one verb
 /// enqueuing several restacks hands out distinct numbers before any `.seq`
 /// write lands). With a live row, merge `stack` into its doc
-/// ([`merge_into_live_restack`]), or refuse `started` if a session holds that
-/// doc. The doc write is staged, not made (so a dry run can compute the row
+/// ([`merge_into_live_restack`]), which stays under that row's own project, or
+/// refuse `started` if a session holds that doc. The doc write is staged, not made (so a dry run can compute the row
 /// without writing anything), rendered from `stack` (the §8 full template when
 /// non-empty; the caller passes the git-resolved stack, or `&[]` when it has
 /// none). The caller proves the project exists before calling — its entry rows
@@ -626,13 +627,14 @@ fn restack_core(
     next: &mut u32,
     stack: &[RestackBranch],
 ) -> Result<RestackStaged, (ErrorKind, String)> {
-    let main = project_main(queue, project);
     if let Some(live) = live_restack(queue, project) {
         if session_holds_doc(live) {
             return Err(refuse(QueueRefusal::Started { id: live.id.clone() }));
         }
-        return merge_into_live_restack(wt, &live.id, archive, project, &main, stack);
+        let main = project_main(queue, &live.project);
+        return merge_into_live_restack(wt, &live.id, archive, &live.project, &main, stack);
     }
+    let main = project_main(queue, project);
 
     let number = *next;
     let tasks_dir = paths::tasks_dir();
@@ -833,10 +835,11 @@ fn restack_extras(wt: &WorkTree, restacks: &[RestackStaged]) -> Vec<FileWrite> {
     extras
 }
 
-/// The stack of `project` as the list records it (§8's remote proxy): every
-/// live entry with a branch that has been claimed, in claim order, each with
-/// its recorded `parent` and `base`, and `onto` from [`onto_of_parent`]. Empty
-/// when nothing of the project has been claimed. keeperd runs no git, so a
+/// The stack of `project`'s repo as the list records it (§8's remote proxy):
+/// every live entry on that repo with a branch that has been claimed, whichever
+/// project it belongs to, in claim order, each with its recorded `parent` and
+/// `base`, and `onto` from [`onto_of_parent`]. Empty when nothing on the repo has
+/// been claimed. keeperd runs no git, so a
 /// branch already merged or deleted is still here: the doc's merged rule
 /// ([`restack_doc`]) gives it no step when the session reaches it.
 fn stack_from_list(
@@ -847,7 +850,9 @@ fn stack_from_list(
     let mut started: Vec<&Entry> = queue
         .entries
         .iter()
-        .filter(|e| e.project == project && !e.branch.is_empty() && !e.claimed.is_empty())
+        .filter(|e| {
+            queue.same_repo(&e.project, project) && !e.branch.is_empty() && !e.claimed.is_empty()
+        })
         .collect();
     started.sort_by(|a, b| a.claimed.cmp(&b.claimed));
     started
@@ -1016,7 +1021,7 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
 /// the daemon detected a stale stack (§8, read-only git) and enqueues ONE urgent
 /// restack row for `project`, rendering the full restack doc from `stack` (each
 /// branch's `parent`/`base` and the resolved `--onto`, the steps, the gate).
-/// A live row takes the stack instead ([`restack_core`]). Idempotent per project:
+/// A live row takes the stack instead ([`restack_core`]). Idempotent per repo:
 /// `id`/`path` are `None` and nothing commits when the live row's doc already
 /// carries the stack, or a session holds that doc, where detection is
 /// level-triggered and finds the stack again once the row ends. One commit,
@@ -1671,7 +1676,7 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     }
 
     // The drop→restack path (§8, queue-v2-git slices 004 + 006): the live
-    // subtree cut from the dropped entry, one restack per distinct project.
+    // subtree cut from the dropped entry, one restack per distinct repo.
     // The direct children move off the abandoned commits (`git rebase --onto
     // <new parent's branch> <dropped branch> <child>`) and are re-parented in
     // this same write, so later rewrites of the real parent are still detected
@@ -1731,24 +1736,26 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // Dry runs compute the restack rows too (the would-be view shows them)
     // but stage no docs. Numbers come from one high-water read plus the
     // core's own bump, so several restacks in this one verb get distinct
-    // numbers even before any `.seq` write lands. A project with a live row
+    // numbers even before any `.seq` write lands. A repo with a live row
     // merges into it, and a session holding that row's doc refuses the drop:
     // the steps below exist only in this write, so they can't be left out.
     let restacks: Vec<RestackStaged> = {
         let wt = WorkTree::new(daemon, &inner);
-        // Group the stack per project (project order = first-branch order,
-        // branch order = bottom first, siblings in list order — the claim
-        // order §8).
-        let mut by_project: Vec<(String, Vec<RestackBranch>)> = Vec::new();
+        // Group the stack per repo, under the first project seen on it (repo
+        // order = first-branch order, branch order = bottom first, siblings in
+        // list order — the claim order §8).
+        let mut by_repo: Vec<(String, Vec<RestackBranch>)> = Vec::new();
         for (project, rb) in subtree {
-            if let Some((_, stack)) = by_project.iter_mut().find(|(p, _)| *p == project) {
+            if let Some((_, stack)) =
+                by_repo.iter_mut().find(|(p, _)| queue.same_repo(p, &project))
+            {
                 stack.push(rb);
             } else {
-                by_project.push((project, vec![rb]));
+                by_repo.push((project, vec![rb]));
             }
         }
         let mut next = numbering::next_number(&wt, &paths::tasks_dir());
-        by_project
+        by_repo
             .iter()
             .map(|(p, stack)| restack_core(&wt, &mut queue, &archive, p, &mut next, stack))
             .collect::<Result<_, _>>()?
@@ -3268,6 +3275,70 @@ mod tests {
         drop(inner);
     }
 
+    /// §8: the stack is per repo, so a second project on the repo merges into
+    /// the row that exists, and the doc stays that row's, under its own project.
+    #[test]
+    fn enqueue_restack_is_one_row_for_two_projects_on_one_repo() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_project(&daemon, "mirror", "~/p");
+
+        let first = enqueue_restack(&daemon, "softfig", vec![rb("feat/one", "", "abc123", "main")])
+            .expect("first");
+        assert_eq!(first.id.as_deref(), Some("001"));
+        let wider = vec![
+            rb("feat/one", "", "abc123", "main"),
+            rb("feat/two", "one", "def456", "feat/one"),
+        ];
+        let second = enqueue_restack(&daemon, "mirror", wider).expect("second");
+        assert_eq!(second.id.as_deref(), Some("001"), "it merges into the live row");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert_eq!(qs.queue.model.entries.len(), 1, "one restack row for the repo");
+        assert_eq!(qs.queue.model.entries[0].project, "softfig");
+        assert!(!wt.exists("growlight/backlog/tasks/002-restack-mirror.md"));
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(doc.starts_with("# Restack softfig"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto feat/one def456 feat/two`"), "{doc}");
+    }
+
+    /// A hand-enqueued restack names one project and renders its repo's stack,
+    /// so it can't rebase one project's branches out from under the other's.
+    #[test]
+    fn a_human_enqueued_restack_lists_every_project_on_the_repo() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut one = entry("one");
+        one.claimed = "2026-10-11T12:00:00Z".to_string();
+        one.base = "main-tip".to_string();
+        let mut two = entry("two");
+        two.project = "mirror".to_string();
+        two.parent = "one".to_string();
+        two.claimed = "2026-10-12T12:00:00Z".to_string();
+        two.base = "one-tip".to_string();
+        let mirror = Project { name: "mirror".to_string(), ..project() };
+        seed_queue(&daemon, vec![project(), mirror], vec![one, two], None);
+
+        add_entry(&daemon, restack_args("mirror", serde_json::json!({}))).expect("restack");
+        add_entry(&daemon, restack_args("softfig", serde_json::json!({}))).expect("second");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let restacks = qs.queue.model.entries.iter().filter(|e| e.kind == EntryKind::Restack);
+        assert_eq!(restacks.count(), 1, "one row for the repo");
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-mirror.md")
+            .expect("restack doc");
+        assert!(doc.contains("- `git rebase --onto main main-tip feat/one`"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto feat/one one-tip feat/two`"), "{doc}");
+    }
+
     #[test]
     fn enqueue_restack_refuses_an_unknown_project() {
         let garden = tempfile::tempdir().unwrap();
@@ -4229,7 +4300,7 @@ mod tests {
         let wt = WorkTree::new(&daemon, &inner);
         let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
         let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, ["001", "b", "c"], "exactly one restack per project");
+        assert_eq!(ids, ["001", "b", "c"], "exactly one restack for the repo");
         assert!(!wt.exists("growlight/backlog/tasks/002-restack-softfig.md"));
         // Both children's --onto steps ride the one restack doc, in list order.
         let doc = wt
@@ -4243,6 +4314,34 @@ mod tests {
             doc.contains("- `git rebase --onto main feat/a feat/c`"),
             "{doc}"
         );
+    }
+
+    #[test]
+    fn queue_drop_writes_one_restack_for_children_of_two_projects_on_one_repo() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a");
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "parent-commit".to_string();
+        let mut b = entry("b");
+        b.parent = "a".to_string();
+        let mut c = entry("c");
+        c.project = "mirror".to_string();
+        c.parent = "a".to_string();
+        let mirror = Project { name: "mirror".to_string(), ..project() };
+        seed_queue(&daemon, vec![project(), mirror], vec![a, b, c], None);
+
+        drop_entry(&daemon, serde_json::json!({ "id": "a", "reason": "gone" })).expect("drop");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["001", "b", "c"], "one restack for the repo");
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(doc.contains("- `git rebase --onto main feat/a feat/b`"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto main feat/a feat/c`"), "{doc}");
     }
 
     #[test]
