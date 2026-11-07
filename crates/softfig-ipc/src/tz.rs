@@ -165,6 +165,11 @@ impl Zone {
         if h.typecnt == 0 {
             return Err(bad("no local time types"));
         }
+        // The counts come off the wire: size the tables only once the data
+        // block they describe is known to fit in what is left of the file.
+        if h.block_len(time_size) > bytes.len() - r.at {
+            return Err(bad("header counts exceed the file"));
+        }
         let mut transitions = Vec::with_capacity(h.timecnt);
         for _ in 0..h.timecnt {
             let t = if time_size == 8 {
@@ -813,6 +818,26 @@ mod tests {
         assert!(Zone::from_tzif_bytes("x", &bad_index).is_err());
         let descending = tzif_v2(&[(10, 0), (5, 0)], &[(0, false)], "UTC0");
         assert!(Zone::from_tzif_bytes("x", &descending).is_err());
+    }
+
+    #[test]
+    fn a_header_whose_counts_outrun_the_file_is_an_error_not_an_allocation() {
+        // A v1 header: magic, version 0, 15 reserved bytes, then the six
+        // counts (isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt).
+        let header = |counts: [u32; 6]| {
+            let mut b = b"TZif\0".to_vec();
+            b.extend([0u8; 15]);
+            for c in counts {
+                b.extend(c.to_be_bytes());
+            }
+            b
+        };
+        let all_zero = header([0; 6]);
+        assert!(Zone::from_tzif_bytes("x", &all_zero).is_err(), "no local time types");
+        let huge_times = header([0, 0, 0, u32::MAX, 1, 0]);
+        assert!(Zone::from_tzif_bytes("x", &huge_times).is_err());
+        let huge_types = header([0, 0, 0, 0, u32::MAX, 0]);
+        assert!(Zone::from_tzif_bytes("x", &huge_types).is_err());
     }
 
     #[test]
