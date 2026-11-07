@@ -766,6 +766,10 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
             return FleetConfig::disabled();
         }
     };
+    if let Some(refusal) = v2_protocol_refusal(&cfg, garden_root) {
+        eprintln!("softfig-growlightd: {refusal} ({})", path.display());
+        return FleetConfig::disabled();
+    }
     // Slot presence (claude-login-switcher slices 003, 007): a member whose
     // profile_pool names a slot with no directory could never spawn, so it is
     // left out of the roster at load, by name. The rest of the fleet arms.
@@ -775,6 +779,23 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
         eprintln!("softfig-growlightd: {line} ({})", path.display());
     }
     cfg
+}
+
+/// Why an armed `queue = "v2"` fleet must not start: its members boot from
+/// `protocol-fleet-v2.md`, and without that file they would run with no operating
+/// contract. Names the file. `None` when nothing is armed, under `legacy`, or when
+/// the file is there.
+fn v2_protocol_refusal(cfg: &FleetConfig, garden_root: &Path) -> Option<String> {
+    if !cfg.enabled || cfg.queue != QueueMode::V2 {
+        return None;
+    }
+    let protocol = fleet_protocol(garden_root, cfg.queue);
+    (!protocol.is_file()).then(|| {
+        format!(
+            "queue = \"v2\" needs {}, which is missing; fleet stays OFF",
+            protocol.display()
+        )
+    })
 }
 
 /// Assemble the live [`DriveLoop`] — **iff `fleet.enabled`**. Gate off ⇒ `None`
@@ -1618,6 +1639,31 @@ agent = "reviewer"
             FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"legacy\"\n")
                 .unwrap();
         assert_eq!(legacy.queue, QueueMode::Legacy);
+    }
+
+    #[test]
+    fn an_armed_v2_fleet_with_no_v2_protocol_stays_off_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "fleet_enabled = true\nqueue = \"v2\"\n");
+
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n").unwrap();
+        let refusal = v2_protocol_refusal(&cfg, dir.path()).expect("the file is missing");
+        assert!(refusal.contains("growlight/protocol-fleet-v2.md"), "{refusal}");
+        assert!(!load_fleet_config(dir.path()).enabled, "fail closed");
+
+        let pillar = dir.path().join(PILLAR);
+        std::fs::create_dir_all(&pillar).unwrap();
+        std::fs::write(pillar.join(FLEET_PROTOCOL_V2_FILE), "# protocol\n").unwrap();
+        assert!(load_fleet_config(dir.path()).enabled, "the file is there");
+    }
+
+    #[test]
+    fn the_v2_protocol_is_only_required_of_an_armed_v2_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        for toml in ["fleet_enabled = true\n", "fleet_enabled = false\nqueue = \"v2\"\n"] {
+            let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+            assert_eq!(v2_protocol_refusal(&cfg, dir.path()), None, "{toml}");
+        }
     }
 
     #[test]
