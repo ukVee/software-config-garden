@@ -445,6 +445,110 @@ mod tests {
         assert!(matches!(human, Response::Ok { .. }), "{human:?}");
     }
 
+    /// Review 056 F6 (report 121): a fleet member's write under `config/` is
+    /// refused `member_not_allowed` through every verb that reaches the
+    /// worktree — `replace_file`, `patch_file`, `edit_section`, `unlink` and
+    /// `batch` — and the file is left as the human wrote it. The same calls
+    /// without the stamp land, and a member's write elsewhere still works.
+    #[test]
+    fn a_members_write_under_config_is_refused_through_every_verb() {
+        use softfig_ipc::op;
+        const TOML: &str = "config/growlight.toml";
+        const DOC: &str = "config/README.md";
+        let (_g, daemon) = unlocked();
+        let human = |op: &str, args: serde_json::Value| dispatch(&daemon, Request::new(op, args));
+        let member = |op: &str, args: serde_json::Value| {
+            dispatch(&daemon, Request::new(op, args).with_member(Some("c")))
+        };
+        let read = |rel: &str| {
+            let inner = daemon.inner.lock().unwrap();
+            WorkTree::new(&daemon, &inner).read_to_string(rel)
+        };
+        let seed = "[schedule]\nenabled = true\nwindows = [\"23:00-07:00\"]\n";
+        let widened = seed.replace("23:00-07:00", "00:00-00:00");
+        let ok = |resp: Response| assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        ok(human(op::REPLACE_FILE, serde_json::json!({ "path": TOML, "content": seed })));
+        ok(human(op::REPLACE_FILE, serde_json::json!({ "path": DOC, "content": "# cfg\n\n## a\n\nbody\n" })));
+
+        let patch = serde_json::json!({ "path": TOML, "old": "23:00-07:00", "new": "00:00-00:00" });
+        let attempts = [
+            ("replace_file", member(op::REPLACE_FILE, serde_json::json!({ "path": TOML, "content": widened }))),
+            ("patch_file", member(op::PATCH_FILE, patch.clone())),
+            (
+                "edit_section",
+                member(op::EDIT_SECTION, serde_json::json!({ "path": DOC, "heading": "a", "body": "x\n" })),
+            ),
+            ("unlink", member(op::UNLINK, serde_json::json!({ "path": TOML }))),
+            (
+                "batch",
+                member(
+                    op::BATCH,
+                    serde_json::json!({ "ops": [{ "op": "patch_file", "args": patch.clone() }] }),
+                ),
+            ),
+            (
+                "replace_file creating",
+                member(op::REPLACE_FILE, serde_json::json!({ "path": "config/pricing.toml", "content": "x = 1\n" })),
+            ),
+        ];
+        for (verb, resp) in attempts {
+            let (_, msg) = err_of(resp);
+            // `batch` wraps its sub-op's refusal ("batch op[0] … failed: …").
+            assert!(msg.contains("member_not_allowed:") && msg.contains("member c"), "{verb}: {msg}");
+        }
+        assert_eq!(read(TOML).as_deref(), Some(seed), "every refusal left the config untouched");
+        assert_eq!(read(DOC).as_deref(), Some("# cfg\n\n## a\n\nbody\n"));
+        assert_eq!(read("config/pricing.toml"), None, "a refused create wrote nothing");
+
+        // A refused batch op never follows an op that already landed.
+        let mixed = serde_json::json!({ "ops": [
+            { "op": "patch_file", "args": { "path": "projects/p/notes/001-x.md", "old": "a", "new": "b" } },
+            { "op": "patch_file", "args": patch.clone() },
+        ] });
+        ok(human(op::REPLACE_FILE, serde_json::json!({ "path": "projects/p/notes/001-x.md", "content": "a\n" })));
+        let (_, msg) = err_of(member(op::BATCH, mixed));
+        assert!(msg.contains("member_not_allowed:"), "{msg}");
+        assert_eq!(read("projects/p/notes/001-x.md").as_deref(), Some("a\n"), "the whole batch refused");
+
+        // The same calls without the stamp are a human's, and land.
+        ok(human(op::PATCH_FILE, patch));
+        assert_eq!(read(TOML).as_deref(), Some(widened.as_str()));
+        ok(human(op::EDIT_SECTION, serde_json::json!({ "path": DOC, "heading": "a", "body": "x\n" })));
+        ok(human(op::UNLINK, serde_json::json!({ "path": TOML })));
+    }
+
+    /// The other half of the config guard: a member's write to a `notes/` path
+    /// still works, and leaves `config/growlight.toml` byte-for-byte alone.
+    #[test]
+    fn a_members_notes_write_still_lands_and_config_is_untouched() {
+        use softfig_ipc::op;
+        let (_g, daemon) = unlocked();
+        let seed = "[schedule]\nenabled = true\n";
+        let resp = dispatch(
+            &daemon,
+            Request::new(op::REPLACE_FILE, serde_json::json!({ "path": "config/growlight.toml", "content": seed })),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let member = |op: &str, args: serde_json::Value| {
+            dispatch(&daemon, Request::new(op, args).with_member(Some("c")))
+        };
+        let resp = member(
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": "projects/p/notes/001-x.md", "content": "# note\n" }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let resp = member(
+            op::BATCH,
+            serde_json::json!({ "ops": [{ "op": "patch_file", "args":
+                { "path": "projects/p/notes/001-x.md", "old": "note", "new": "noted" } }] }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert_eq!(wt.read_to_string("projects/p/notes/001-x.md").as_deref(), Some("# noted\n"));
+        assert_eq!(wt.read_to_string("config/growlight.toml").as_deref(), Some(seed));
+    }
+
     /// A member's `slice_insert` is relayed to growlightd as a member call
     /// around the human verb's args (growlightd holds it to the member's own
     /// entry); a human's is served by keeperd as before, never relayed.

@@ -156,6 +156,9 @@ impl<'a> WorkTree<'a> {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
+        if spans_config(rel) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "removes")));
+        }
         let scope = if spans_backlog(rel) {
             super::growlight::paths::backlog_dir()
         } else if is_backlog_rel(rel) {
@@ -189,6 +192,9 @@ impl<'a> WorkTree<'a> {
             return Ok(());
         };
         self.guard_member_removal(from)?;
+        if is_config_rel(to) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, to, "renames onto")));
+        }
         if (is_backlog_rel(to) || spans_backlog(to))
             && let Some((doc, text)) = self.first_reserved_doc(from) {
                 let landing = match doc.strip_prefix(from) {
@@ -473,6 +479,9 @@ fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes:
     };
     let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
     let (old, new) = (text(old), text(new));
+    if is_config_rel(rel) {
+        return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "writes")));
+    }
     if bytes == Bytes::Caller
         && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
     {
@@ -502,6 +511,38 @@ fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether canonical `rel` lies under the garden's `config/` tree — the
+/// daemons' own settings (`growlight.toml`, `keeper.toml`, `pricing.toml`,
+/// `peers.toml`, `deploy.toml`).
+fn is_config_rel(rel: &str) -> bool {
+    rel.strip_prefix(crate::keeper_toml::CONFIG_DIR)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether `rel` is `config/`, something under it, or the garden root:
+/// removing it removes (part of) the config tree.
+fn spans_config(rel: &str) -> bool {
+    rel.is_empty() || is_config_rel(rel)
+}
+
+/// Review 056 F6 (report 121): a fleet member may not change the daemons'
+/// settings. `config/growlight.toml` is the fleet's admission control — the
+/// `[schedule]` windows, the reserve, the build caps — and growlightd reads it
+/// at its next start, so a member's `patch_file` there would widen its own
+/// window. `folder-grants` is not the general fix (its spec excludes garden
+/// writes and leaves claude members advisory), so keeperd refuses it at the
+/// write. This does not confine a member's shell, which can still write the
+/// mount directly (spec-growlight-queue §6.7). The refusal text leads with the
+/// wire code, `member_not_allowed`.
+fn member_config_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {rel}, and fleet member {member} may not change anything \
+         under config/ — growlightd and keeperd read their settings from there, so a member's \
+         edit would be its own admission control. The human edits config/; if a setting is \
+         wrong, file_report it or post_message @human. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// The inline `<vault id="…">…</vault>` regions in `text` at repo-relative
@@ -1242,6 +1283,49 @@ Example:
             .expect("the prose around the region is the member's");
         wt.write_derived(host, table("done").replace("prose", "edited prose").as_bytes())
             .expect("the daemon's re-derivation of the region");
+    }
+
+    /// Review 056 F6 (report 121): a member may not write, remove, or rename
+    /// onto anything under `config/` (nor remove the tree above it), by any
+    /// spelling of the path; a human may. The refusal names the file.
+    #[test]
+    fn a_member_may_not_change_config() {
+        assert!(is_config_rel("config/growlight.toml"));
+        assert!(is_config_rel("config/source/dots/x"));
+        assert!(is_config_rel("config"));
+        assert!(!is_config_rel("configs/x"), "a sibling that merely shares the prefix");
+        assert!(!is_config_rel("projects/p/config/x"), "only the garden's own config/");
+        assert!(spans_config("") && spans_config("config") && !spans_config("projects"));
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let toml = "config/growlight.toml";
+        wt.write(toml, b"[schedule]\nenabled = true\n").unwrap();
+        wt.write("projects/p/notes/001-x.md", b"# n\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+
+        let err = wt.write(toml, b"[schedule]\nenabled = false\n").unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains(toml), "{err:?}");
+        assert!(wt.write("config/pricing.toml", b"x = 1\n").is_err(), "creating one too");
+        assert!(wt.write("./config//growlight.toml", b"x\n").is_err(), "an alias of it");
+        assert!(wt.check_write_bytes(toml, b"x\n").is_err(), "the pre-check agrees");
+        assert!(wt.check_write_bytes_over(toml, None, b"x\n").is_err(), "so does the batch's");
+        assert!(wt.write_derived(toml, b"x\n").is_err(), "a derived write for a member too");
+        assert!(wt.remove(toml).is_err(), "removing the file");
+        assert!(wt.remove("config").is_err(), "removing the tree");
+        assert!(wt.remove("").is_err(), "removing the garden root");
+        assert!(wt.rename(toml, "projects/p/notes/002-y.md").is_err(), "renaming it away");
+        assert!(wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").is_err(), "renaming onto config/");
+        assert_eq!(wt.read_to_string(toml).as_deref(), Some("[schedule]\nenabled = true\n"));
+        assert!(!wt.exists("config/deploy.toml") && wt.exists("projects/p/notes/001-x.md"));
+        wt.write("projects/p/notes/001-x.md", b"# edited\n").expect("a notes/ write still works");
+
+        drop(_member);
+        wt.write(toml, b"[schedule]\nenabled = false\n").expect("a human's write");
+        wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").expect("a human's rename");
+        wt.remove("config/deploy.toml").expect("a human's removal");
     }
 
     /// Review 042 G74-3: every spelling of a garden path canonicalises to one,
