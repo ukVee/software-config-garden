@@ -420,17 +420,15 @@ impl ScheduleVerdict {
     }
 
     /// How far the schedule admits `agent` this tick, given the config's
-    /// `tasks` switch (§3.5). A member held only because no window is open to
-    /// it — [`HoldReason::OutsideWindow`] or [`HoldReason::NotInWindow`] — may
-    /// still take an item whose `> Not before:` has arrived when `tasks` is
-    /// on: the item opens its own window, to any member. A reserve hold or an
-    /// unreadable zone holds outright.
+    /// `tasks` switch (§3.5). A member held only because no window is open —
+    /// [`HoldReason::OutsideWindow`] — may still take an item whose
+    /// `> Not before:` has arrived when `tasks` is on: the item opens its own
+    /// window. A member a window's filter excludes ([`HoldReason::NotInWindow`]),
+    /// a reserve hold and an unreadable zone hold outright (ruling 3).
     pub fn admission(&self, agent: &str, tasks: bool) -> Admission {
         match self.held.get(agent) {
             None => Admission::Open,
-            Some(HoldReason::OutsideWindow | HoldReason::NotInWindow) if tasks => {
-                Admission::TimedOnly
-            }
+            Some(HoldReason::OutsideWindow) if tasks => Admission::TimedOnly,
             Some(&reason) => Admission::Held(reason),
         }
     }
@@ -823,7 +821,11 @@ mod tests {
         };
         assert_eq!(verdict.admission("free", true), Admission::Open);
         assert_eq!(verdict.admission("out", true), Admission::TimedOnly);
-        assert_eq!(verdict.admission("filtered", true), Admission::TimedOnly);
+        assert_eq!(
+            verdict.admission("filtered", true),
+            Admission::Held(HoldReason::NotInWindow),
+            "a filter-excluded member takes no timed item while a window is open"
+        );
         assert_eq!(verdict.admission("out", false), Admission::Held(HoldReason::OutsideWindow));
         assert_eq!(verdict.admission("reserve", true), Admission::Held(HoldReason::Reserve));
         assert_eq!(verdict.admission("zone", true), Admission::Held(HoldReason::ZoneUnreadable));
@@ -1177,6 +1179,19 @@ mod tests {
             let w = window(backends, ids);
             assert_eq!((w.matches(&a), w.matches(&b)), want, "{backends:?} {ids:?}");
         }
+    }
+
+    #[test]
+    fn a_filter_excluded_member_takes_no_due_timed_item_while_its_window_is_open() {
+        let cfg = schedule("[[schedule.window]]\nstart = \"10:00\"\nend = \"12:00\"\nbackends = [\"claude\"]\n");
+        let day = |h, mi| at(2026, 10, 28, h, mi, EDT);
+        let v = eval(&cfg, day(10, 30));
+        assert_eq!(v.admission("a", true), Admission::Open);
+        assert_eq!(v.admission("b", true), Admission::Held(HoldReason::NotInWindow));
+        // With every window closed the same member is held only by the clock,
+        // so a due item still opens its own window.
+        let v = eval(&cfg, day(14, 0));
+        assert_eq!(v.admission("b", true), Admission::TimedOnly);
     }
 
     #[test]
