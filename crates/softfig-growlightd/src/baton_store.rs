@@ -721,6 +721,29 @@ mod tests {
         assert_eq!(s.baton_slice("a", "t1"), None, "a task baton names no slice");
     }
 
+    /// A first spawn is attributed to the slice the baton on disk names, read
+    /// before the claim's seed runs. A kept baton (same item) carries its slice
+    /// through the seed; a fresh seed names none, so a first spawn on it is
+    /// unattributed rather than guessed.
+    #[test]
+    fn a_first_spawn_reads_the_slice_a_kept_baton_names_and_never_guesses_for_a_fresh_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        std::fs::create_dir_all(s.baton_path("a").parent().unwrap()).unwrap();
+        std::fs::write(s.baton_path("a"), "---\nstatus: IN_PROGRESS\nitem: t1\nslice: \"004\"\n---\n")
+            .unwrap();
+
+        // Same item: the seed keeps the baton, and the slice read before it is the baton's.
+        assert_eq!(s.baton_slice("a", "t1").as_deref(), Some("004"));
+        assert!(matches!(s.seed("a", "default", "t1"), Ok(SeedOutcome::Kept { .. })));
+        assert_eq!(s.baton_slice("a", "t1").as_deref(), Some("004"), "kept through the seed");
+
+        // Another item: the old baton's slice is not this item's, and the fresh seed names none.
+        assert_eq!(s.baton_slice("a", "t2"), None);
+        assert!(matches!(s.seed("a", "default", "t2"), Ok(SeedOutcome::Fresh)));
+        assert_eq!(s.baton_slice("a", "t2"), None, "a fresh seed names no slice");
+    }
+
     /// Review 043 G64-8: a second warning replaces the first in place — one
     /// current section, the rest of the baton byte for byte — and the baton
     /// parses exactly as it did before either.

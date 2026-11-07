@@ -1200,6 +1200,10 @@ pub struct HeldPart {
 pub struct TickReport {
     /// Agents started this tick, with their scheduler assignment.
     pub started: Vec<Assignment>,
+    /// The subset of `started` whose first session's token-telemetry rows carry
+    /// no `slice_id`: the seed baton named no slice (a fresh seed never does),
+    /// so growlightd attributes nothing rather than guess one.
+    pub unattributed: Vec<Assignment>,
     /// Agents started this tick under queue v2, with their `(entry, unit)`
     /// assignment and the resolved model the spawn carried (slice 006). Empty on
     /// every legacy tick.
@@ -3135,9 +3139,11 @@ impl DriveLoop {
                 let member_budget = budget_for(agent);
                 // The slice comes from the member's baton only while that baton
                 // is on this part: a kept baton carries it, a fresh seed has none.
+                let slice_id = self.baton.baton_slice(agent, &part);
+                let slice_known = slice_id.is_some();
                 let tags = TelemetryTags {
                     item_id: Some(part.clone()),
-                    slice_id: self.baton.baton_slice(agent, &part),
+                    slice_id,
                     queue: Some(queue.clone()),
                 };
                 let outcome = self.supervisor.start_claiming(
@@ -3168,11 +3174,15 @@ impl DriveLoop {
                         // is overwritten only on its next fresh start.
                         self.assignments
                             .insert(agent.clone(), (queue.clone(), part.clone()));
-                        report.started.push(Assignment {
+                        let assignment = Assignment {
                             agent: agent.clone(),
                             queue,
                             part,
-                        });
+                        };
+                        if !slice_known {
+                            report.unattributed.push(assignment.clone());
+                        }
+                        report.started.push(assignment);
                     }
                     // The claim landed (it precedes the spawn) even though the
                     // spawn failed — keep the part excluded this tick so no peer
@@ -4106,6 +4116,12 @@ impl TickLogger {
         let mut out = Vec::new();
         for a in &r.started {
             out.push(format!("fleet: started {} on {}/{}", a.agent, a.queue, a.part));
+        }
+        for a in &r.unattributed {
+            out.push(format!(
+                "telemetry: {}'s first session on {}/{} is unattributed to a slice (its baton names none); its rows carry slice_id null until a re-roll reads the slice it hands off",
+                a.agent, a.queue, a.part
+            ));
         }
         for a in &r.v2_started {
             // The v2 journal voice (slice 006): name the entry, unit and resolved
@@ -6967,6 +6983,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             logger.lines(&started),
             vec!["fleet: started a on default/020".to_string()],
         );
+
+        // A first spawn whose baton names no slice says so, beside its start.
+        let first = Assignment {
+            agent: "a".into(),
+            queue: "default".into(),
+            part: "020".into(),
+        };
+        let unattributed = TickReport {
+            started: vec![first.clone()],
+            unattributed: vec![first],
+            ..TickReport::default()
+        };
+        let lines = logger.lines(&unattributed);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].starts_with("telemetry: a's first session on default/020 is unattributed"));
 
         // The stall shape: held (no workable part) tick after tick → one line.
         let held = TickReport {

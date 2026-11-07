@@ -186,6 +186,13 @@ The rest of the verb's behaviour:
   `softfig growlight start --opencode` records nothing.
 - **Semi-auto rows always have `queue = NULL`.** The root baton has no `queue:`
   field, and the launcher doesn't resolve one.
+- **A fleet member's first session on an item has `slice_id = NULL` unless its
+  baton already named a slice.** growlightd reads the slice from the member's
+  baton before the claim seeds it. A kept baton (the same item) carries its
+  slice; a fresh seed names none, and growlightd attributes nothing rather than
+  guess, journalling `telemetry: <agent>'s first session on <queue>/<item> is
+  unattributed to a slice`. A re-roll reads the slice the member handed off, so
+  later sessions are attributed.
 - **No surfaces yet.** There is no `softfig telemetry` report verb, no TUI pane
   and no budget projection. Read the db with `sqlite3` for now:
 
