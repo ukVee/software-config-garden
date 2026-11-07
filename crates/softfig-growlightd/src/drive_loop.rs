@@ -10658,6 +10658,101 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("070".to_string(), None)));
     }
 
+    /// F2 + V8, over a real two-member loop: the restack a drop leaves is not
+    /// picked while the child's session lives, even across its re-roll. When
+    /// the child hands off the restack runs alone, and normal work resumes
+    /// after it, with no deadlock at any tick.
+    #[test]
+    fn v2_a_restack_waits_for_the_active_child_then_normal_work_resumes() {
+        let restack = |status| {
+            let mut r = row("072", EntryKind::Restack, Lane::Urgent, status);
+            r.branch = String::new();
+            r
+        };
+        let task = |status| row("071", EntryKind::Task, Lane::Normal, status);
+        let started = |r: &TickReport| {
+            r.v2_started.iter().map(|a| a.entry.clone()).collect::<Vec<_>>()
+        };
+        let garden = TestGarden::new("restack-waits");
+        garden.queue(vec![task(EntryStatus::Queued), milestone_row("m2", EntryStatus::Queued)]);
+        garden.slices("m2", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), opencode_member("a2")], &garden);
+        let r = loop_.tick(0);
+        assert_eq!(started(&r), vec!["071".to_string()], "{r:?}");
+
+        // The drop's one write: the child runs on, its restack row leads.
+        garden.queue(vec![
+            restack(EntryStatus::Queued),
+            task(EntryStatus::Active),
+            milestone_row("m2", EntryStatus::Queued),
+        ]);
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "a2 stays free, a1 holds the child: {r:?}");
+
+        // A re-roll is not a hand-off: the child keeps going, unpaused.
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("071", "IN_PROGRESS", "resume"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(2);
+        assert_eq!(started(&r), vec!["071".to_string()], "{r:?}");
+        assert!(parker.paused.lock().unwrap().is_empty(), "the restack preempts nothing");
+
+        // The child hands off, and the restack takes the repo.
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "finished",
+                "baton": handoff_baton("071", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(vec![restack(EntryStatus::Queued), milestone_row("m2", EntryStatus::Queued)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(3);
+        assert_eq!(started(&r), vec!["072".to_string()], "the restack, and only it: {r:?}");
+        let holder = r.v2_started[0].agent.clone();
+
+        // While it runs, the other member is free and m2 still waits.
+        garden.queue(vec![restack(EntryStatus::Active), milestone_row("m2", EntryStatus::Queued)]);
+        let r = loop_.tick(4);
+        assert!(r.v2_started.is_empty(), "{r:?}");
+
+        // The restack finishes, and normal work resumes.
+        let reply = verb_call(
+            &d,
+            &holder,
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "restacked",
+                "baton": handoff_baton("072", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(vec![milestone_row("m2", EntryStatus::Queued)]);
+        backend.set_health(&holder, AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(5);
+        assert_eq!(started(&r), vec!["m2".to_string()], "{r:?}");
+        let claims = claimer.claims.lock().unwrap();
+        assert_eq!(
+            claims.iter().map(|(entry, _)| entry.as_str()).collect::<Vec<_>>(),
+            vec!["071", "071", "072", "m2"],
+            "one claim each, in order",
+        );
+    }
+
     /// SLICE 009 — a pause whose keeperd write fails is retried every tick,
     /// and until it lands the entry stays held by the member that moved on, so
     /// it never sits `active` with nobody allowed to take it.

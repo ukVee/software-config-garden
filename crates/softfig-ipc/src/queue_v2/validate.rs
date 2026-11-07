@@ -102,7 +102,8 @@ pub enum QueueRefusal {
     /// The entry (or its repo) is already started. Verb: moving a started
     /// entry, or moving an `active`/`done`/`split` slice item (§6.8).
     /// Validation: a second normal-lane entry in the same repo is `active`
-    /// or `paused` (§3.1: at most one).
+    /// or `paused` (§3.1: at most one), or an `active` restack shares its
+    /// repo with another `active` entry (§3.1: it runs alone).
     Started {
         /// The entry that is already started.
         id: String,
@@ -226,7 +227,8 @@ impl QueueToml {
     ///    final status `done`, and the link graph has no cycle (live edges
     ///    only — an archived row's own links are history);
     /// 4. every entry's project exists in the projects table;
-    /// 5. at most one normal-lane entry per repo carries `active` or `paused`.
+    /// 5. at most one normal-lane entry per repo carries `active` or `paused`;
+    /// 6. an `active` restack shares its repo with no other `active` entry.
     ///
     /// Invariant 6 (remote entries never get an opencode member) is not file
     /// state — see the module docs.
@@ -310,6 +312,18 @@ impl QueueToml {
                 && started_in_repo.insert(repo, e.id.as_str()).is_some()
             {
                 return Err(QueueRefusal::Started { id: e.id.clone() });
+            }
+        }
+
+        // 6. An active restack runs alone in its repo: it rewrites branches a
+        // live session may hold, and the claim backstop is what closes the
+        // race between two members' picks. Grouped by repo path, as 5 is.
+        let active = || self.entries.iter().filter(|e| e.status == EntryStatus::Active);
+        for restack in active().filter(|e| e.kind == EntryKind::Restack) {
+            if let Some(other) = active().find(|e| {
+                e.id != restack.id && repo_of.get(e.project.as_str()) == repo_of.get(restack.project.as_str())
+            }) {
+                return Err(QueueRefusal::Started { id: other.id.clone() });
             }
         }
 
@@ -684,6 +698,72 @@ mod tests {
         )
         .validate(&archive(vec![]))
         .expect("one active per repo");
+    }
+
+    // -- §3.1 invariant 6: an active restack runs alone in its repo ----------
+
+    fn restack(id: &str, status: EntryStatus) -> Entry {
+        let mut r = entry(id);
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        r.status = status;
+        r
+    }
+
+    #[test]
+    fn an_active_restack_beside_any_active_entry_in_its_repo_is_refused() {
+        let mut normal = entry("n");
+        normal.status = EntryStatus::Active;
+        let mut urgent = entry("u");
+        urgent.lane = Lane::Urgent;
+        urgent.status = EntryStatus::Active;
+        for (rows, id) in [
+            (vec![restack("r", EntryStatus::Active), normal], "n"),
+            (vec![restack("r", EntryStatus::Active), urgent], "u"),
+            (
+                vec![restack("r", EntryStatus::Active), restack("s", EntryStatus::Active)],
+                "s",
+            ),
+        ] {
+            let err = queue(vec![softfig_project()], rows)
+                .validate(&archive(vec![]))
+                .unwrap_err();
+            assert_eq!(err, QueueRefusal::Started { id: id.into() });
+        }
+    }
+
+    #[test]
+    fn a_waiting_restack_or_one_beside_a_paused_entry_is_ok() {
+        let mut active = entry("n");
+        active.status = EntryStatus::Active;
+        queue(
+            vec![softfig_project()],
+            vec![restack("r", EntryStatus::Queued), active],
+        )
+        .validate(&archive(vec![]))
+        .expect("a queued restack waits beside an active entry");
+
+        let mut paused = entry("n");
+        paused.status = EntryStatus::Paused;
+        queue(
+            vec![softfig_project()],
+            vec![restack("r", EntryStatus::Active), paused],
+        )
+        .validate(&archive(vec![]))
+        .expect("a paused entry holds no session");
+    }
+
+    #[test]
+    fn an_active_restack_beside_an_active_entry_in_another_repo_is_ok() {
+        let mut other = entry("n");
+        other.status = EntryStatus::Active;
+        other.project = "other".into();
+        queue(
+            vec![softfig_project(), project("other", "host:other-repo")],
+            vec![restack("r", EntryStatus::Active), other],
+        )
+        .validate(&archive(vec![]))
+        .expect("the bound is per repo");
     }
 
     #[test]

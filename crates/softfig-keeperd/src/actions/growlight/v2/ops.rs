@@ -387,7 +387,8 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     }
 
     // Backstop: every §3.1 invariant still holds (the claim is what takes a
-    // second entry in a repo `active` — invariant 5 refuses it here).
+    // second entry in a repo `active` — invariant 5 refuses it here, and
+    // invariant 6 refuses a restack beside any active entry in its repo).
     queue.validate(&archive).map_err(refuse)?;
 
     if !entry_changed && !slice_changed {
@@ -1284,7 +1285,9 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::growlight::queue_verbs::{queue_add_entry, queue_add_project, queue_update_entry, slice_update};
+    use crate::actions::growlight::queue_verbs::{
+        queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_update,
+    };
     use crate::actions::growlight::v2::write::tests::unlocked;
     use crate::actions::managed;
     use softfig_ipc::queue_v2::{Lane, Project, QueueToml, SlicesToml};
@@ -1617,6 +1620,49 @@ mod tests {
             .expect("human block");
         let err = claim(&daemon, "b", Some("001")).unwrap_err();
         assert!(err.1.contains("is blocked"), "{err:?}");
+    }
+
+    /// F2 + V8: a drop does not refuse for an active child. It re-parents the
+    /// child in the same write, and its restack can't be claimed until the
+    /// child's session has handed off. Once the restack runs, the claim
+    /// refuses the other way round.
+    #[test]
+    fn the_restack_of_a_drop_waits_for_the_active_child() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut parent = entry("a", Lane::Normal, EntryStatus::Queued);
+        parent.branch = "feat/a".to_string();
+        parent.base = "main-commit".to_string();
+        parent.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut child = entry("b", Lane::Normal, EntryStatus::Active);
+        child.branch = "feat/b".to_string();
+        child.parent = "a".to_string();
+        child.base = "a-commit".to_string();
+        child.claimed = "2026-10-11T12:10:00Z".to_string();
+        seed_queue_rows(&daemon, vec![parent, child]);
+
+        queue_drop(&daemon, serde_json::json!({ "id": "a", "reason": "abandoned" }))
+            .expect("the drop proceeds over an active child");
+        let (queue, _) = loaded_queue(&daemon);
+        let restack = queue
+            .entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Restack)
+            .expect("the drop enqueued a restack")
+            .id
+            .clone();
+        let child = queue.entries.iter().find(|e| e.id == "b").unwrap();
+        assert_eq!(child.status, EntryStatus::Active, "the live session runs on");
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("", "main-commit"));
+
+        let err = claim(&daemon, &restack, None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
+
+        set_status(&daemon, "b", None, "paused").expect("the child hands off");
+        claim(&daemon, &restack, None).expect("no session holds a branch now");
+
+        let err = claim(&daemon, "b", None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
     }
 
     #[test]

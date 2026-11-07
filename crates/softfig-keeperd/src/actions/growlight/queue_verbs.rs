@@ -1012,6 +1012,14 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
             }
         }
         let idx = idx_of(&queue, &args.id);
+        // A link could name an entry the restack's own repo hold keeps waiting
+        // (§2), and neither would ever run. `[]` still clears a hand-made one.
+        if queue.entries[idx].kind == EntryKind::Restack && !links.is_empty() {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("entry {:?} is a restack: a restack takes no after links", args.id),
+            ));
+        }
         queue.entries[idx].after = links;
     }
 
@@ -2760,6 +2768,23 @@ mod tests {
         let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
         let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["001", "002", "m1"], "urgent entries keep file order: oldest first");
+    }
+
+    /// A link could point a restack at an entry its own repo hold keeps
+    /// waiting, and neither would ever run.
+    #[test]
+    fn update_entry_refuses_a_link_on_a_restack() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut r = entry("r");
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        seed_queue(&daemon, vec![project()], vec![r, entry("n")], None);
+
+        let err = queue_update_entry(&daemon, serde_json::json!({ "id": "r", "after": ["n"] }))
+            .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        assert!(err.1.contains("restack"), "{err:?}");
     }
 
     #[test]
