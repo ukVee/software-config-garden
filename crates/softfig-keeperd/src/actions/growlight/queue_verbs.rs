@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
-    sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
+    sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
     QueueArchiveToml, QueueRefusal, QueueToml, RestackBranch, SliceItem, SliceKind, SliceStatus,
     SlicesToml, QUEUE_ARCHIVE_FILE,
 };
@@ -63,6 +63,9 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     let main = args.main.as_deref().unwrap_or("main");
     if main.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "main must be non-empty".to_string()));
+    }
+    if !valid_branch_name(main) {
+        return Err(refuse(QueueRefusal::BadName { name: main.to_string() }));
     }
 
     let mut inner = daemon.inner.lock().unwrap();
@@ -2373,6 +2376,13 @@ mod tests {
         // Bad name → `bad_name`; empty repo is a shape error.
         let err = queue_add_project(&daemon, serde_json::json!({ "name": "Bad Name", "repo": "~/x" }))
             .unwrap_err();
+        assert!(err.1.starts_with("bad_name:"), "{:?}", err.1);
+        // V20: a `main` that git would read as an option is refused here too.
+        let err = queue_add_project(
+            &daemon,
+            serde_json::json!({ "name": "ok", "repo": "~/x", "main": "--show-toplevel" }),
+        )
+        .unwrap_err();
         assert!(err.1.starts_with("bad_name:"), "{:?}", err.1);
         let err = queue_add_project(&daemon, serde_json::json!({ "name": "ok", "repo": "  " }))
             .unwrap_err();

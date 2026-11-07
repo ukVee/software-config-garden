@@ -40,7 +40,7 @@ pub use sub_doc::{
     reserved_field, reserved_lines, sub_doc_violation, FieldViolation, SubSliceText,
     SLICE_BODY_RESERVED, SUB_DOC_RESERVED,
 };
-pub use validate::{sub_depth, QueueRefusal};
+pub use validate::{sub_depth, valid_branch_name, QueueRefusal};
 
 use std::fmt;
 

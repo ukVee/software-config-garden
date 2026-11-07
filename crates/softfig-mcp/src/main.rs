@@ -435,7 +435,7 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "[a-z0-9-]+; the project name entries reference (refused bad_name; exists when already present)" },
                     "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
-                    "main": { "type": "string", "description": "the branch merges land on; defaults to main" },
+                    "main": { "type": "string", "description": "the branch merges land on, a valid git branch name; defaults to main" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },

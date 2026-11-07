@@ -62,9 +62,10 @@ pub enum QueueRefusal {
         /// The id (or name) that already exists.
         id: String,
     },
-    /// The name does not conform. Verb: a slug outside `[a-z0-9-]+`.
-    /// Validation: a milestone path nested deeper than §3.3 allows
-    /// (via [`sub_depth`]).
+    /// The name does not conform. Verb: a slug outside `[a-z0-9-]+`, or a
+    /// project's `main` that is no branch name ([`valid_branch_name`]).
+    /// Validation: that same `main`, or a milestone path nested deeper than
+    /// §3.3 allows (via [`sub_depth`]).
     BadName {
         /// The offending name.
         name: String,
@@ -230,7 +231,8 @@ impl QueueToml {
     /// 4. every entry's project exists in the projects table;
     /// 5. at most one normal-lane entry per repo carries `active` or `paused`;
     /// 6. an `active` restack shares its repo with no other `active` entry;
-    /// 7. a repo has at most one restack row, whatever its status.
+    /// 7. a repo has at most one restack row, whatever its status;
+    /// 8. every project's `main` is a branch name ([`valid_branch_name`]).
     ///
     /// Invariant 6 (remote entries never get an opencode member) is not file
     /// state — see the module docs.
@@ -339,6 +341,14 @@ impl QueueToml {
             }
         }
 
+        // 8. `main` reaches git as a rev, so a hand-edited value must not read
+        // as an option there.
+        for p in &self.projects {
+            if !valid_branch_name(&p.main) {
+                return Err(QueueRefusal::BadName { name: p.main.clone() });
+            }
+        }
+
         Ok(())
     }
 }
@@ -346,6 +356,21 @@ impl QueueToml {
 /// DFS over live `after` edges; returns an entry index on the cycle when a
 /// back edge is found. Edges to archive rows are already checked as `done`
 /// sinks and are not followed (an archived row's own links are history).
+/// Is `name` a branch name, by `git check-ref-format --branch`'s rule? keeperd
+/// runs no git, so this is that rule rather than a call to it. It refuses a
+/// leading `-`, which is what keeps a project's `main` from reading as an option.
+pub fn valid_branch_name(name: &str) -> bool {
+    let component = |c: &str| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock");
+    !name.starts_with('-')
+        && name != "HEAD"
+        && name != "@"
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.chars().any(|c| c.is_ascii_control() || " ~^:?*[\\".contains(c))
+        && name.split('/').all(component)
+}
+
 fn dfs_cycle(
     idx: usize,
     entries: &[Entry],
@@ -427,6 +452,30 @@ mod tests {
             repo: repo.to_string(),
             main: "main".to_string(),
         }
+    }
+
+    /// V20. Each row's verdict is what `git check-ref-format --branch` says.
+    #[test]
+    fn valid_branch_name_follows_gits_rule() {
+        for good in ["main", "trunk", "release/1.2", "feat/x-y", "refs/heads/main", "a@b"] {
+            assert!(valid_branch_name(good), "{good}");
+        }
+        for bad in [
+            "", "--show-toplevel", "-x", "HEAD", "@", "a b", " main", "a..b", "a~1", "a^", "a:b",
+            "a?", "a*", "a[b", "a\\b", "a@{1}", "a/", "/a", "a//b", ".a", "a/.b", "a.", "a.lock",
+            "a.lock/b", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(!valid_branch_name(bad), "{bad:?}");
+        }
+    }
+
+    /// V20: `queue_add_project` refuses this up front, and a hand edit lands here.
+    #[test]
+    fn a_main_git_would_read_as_an_option_fails_validation() {
+        let mut hostile = softfig_project();
+        hostile.main = "--show-toplevel".to_string();
+        let err = queue(vec![hostile], vec![]).validate(&archive(vec![])).unwrap_err();
+        assert_eq!(err, QueueRefusal::BadName { name: "--show-toplevel".into() });
     }
 
     fn softfig_project() -> super::super::Project {

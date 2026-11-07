@@ -2205,7 +2205,8 @@ pub struct QueueAddProjectArgs {
     pub name: String,
     /// A local path (`~` allowed) or `host:path`. Non-empty.
     pub repo: String,
-    /// The branch merges land on; defaults to `"main"`.
+    /// The branch merges land on; defaults to `"main"`. Refused `bad_name` when
+    /// it is no branch name, by `git check-ref-format --branch`'s rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
