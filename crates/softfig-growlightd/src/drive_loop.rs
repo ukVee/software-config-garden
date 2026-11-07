@@ -3493,14 +3493,13 @@ impl DriveLoop {
             .map(|m| (m.spec.agent.as_str(), self.profiles_resolver.admission_profiles(&m.spec.agent)))
             .collect();
         let dir = self.usage_by_profile_dir.as_deref();
-        let readings: BTreeMap<&str, Vec<softfig_ipc::usage::UsageSnapshot>> = pools
-            .iter()
-            .flat_map(|(_, pool)| pool)
-            .map(|slot| {
-                let read = dir.map(|dir| crate::profile_budget::slot_readings(dir, slot));
-                (slot.as_str(), read.unwrap_or_default())
-            })
-            .collect();
+        // A slot two members share is read once: skip it once it is in the map.
+        let mut readings: BTreeMap<&str, Vec<softfig_ipc::usage::UsageSnapshot>> = BTreeMap::new();
+        for slot in pools.iter().flat_map(|(_, pool)| pool) {
+            readings.entry(slot.as_str()).or_insert_with(|| {
+                dir.map(|dir| crate::profile_budget::slot_readings(dir, slot)).unwrap_or_default()
+            });
+        }
         apply_reserve(&mut verdict, cfg, &pools, |slot| {
             crate::profile_budget::vouchable_7d(&readings[slot], now)
         });
