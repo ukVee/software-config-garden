@@ -1296,6 +1296,37 @@ mod tests {
         assert_eq!(need[0].onto, "main", "{need:?}");
     }
 
+    /// Report 095: a live parent whose branch is gone must not fail detection
+    /// for the repo, or its siblings go unseen. A repo git can't read still does.
+    #[test]
+    fn a_deleted_live_parent_does_not_disable_detection_for_its_siblings() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let a_tip = open_branch_from(repo, "feat/a", "main");
+        open_branch_from(repo, "feat/b", "feat/a");
+        open_branch_from(repo, "feat/c", "main");
+        ff_main(repo);
+        sh_git(repo, &["branch", "-q", "-D", "feat/a"]);
+        let entries = [
+            restack_entry("a", "feat/a", "", "root", "2026-10-01T00:00:00Z"),
+            restack_entry("b", "feat/b", "a", &a_tip, "2026-10-02T00:00:00Z"),
+            restack_entry("c", "feat/c", "", "root", "2026-10-03T00:00:00Z"),
+        ];
+        let local = Repo::Local(repo.to_path_buf());
+        let archived = BTreeMap::new();
+
+        let need = detect_restack(&local, "main", &entries, &archived, &Git::new(repo))
+            .expect("a deleted live parent must not fail detection")
+            .expect("both branches lack the urgent fix");
+        let onto: Vec<(&str, &str)> =
+            need.iter().map(|b| (b.branch.as_str(), b.onto.as_str())).collect();
+        assert_eq!(onto, [("feat/b", "main"), ("feat/c", "main")]);
+
+        let nowhere = tempfile::tempdir().unwrap();
+        detect_restack(&local, "main", &entries, &archived, &Git::new(nowhere.path()))
+            .expect_err("a real git failure stays an error");
+    }
+
     /// V20: a value spelled like an option is a rev that doesn't resolve. Bare,
     /// `rev-parse --show-toplevel` answers with a path, which a first claim would
     /// record as the base.
