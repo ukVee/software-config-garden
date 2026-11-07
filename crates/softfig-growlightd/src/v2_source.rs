@@ -95,8 +95,13 @@ pub enum V2SourceError {
     Unreadable { rel: String, cause: String },
     /// Does not parse as the file it claims to be: malformed TOML, a missing
     /// or unknown field, a value outside a closed vocabulary, or a schema
-    /// this build does not write.
-    InvalidToml { rel: String, source: QueueV2Error },
+    /// this build does not write. `at` is where the parser stopped (line,
+    /// column, both 1-based), when it says — see [`V2SourceError::invalid_toml`].
+    InvalidToml {
+        rel: String,
+        source: QueueV2Error,
+        at: Option<(usize, usize)>,
+    },
     /// Parses, but violates a §3.1/§3.3 writer invariant.
     InvalidState { rel: String, refusal: QueueRefusal },
     /// A doc in the unit's §6.4 chain declares a `> Model:` line that does
@@ -109,7 +114,23 @@ impl fmt::Display for V2SourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreadable { rel, cause } => write!(f, "{rel}: unreadable ({cause})"),
-            Self::InvalidToml { rel, source } => write!(f, "{rel}: {source}"),
+            // One line, whatever the parser's own multi-line rendering: one
+            // bad byte stops every v2 claim (§3, F6), and this is the journal
+            // line the owner finds it by.
+            Self::InvalidToml {
+                rel,
+                source: QueueV2Error::InvalidToml(e),
+                at,
+            } => {
+                let reason = e.message().split_whitespace().collect::<Vec<_>>().join(" ");
+                match at {
+                    Some((line, column)) => {
+                        write!(f, "{rel}: invalid TOML at line {line}, column {column}: {reason}")
+                    }
+                    None => write!(f, "{rel}: invalid TOML: {reason}"),
+                }
+            }
+            Self::InvalidToml { rel, source, .. } => write!(f, "{rel}: {source}"),
             Self::InvalidState { rel, refusal } => write!(f, "{rel}: {refusal}"),
             Self::InvalidModelDecl { context, message } => {
                 write!(f, "{context}: invalid `> Model:` declaration ({message})")
@@ -119,6 +140,26 @@ impl fmt::Display for V2SourceError {
 }
 
 impl std::error::Error for V2SourceError {}
+
+impl V2SourceError {
+    /// `raw`, the text of `rel`, did not parse: the error, with the parser's
+    /// byte span turned into the line and column an editor shows.
+    fn invalid_toml(rel: &str, raw: &str, source: QueueV2Error) -> Self {
+        let at = match &source {
+            QueueV2Error::InvalidToml(e) => e.span().and_then(|span| raw.get(..span.start)),
+            _ => None,
+        }
+        .map(|before| {
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            (before.matches('\n').count() + 1, before[line_start..].chars().count() + 1)
+        });
+        Self::InvalidToml {
+            rel: rel.to_string(),
+            source,
+            at,
+        }
+    }
+}
 
 /// One tick's verdict from [`V2Source::load`] — the fail-closed answer the
 /// drive loop (slice 006) switches on.
@@ -177,8 +218,8 @@ impl V2Source {
                 let alert = self.last_error.as_deref() != Some(rendered.as_str());
                 if alert {
                     eprintln!(
-                        "growlightd: v2 queue source failed (scheduling nothing from v2): \
-                         {error}"
+                        "growlightd: v2 queue source failed (scheduling nothing from v2 until \
+                         it is fixed): {error}"
                     );
                 }
                 self.last_error = Some(rendered);
@@ -222,20 +263,14 @@ fn assemble_with(
     let Some(queue_raw) = read_v2_file(reads, garden_root, QUEUE_FILE)? else {
         return Ok(None);
     };
-    let queue = QueueToml::parse(&queue_raw).map_err(|source| V2SourceError::InvalidToml {
-        rel: QUEUE_FILE.to_string(),
-        source,
-    })?;
+    let queue = QueueToml::parse(&queue_raw)
+        .map_err(|source| V2SourceError::invalid_toml(QUEUE_FILE, &queue_raw, source))?;
 
     // The archive is optional on disk: no file means nothing has left the
     // list yet, which is an empty archive (and validates as one).
     let archive = match read_v2_file(reads, garden_root, QUEUE_ARCHIVE_FILE)? {
-        Some(text) => QueueArchiveToml::parse(&text).map_err(|source| {
-            V2SourceError::InvalidToml {
-                rel: QUEUE_ARCHIVE_FILE.to_string(),
-                source,
-            }
-        })?,
+        Some(text) => QueueArchiveToml::parse(&text)
+            .map_err(|source| V2SourceError::invalid_toml(QUEUE_ARCHIVE_FILE, &text, source))?,
         None => QueueArchiveToml::new(Vec::new()),
     };
 
@@ -360,10 +395,8 @@ fn load_tree(
     let Some(raw) = read_v2_file(reads, garden_root, &rel)? else {
         return Ok(());
     };
-    let slices = SlicesToml::parse(&raw).map_err(|source| V2SourceError::InvalidToml {
-        rel: rel.clone(),
-        source,
-    })?;
+    let slices =
+        SlicesToml::parse(&raw).map_err(|source| V2SourceError::invalid_toml(&rel, &raw, source))?;
     slices.validate(milestone).map_err(|refusal| V2SourceError::InvalidState {
         rel: rel.clone(),
         refusal,
@@ -882,6 +915,40 @@ mod tests {
             V2Load::Failed { alert: false, .. } => {}
             other => panic!("a repeated error must stay quiet, got {other:?}"),
         }
+    }
+
+    /// F6: one bad value stops all v2 scheduling (§3, by design), so the one
+    /// journal line it gets must lead the owner straight to it — the file, the
+    /// line and column, and the parser's reason, on a single line.
+    #[test]
+    fn a_bad_value_names_its_file_line_and_reason_on_one_line() {
+        let garden = TempGarden::new();
+        let mut held = entry("m");
+        held.fleet = false;
+        let text = queue_toml(vec![softfig_project()], vec![held])
+            .replace("fleet = false", "fleet = \"no\"");
+        assert!(text.contains("fleet = \"no\""), "the fixture writes the hold: {text}");
+        let line = text.lines().position(|l| l == "fleet = \"no\"").unwrap() + 1;
+        garden.write(QUEUE_FILE, &text);
+        let error = assemble(garden.root()).unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains('\n'), "one journal line: {rendered:?}");
+        assert!(
+            rendered.starts_with(&format!("{QUEUE_FILE}: invalid TOML at line {line}, column ")),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("expected a boolean"), "{rendered:?}");
+
+        // A slices.toml names itself the same way.
+        let garden = TempGarden::new();
+        garden.write(QUEUE_FILE, &queue_toml(vec![softfig_project()], vec![entry("m")]));
+        garden.write(&slices_file("m"), "schema = 1\n\nbroken = = 1\n");
+        let rendered = assemble(garden.root()).unwrap_err().to_string();
+        assert!(
+            rendered.starts_with(&format!("{}: invalid TOML at line 3, column ", slices_file("m"))),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains('\n'), "{rendered:?}");
     }
 
     #[test]

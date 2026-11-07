@@ -475,6 +475,16 @@ past its claim, so a start time set on one holds nothing. `queue not-before` kee
 the same (it applies if the entry is queued again) and says so with a `note:` line after
 the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
 
+One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
+`slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
+held only the one item whose doc it couldn't read. The journal gets one line per incident,
+naming the file, the line and column, and the parser's reason, and the first tick after
+the fix resumes:
+
+```
+growlightd: v2 queue source failed (scheduling nothing from v2 until it is fixed): growlight/backlog/queue.toml: invalid TOML at line 9, column 9: invalid type: string "no", expected a boolean
+```
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
