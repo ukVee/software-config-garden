@@ -19,6 +19,23 @@ decision record or crate that owns it, rather than at every internal change.
   fleet slice 003). A claude member whose model Claude Code refuses
   (`model_not_found` / 404) parks the unit with an alert carrying the reason;
   there is no crash loop and no backoff retry.
+- growlightd's own schedule (`growlight-schedule`): a `[schedule]` table in
+  `config/growlight.toml` decides when the fleet may start or re-roll a
+  member, replacing the interim `growlight-window` timer that flipped
+  `fleet_enabled`. Plain `windows = ["HH:MM-HH:MM"]` strings and
+  `[[schedule.window]]` rows (`days`, `backends`, `members`) are accepted;
+  overlapping windows union, and an unknown key or an unreadable time zone
+  fails closed. A close never kills a member mid-iteration; one still running
+  `close_grace_minutes` later raises an information-only alert. With
+  `tasks = true` an item whose `> Not before:` has arrived may run outside
+  every window. `reserve_weekly_pct` keeps a share of each claude-login slot's
+  week for the owner, and a key naming no slot refuses to load the fleet.
+  `growlight status` gains a schedule block (open or closed, the next edge in
+  local time, held members and items, each slot's reserve and a budget
+  projection range). `softfig growlight queue pick` says it does not apply the
+  schedule (`growlight-schedule`; see `meta/spec-growlight-schedule.md`).
+- `[build_caps] test_threads` (default 2) sets `RUST_TEST_THREADS` on every
+  growlight build scope, replacing the `50-test-threads.conf` drop-in.
 
 ## [1.0.0-alpha.1] - 2026-10-17
 
