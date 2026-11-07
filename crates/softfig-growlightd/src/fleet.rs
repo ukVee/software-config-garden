@@ -717,6 +717,41 @@ impl FleetConfig {
         missing
     }
 
+    /// The first `[schedule] reserve_weekly_pct` key that names no slot in the
+    /// slot `store` (§3.1). `"*"` and `home` always exist; any other key must
+    /// be a well-formed slot name with a directory in `store`. A typo is
+    /// otherwise inert and never reaches `growlight status`, so the loader
+    /// fails closed on it, like an unknown `members` entry. Separate from
+    /// [`from_growlight_toml`] for the same reason as
+    /// [`missing_profile_pool_slots`](Self::missing_profile_pool_slots): the
+    /// parser reads no filesystem.
+    pub fn unknown_reserve_slot(&self, store: Option<&Path>) -> Option<String> {
+        let schedule = self.schedule.as_ref()?;
+        schedule.reserve_weekly_pct.keys().find_map(|key| {
+            if key == crate::schedule::RESERVE_DEFAULT_KEY {
+                return None;
+            }
+            let Some(store) = store else {
+                return (key != claude_profiles::HOME_SLOT).then(|| {
+                    format!("reserve_weekly_pct names slot {key:?} but no claude-login store can be named (is $HOME set?)")
+                });
+            };
+            match claude_profiles::slot_dir(store, key) {
+                Ok(SlotDir::Home) => None,
+                Ok(SlotDir::Store(dir))
+                    if std::fs::symlink_metadata(&dir).is_ok_and(|md| md.is_dir()) =>
+                {
+                    None
+                }
+                Ok(SlotDir::Store(dir)) => Some(format!(
+                    "reserve_weekly_pct names slot {key:?}, which has no directory at {}",
+                    dir.display()
+                )),
+                Err(e) => Some(format!("reserve_weekly_pct slot {key:?}: {e}")),
+            }
+        })
+    }
+
     /// Drop the members [`Self::missing_profile_pool_slots`] names, returning one
     /// journal line per dropped member. Every other member, pooled or not,
     /// stays armed (review 047 nit: one missing slot used to turn the whole
@@ -792,6 +827,13 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
     // left out of the roster at load, by name. The rest of the fleet arms.
     // Byte-identical to today when no member declares a pool.
     let store = claude_profiles::store_root_from_env();
+    if let Some(why) = cfg.unknown_reserve_slot(store.as_deref()) {
+        eprintln!(
+            "softfig-growlightd: ignoring fleet config at {} ([schedule] {why}); fleet stays OFF",
+            path.display()
+        );
+        return FleetConfig::disabled();
+    }
     for line in cfg.disable_members_with_missing_slots(store.as_deref()) {
         eprintln!("softfig-growlightd: {line} ({})", path.display());
     }
@@ -2513,6 +2555,30 @@ agent = "reviewer"
         std::fs::remove_dir(store.path().join("slot2")).unwrap();
         std::os::unix::fs::symlink(store.path().join("slot1"), store.path().join("slot2")).unwrap();
         assert_eq!(cfg.missing_profile_pool_slots(Some(store.path())).len(), 1);
+    }
+
+    #[test]
+    fn a_reserve_key_must_name_a_real_slot() {
+        let cfg = |keys: &str| {
+            FleetConfig::from_growlight_toml(&format!(
+                "[[fleet]]\nagent = \"a\"\n[schedule]\nenabled = true\nreserve_weekly_pct = {keys}\n"
+            ))
+            .unwrap()
+        };
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(store.path().join("slot1")).unwrap();
+        let ok = cfg("{ slot1 = 20, home = 10, \"*\" = 5 }");
+        assert_eq!(ok.unknown_reserve_slot(Some(store.path())), None);
+        let typo = cfg("{ slot1 = 20, slott2 = 20 }");
+        let why = typo.unknown_reserve_slot(Some(store.path())).expect("a typo is named");
+        assert!(why.contains("slott2"), "{why}");
+        let shape = cfg("{ \"../x\" = 20 }");
+        assert!(shape.unknown_reserve_slot(Some(store.path())).is_some());
+        // With no store only `home` and `*` can be real.
+        assert_eq!(cfg("{ home = 10, \"*\" = 5 }").unknown_reserve_slot(None), None);
+        assert!(cfg("{ slot1 = 20 }").unknown_reserve_slot(None).is_some());
+        // No [schedule] table: nothing to check.
+        assert_eq!(FleetConfig::disabled().unknown_reserve_slot(Some(store.path())), None);
     }
 
     #[test]
