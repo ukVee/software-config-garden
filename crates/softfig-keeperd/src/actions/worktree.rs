@@ -438,11 +438,34 @@ impl<'a> WorkTree<'a> {
     /// the docs keeperd builds itself from a verb's typed fields — the v2 queue
     /// writer ([`super::growlight::v2::apply`]), whose generated `001-plan`
     /// slice carries keeperd's own `> Model:` line, not the caller's. The verb
-    /// holds a member's text fields to §6.7 before it gets here.
+    /// holds a member's text fields to §6.7 before it gets here. The state-file
+    /// refusal still applies: see [`check_structured`](Self::check_structured).
     pub fn write_structured(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
-        self.check_write(rel)?;
+        self.check_structured(rel)?;
         self.stage(rel, bytes)
+    }
+
+    /// Every check [`write_structured`](Self::write_structured) makes, without
+    /// writing: [`check_write`](Self::check_write), and for a fleet member a
+    /// refusal of any queue v2 state file ([`is_queue_state_path`]) unless the
+    /// verb running has vouched for it ([`crate::caller::vouch_for_state`]).
+    /// The raw-byte routes refuse a member the state files outright
+    /// ([`guard_member_change`](Self::guard_member_change)); this is the typed
+    /// writer's half, so a member-callable verb that reaches `v2::apply`
+    /// without holding the member to §6.7 can't write them either (review 054
+    /// F8).
+    pub fn check_structured(&self, rel: &str) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        if let Some(member) = crate::caller::member()
+            && is_queue_state_path(rel)
+            && crate::caller::state_vouch().is_none()
+        {
+            let what = "typed write, which no verb vouched for, reaches";
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, what)));
+        }
+        Ok(())
     }
 
     /// [`write`](Self::write) for the daemon's own re-derivation of a managed
@@ -772,8 +795,10 @@ fn member_growlight_config_refusal(member: &str, what: &str) -> String {
 /// state file ([`is_queue_state_path`]). growlightd schedules from them, and
 /// they move only through the queue verbs — keeperd's typed writer
 /// (`write_structured`), which validates the whole file and which a member
-/// reaches with `queue_add_entry` / `slice_insert` or through growlightd's
-/// handshake. The refusal text leads with the wire code, `member_not_allowed`.
+/// reaches with `queue_add_entry` (the one verb that vouches for it,
+/// [`WorkTree::check_structured`]) or through growlightd (`slice_insert` /
+/// `slice_update`, the handshake). The refusal text leads with the wire code,
+/// `member_not_allowed`.
 fn member_queue_file_refusal(member: &str, rel: &str, what: &str) -> String {
     format!(
         "member_not_allowed: this {what} {rel}, and fleet member {member} may not edit queue v2's \
@@ -1371,7 +1396,18 @@ Example:
         assert_eq!(wt.read(QUEUE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
         assert!(!wt.exists(SLICES));
         wt.write(QUEUE, b"schema = 1\n").expect("the same bytes change nothing");
-        wt.write_structured(QUEUE, b"schema = 1\n# keeperd\n").expect("keeperd's typed writer");
+        // F8: the typed writer refuses a member too, unless the verb vouched.
+        for path in [QUEUE, ARCHIVE, SLICES] {
+            let err = wt.write_structured(path, b"schema = 1\n# keeperd\n").unwrap_err();
+            assert!(
+                err.1.starts_with(&format!("member_not_allowed: this typed write, which no verb vouched for, reaches {path}")),
+                "{err:?}"
+            );
+            assert!(wt.check_structured(path).is_err(), "the pre-check agrees");
+        }
+        assert_eq!(wt.read(QUEUE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        let _vouch = caller::vouch_for_state("queue_add_entry");
+        wt.write_structured(QUEUE, b"schema = 1\n# keeperd\n").expect("a vouched typed write");
     }
 
     /// queue-v2-parity row 5: a member may not replace the archive, unlink it,

@@ -179,6 +179,9 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                 ),
             ));
         }
+    // Both member checks passed: the rows keeperd renders from these fields
+    // are the verb's own, so its state writes may land for a member (F8).
+    let _vouch = crate::caller::vouch_for_state(softfig_ipc::op::QUEUE_ADD_ENTRY);
     match args.kind {
         EntryKind::Milestone => add_milestone(daemon, args),
         EntryKind::Task => add_task(daemon, args),

@@ -23,7 +23,7 @@
 //! server are the member's own descendants. [`resolve`] joins the two, and a
 //! stamp that disagrees with the scope is refused.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -109,6 +109,43 @@ impl Drop for Scope {
     fn drop(&mut self) {
         let previous = self.previous.take();
         MEMBER.with(|m| *m.borrow_mut() = previous);
+    }
+}
+
+thread_local! {
+    static STATE_VOUCH: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// The verb that has vouched for this request's queue v2 state writes, if one
+/// has. keeperd's typed writer refuses a member's write to a state file
+/// ([`WorkTree::check_structured`](crate::actions::WorkTree::check_structured))
+/// unless the verb running it held the member's call to §6.7 first and said so
+/// with [`vouch_for_state`] — today only `queue_add_entry`, whose found work
+/// lands as a new `queue.toml` row. A verb that never vouches can't reach the
+/// state files for a member, however it builds its writes (review 054 F8).
+pub fn state_vouch() -> Option<&'static str> {
+    STATE_VOUCH.with(Cell::get)
+}
+
+/// Vouch, until the guard drops, that `verb` has held this request's member
+/// to §6.7, so the state rows keeperd renders from its typed fields may land.
+/// Call it after the verb's own member checks, never before.
+pub fn vouch_for_state(verb: &'static str) -> Vouch {
+    Vouch {
+        previous: STATE_VOUCH.with(|v| v.replace(Some(verb))),
+    }
+}
+
+/// Restores the vouch [`vouch_for_state`] replaced.
+#[derive(Debug)]
+#[must_use = "the vouch ends when this guard drops"]
+pub struct Vouch {
+    previous: Option<&'static str>,
+}
+
+impl Drop for Vouch {
+    fn drop(&mut self) {
+        STATE_VOUCH.with(|v| v.set(self.previous));
     }
 }
 

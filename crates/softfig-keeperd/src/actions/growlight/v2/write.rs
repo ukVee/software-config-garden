@@ -100,7 +100,7 @@ pub fn apply(
         let wt = WorkTree::new(daemon, inner);
         // Pass 1 — refuse everything that could fail, before anything lands.
         for f in files.iter().chain(extras.writes) {
-            wt.check_write(&f.rel)?;
+            wt.check_structured(&f.rel)?;
             match &f.expected {
                 Some(_) => crate::handlers::cas_check_whole_file(&wt, &f.rel, &f.expected)?,
                 None => {
@@ -130,7 +130,8 @@ pub fn apply(
         // Structured writes: every byte here is keeperd's own rendering of a
         // verb's typed fields (`write_structured`, outside §6.7's member
         // `> Model:` guard — the one member-callable verb that reaches here,
-        // `queue_add_entry`, holds the member's text fields to §6.7 itself).
+        // `queue_add_entry`, holds the member's text fields to §6.7 itself, and
+        // vouches for its state writes, which pass 1 refused otherwise).
         for f in files {
             wt.write_structured(&f.rel, &f.bytes)?;
         }
@@ -454,6 +455,61 @@ pub(crate) mod tests {
             before + 1,
             "an identical write mints no commit (no churn)"
         );
+    }
+
+    /// Review 054 F8: a member's request that reaches `apply` through a verb
+    /// that never vouched for it writes no state file — none of the three, nor
+    /// the doc riding the same envelope — and commits nothing. The vouch is
+    /// what `queue_add_entry` gives after its own §6.7 checks.
+    #[test]
+    fn a_member_route_into_apply_writes_no_state_file_unless_vouched() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
+        create_queue(&daemon, &q, None);
+        let doc = "growlight/backlog/milestones/b/CLAUDE.md";
+        // `expected: None` (first creation) even for the live queue.toml: the
+        // member refusal runs before the CAS check, so it is what answers.
+        let write_one = |daemon: &Daemon, rel: String, doc: &str| {
+            let mut inner = daemon.inner.lock().unwrap();
+            apply(
+                daemon,
+                &mut inner,
+                "queue_v2_updated",
+                serde_json::json!({ "test": true }),
+                &[FileWrite { rel, expected: None, bytes: b"schema = 1\n".to_vec() }],
+                &[],
+                &ExtraWrites {
+                    writes: &[FileWrite { rel: doc.into(), expected: None, bytes: b"# b\n".to_vec() }],
+                    refresh_backlinks: false,
+                },
+            )
+        };
+        let before = commit_count(&daemon);
+        let state_files = [
+            QUEUE_FILE.to_string(),
+            state::QUEUE_ARCHIVE_FILE.to_string(),
+            softfig_ipc::queue_v2::slices_file("b"),
+        ];
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for rel in state_files.clone() {
+                let err = write_one(&daemon, rel.clone(), doc).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs, "{rel}: {err:?}");
+                assert!(err.1.starts_with("member_not_allowed:") && err.1.contains(&rel), "{err:?}");
+            }
+            assert!(!garden.path().join(doc).exists(), "nothing staged beside the refusal");
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+
+            let _vouch = crate::caller::vouch_for_state("queue_add_entry");
+            write_one(&daemon, softfig_ipc::queue_v2::slices_file("b"), doc)
+                .expect("a vouched verb's write");
+        }
+        assert!(garden.path().join(doc).exists());
+        assert_eq!(commit_count(&daemon), before + 1);
+        // A human's request needs no vouch.
+        write_one(&daemon, state::QUEUE_ARCHIVE_FILE.to_string(), "growlight/backlog/milestones/c/CLAUDE.md")
+            .expect("a human's verb");
     }
 
     #[test]
