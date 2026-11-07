@@ -1327,6 +1327,9 @@ pub struct TickReport {
     /// (growlight-schedule slice 003, §3.4): no claim, no spawn, no re-roll. A
     /// member admitted only to due timed items (`tasks = true`, §3.5) is listed
     /// with its window reason too. Empty while no schedule is enabled.
+    ///
+    /// A test observation: nothing outside the tests reads it. The live
+    /// surfaces take the verdict itself (`FleetStatusReply.schedule`).
     pub schedule_held: Vec<(String, HoldReason)>,
     /// The schedule's open/close edge crossed this tick, as its one journal
     /// line (`schedule: window <label> opened|closed`). `None` on every other
