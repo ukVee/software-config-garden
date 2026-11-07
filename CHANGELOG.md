@@ -24,9 +24,10 @@ decision record or crate that owns it, rather than at every internal change.
 
 - keeperd no longer re-walks the whole commit and tree history on every 20 s
   replica sync. The served closure is built only when a host actually asks for
-  an object and is kept across ticks, so an up-to-date host costs no walk and a
-  new commit walks only what is new (about 4.5 % of a core around the clock
-  before; growlight report 092).
+  an object and is kept across ticks, and so is the height the announce signs,
+  so an up-to-date host costs no walk and no commit read and a new commit reads
+  only what is new (about 4.5 % of a core around the clock before; growlight
+  report 092).
 
 ## [1.0.0-alpha.1] - 2026-10-17
 

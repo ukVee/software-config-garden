@@ -29,7 +29,7 @@ use softfig_ipc::{
     ErrorKind, Request, Response,
 };
 use softfig_keeperd::replica::{
-    build_announce, mirror_dir, ClosureCache, MirrorStore, RepoSource,
+    build_announce, build_announce_with, mirror_dir, ClosureCache, MirrorStore, RepoSource,
 };
 use softfig_keeperd::{Daemon, KeeperConfig};
 use softfig_net::proto::{HelloPayload, TipAnnounce};
@@ -39,7 +39,7 @@ use softfig_net::{
     pull_replication, pull_replication_pipelined, serve_replication, tipannounce_signing_bytes,
     NetError, PullSummary, ReplicaSink, ReplicaSource,
 };
-use softfig_store::{Db, Hash, ObjectStore, StorePaths};
+use softfig_store::{Db, Hash, ObjectStore, ReadCounts, StorePaths};
 use softfig_vault::{Vault, VaultSession};
 use softfig_vcs::{reachable_from, walk, Intent, Repo};
 
@@ -180,6 +180,29 @@ fn replicate_with_cache(
     mirror: &mut MirrorStore,
     cache: Arc<ClosureCache>,
 ) -> Result<PullSummary, NetError> {
+    replicate_counted(
+        driver,
+        garden,
+        owner_transport,
+        owner_device_id,
+        announce,
+        mirror,
+        cache,
+    )
+    .0
+}
+
+/// [`replicate_with_cache`] that also returns the commit and tree reads the
+/// owner's serve handle made: the cost of the session on the store.
+fn replicate_counted(
+    driver: Driver,
+    garden: &Path,
+    owner_transport: [u8; 32],
+    owner_device_id: [u8; 32],
+    announce: TipAnnounce,
+    mirror: &mut MirrorStore,
+    cache: Arc<ClosureCache>,
+) -> (Result<PullSummary, NetError>, ReadCounts) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap();
     let garden = garden.to_path_buf();
@@ -191,6 +214,7 @@ fn replicate_with_cache(
         let repo = Repo::open(&garden).unwrap();
         let source = RepoSource::with_cache(repo, announce, cache).unwrap();
         let _ = serve_replication(&mut session, &source);
+        source.read_counts()
     });
 
     let stream = softfig_net::testing::connect_within(endpoint, "the replica owner");
@@ -206,8 +230,8 @@ fn replicate_with_cache(
         // drop at the end, closing the socket for the same EOF-on-abort effect.
         Driver::Pipelined => pull_replication_pipelined(session, mirror),
     };
-    owner_thread.join().unwrap();
-    result
+    let reads = owner_thread.join().unwrap();
+    (result, reads)
 }
 
 /// fsck the mirror at `<replica_root>/<owner-id>/.softfig/` and return the
@@ -319,8 +343,9 @@ fn incremental_fast_forward_fetches_only_new_commits() {
     assert!(fsck_mirror(replica_root.path(), &owner.device_id).ok());
 }
 
-/// Report 092: an up-to-date host costs no history walk, and a tip that moved
-/// forward walks only the commits added since — across the sessions of one
+/// Report 092: an up-to-date host costs no history walk and no tree read, a
+/// second host at the same tip is served from the cached closure, and a tip that
+/// moved forward walks only the commits added since — across the sessions of one
 /// replica loop, which share a [`ClosureCache`].
 #[test]
 fn up_to_date_sync_walks_no_history_and_new_commits_walk_only_themselves() {
@@ -333,8 +358,8 @@ fn up_to_date_sync_walks_no_history_and_new_commits_walk_only_themselves() {
             .unwrap();
     let cache = Arc::new(ClosureCache::default());
     let sync = |owner: &Owner, mirror: &mut MirrorStore| {
-        let announce = build_announce(&owner.repo, &owner.session).unwrap();
-        replicate_with_cache(
+        let announce = build_announce_with(&owner.repo, &owner.session, &cache).unwrap();
+        let (summary, reads) = replicate_counted(
             Driver::Sequential,
             &owner.garden,
             owner.transport_secret,
@@ -342,34 +367,98 @@ fn up_to_date_sync_walks_no_history_and_new_commits_walk_only_themselves() {
             announce,
             mirror,
             Arc::clone(&cache),
-        )
-        .unwrap()
+        );
+        (summary.unwrap(), reads)
     };
 
     // First sync backfills genesis + a.md: the whole chain is walked, once.
-    let s1 = sync(&owner, &mut mirror);
+    let (s1, _) = sync(&owner, &mut mirror);
     assert_eq!(s1.commits, 2);
     assert_eq!(cache.commits_walked(), 2);
+    assert_eq!(cache.closure_builds(), 1);
 
-    // Same tip, host already there: nothing fetched, nothing walked.
+    // Same tip, host already there: nothing fetched, nothing walked, and not a
+    // single commit or tree row read on the serve side.
     for _ in 0..3 {
-        let s = sync(&owner, &mut mirror);
+        let (s, reads) = sync(&owner, &mut mirror);
         assert_eq!(s.commits, 0, "host is up to date");
         assert_eq!(cache.commits_walked(), 2, "an up-to-date sync walked history");
+        assert_eq!(cache.closure_builds(), 1, "an up-to-date sync built a closure");
+        assert_eq!(
+            reads,
+            ReadCounts::default(),
+            "an up-to-date sync read the store"
+        );
     }
+
+    // A second host at the same tip asks for every object, so this does reach
+    // `closure_for`: the cached closure is handed back, not built again.
+    let other_root = tempfile::tempdir().unwrap();
+    let mut other =
+        MirrorStore::open_or_create(other_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+    let (s_other, _) = sync(&owner, &mut other);
+    assert_eq!(s_other.commits, 2, "a fresh host backfills the whole chain");
+    assert_eq!(cache.commits_walked(), 2, "a second host re-walked history");
+    assert_eq!(cache.closure_builds(), 1, "a second host rebuilt the closure");
+    drop(other);
 
     // Two new commits: the walk advances by exactly those two.
     owner.commit_file("b.md", "beta");
     let tip = owner.commit_file("dir/c.md", "gamma");
-    let s2 = sync(&owner, &mut mirror);
+    let (s2, _) = sync(&owner, &mut mirror);
     assert_eq!(s2.commits, 2);
     assert_eq!(cache.commits_walked(), 4, "walked more than the new commits");
+    assert_eq!(cache.closure_builds(), 2);
     drop(mirror);
 
     assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
     let report = fsck_mirror(replica_root.path(), &owner.device_id);
     assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
     assert_eq!(report.commits_checked, 4);
+}
+
+/// The announce's height costs no commit read on an unchanged tip and one per
+/// new commit on a moved tip, and the signed bytes are those a fresh count signs.
+#[test]
+fn announce_height_reads_only_the_commits_added_since() {
+    let mut owner = new_owner();
+    let first = owner.commit_file("a.md", "alpha");
+    let cache = ClosureCache::default();
+    let commit_reads = |owner: &Owner| owner.repo.db().read_counts().commits;
+    // What `build_announce` signs with no cache: the reference for every case.
+    let fresh = |owner: &Owner| build_announce(&owner.repo, &owner.session).unwrap();
+
+    // First use counts the whole history: genesis + a.md.
+    let before = commit_reads(&owner);
+    let a1 = build_announce_with(&owner.repo, &owner.session, &cache).unwrap();
+    assert_eq!(a1.height, 2);
+    assert_eq!(commit_reads(&owner) - before, 2);
+    assert_eq!(a1, fresh(&owner));
+
+    // The same tip reads nothing, however often it is announced.
+    let before = commit_reads(&owner);
+    for _ in 0..3 {
+        assert_eq!(build_announce_with(&owner.repo, &owner.session, &cache).unwrap(), a1);
+    }
+    assert_eq!(commit_reads(&owner), before, "an unchanged tip read commit rows");
+
+    // N new commits read N, whatever the history length before them.
+    owner.commit_file("b.md", "beta");
+    owner.commit_file("c.md", "gamma");
+    let before = commit_reads(&owner);
+    let a2 = build_announce_with(&owner.repo, &owner.session, &cache).unwrap();
+    assert_eq!(commit_reads(&owner) - before, 2, "read more than the new commits");
+    assert_eq!(a2.height, 4);
+    assert_eq!(a2, fresh(&owner));
+
+    // A tip that does not descend from the cached one takes the full count: ask
+    // for the older tip once the newer is cached.
+    let before = commit_reads(&owner);
+    let older = cache.height_for(owner.repo.db(), first).unwrap();
+    assert_eq!(older, 2, "a rollback must count its own history, not the cached one");
+    assert_eq!(commit_reads(&owner) - before, 2);
+    assert_eq!(cache.height_for(owner.repo.db(), first).unwrap(), 2);
 }
 
 #[test]

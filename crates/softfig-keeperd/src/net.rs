@@ -2937,7 +2937,7 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice, closures: &Arc<Closu
                 }
             return;
         }
-        let announce = match replica::build_announce(repo, session) {
+        let announce = match replica::build_announce_with(repo, session, closures) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("keeperd: net: replica announce build failed: {e}");

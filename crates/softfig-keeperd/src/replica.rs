@@ -38,11 +38,11 @@ use softfig_net::{
     grant_signing_bytes, tipannounce_signing_bytes, verify_tipannounce, ReplicaSink, ReplicaSource,
 };
 use softfig_store::{
-    put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, StorePaths, TreeEntryKind,
-    TreeEntryRow,
+    put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, ReadCounts, StorePaths,
+    TreeEntryKind, TreeEntryRow,
 };
 use softfig_vcs::{
-    canonical_tree_bytes, log_collect, reachable_extend, reachable_from, reachable_from_tree,
+    canonical_tree_bytes, reachable_extend, reachable_from, reachable_from_tree,
     verify_commit,
     CanonicalCommit, Reachable, Repo, TIP_REF,
 };
@@ -176,12 +176,20 @@ pub fn mint_grant(
 /// (`device_chain_replica_excludes_a_shared_chain`) and `softfig-vcs`'s
 /// `tests/replica_isolation.rs`.
 pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnounce> {
+    build_announce_with(repo, session, &ClosureCache::default())
+}
+
+/// [`build_announce`] with the height kept in `cache`, which the caller holds
+/// across ticks: an unchanged tip reads no commit rows and a tip that moved
+/// forward reads only the commits added since ([`ClosureCache::height_for`]).
+pub fn build_announce_with(
+    repo: &Repo,
+    session: &VaultSession,
+    cache: &ClosureCache,
+) -> NetResult<TipAnnounce> {
     let chain_id = repo.repo_id().map_err(neterr)?.into_bytes();
     let (tip_hash, height) = match repo.tip().map_err(neterr)? {
-        Some(tip) => {
-            let height = log_collect(repo.db(), tip).map_err(neterr)?.len() as u64;
-            (tip.as_bytes().to_vec(), height)
-        }
+        Some(tip) => (tip.as_bytes().to_vec(), cache.height_for(repo.db(), tip)?),
         None => (Vec::new(), 0),
     };
     let signature = session
@@ -196,25 +204,32 @@ pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnou
     })
 }
 
-/// The reachable closure of the announced device-chain tip, kept across
-/// reconcile ticks so an up-to-date push costs nothing.
+/// The reachable closure of the announced device-chain tip, and the announced
+/// height, kept across reconcile ticks so an up-to-date push costs nothing.
 ///
 /// History is append-only, so the closure of a new tip is the previous one plus
 /// the commits added since ([`reachable_extend`]): the same tip is a hit
 /// (no walk at all), a tip that moved forward walks only the new commits, and
 /// only a first use or a tip that does not descend from the cached one
-/// (fork/reset) walks the whole history. One cache belongs to one replica loop
-/// and one chain; it is not shared across chains.
+/// (fork/reset) walks the whole history. The height behind the signed announce
+/// follows the same rule ([`height_for`](Self::height_for)), but it is needed on
+/// every tick whether or not a host asks for an object, so it is kept apart from
+/// the lazily built closure. One cache belongs to one replica loop and one
+/// chain; it is not shared across chains.
 #[derive(Default)]
 pub struct ClosureCache {
     last: Mutex<Option<(Hash, Arc<Reachable>)>>,
     walked: AtomicUsize,
+    builds: AtomicUsize,
+    /// `(tip, height)` of the last announce built through this cache.
+    height: Mutex<Option<(Hash, u64)>>,
 }
 
 impl std::fmt::Debug for ClosureCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClosureCache")
             .field("commits_walked", &self.commits_walked())
+            .field("closure_builds", &self.closure_builds())
             .finish_non_exhaustive()
     }
 }
@@ -227,11 +242,47 @@ impl ClosureCache {
         self.walked.load(Ordering::Relaxed)
     }
 
+    /// Closures this cache has had to build or extend, rather than hand back
+    /// as they were. Another counting seam: serving the same tip again must
+    /// leave it unchanged, because that is the same-tip hit in `closure_for`.
+    pub fn closure_builds(&self) -> usize {
+        self.builds.load(Ordering::Relaxed)
+    }
+
+    /// The number of commits in `tip`'s history, for the signed announce.
+    ///
+    /// The cached tip is a hit (no read). A tip that moved forward counts the
+    /// commits from `tip` back to the cached one and adds the cached height, so
+    /// it reads only what is new. A tip that does not descend from the cached one
+    /// (fork/reset) never meets it, so the same walk runs to genesis and counts
+    /// the whole history. A store error leaves the cache as it was.
+    pub fn height_for(&self, db: &Db, tip: Hash) -> NetResult<u64> {
+        let mut last = self.height.lock().unwrap();
+        let cached = *last;
+        let mut counted = 0u64;
+        let mut cur = Some(tip);
+        let height = loop {
+            let Some(ch) = cur else {
+                break counted;
+            };
+            if let Some((cached_tip, cached_height)) = cached
+                && ch == cached_tip
+            {
+                break cached_height + counted;
+            }
+            cur = db.get_commit(&ch).map_err(neterr)?.parent;
+            counted += 1;
+        };
+        *last = Some((tip, height));
+        Ok(height)
+    }
+
     fn closure_for(&self, db: &Db, tip: Hash) -> NetResult<Arc<Reachable>> {
         let mut last = self.last.lock().unwrap();
         let (closure, walked) = match last.take() {
             Some((cached_tip, closure)) if cached_tip == tip => (closure, 0),
             Some((cached_tip, closure)) => {
+                self.builds.fetch_add(1, Ordering::Relaxed);
                 // Sessions run one at a time on the replica loop, so the previous
                 // serve has dropped its handle; a clone is only the fallback.
                 let base = Arc::try_unwrap(closure).unwrap_or_else(|a| clone_reachable(&a));
@@ -240,6 +291,7 @@ impl ClosureCache {
                 (Arc::new(next), walked)
             }
             None => {
+                self.builds.fetch_add(1, Ordering::Relaxed);
                 let full = reachable_from(db, tip).map_err(neterr)?;
                 let walked = full.commits.len();
                 (Arc::new(full), walked)
@@ -366,6 +418,12 @@ impl RepoSource {
                 None
             }
         }
+    }
+
+    /// Commit and tree reads this source's own store handle has served: the
+    /// counting seam for what a serve session costs.
+    pub fn read_counts(&self) -> ReadCounts {
+        self.repo.db().read_counts()
     }
 
     fn serves(&self, pick: impl Fn(&Reachable) -> bool) -> bool {
