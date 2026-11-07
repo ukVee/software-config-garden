@@ -1238,19 +1238,24 @@ impl ClaudeFlavor {
             survivors.as_slice()
         };
         // The weekly reserve (growlight-schedule slice 004, §3.6): skip a
-        // reserve-held slot while the pool has a clear one. A pool held on
-        // every slot never reaches a spawn — the schedule verdict holds the
-        // member with `HoldReason::Reserve` — so an all-held view here is a
-        // tick-boundary race, and the pick proceeds on the unnarrowed set.
-        let unreserved: Vec<String> = self
+        // reserve-held slot while the candidates include a clear one. When
+        // every candidate is held the member waits: a sibling slot on a
+        // rate-limit hold narrows `candidates` to the reserved slot alone, so
+        // this is reached without any race, and picking it would spend the
+        // owner's reserve. The Hold names no slot, so the drive loop stamps no
+        // rate-limit entry on a slot that is only reserved; the next tick
+        // re-runs the pick and it clears when the reserve or the sibling does.
+        let reserve_held: BTreeSet<String> = self
             .reserve_view
             .get()
-            .map(|view| {
-                let held = view.lock().unwrap();
-                candidates.iter().filter(|slot| !held.contains(*slot)).cloned().collect()
-            })
+            .map(|view| view.lock().unwrap().clone())
             .unwrap_or_default();
-        let candidates: &[String] = if unreserved.is_empty() || unreserved.len() == candidates.len() {
+        let unreserved: Vec<String> =
+            candidates.iter().filter(|slot| !reserve_held.contains(*slot)).cloned().collect();
+        if unreserved.is_empty() && !candidates.is_empty() {
+            return Err(SpawnKind::Hold { slots: Vec::new(), until: None });
+        }
+        let candidates: &[String] = if unreserved.len() == candidates.len() {
             candidates
         } else {
             eprintln!(
@@ -3184,9 +3189,7 @@ mod tests {
     }
 
     /// growlight-schedule slice 004 — a slot at its weekly reserve is skipped
-    /// while the pool has a clear one, and an all-reserved view (a
-    /// tick-boundary race: the verdict holds such a member) leaves the pick
-    /// unnarrowed instead of failing it.
+    /// while the pool has a clear one.
     #[test]
     fn a_reserve_held_slot_is_skipped_while_the_pool_has_a_clear_one() {
         let mut fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
@@ -3195,9 +3198,32 @@ mod tests {
         fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
         reserve.lock().unwrap().insert("slot1".to_string());
         assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// Review 056 F8 — a candidate set that is all reserve-held waits (a quiet
+    /// `Hold` naming no slot) instead of spending a reserved slot. A
+    /// rate-limited sibling reaches this deterministically: slot1 is held, so
+    /// the pick narrows to slot2, which is at its reserve.
+    #[test]
+    fn a_pool_with_only_reserved_slots_left_holds_instead_of_picking_one() {
+        let (mut fx, holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        holds.lock().unwrap().extend("slot1", 10_000);
         reserve.lock().unwrap().insert("slot2".to_string());
         let paths = crate::preapproval::agent_paths(&fx.agents, "a");
-        assert!(fx.backend.flavor.child_env("a", &paths).is_ok(), "an all-reserved view still picks");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("only a reserved slot is left") {
+            SpawnKind::Hold { slots, until } => {
+                assert!(slots.is_empty(), "no rate-limit entry is stamped on a reserved slot");
+                assert_eq!(until, None);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        assert!(fx.history("a").is_empty(), "nothing was picked");
+        // The reserve clearing releases the member.
+        reserve.lock().unwrap().clear();
+        assert!(fx.backend.flavor.child_env("a", &paths).is_ok());
     }
 
     /// M-C finish check 3a — every slot held = quiet Stall-shape, same as
