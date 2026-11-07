@@ -4839,6 +4839,69 @@ mod tests {
         );
     }
 
+    /// A growlightd stand-in on a real socket that answers one call with
+    /// `reply` and hands back the op it was asked for.
+    fn one_shot_growlightd(
+        dir: &Path,
+        reply: softfig_ipc::Response,
+    ) -> (PathBuf, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = dir.join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let req: softfig_ipc::Request = serde_json::from_str(&line).unwrap();
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+            req.op
+        });
+        (sock, served)
+    }
+
+    #[test]
+    fn a_queue_view_from_growlightd_is_decoded_and_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::ok(serde_json::json!({
+            "list": true,
+            "projects": [{
+                "name": "softfig", "repo": "~/p", "main": "main", "local": true, "stack": [],
+            }],
+        }));
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let view = fetch_queue_view(&sock).unwrap().expect("a reply is a view");
+        assert_eq!(served.join().unwrap(), growlightd::op::QUEUE_SHOW);
+        assert!(view.list);
+        assert_eq!(view.projects[0].name, "softfig");
+    }
+
+    #[test]
+    fn a_growlightd_too_old_for_queue_show_costs_only_the_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::BadArgs, "unknown op");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        assert_eq!(fetch_queue_view(&sock).unwrap(), None);
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn any_other_growlightd_error_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::Internal, "boom");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let err = fetch_queue_view(&sock).unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn no_growlightd_at_all_is_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch_queue_view(&dir.path().join("absent.sock")).unwrap(), None);
+    }
+
     #[test]
     fn queue_show_annotations_render_stack_and_sessions() {
         use softfig_ipc::growlightd::{QueueProjectStack, QueueShowSession, QueueStackBranch};
