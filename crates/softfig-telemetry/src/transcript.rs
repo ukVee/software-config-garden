@@ -57,11 +57,12 @@ pub fn ingest_transcript(reader: impl BufRead, keys: &TranscriptKeys, now: i64) 
         if let Some(ts) = ev.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601_utc) {
             at = ts;
         }
-        let Some(req) = request_for_assistant(&ev) else {
+        let Some(mut req) = request_for_assistant(&ev) else {
             continue;
         };
+        let id = fold.identify(&mut req);
         let str_at = |k: &str| ev.get(k).and_then(Value::as_str).map(str::to_string);
-        meta.entry(req.id.clone()).or_insert_with(|| LineMeta {
+        meta.entry(id).or_insert_with(|| LineMeta {
             session_id: str_at("sessionId")
                 .or_else(|| str_at("session_id"))
                 .or_else(|| keys.session_id.clone())
@@ -211,6 +212,24 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"id":"m","model":"claude-opus-5-5"}}"#;
         let rows = ingest_transcript(line.as_bytes(), &keys(), at(NOW));
         assert_eq!(rows[0].session_id, "hook-session");
+    }
+
+    #[test]
+    fn an_id_less_line_with_usage_becomes_a_row_keyed_by_its_session() {
+        let lines = concat!(
+            r#"{"type":"assistant","sessionId":"sess-t","message":{"model":"claude-opus-5-5","usage":{"output_tokens":7}}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"sess-t","message":{"model":"claude-opus-5-5","usage":{"output_tokens":9}}}"#,
+        );
+        let rows = ingest_transcript(lines.as_bytes(), &keys(), at(NOW));
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.session_id.as_str(), r.request_id.as_str(), r.tokens.output))
+            .collect();
+        assert_eq!(got, [("sess-t", "anon:main:0", 7), ("sess-t", "anon:main:1", 9)]);
+        let again = ingest_transcript(lines.as_bytes(), &keys(), at(NOW));
+        let key = |rs: &[RequestRow]| rs.iter().map(|r| r.request_id.clone()).collect::<Vec<_>>();
+        assert_eq!(key(&rows), key(&again), "a re-ingest names the lines the same way");
     }
 
     #[test]

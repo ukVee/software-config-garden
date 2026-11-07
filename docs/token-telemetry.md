@@ -82,6 +82,12 @@ already emit (spec §4):
    `message.id`. A message spans several events, one per content block, and
    carries the same usage on each.
    - A row closes when a different id appears in the same lane, or at EOF.
+   - An id the fold already closed is ignored if a later line re-emits it, so
+     the ring shows the rows the db's `UNIQUE(session_id, request_id)` keeps.
+   - A line with a `usage` but no `message.id` is its own request, named
+     `anon:<lane or main>:<n>` (`n` counts the id-less lines in that fold), so
+     its tokens are kept and a re-ingest names it the same way. An id-less line
+     with no `usage` is dropped.
    - A lane is the line's `parent_tool_use_id` (stream-json), or its `agentId`
      (a transcript's subagent lines). So a subagent's interleaved messages never
      close the parent's.
