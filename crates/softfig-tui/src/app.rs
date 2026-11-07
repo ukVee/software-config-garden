@@ -3992,8 +3992,9 @@ impl App {
             self.status = "edit links needs an entry row".into();
             return;
         }
+        let Some(buf) = queue_v2_view::after_text(r, &row.entry_id) else { return };
         self.overlay = Overlay::QueueEditAfter {
-            buf: String::new(),
+            buf,
             entry: row.entry_id.clone(),
             error: None,
         };
@@ -8548,6 +8549,52 @@ mod tests {
         assert!(p.dry_run);
         let V2Action::Drop(args) = &p.action else { panic!("expected a drop") };
         assert_eq!((args.id.as_str(), args.reason.as_str()), ("b", "old"));
+    }
+
+    /// `b` linked to two entries, with the cursor on it.
+    fn v2_app_with_links() -> App {
+        let mut app = v2_app_cursor_on_b();
+        let reply = app.growlight_queue_v2.as_mut().unwrap();
+        reply.entries[1].after = vec!["a".into(), "c".into()];
+        app
+    }
+
+    #[test]
+    fn the_links_editor_opens_on_the_entrys_current_links() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        let Overlay::QueueEditAfter { buf, entry, .. } = &app.overlay else {
+            panic!("`a` opens the editor, got {:?}", app.overlay)
+        };
+        assert_eq!((buf.as_str(), entry.as_str()), ("a, c", "b"));
+    }
+
+    #[test]
+    fn a_bare_enter_in_the_links_editor_keeps_every_link() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.after.as_deref(), Some(&["a".to_string(), "c".to_string()][..]));
+    }
+
+    #[test]
+    fn deleting_the_text_still_clears_the_links() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        for _ in 0.."a, c".len() {
+            press(&mut app, &mut ipc, KeyCode::Backspace);
+        }
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.after.as_deref(), Some(&[][..]));
     }
 
     #[test]

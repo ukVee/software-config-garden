@@ -567,6 +567,12 @@ fn live_entry<'a>(reply: &'a QueueShowReply, id: &str) -> Option<&'a softfig_ipc
     reply.entries.iter().find(|e| e.id == id)
 }
 
+/// The text the `edit links` overlay opens on: `id`'s current links, so a bare
+/// Enter keeps them. Clearing them takes deleting the text.
+pub fn after_text(reply: &QueueShowReply, id: &str) -> Option<String> {
+    Some(live_entry(reply, id)?.after.join(", "))
+}
+
 /// Replace entry `id`'s `after` links (the `edit links` action).
 pub fn entry_after(reply: &QueueShowReply, id: &str, after: Vec<String>) -> Option<V2Action> {
     live_entry(reply, id)?;
