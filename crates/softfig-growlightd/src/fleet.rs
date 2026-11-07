@@ -543,7 +543,7 @@ pub struct FleetConfig {
     pub roll_grace_secs: u64,
     /// `[schedule]` — growlightd's clock (milestone `growlight-schedule`),
     /// validated against the members. `None` when the table is absent: no
-    /// schedule gate. Nothing reads it for admission yet (slice 003).
+    /// schedule gate. The drive loop evaluates it every tick.
     pub schedule: Option<crate::schedule::ScheduleConfig>,
 }
 
