@@ -805,6 +805,8 @@ pub(crate) mod tests {
             .collect(),
             done_ids: Default::default(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 

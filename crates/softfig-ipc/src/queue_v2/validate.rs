@@ -457,6 +457,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }
     }
 
@@ -466,6 +467,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Dropped,
             reason: Some("superseded".to_string()),
+            re_record_due: false,
         }
     }
 
@@ -652,6 +654,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         };
         queue(vec![softfig_project()], vec![a])
             .validate(&archive(vec![arch]))

@@ -2751,11 +2751,16 @@ pub struct QueueV2BaseRecord {
 /// `queue_v2_re_record_bases({entries}) -> {hash}` — the §8 re-record
 /// (`queue-v2-git` slice 004), keeperd↔growlightd only. growlightd recomputed
 /// each restacked branch's base after the restack completed and passes the
-/// `(entry, base)` pairs; keeperd replaces each named live entry's `base`.
+/// `(entry, base)` pairs; keeperd replaces each named live entry's `base` and
+/// clears `re_record_due` on each `settled` archive row, in one commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2ReRecordBasesArgs {
     /// The re-recorded `(entry, base)` pairs.
     pub entries: Vec<QueueV2BaseRecord>,
+    /// The archived restack rows this pass answers. Empty pairs with a settled
+    /// row is a pass that found nothing to move.
+    #[serde(default)]
+    pub settled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

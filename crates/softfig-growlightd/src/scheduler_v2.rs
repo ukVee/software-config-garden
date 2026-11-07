@@ -165,6 +165,12 @@ pub struct V2Snapshot {
     /// detection resolves a child's archived parent through it (queue-v2-git
     /// §8, V7).
     pub done_branches: BTreeMap<String, String>,
+    /// The project of each archive row with `final_status = done`: the row left
+    /// `entries`, and a handoff scan still has to find its repo (§8, V17).
+    pub done_projects: BTreeMap<String, String>,
+    /// Archived restack rows still owed their §8 re-record, by project (project
+    /// → row ids). Read from the archive, so a daemon restart doesn't lose them.
+    pub re_records_due: BTreeMap<String, Vec<String>>,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -706,6 +712,8 @@ mod tests {
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 

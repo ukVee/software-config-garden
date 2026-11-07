@@ -1226,11 +1226,15 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                     return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
                 }
                 let row = queue.entries.remove(idx);
+                // The human's `done` finishes a deferred restack too, and the
+                // re-record tests each branch, so it moves only what landed.
+                let re_record_due = row.kind == EntryKind::Restack;
                 archive.entries.push(ArchivedEntry {
                     row,
                     finished: conventions::now_rfc3339(),
                     final_status: FinalStatus::Done,
                     reason: None,
+                    re_record_due,
                 });
                 archived = true;
             }
@@ -1721,6 +1725,7 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         finished: conventions::now_rfc3339(),
         final_status: FinalStatus::Dropped,
         reason: Some(args.reason.clone()),
+        re_record_due: false,
     });
 
     // Dry runs compute the restack rows too (the would-be view shows them)
@@ -2670,6 +2675,7 @@ mod tests {
                 finished: "2026-10-11T16:00:00Z".to_string(),
                 final_status: FinalStatus::Done,
                 reason: None,
+                re_record_due: false,
             }]);
             let mut inner = daemon.inner.lock().unwrap();
             apply(
@@ -3219,6 +3225,7 @@ mod tests {
             finished: "2026-10-13T12:00:00Z".to_string(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }]);
         let queue = QueueToml::new(vec![project()], vec![child]);
         let stack = stack_from_list(&queue, &archive, "softfig");
@@ -3343,6 +3350,29 @@ mod tests {
         assert_eq!(s.parent, "p", "parent stays");
         assert_eq!(s.base, "abc123", "base stays");
         assert_eq!(s.claimed, "2026-10-11T12:00:00Z", "claimed stays");
+    }
+
+    /// The human's `done` is how a deferred restack finishes, so it owes the
+    /// re-record as a session's `done` does (§8). Any other row owes nothing.
+    #[test]
+    fn human_done_marks_a_restack_row_due_and_nothing_else() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut r = entry("r");
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        r.branch = String::new();
+        r.status = EntryStatus::Deferred;
+        seed_queue(&daemon, vec![project()], vec![r, entry("n")], None);
+
+        update_entry(&daemon, serde_json::json!({ "id": "r", "status": "done" })).expect("done");
+        update_entry(&daemon, serde_json::json!({ "id": "n", "status": "done" })).expect("done");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let due: Vec<_> = qs.archive.model.entries.iter().map(|a| a.re_record_due).collect();
+        assert_eq!(due, [true, false]);
     }
 
     #[test]

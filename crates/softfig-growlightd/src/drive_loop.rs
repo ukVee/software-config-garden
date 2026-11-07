@@ -1025,11 +1025,12 @@ pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
 /// `queue_v2_re_record_bases({entries: [{entry, base}]})` — growlightd
 /// recomputed each branch's base read-only with `git merge-base` after a
 /// restack completed, and keeperd writes them back. Fail-soft in the drive
-/// loop: a failed write is logged, never wedges a completion. The live impl is
-/// [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
+/// loop: a failed write leaves the rows due, so the next tick retries it. The
+/// live impl is [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
 pub trait V2BaseReRecorder: Send + Sync + fmt::Debug {
-    /// Re-record `entries`' bases — `(entry, new base)` pairs.
-    fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String>;
+    /// Re-record `entries`' bases — `(entry, new base)` pairs — and mark the
+    /// archived restack rows `settled` as answered, in one write.
+    fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String>;
 }
 
 /// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
@@ -1547,14 +1548,10 @@ pub struct DriveLoop {
     /// the handshake runs in step 1, before the snapshot loads, so its §8
     /// restack scan is deferred here and drained once the snapshot is read.
     v2_handoff_scans: std::collections::BTreeSet<String>,
-    /// A restack entry's project, recorded at claim (queue-v2-git slice 004) so
-    /// its completion — which archives the row, dropping it from the snapshot —
-    /// still names the repo whose branches' bases must be re-recorded.
-    v2_restack_project: std::collections::BTreeMap<String, String>,
-    /// Projects whose restack completed this tick (queue-v2-git slice 004): the
-    /// re-record is deferred like the handoff scan — the handshake runs in step
-    /// 1, before the snapshot loads — and drained once it is read.
-    v2_re_record_scans: std::collections::BTreeSet<String>,
+    /// Projects whose due re-record already alerted the human (V17). The row
+    /// stays due and retries every tick, so the alert goes out once per project
+    /// until that project has nothing due.
+    v2_re_record_alerted: std::collections::BTreeSet<String>,
     /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
     /// of `assignments`, recorded on the member's v2 fresh start and carried
     /// across re-rolls (a re-roll re-spawns on the same spec, model included).
@@ -1756,8 +1753,7 @@ impl DriveLoop {
             restack_boot_done: false,
             git_probes: ProbeCache::new(),
             v2_handoff_scans: std::collections::BTreeSet::new(),
-            v2_restack_project: std::collections::BTreeMap::new(),
-            v2_re_record_scans: std::collections::BTreeSet::new(),
+            v2_re_record_alerted: std::collections::BTreeSet::new(),
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
@@ -2669,6 +2665,15 @@ impl DriveLoop {
                 });
                 apply_v2_overlay(snapshot, &self.v2_overlay());
 
+                // §8 re-record: every archived restack still due, ahead of the
+                // scans below, so a follow-up restack they enqueue this tick
+                // renders the new bases rather than the pre-rebase ones.
+                let re_records_due = snapshot.re_records_due.clone();
+                self.v2_re_record_alerted.retain(|p| re_records_due.contains_key(p));
+                for (project, restacks) in &re_records_due {
+                    self.re_record_restack(snapshot, project, restacks, &mut report.v2_restack_blocked);
+                }
+
                 // §8 restack detection (queue-v2-git slice 003): once at daemon
                 // start, and once per handoff this tick (deferred from step 1,
                 // which runs before the snapshot loads).
@@ -2678,20 +2683,17 @@ impl DriveLoop {
                 }
                 let handoff_scans = std::mem::take(&mut self.v2_handoff_scans);
                 for entry_id in &handoff_scans {
+                    // An entry that completed has left `entries` for the archive.
                     if let Some(p) = snapshot
                         .entries
                         .iter()
                         .find(|e| e.id == *entry_id)
-                        .map(|e| e.project.clone())
+                        .map(|e| &e.project)
+                        .or_else(|| snapshot.done_projects.get(entry_id))
+                        .cloned()
                     {
                         self.scan_restacks(snapshot, Some(&p), &mut report.v2_restack_blocked);
                     }
-                }
-                // §8 re-record (queue-v2-git slice 004): restack completions
-                // deferred from step 1, drained once the snapshot loads.
-                let re_record_scans = std::mem::take(&mut self.v2_re_record_scans);
-                for project in &re_record_scans {
-                    self.re_record_restack(snapshot, project, &mut report.v2_restack_blocked);
                 }
 
                 // The per-member `pick_v2` input, built from the configured fleet:
@@ -2969,14 +2971,6 @@ impl DriveLoop {
                                 // §8 restack detection at claim (queue-v2-git
                                 // slice 003): check the claimed entry's repo.
                                 if let Some(ev) = snapshot.entries.iter().find(|e| e.id == entry_top) {
-                                    // Record a restack entry's project now, so
-                                    // its completion (which archives the row)
-                                    // still names the repo to re-record (§8,
-                                    // queue-v2-git slice 004).
-                                    if ev.kind == EntryKind::Restack {
-                                        self.v2_restack_project
-                                            .insert(entry_top.to_string(), ev.project.clone());
-                                    }
                                     self.scan_restacks(snapshot, Some(&ev.project), &mut report.v2_restack_blocked);
                                 }
                             }
@@ -3945,35 +3939,56 @@ impl DriveLoop {
         }
     }
 
-    /// §8 re-record (queue-v2-git slice 004): after a restack completed,
-    /// recompute each restacked local branch's `base` read-only
-    /// (`git merge-base <branch> <its parent's tip or main>`) and write them
-    /// back through the re-recorder seam. A branch that tracks an upstream is
-    /// never rewritten — the pass returns [`git_stack::ReRecord::Upstream`],
-    /// the loop leaves the base untouched and alerts the human through
-    /// `blocked`. This is the backstop: [`Self::scan_restacks`] withholds a
-    /// restack over such a branch up front, and the restack's doc and the v2
-    /// protocol tell the agent to end with `growlight_block kind = human`, so
-    /// reaching it means a branch gained an upstream mid-restack. Fail-soft: a
-    /// git or write error is skipped — the next restack detection re-flags the
-    /// stale base.
+    /// §8 re-record (queue-v2-git slice 004): `restacks` are this project's
+    /// archived rows still due. Recompute each restacked local branch's `base`
+    /// read-only (`git merge-base <branch> <its parent's tip or main>`), write
+    /// them back through the re-recorder seam with the rows marked settled, and
+    /// patch `snapshot` so this tick's scans carry the new bases.
+    ///
+    /// The rows stay due, and the next tick retries, on anything that can still
+    /// come right: a git error, a failed write, a worktree mid-rebase, or a live
+    /// restack row in the project. That last one is the drop's case: its child
+    /// keeps a `base` it needs until the rewrite lands, and it contains `main`
+    /// beforehand, so a pass now would move that base. The later row's own
+    /// completion settles both.
+    ///
+    /// A branch that tracks an upstream settles the rows instead: the loop
+    /// never rewrites it, so waiting changes nothing, its base stays as recorded
+    /// and the human is told through `blocked`. This is the backstop:
+    /// [`Self::scan_restacks`] withholds a restack over such a branch up front,
+    /// and the restack's doc and the v2 protocol tell the agent to end with
+    /// `growlight_block kind = human`, so reaching it means a branch gained an
+    /// upstream mid-restack.
     fn re_record_restack(
-        &self,
-        snapshot: &scheduler_v2::V2Snapshot,
+        &mut self,
+        snapshot: &mut scheduler_v2::V2Snapshot,
         project: &str,
+        restacks: &[String],
         blocked: &mut Vec<String>,
     ) {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
+        if snapshot
+            .entries
+            .iter()
+            .any(|e| e.project == project && e.kind == EntryKind::Restack)
+        {
+            return;
+        }
         let Some(proj) = snapshot.projects.iter().find(|p| p.name == project) else {
+            let _ = seams.re_recorder.re_record_bases(&[], restacks);
             return;
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let repo = Repo::classify(&proj.repo, home.as_deref());
         let repo_path = match &repo {
             Repo::Local(path) => path.clone(),
-            Repo::Remote => return, // a remote repo has no commit to resolve (§8)
+            // A remote repo has no commit to resolve: the human re-records (§8).
+            Repo::Remote => {
+                let _ = seams.re_recorder.re_record_bases(&[], restacks);
+                return;
+            }
         };
         let entries: Vec<git_stack::RestackEntry> = snapshot
             .entries
@@ -3988,9 +4003,6 @@ impl DriveLoop {
                 base: e.base.clone(),
             })
             .collect();
-        if entries.is_empty() {
-            return;
-        }
         // Fresh reads: this runs after a restack the loop was told about, and
         // writes bases back, so it must not answer from this tick's earlier scans.
         let main = proj.main.clone();
@@ -4003,25 +4015,34 @@ impl DriveLoop {
             // A branch tracks an upstream: the loop never rewrites it, so the
             // bases stay as recorded and the human is told.
             Ok(git_stack::ReRecord::Upstream { branch }) => {
-                blocked.push(restack_blocked_alert(project, &branch));
+                let _ = seams.re_recorder.re_record_bases(&[], restacks);
+                if self.v2_re_record_alerted.insert(project.to_string()) {
+                    blocked.push(restack_blocked_alert(project, &branch));
+                }
                 return;
             }
             // A stack worktree is mid-rebase (a killed restack session): the
             // branch has not moved yet, so record nothing and tell the human.
             Ok(git_stack::ReRecord::Rebasing { worktree }) => {
-                blocked.push(restack_rebasing_alert(project, &worktree));
+                if self.v2_re_record_alerted.insert(project.to_string()) {
+                    blocked.push(restack_rebasing_alert(project, &worktree));
+                }
                 return;
             }
-            Err(_) => return, // fail-soft: re-detected on the next scan
+            Err(_) => return, // fail-soft: still due, so the next tick retries
         };
-        if bases.is_empty() {
-            return;
-        }
         let pairs: Vec<(String, String)> = bases
             .iter()
             .map(|b| (b.entry.clone(), b.base.clone()))
             .collect();
-        let _ = seams.re_recorder.re_record_bases(&pairs);
+        if seams.re_recorder.re_record_bases(&pairs, restacks).is_err() {
+            return;
+        }
+        for (id, base) in pairs {
+            if let Some(e) = snapshot.entries.iter_mut().find(|e| e.id == id) {
+                e.base = base;
+            }
+        }
     }
 
     /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
@@ -4064,14 +4085,6 @@ impl DriveLoop {
         // §8 restack detection at handshake (queue-v2-git slice 003): deferred
         // until the snapshot loads (step 3), then drained by the tick.
         self.v2_handoff_scans.insert(entry.clone());
-        // §8 re-record (queue-v2-git slice 004): a restack entry that completed
-        // is archived — its row is gone from the next snapshot — so its project
-        // was recorded at claim. Defer the re-record for that project here.
-        if handoff.verb == softfig_ipc::growlightd::op::GROWLIGHT_COMPLETE_ENTRY
-            && let Some(project) = self.v2_restack_project.remove(&entry)
-        {
-            self.v2_re_record_scans.insert(project);
-        }
         if let Some(model) = &handoff.next_model {
             // The same unit's next session runs on the requested model (§6.4).
             let unit = handoff.assignment.unit.clone();
@@ -9259,6 +9272,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     #[derive(Debug, Default)]
     struct FakeV2RestackEnqueuer {
         enqueued: Mutex<Vec<(String, usize)>>,
+        stacks: Mutex<Vec<Vec<RestackBranch>>>,
     }
 
     impl V2RestackEnqueuer for FakeV2RestackEnqueuer {
@@ -9271,6 +9285,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 .lock()
                 .unwrap()
                 .push((project.to_string(), stack.len()));
+            self.stacks.lock().unwrap().push(stack.to_vec());
             Ok(Some("001".into()))
         }
     }
@@ -9290,18 +9305,24 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     #[derive(Debug, Default)]
     struct FakeV2BaseReRecorder {
         recorded: Mutex<Vec<(String, String)>>,
+        settled: Mutex<Vec<String>>,
+        refuse: std::sync::atomic::AtomicBool,
     }
 
     impl V2BaseReRecorder for FakeV2BaseReRecorder {
-        fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
+        fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("refused".into());
+            }
             self.recorded.lock().unwrap().extend_from_slice(entries);
+            self.settled.lock().unwrap().extend_from_slice(settled);
             Ok(())
         }
     }
 
     impl V2BaseReRecorder for Arc<FakeV2BaseReRecorder> {
-        fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
-            (**self).re_record_bases(entries)
+        fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String> {
+            (**self).re_record_bases(entries, settled)
         }
     }
 
@@ -9357,6 +9378,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             .collect(),
             done_ids: BTreeSet::new(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -9718,7 +9741,16 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
+    }
+
+    /// Swap `loop_`'s re-recorder for a spy the test can read.
+    fn spy_re_recorder(loop_: &mut DriveLoop) -> Arc<FakeV2BaseReRecorder> {
+        let rec = Arc::new(FakeV2BaseReRecorder::default());
+        loop_.v2.as_mut().unwrap().re_recorder = Box::new(Arc::clone(&rec));
+        rec
     }
 
     fn v2_loop_with_restacker(enq: &Arc<FakeV2RestackEnqueuer>) -> DriveLoop {
@@ -9827,12 +9859,68 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     fn v2_mode_re_record_over_an_upstream_branch_alerts_instead_of_returning_silently() {
         let (dir, base) = stale_stack_repo(true);
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
 
         let mut blocked = Vec::new();
-        loop_.re_record_restack(&restack_snapshot(dir.path(), &base), "softfig", &mut blocked);
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut restack_snapshot(dir.path(), &base), "softfig", &due, &mut blocked);
 
         assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+        // Waiting changes nothing for a pushed branch, so the row stops being due.
+        assert!(rec.recorded.lock().unwrap().is_empty());
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    /// A remote repo runs no git, so its row settles at once with nothing moved.
+    #[test]
+    fn v2_mode_re_record_settles_a_remote_repo_with_nothing_moved() {
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        let mut snapshot = restack_snapshot(std::path::Path::new("/tmp"), "abc");
+        snapshot.projects[0].repo = "ssh://host/repo.git".into();
+
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+
+        assert!(rec.recorded.lock().unwrap().is_empty());
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    /// A refused write leaves the list as it was, so the row stays due and the
+    /// snapshot keeps the base the list still holds.
+    #[test]
+    fn v2_mode_a_refused_re_record_patches_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        rec.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let main = git(&["rev-parse", "main"]);
+        git(&["rebase", "-q", "--onto", "main", &base, "feat/one"]);
+        git(&["checkout", "-q", "main"]);
+
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(snapshot.entries[0].base, base, "the list still holds the old base");
+
+        rec.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(snapshot.entries[0].base, main, "the retry lands and patches");
+        assert_eq!(*rec.settled.lock().unwrap(), due);
     }
 
     /// V4: a restack session killed mid-rebase leaves a stack worktree in
@@ -9857,9 +9945,12 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(!git(&["rebase", "main", "feat/one"]).status.success(), "stops on the conflict");
 
         let enq = Arc::new(FakeV2RestackEnqueuer::default());
-        let loop_ = v2_loop_with_restacker(&enq);
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
         let mut blocked = Vec::new();
-        loop_.re_record_restack(&restack_snapshot(repo, &base), "softfig", &mut blocked);
+        let due = ["r".to_string()];
+        let mut snapshot = restack_snapshot(repo, &base);
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
 
         assert_eq!(blocked.len(), 1, "{blocked:?}");
         assert!(
@@ -9867,6 +9958,16 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 && blocked[0].ends_with(" is mid-rebase; bases not re-recorded"),
             "{blocked:?}",
         );
+
+        // The row stays due, so the retry every tick must not alert again.
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
+        assert_eq!(blocked.len(), 1, "one alert, not one per tick: {blocked:?}");
+        assert!(rec.settled.lock().unwrap().is_empty(), "still due");
+
+        // The rebase ends, and the retry finishes the job.
+        assert!(git(&["rebase", "--abort"]).status.success());
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
+        assert_eq!(*rec.settled.lock().unwrap(), due);
     }
 
     #[test]
@@ -10280,7 +10381,10 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     use crate::member_handoff::tests::SpyKeeper;
     use crate::member_handoff::{HandoffSeams, KeeperOp};
     use softfig_ipc::growlightd::{op as gop, MemberVerbReply, NextUnit, RefusalCode, MEMBER_VERB_OK};
-    use softfig_ipc::queue_v2::{slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE};
+    use softfig_ipc::queue_v2::{
+        slices_file, ArchivedEntry, Entry, FinalStatus, Project, QueueArchiveToml, QueueToml,
+        SliceItem, SlicesToml, QUEUE_ARCHIVE_FILE, QUEUE_FILE,
+    };
     use softfig_ipc::verbs::DaemonStatusArg;
 
     /// A throwaway garden the v2 source reads.
@@ -10751,6 +10855,293 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec!["071", "071", "072", "m2"],
             "one claim each, in order",
         );
+    }
+
+    /// `git` in the garden's repo, asserting it worked; returns its stdout.
+    fn garden_git(garden: &TestGarden, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(&garden.repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// One commit adding `file`, on whatever is checked out; returns its hash.
+    fn garden_commit(garden: &TestGarden, file: &str) -> String {
+        std::fs::write(garden.repo.join(file), "x\n").unwrap();
+        garden_git(garden, &["add", "."]);
+        garden_git(garden, &["commit", "-q", "-m", file]);
+        garden_git(garden, &["rev-parse", "HEAD"])
+    }
+
+    /// `feat/one` off `main` and `feat/two` off it, then `main` moved under
+    /// both. Returns the rows and `feat/one`'s tip before any restack.
+    fn stale_garden_stack(garden: &TestGarden) -> (Vec<Entry>, String) {
+        let base = garden_git(garden, &["rev-parse", "main"]);
+        garden_git(garden, &["checkout", "-q", "-b", "feat/one"]);
+        let one_tip = garden_commit(garden, "one.txt");
+        garden_git(garden, &["checkout", "-q", "-b", "feat/two"]);
+        garden_commit(garden, "two.txt");
+        garden_git(garden, &["checkout", "-q", "main"]);
+        garden_commit(garden, "urgent.txt");
+        let mut one = row("one", EntryKind::Task, Lane::Normal, EntryStatus::Blocked);
+        one.branch = "feat/one".into();
+        one.base = base;
+        let mut two = row("two", EntryKind::Task, Lane::Normal, EntryStatus::Blocked);
+        two.branch = "feat/two".into();
+        two.parent = "one".into();
+        two.base = one_tip.clone();
+        two.claimed = "2026-10-14T00:02:00Z".into();
+        (vec![one, two], one_tip)
+    }
+
+    /// What a restack session does to [`stale_garden_stack`]'s branches.
+    fn restack_garden_stack(garden: &TestGarden, one_tip: &str) {
+        garden_git(garden, &["rebase", "-q", "main", "feat/one"]);
+        garden_git(garden, &["rebase", "-q", "--onto", "feat/one", one_tip, "feat/two"]);
+        garden_git(garden, &["checkout", "-q", "main"]);
+    }
+
+    /// `queue-archive.toml` holding restack row `id`, finished `done`.
+    fn archive_restack(garden: &TestGarden, id: &str, re_record_due: bool) {
+        let mut row = row(id, EntryKind::Restack, Lane::Urgent, EntryStatus::Active);
+        row.branch = String::new();
+        let archived = ArchivedEntry {
+            row,
+            finished: "2026-10-15T00:00:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due,
+        };
+        let archive = QueueArchiveToml::new(vec![archived]);
+        garden.write(QUEUE_ARCHIVE_FILE, &archive.to_toml().unwrap());
+    }
+
+    /// V17's acceptance: one real move fires one restack across every tick that
+    /// follows, and a claim scan in the re-record's own tick adds no second one.
+    /// Detection judges containment, not the recorded base (`8feb7b1`), so this
+    /// holds without the snapshot patch: it pins the behaviour, and it is
+    /// `v2_a_follow_up_restack_carries_the_re_recorded_bases` that tests the patch.
+    #[test]
+    fn v2_one_real_move_fires_one_restack_and_no_follow_up_across_ticks() {
+        let garden = TestGarden::new("one-restack");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        garden.queue(rows.clone());
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+
+        // The session restacks and completes: its row is archived, still due.
+        // A queued entry is claimed in the same tick the re-record runs in.
+        restack_garden_stack(&garden, &one_tip);
+        archive_restack(&garden, "072", true);
+        let mut with_three = rows.clone();
+        with_three.push(row("three", EntryKind::Task, Lane::Normal, EntryStatus::Queued));
+        garden.queue(with_three);
+        let r = loop_.tick(1);
+        assert_eq!(r.v2_started.len(), 1, "the claim scan ran this tick: {r:?}");
+
+        let main = garden_git(&garden, &["rev-parse", "main"]);
+        let one = garden_git(&garden, &["rev-parse", "feat/one"]);
+        assert_eq!(
+            *rec.recorded.lock().unwrap(),
+            vec![("one".to_string(), main.clone()), ("two".to_string(), one.clone())],
+        );
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+
+        // keeperd's write: the new bases, and the row no longer due.
+        let mut landed = rows;
+        landed[0].base = main;
+        landed[1].base = one;
+        garden.queue(landed);
+        archive_restack(&garden, "072", false);
+        loop_.tick(2);
+        loop_.tick(3);
+        assert_eq!(enq.enqueued.lock().unwrap().len(), 1, "no spurious follow-up");
+        assert_eq!(rec.settled.lock().unwrap().len(), 1, "one re-record");
+    }
+
+    /// V17's acceptance: the trigger is on the archive row, so a loop that never
+    /// saw the claim or the completion still re-records.
+    #[test]
+    fn v2_a_restart_between_the_restack_and_its_re_record_still_re_records() {
+        let garden = TestGarden::new("restart-re-record");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        garden.queue(rows);
+        archive_restack(&garden, "072", true);
+
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+        loop_.tick(0);
+
+        assert_eq!(rec.recorded.lock().unwrap().len(), 2);
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+    }
+
+    /// V17: `outcome = deferred` leaves the row live for the human's verdict, so
+    /// nothing is re-recorded until that row is finished `done`.
+    #[test]
+    fn v2_a_deferred_restack_re_records_only_once_it_is_done() {
+        let restack = |status| {
+            let mut r = row("072", EntryKind::Restack, Lane::Urgent, status);
+            r.branch = String::new();
+            r
+        };
+        let garden = TestGarden::new("deferred-re-record");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        let list = |status| {
+            let mut list = vec![restack(status)];
+            list.extend(rows.clone());
+            list
+        };
+        garden.queue(list(EntryStatus::Queued));
+        let (mut loop_, d, backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+
+        garden.queue(list(EntryStatus::Active));
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "deferred",
+                "summary": "needs a look",
+                "deferred_tests": [{ "what": "check", "expected": "fine" }],
+                "baton": handoff_baton("072", "ITEM_DEFERRED", "wait"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(list(EntryStatus::Deferred));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        loop_.tick(1);
+        loop_.tick(2);
+        assert!(rec.recorded.lock().unwrap().is_empty(), "deferred is not done");
+
+        // The human's `done` archives the row, and that is what triggers it.
+        garden.queue(rows.clone());
+        archive_restack(&garden, "072", true);
+        loop_.tick(3);
+        assert_eq!(rec.recorded.lock().unwrap().len(), 2);
+    }
+
+    /// V17: a completed entry's row has left the list, and its handoff scan still
+    /// has to find the repo.
+    #[test]
+    fn v2_a_completed_entry_still_gets_its_handoff_scan() {
+        let task = |status| row("071", EntryKind::Task, Lane::Normal, status);
+        let garden = TestGarden::new("handoff-scan");
+        garden.queue(vec![task(EntryStatus::Queued)]);
+        let (mut loop_, d, backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert!(enq.enqueued.lock().unwrap().is_empty(), "nothing is stale at boot");
+
+        // The stack goes stale while 071 runs, and only its handoff can see it.
+        let (rows, _) = stale_garden_stack(&garden);
+        let mut list = vec![task(EntryStatus::Active)];
+        list.extend(rows.clone());
+        garden.queue(list);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "finished",
+                "baton": handoff_baton("071", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+
+        garden.queue(rows);
+        let archived = ArchivedEntry {
+            row: task(EntryStatus::Active),
+            finished: "2026-10-15T00:00:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due: false,
+        };
+        garden.write(
+            QUEUE_ARCHIVE_FILE,
+            &QueueArchiveToml::new(vec![archived]).to_toml().unwrap(),
+        );
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        loop_.tick(1);
+
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+    }
+
+    /// A live restack row holds a due re-record back: a drop's child keeps a base
+    /// it needs until the rewrite lands, and it already contains `main`.
+    #[test]
+    fn v2_a_due_re_record_waits_for_a_live_restack_row() {
+        let garden = TestGarden::new("re-record-waits");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        let mut restack = row("073", EntryKind::Restack, Lane::Urgent, EntryStatus::Blocked);
+        restack.branch = String::new();
+        let mut list = vec![restack];
+        list.extend(rows.clone());
+        garden.queue(list);
+        archive_restack(&garden, "072", true);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+        assert!(rec.settled.lock().unwrap().is_empty(), "the live row holds it back");
+        assert!(rec.recorded.lock().unwrap().is_empty());
+
+        garden.queue(rows);
+        loop_.tick(1);
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+    }
+
+    /// `main` moved again while the restack ran: the follow-up is real, and the
+    /// doc it renders must carry the re-recorded bases, not the pre-rebase ones
+    /// (the old `feat/one` tip is no longer in `feat/two`, so a step from it
+    /// would replay `feat/one`'s commits).
+    #[test]
+    fn v2_a_follow_up_restack_carries_the_re_recorded_bases() {
+        let garden = TestGarden::new("follow-up-bases");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        garden_commit(&garden, "urgent-two.txt");
+        garden.queue(rows);
+        archive_restack(&garden, "072", true);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+
+        // `feat/one` isn't on the new `main`, so only `feat/two` re-records.
+        let one = garden_git(&garden, &["rev-parse", "feat/one"]);
+        assert_eq!(*rec.recorded.lock().unwrap(), vec![("two".to_string(), one.clone())]);
+        let stacks = enq.stacks.lock().unwrap();
+        assert_eq!(stacks.len(), 1, "{stacks:?}");
+        let two = stacks[0].iter().find(|b| b.branch == "feat/two").unwrap();
+        assert_eq!(two.base, one, "not the pre-rebase {one_tip}");
     }
 
     /// SLICE 009 — a pause whose keeperd write fails is retried every tick,

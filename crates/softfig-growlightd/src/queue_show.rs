@@ -440,6 +440,8 @@ mod tests {
             trees,
             done_ids: Default::default(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -525,6 +527,8 @@ mod tests {
             trees: BTreeMap::new(),
             done_ids: Default::default(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         };
         let reply = show(&snapshot, Path::new("/nonexistent"));
         assert_eq!(reply.projects.len(), 1);
@@ -610,6 +614,8 @@ mod tests {
             trees: BTreeMap::new(),
             done_ids: Default::default(),
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -801,6 +807,7 @@ mod tests {
             finished: "2026-10-02T00:00:00Z".into(),
             final_status,
             reason: reason.map(str::to_string),
+            re_record_due: false,
         }
     }
 
