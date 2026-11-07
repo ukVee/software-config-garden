@@ -1887,26 +1887,39 @@ const RESTACK_UPSTREAM_RULE: &str = "## Before you rebase\n\n\
 /// they rewrite safe lives here: which worktree runs them (a branch checked out
 /// in one worktree cannot be rebased from another), a clean tree, a backup ref,
 /// and what a session killed mid-rebase leaves for the next one.
+///
+/// The skip test is the whole post-condition of `rebase --onto <onto> <base>
+/// <branch>`, for every step the doc can carry: containing `<onto>` is only half
+/// of it, because a drop's direct child contains its `--onto` commit (the
+/// dropped base) before its step has run (review 055 F1). It is run per step,
+/// not as a pre-flight, because a grandchild contains its parent's tip until the
+/// parent's own step moves that tip.
 const RESTACK_SAFETY_RULE: &str = "## Protect the work\n\n\
      1. **Resume first.** A previous session may have died mid-rebase. In every \
      worktree (`git worktree list --porcelain`), if \
      `git -C <worktree> rev-parse --git-path rebase-merge` or `… rebase-apply` \
      names a directory that exists, run `git -C <worktree> rebase --abort`; the \
-     branch goes back to its pre-rebase tip, so nothing is lost. A branch that \
-     already contains its `--onto` tip \
-     (`git merge-base --is-ancestor <onto> <branch>`) is done: skip its step.\n\
-     2. **Use the branch's worktree.** Run each step from the worktree that has \
+     branch goes back to its pre-rebase tip, so nothing is lost.\n\
+     2. **Skip only a finished step.** Test each step right before you reach it, \
+     once the steps above it have landed, never up front: a branch contains its \
+     parent's old tip until the parent moves. `git rebase --onto <onto> <base> \
+     <branch>` already happened if `git merge-base --is-ancestor <onto> <branch>` \
+     and `git merge-base --is-ancestor \"$(git merge-base <base> <branch>)\" <onto>` \
+     both succeed: the branch stands on `<onto>` and holds nothing of `<base>` \
+     that `<onto>` lacks. Only then skip its step. Containing `<onto>` alone \
+     proves nothing: the child of a dropped entry contains it from the start.\n\
+     3. **Use the branch's worktree.** Run each step from the worktree that has \
      the branch checked out (the `worktree` block of `git worktree list \
      --porcelain` whose `branch` is `refs/heads/<branch>`). If none has it, run \
      it from the repo's main worktree.\n\
-     3. **Clean tree.** `git -C <worktree> status --porcelain` must print \
+     4. **Clean tree.** `git -C <worktree> status --porcelain` must print \
      nothing. If it prints anything, rebase nothing: `growlight_block`, \
      `kind = human`, naming the worktree. Never stash, reset or discard.\n\
-     4. **Back up.** Before a branch's rebase run \
+     5. **Back up.** Before a branch's rebase run \
      `git branch restack-backup/<branch> <branch>`. If that ref already exists \
      an earlier attempt made it: keep it, it holds the original tip. Never \
      delete a backup ref; the human does, after review.\n\
-     5. **On a conflict, abort and block.** Run `git -C <worktree> rebase \
+     6. **On a conflict, abort and block.** Run `git -C <worktree> rebase \
      --abort`, then end with `growlight_block`, `kind = human`, naming the \
      branch and its backup ref. Do not resolve the conflict and do not rebase \
      any later branch.\n";
@@ -2865,6 +2878,8 @@ mod tests {
             "git worktree list --porcelain",
             "rev-parse --git-path rebase-merge",
             "rebase --abort",
+            "git merge-base --is-ancestor <onto> <branch>",
+            "$(git merge-base <base> <branch>)",
             "git -C <worktree> status --porcelain",
             "git branch restack-backup/<branch> <branch>",
             "`growlight_block`, `kind = human`",
@@ -4018,5 +4033,196 @@ mod tests {
         let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"], "nothing landed");
         assert!(qs.archive.model.entries.is_empty());
+    }
+
+    // ---- review 055 F1: a restack doc, followed literally in a real repo ----
+
+    /// A throwaway repo to follow a generated restack doc in.
+    struct StackRepo {
+        dir: tempfile::TempDir,
+    }
+
+    impl StackRepo {
+        fn new() -> Self {
+            let repo = StackRepo { dir: tempfile::tempdir().unwrap() };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.commit("root");
+            repo
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(self.dir.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "git {args:?}: {stderr}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        /// Whether a shell command the doc names succeeds here.
+        fn sh(&self, command: &str) -> bool {
+            std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(self.dir.path())
+                .status()
+                .unwrap()
+                .success()
+        }
+
+        /// One new file on the checked-out branch, its name as the subject.
+        fn commit(&self, name: &str) -> String {
+            std::fs::write(self.dir.path().join(name), name).unwrap();
+            self.git(&["add", name]);
+            self.git(&["commit", "-qm", name]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        fn tip(&self, branch: &str) -> String {
+            self.git(&["rev-parse", branch])
+        }
+
+        /// `branch`'s commit subjects, oldest first.
+        fn subjects(&self, branch: &str) -> Vec<String> {
+            self.git(&["log", "--reverse", "--format=%s", branch])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// Cut a stack in `repo` from `(id, parent id)` pairs, parents first: each
+    /// gets `feat/<id>` with one commit named `<id>`, cut from its parent's tip
+    /// (`main` for `""`). Returns the live rows, that tip recorded as `base`.
+    fn cut_stack(repo: &StackRepo, stack: &[(&str, &str)]) -> Vec<Entry> {
+        stack
+            .iter()
+            .map(|(id, parent)| {
+                let mut row = entry(id);
+                let from = if parent.is_empty() { "main".to_string() } else { format!("feat/{parent}") };
+                row.parent = parent.to_string();
+                row.base = repo.tip(&from);
+                row.claimed = "2026-10-11T12:00:00Z".to_string();
+                repo.git(&["checkout", "-qb", &row.branch, &from]);
+                repo.commit(id);
+                row
+            })
+            .collect()
+    }
+
+    /// The doc `queue_drop` writes when `id` is dropped from `entries`.
+    fn drop_doc(entries: Vec<Entry>, id: &str) -> String {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], entries, None);
+        drop_entry(&daemon, serde_json::json!({ "id": id, "reason": "abandoned" })).expect("drop");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc")
+    }
+
+    /// Follow the first `limit` of a doc's `## Steps` the way a session does:
+    /// right before each step, run the doc's own skip test on that step's
+    /// operands, and run the step unless the test says it already happened.
+    fn follow_restack_doc(repo: &StackRepo, doc: &str, limit: usize) {
+        let rule = doc
+            .lines()
+            .find(|l| l.contains("skip its step"))
+            .unwrap_or_else(|| panic!("no skip rule\n{doc}"));
+        let tests: Vec<&str> = rule
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("git merge-base"))
+            .collect();
+        assert!(!tests.is_empty(), "the skip rule names no test\n{doc}");
+        let steps = &doc[doc.find("## Steps").expect("steps")..];
+        let steps = steps.lines().filter_map(|l| l.strip_prefix("- `git rebase --onto "));
+        for step in steps.take(limit) {
+            let operands: Vec<&str> = step.trim_end_matches('`').split(' ').collect();
+            let [onto, base, branch] = operands[..] else { panic!("bad step {step}\n{doc}") };
+            let done = tests.iter().all(|test| {
+                repo.sh(&test.replace("<onto>", onto).replace("<base>", base).replace("<branch>", branch))
+            });
+            if !done {
+                repo.git(&["rebase", "-q", "--onto", onto, base, branch]);
+            }
+        }
+    }
+
+    #[test]
+    fn following_a_drop_doc_takes_the_abandoned_commits_out_of_the_child() {
+        // Never restacked: the child still contains the dropped base, which is
+        // its `--onto` tip, and that must not read as "already done".
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("a", ""), ("b", "a"), ("c", "b")]);
+        let doc = drop_doc(entries, "b");
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.subjects("feat/c"), ["root", "a", "c"], "{doc}");
+    }
+
+    #[test]
+    fn following_a_drop_doc_moves_the_whole_subtree() {
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("r", ""), ("m", "r"), ("g", "m"), ("h", "g")]);
+        let doc = drop_doc(entries, "m");
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.subjects("feat/g"), ["root", "r", "g"], "{doc}");
+        assert_eq!(repo.subjects("feat/h"), ["root", "r", "g", "h"], "{doc}");
+    }
+
+    #[test]
+    fn following_a_drop_doc_covers_a_dropped_branch_that_grew_after_the_cut() {
+        // The child holds m but not m2, so it never contains the dropped tip:
+        // "the dropped branch is not in it" would read as done here.
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("r", ""), ("m", "r"), ("g", "m")]);
+        repo.git(&["checkout", "-q", "feat/m"]);
+        repo.commit("m2");
+        let doc = drop_doc(entries, "m");
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.subjects("feat/g"), ["root", "r", "g"], "{doc}");
+    }
+
+    #[test]
+    fn a_session_resuming_a_drop_doc_skips_only_the_finished_steps() {
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("r", ""), ("m", "r"), ("g", "m"), ("h", "g")]);
+        let doc = drop_doc(entries, "m");
+
+        // The first session dies after the child's step ...
+        follow_restack_doc(&repo, &doc, 1);
+        let child = repo.tip("feat/g");
+        assert_eq!(repo.subjects("feat/h"), ["root", "r", "m", "g", "h"], "{doc}");
+
+        // ... so the next skips that step and still moves the grandchild.
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.tip("feat/g"), child, "a finished step is not re-run\n{doc}");
+        assert_eq!(repo.subjects("feat/h"), ["root", "r", "g", "h"], "{doc}");
+
+        // A third pass finds nothing left to do.
+        let grandchild = repo.tip("feat/h");
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.tip("feat/g"), child, "{doc}");
+        assert_eq!(repo.tip("feat/h"), grandchild, "{doc}");
+    }
+
+    #[test]
+    fn a_finished_step_of_a_plain_restack_is_skipped() {
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("a", ""), ("b", "a")]);
+        repo.git(&["checkout", "-q", "feat/a"]);
+        repo.git(&["commit", "-q", "--amend", "-m", "a2"]);
+        let stack = [rb("feat/b", "a", &entries[1].base, "feat/a")];
+        let doc = restack_doc("softfig", "2026-11-07", &stack);
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.subjects("feat/b"), ["root", "a2", "b"], "{doc}");
+        let tip = repo.tip("feat/b");
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.tip("feat/b"), tip, "{doc}");
     }
 }
