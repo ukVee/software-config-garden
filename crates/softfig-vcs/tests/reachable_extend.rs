@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use softfig_store::Hash;
+use softfig_store::{Hash, ReadCounts};
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
 use softfig_vcs::{reachable_extend, reachable_from, Intent, Reachable, Repo};
 
@@ -70,4 +70,38 @@ fn a_tip_that_does_not_descend_falls_back_to_an_exact_fresh_walk() {
     let fresh = reachable_from(repo.db(), first).unwrap();
     assert!(same(&ext, &fresh), "must not serve a superset of the tip's closure");
     assert_eq!(walked, fresh.commits.len());
+}
+
+/// Report 092's real cost is the tree reads, so pin them: advancing across two
+/// commits reads each new root tree and only the subtrees it changed. A subtree
+/// the cached closure already holds is not read again (`walk_tree`'s early
+/// stop), which is what keeps a tick off the 18.7k trees of a grown store.
+#[test]
+fn extend_reads_only_the_new_root_trees_and_the_subtrees_they_change() {
+    let (tmp, mut repo, session) = init();
+    commit_file(&tmp, &mut repo, &session, "a.md");
+    commit_file(&tmp, &mut repo, &session, "dir/b.md");
+    let old = commit_file(&tmp, &mut repo, &session, "other/x.md");
+    let base = reachable_from(repo.db(), old).unwrap();
+
+    // Changes root + `dir`; `other` is untouched.
+    commit_file(&tmp, &mut repo, &session, "dir/c.md");
+    // Changes the root alone; `dir` and `other` are both untouched.
+    let new = commit_file(&tmp, &mut repo, &session, "a2.md");
+
+    let before = repo.db().read_counts();
+    let (ext, walked) = reachable_extend(repo.db(), base, old, new).unwrap();
+    let after = repo.db().read_counts();
+
+    assert_eq!(walked, 2);
+    assert_eq!(
+        ReadCounts {
+            commits: after.commits - before.commits,
+            trees: after.trees - before.trees,
+        },
+        // Two new commits; first root + changed `dir`, then the second root.
+        ReadCounts { commits: 2, trees: 3 },
+        "extend read trees the cached closure already holds"
+    );
+    assert!(same(&ext, &reachable_from(repo.db(), new).unwrap()));
 }
