@@ -42,7 +42,12 @@ toml and thiserror, and on no other workspace crate.
   telemetry is per-device and high-churn.
 - **`requests`:** one row per request. The unique key is
   `(session_id, request_id)`, so re-ingesting a request adds nothing.
-  - `cost_usd` is `NULL` when the model has no price, never `0`.
+  - `cost_usd` is `NULL` when the model has no price, never `0`. The garden
+    price table prices every row on every backend, so one basis sums.
+  - `vendor_cost_usd` (schema v4) is the backend's own figure for the request
+    (opencode's `part.cost`, or the ledger's USD difference on the remainder
+    row). It is a cross-check, `NULL` where the wire carries none, never summed
+    into `cost_usd` and not rolled up.
   - `cache_creation_1h_input_tokens` is a subset of
     `cache_creation_input_tokens`, priced at the 1-hour cache-write rate.
   - `settled_from` is `stream`, `ledger` or `transcript`.
@@ -97,7 +102,15 @@ already emit (spec §4):
 2. **opencode fleet members.** There are two kinds of row:
    - one row per `step_finish` event (`stream`);
    - one remainder row at EOF (`ledger`). opencode 2.x never streams its final
-     step, so this row is settled against opencode's `session_v2` totals.
+     step, so this row is settled against opencode's `session_v2` totals: its
+     token classes are the ledger's per-class totals minus the streamed sums.
+     It is priced from the garden table like any other row.
+
+   opencode's `part.cost` has no peak-hour dimension, while the garden table
+   charges DeepSeek peak rates (weekday UTC hours 01-04 and 06-10). So
+   `sum(cost_usd)` for a session matches `session_v2` off-peak and runs up to 2x
+   above it at peak, which is expected. Compare `session_v2` against
+   `sum(vendor_cost_usd)`.
 3. **semi-auto claude** (`transcript`). A `SessionEnd` hook ingests the
    session's transcript JSONL in one batch. See below.
 

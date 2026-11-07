@@ -109,14 +109,12 @@ impl CaptureContext {
         }
     }
 
-    /// Record a row whose cost is already settled, as built — an opencode
-    /// step row (priced with the wire fallback) or a ledger row. Pricing it
-    /// again would drop the fallback.
+    /// Record a row already priced as built — an opencode step or ledger row.
     pub fn record_settled(&self, row: RequestRow) {
         self.sink.recorder.record(row);
     }
 
-    /// Price `row` (a ledger row keeps its own cost) and hand it to the recorder.
+    /// Price `row` and hand it to the recorder.
     fn emit(&self, mut row: RequestRow) {
         if let Some(prices) = &self.sink.prices {
             prices.price_row(&mut row);
@@ -225,6 +223,29 @@ impl StepTokens {
         .fold(0, u64::saturating_add)
     }
 
+    /// Class-wise sum, saturating.
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            reasoning: self.reasoning.saturating_add(other.reasoning),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+        }
+    }
+
+    /// Class-wise difference, floored at zero: a class the stream carried more
+    /// of than the ledger is no remainder, never a negative one.
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            reasoning: self.reasoning.saturating_sub(other.reasoning),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
+            cache_write: self.cache_write.saturating_sub(other.cache_write),
+        }
+    }
+
     fn counts(&self) -> TokenCounts {
         TokenCounts {
             input: self.input,
@@ -243,9 +264,9 @@ fn split_model(model: &str) -> (&str, &str) {
 }
 
 /// One opencode step's row. `model` is the spawn's `provider/model` (the step
-/// event names none). The cost is the pricing table's; when the table has no
-/// price for the model, the wire's own `part.cost` is kept, since opencode
-/// already priced the step.
+/// event names none). `cost_usd` is the pricing table's alone, null when the
+/// table has no price for the model; the wire's own `part.cost` is kept apart
+/// in `vendor_cost_usd` and never stands in for it.
 #[allow(clippy::too_many_arguments)]
 pub fn opencode_step_row(
     ctx: &CaptureContext,
@@ -271,22 +292,20 @@ pub fn opencode_step_row(
     if let Some(prices) = &ctx.sink.prices {
         prices.price_row(&mut row);
     }
-    if row.cost_usd.is_none() {
-        row.cost_usd = wire_cost;
-    }
     row.vendor_cost_usd = wire_cost;
     row
 }
 
-/// The run-end remainder: tokens the session ledger settled beyond what the
-/// stream carried, unsplit in `input`, costing the ledger's USD difference.
+/// The run-end remainder: the tokens the session ledger settled beyond what
+/// the stream carried, by class, priced from the garden table like a streamed
+/// row. The ledger's USD difference is the vendor cross-check.
 pub fn opencode_ledger_row(
     ctx: &CaptureContext,
     model: &str,
     session_id: &str,
     turn_index: u32,
-    unseen_tokens: u64,
-    cost_usd: f64,
+    unseen: StepTokens,
+    vendor_cost_usd: f64,
     at: i64,
 ) -> RequestRow {
     let mut row = ctx.row(
@@ -298,9 +317,11 @@ pub fn opencode_ledger_row(
     );
     row.settled_from = SettledFrom::Ledger;
     row.turn_index = turn_index;
-    row.tokens.input = unseen_tokens;
-    row.cost_usd = Some(cost_usd.max(0.0));
-    row.vendor_cost_usd = row.cost_usd;
+    row.tokens = unseen.counts();
+    if let Some(prices) = &ctx.sink.prices {
+        prices.price_row(&mut row);
+    }
+    row.vendor_cost_usd = Some(vendor_cost_usd.max(0.0));
     row
 }
 
@@ -478,8 +499,42 @@ mod tests {
         assert!(rec.0.lock().unwrap().is_empty());
     }
 
+    const FLASH_TABLE: &str = "[[model]]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n\
+         input_per_mtok = 0.30\noutput_per_mtok = 1.20\ncache_read_per_mtok = 0.006\n\
+         cache_create_per_mtok = 0.0\npeak_hours_utc = [[1, 4], [6, 10]]\n\
+         off_peak_multiplier = 0.5\n";
+
+    fn step_tokens() -> StepTokens {
+        StepTokens {
+            input: 167,
+            output: 49,
+            reasoning: 14,
+            cache_read: 5376,
+            cache_write: 0,
+        }
+    }
+
+    /// 2026-10-10 (Saturday) 07:22 UTC: off-peak. 2026-10-08 (Thursday) 07:22
+    /// UTC: inside the 06-10 peak window.
+    const OFF_PEAK: i64 = 1_791_616_920;
+    const PEAK: i64 = 1_791_616_920 - 2 * 86_400;
+
+    fn flash_step(c: &CaptureContext, at: i64, wire: Option<f64>) -> RequestRow {
+        opencode_step_row(
+            c,
+            "deepseek/deepseek-flash",
+            "ses_1",
+            "msg_1",
+            0,
+            step_tokens(),
+            None,
+            wire,
+            at,
+        )
+    }
+
     #[test]
-    fn an_opencode_step_maps_reasoning_beside_output_and_keeps_the_wire_cost_when_unpriced() {
+    fn an_opencode_step_maps_reasoning_beside_output() {
         let rec = Arc::new(Collect::default());
         let c = ctx(rec, None);
         let tokens = StepTokens {
@@ -508,31 +563,70 @@ mod tests {
         assert_eq!(row.tokens.thinking, Some(66));
         assert_eq!(row.tokens.output, 167);
         assert_eq!(row.tokens.total(), tokens.total());
-        assert_eq!(row.cost_usd, Some(0.0002));
-        assert_eq!(row.vendor_cost_usd, Some(0.0002), "the wire total is kept apart");
         assert_eq!(row.turn_index, 3);
         assert_eq!(row.stop_reason.as_deref(), Some("tool-calls"));
     }
 
     #[test]
-    fn the_ledger_row_keeps_its_own_cost_through_pricing() {
-        let prices = PriceTable::parse(
-            "[[model]]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n\
-             input_per_mtok = 1.0\noutput_per_mtok = 1.0\ncache_read_per_mtok = 0.0\n\
-             cache_create_per_mtok = 0.0\n",
-        )
-        .unwrap();
+    fn an_unpriced_opencode_step_stays_null_and_keeps_the_wire_total_apart() {
+        let c = ctx(Arc::new(Collect::default()), None);
+        let row = flash_step(&c, OFF_PEAK, Some(0.0002));
+        assert_eq!(row.cost_usd, None, "no table price: null, never the wire figure");
+        assert_eq!(row.vendor_cost_usd, Some(0.0002));
+    }
+
+    /// The vendor's `part.cost` has no time dimension, so the same step costs the
+    /// same to opencode at any hour; the table's figure doubles at peak.
+    #[test]
+    fn an_opencode_step_is_table_priced_at_peak_and_off_peak_beside_the_flat_vendor_total() {
+        let prices = PriceTable::parse(FLASH_TABLE).unwrap();
+        let c = ctx(Arc::new(Collect::default()), Some(prices));
+        let vendor = 0.000_078_978; // the captured off-peak step's part.cost
+        let off = flash_step(&c, OFF_PEAK, Some(vendor));
+        let peak = flash_step(&c, PEAK, Some(vendor));
+        // 167 in + 49 out + 14 reasoning (at output) + 5376 cache read, per Mtok.
+        let peak_usd = (167.0 * 0.30 + 63.0 * 1.20 + 5376.0 * 0.006) / 1e6;
+        assert!((peak.cost_usd.unwrap() - peak_usd).abs() < 1e-12, "{:?}", peak.cost_usd);
+        assert!((off.cost_usd.unwrap() - peak_usd / 2.0).abs() < 1e-12, "{:?}", off.cost_usd);
+        assert!((off.cost_usd.unwrap() - vendor).abs() < 1e-9, "off-peak matches the vendor");
+        for row in [&off, &peak] {
+            assert_eq!(row.vendor_cost_usd, Some(vendor), "the wire total is stored apart");
+        }
+    }
+
+    #[test]
+    fn the_ledger_row_is_table_priced_per_class_with_the_vendor_difference_beside_it() {
+        let prices = PriceTable::parse(FLASH_TABLE).unwrap();
         let rec = Arc::new(Collect::default());
         let c = ctx(Arc::clone(&rec), Some(prices));
-        let row = opencode_ledger_row(&c, "deepseek/deepseek-flash", "ses_1", 4, 900, 0.01, 9);
+        let row = opencode_ledger_row(&c, "deepseek/deepseek-flash", "ses_1", 4, step_tokens(), 0.01, PEAK);
         assert_eq!(row.settled_from, SettledFrom::Ledger);
-        assert_eq!(row.tokens.input, 900);
+        assert_eq!((row.tokens.input, row.tokens.cache_read), (167, 5376));
+        assert_eq!((row.tokens.output, row.tokens.thinking), (49, Some(14)));
+        let peak_usd = (167.0 * 0.30 + 63.0 * 1.20 + 5376.0 * 0.006) / 1e6;
+        assert!((row.cost_usd.unwrap() - peak_usd).abs() < 1e-12, "{:?}", row.cost_usd);
+        assert_eq!(row.vendor_cost_usd, Some(0.01));
         c.emit(row);
         let rows = rec.0.lock().unwrap();
+        assert!((rows[0].cost_usd.unwrap() - peak_usd).abs() < 1e-12, "emit prices it again to the same figure");
+    }
+
+    #[test]
+    fn an_unpriced_ledger_row_stays_null_with_a_non_negative_vendor_difference() {
+        let c = ctx(Arc::new(Collect::default()), None);
+        let row = opencode_ledger_row(&c, "deepseek/deepseek-flash", "ses_1", 4, step_tokens(), -0.5, 9);
+        assert_eq!(row.cost_usd, None);
+        assert_eq!(row.vendor_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn step_tokens_subtract_per_class_without_going_negative() {
+        let a = StepTokens { input: 5, output: 1, reasoning: 0, cache_read: 9, cache_write: 2 };
+        let b = StepTokens { input: 2, output: 4, reasoning: 0, cache_read: 9, cache_write: 0 };
         assert_eq!(
-            rows[0].cost_usd,
-            Some(0.01),
-            "price_row leaves a ledger row alone"
+            a.saturating_sub(b),
+            StepTokens { input: 3, output: 0, reasoning: 0, cache_read: 0, cache_write: 2 }
         );
+        assert_eq!(a.saturating_add(b).total(), a.total() + b.total());
     }
 }

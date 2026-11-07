@@ -47,7 +47,7 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
-use crate::row::{RequestRow, SettledFrom, Speed};
+use crate::row::{RequestRow, Speed};
 
 /// The price table's path, relative to the garden root.
 pub const PRICING_FILE: &str = "config/pricing.toml";
@@ -132,13 +132,9 @@ impl PriceTable {
 
     /// The row's cost in USD, or `None` when the table has no price for it:
     /// an unknown model, or a fast-mode row on a model with no
-    /// `fast_mode_multiplier`. A [`SettledFrom::Ledger`] remainder is never
-    /// priced here, because its tokens are unsplit; it carries the ledger's own
-    /// USD difference instead.
+    /// `fast_mode_multiplier`. Every row is priced the same way, a
+    /// [`crate::row::SettledFrom::Ledger`] remainder included, so one basis sums.
     pub fn cost(&self, row: &RequestRow) -> Option<f64> {
-        if row.settled_from == SettledFrom::Ledger {
-            return None;
-        }
         let t = &row.tokens;
         let p = self.lookup(&row.provider, &row.model, prompt_tokens(row))?;
 
@@ -170,13 +166,9 @@ impl PriceTable {
         Some(base * fast * off_peak)
     }
 
-    /// Set `row.cost_usd` from [`cost`](Self::cost). A ledger row is left as
-    /// it is. An unpriced row stores null, never 0, and its `(provider, model)`
-    /// is journalled once per table.
+    /// Set `row.cost_usd` from [`cost`](Self::cost). An unpriced row stores
+    /// null, never 0, and its `(provider, model)` is journalled once per table.
     pub fn price_row(&self, row: &mut RequestRow) {
-        if row.settled_from == SettledFrom::Ledger {
-            return;
-        }
         row.cost_usd = self.cost(row);
         if row.cost_usd.is_none() {
             let key = (row.provider.clone(), row.model.clone());
@@ -293,7 +285,7 @@ fn is_peak(ts: i64, windows: &[[u8; 2]]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::TokenCounts;
+    use crate::row::{SettledFrom, TokenCounts};
     use crate::store::tests::row;
 
     const TABLE: &str = r#"
@@ -498,13 +490,13 @@ off_peak_multiplier = 0.5
     }
 
     #[test]
-    fn price_row_skips_ledger_rows_and_nulls_unknown_models_once() {
+    fn price_row_prices_ledger_rows_and_nulls_unknown_models_once() {
         let t = table();
         let mut ledger = priced("claude-opus-5-5", million(|t| t.input = 1_000_000));
         ledger.settled_from = SettledFrom::Ledger;
         ledger.cost_usd = Some(0.42);
         t.price_row(&mut ledger);
-        assert_eq!(ledger.cost_usd, Some(0.42), "the ledger's own USD stands");
+        assert_usd(ledger.cost_usd, 4.0);
 
         let mut known = priced("claude-opus-5-5", million(|t| t.input = 1_000_000));
         t.price_row(&mut known);

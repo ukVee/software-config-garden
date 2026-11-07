@@ -45,7 +45,7 @@ pub enum SettledFrom {
     /// A semi-auto session's transcript, ingested at `SessionEnd`.
     Transcript,
     /// opencode's `session_v2` totals beyond what the stream carried — one
-    /// remainder row per run, its tokens unsplit in `input_tokens`.
+    /// remainder row per run, its tokens the ledger's per-class difference.
     Ledger,
 }
 
@@ -139,7 +139,8 @@ pub struct RequestRow {
     pub latency_ms: Option<u64>,
     /// Derived at write time from `config/pricing.toml` and stored, so a later
     /// price change never rewrites history (spec §3.1). `None` when the
-    /// `(provider, model)` has no price row.
+    /// `(provider, model)` has no price row. Every row, whatever its backend,
+    /// is priced by the table: the vendor's figure never stands in for it.
     pub cost_usd: Option<f64>,
     /// The vendor's own total for this request, kept beside `cost_usd` as a
     /// cross-check and never summed into it. opencode's `part.cost` (a step)

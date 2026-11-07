@@ -247,6 +247,9 @@ struct RunState {
     session_id: Option<String>,
     /// Tokens already metered from streamed `step_finish` lines.
     streamed_tokens: u64,
+    /// The same tokens by class, what the ledger's per-class totals are
+    /// measured against.
+    streamed_classes: StepTokens,
     /// A `step_start` with no `step_finish` yet. On 2.x the final step always ends
     /// open.
     open_step: bool,
@@ -461,6 +464,7 @@ impl LineObserver for Fold<'_> {
             let cost = step.cost.unwrap_or(0.0);
             run.open_step = false;
             run.streamed_tokens = run.streamed_tokens.saturating_add(tokens);
+            run.streamed_classes = run.streamed_classes.saturating_add(step.tokens);
             run.streamed_cost += cost;
             self.rate.record(at, tokens);
             self.member.spend.record_cost(cost);
@@ -502,14 +506,16 @@ impl LineObserver for Fold<'_> {
                     self.rate.record(at, unseen);
                 }
                 // What the ledger settled beyond the stream (the final step,
-                // which 2.x never streams) is one ledger row.
+                // which 2.x never streams) is one ledger row, per class, priced
+                // from the garden table like every streamed row; the vendor's
+                // USD difference rides beside it as the cross-check.
                 if unseen > 0 {
                     self.capture.record_settled(opencode_ledger_row(
                         self.capture,
                         self.model,
                         session,
                         run.steps,
-                        unseen,
+                        totals.classes.saturating_sub(run.streamed_classes),
                         totals.cost_usd - run.streamed_cost,
                         at,
                     ));
@@ -1082,9 +1088,21 @@ mod tests {
                 SessionTotals {
                     cost_usd,
                     tokens,
+                    // All in `input`: the tests that read class totals say so.
+                    classes: StepTokens {
+                        input: tokens,
+                        ..StepTokens::default()
+                    },
                     settled: true,
                 },
             );
+            ledger
+        }
+
+        /// A record whose tokens are split by class, as `session_v2` keeps them.
+        fn with_classes((id, cost_usd, _): (&str, f64, u64), classes: StepTokens) -> Self {
+            let mut ledger = Self::with((id, cost_usd, classes.total()));
+            ledger.sessions.get_mut(id).unwrap().classes = classes;
             ledger
         }
 
@@ -1690,7 +1708,16 @@ mod tests {
             f.launch.clone(),
             f.hub.clone(),
             f.preapproval.clone(),
-            Arc::new(FakeLedger::with(TOOL_RECORD)),
+            Arc::new(FakeLedger::with_classes(
+                TOOL_RECORD,
+                StepTokens {
+                    input: 594,
+                    output: 355,
+                    reasoning: 154,
+                    cache_read: 11648,
+                    cache_write: 0,
+                },
+            )),
             Arc::new(Mutex::new(BuildCaps::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -1725,14 +1752,21 @@ mod tests {
         assert_eq!(step.queue, tags.queue);
         assert_eq!(step.tokens.thinking, Some(66));
         assert_eq!(step.stop_reason.as_deref(), Some("tool-calls"));
-        assert_eq!(step.cost_usd, Some(0.00019357799999999997), "unpriced: the wire cost");
+        assert_eq!(step.cost_usd, None, "unpriced: null, not the wire cost");
+        assert_eq!(step.vendor_cost_usd, Some(0.00019357799999999997));
         assert_eq!(step.settled_from, softfig_telemetry::SettledFrom::Stream);
 
         assert_eq!(ledger.request_id, "ledger");
         assert_eq!(ledger.turn_index, 1);
         assert_eq!(ledger.settled_from, softfig_telemetry::SettledFrom::Ledger);
-        assert_eq!(ledger.tokens.input, TOOL_RECORD.2 - streamed);
-        let rest = ledger.cost_usd.unwrap();
+        assert_eq!(ledger.tokens.total(), TOOL_RECORD.2 - streamed);
+        assert_eq!(
+            (ledger.tokens.input, ledger.tokens.output, ledger.tokens.thinking, ledger.tokens.cache_read),
+            (594 - 251, 355 - 167, Some(154 - 66), 11648 - 5376),
+            "the remainder is the ledger's per-class difference"
+        );
+        assert_eq!(ledger.cost_usd, None, "unpriced: null");
+        let rest = ledger.vendor_cost_usd.unwrap();
         assert!((rest - (TOOL_RECORD.1 - 0.00019357799999999997)).abs() < 1e-12, "{rest}");
     }
 
