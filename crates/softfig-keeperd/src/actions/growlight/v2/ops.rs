@@ -1653,7 +1653,7 @@ mod tests {
             .clone();
         let child = queue.entries.iter().find(|e| e.id == "b").unwrap();
         assert_eq!(child.status, EntryStatus::Active, "the live session runs on");
-        assert_eq!((child.parent.as_str(), child.base.as_str()), ("", "main-commit"));
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("", "a-commit"));
 
         let err = claim(&daemon, &restack, None).unwrap_err();
         assert!(err.1.contains("started"), "{err:?}");
