@@ -232,6 +232,62 @@ mod tests {
         assert_eq!(fc.base, two_tip, "local base is the cut-from commit");
     }
 
+    /// Owner ruling (V19): an urgent branch lands alone, so the newest live
+    /// claim being urgent sends a normal claim to the newest normal entry.
+    #[test]
+    fn a_normal_claim_skips_a_newer_urgent_branch_for_the_newest_normal_one() {
+        let (dir, _main) = seeded_repo();
+        let one_tip = rev_parse(dir.path(), "feat/one");
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one", "the urgent branch is never a parent");
+        assert_eq!(fc.base, one_tip);
+    }
+
+    #[test]
+    fn a_normal_claim_with_only_an_urgent_branch_live_cuts_from_main() {
+        let (dir, main_tip) = seeded_repo();
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "", "records no parent");
+        assert_eq!(fc.base, main_tip);
+    }
+
+    #[test]
+    fn a_remote_normal_claim_skips_an_urgent_branch_too() {
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = snap(
+            vec![ProjectView {
+                name: "softfig".into(),
+                repo: "host:/srv/repo".into(),
+                main: "main".into(),
+            }],
+            entries,
+        );
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one");
+        assert_eq!(fc.base, "feat/one");
+    }
+
     #[test]
     fn empty_stack_branches_from_main() {
         let (dir, main_tip) = seeded_repo();

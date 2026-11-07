@@ -14,14 +14,16 @@
 //!   fails the stack. Archived entries never reach this module, so
 //!   they never pin the stack. A restack entry has no branch (`branch = ""`)
 //!   and contributes nothing.
-//! - **Stack top** ([`stack_top`]) is the newest-claimed candidate; with none,
-//!   the stack is empty and the next branch is cut from `main`.
+//! - **Stack top** ([`stack_top`]) is the newest-claimed *normal* candidate;
+//!   with none, the next branch is cut from `main`.
 //! - **Urgent entries branch from `main`**, not the stack top, so they can
-//!   merge first.
+//!   merge first. An urgent branch stays a candidate, because restack detection
+//!   walks it and `queue show` lists it, but it is never the top: it lands alone
+//!   rather than picking up dependents.
 //! - **The remote-project proxy**: a `host:path` project runs no git, so list
 //!   state stands in — every claimed entry is a candidate, and `base` records
-//!   the newest-claimed entry's branch *name* (growlightd can't resolve a
-//!   commit there). A remote repo's `git` argument is never touched.
+//!   the stack top's branch *name* (growlightd can't resolve a commit there). A
+//!   remote repo's `git` argument is never touched.
 //!
 //! ## The seam
 //!
@@ -476,10 +478,11 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// The newest-claimed candidate (the stack top), or `None` when the stack
-    /// is empty — then the next branch is cut from `main`.
+    /// The newest-claimed normal candidate (the stack top), or `None` when the
+    /// stack holds none — then the next branch is cut from `main`. An urgent
+    /// candidate is never the top: nothing stacks on an urgent branch (§8).
     pub fn top(&self) -> Option<&StackEntry> {
-        self.candidates.last()
+        self.candidates.iter().rev().find(|c| c.lane == Lane::Normal)
     }
 }
 
@@ -525,8 +528,7 @@ pub fn stack_candidates(
     Ok(Stack { candidates })
 }
 
-/// The newest-claimed candidate (the stack top), or `None` with an empty
-/// stack.
+/// The stack top ([`Stack::top`]), or `None` with no normal candidate.
 pub fn stack_top(stack: &Stack) -> Option<&StackEntry> {
     stack.top()
 }
@@ -534,7 +536,7 @@ pub fn stack_top(stack: &Stack) -> Option<&StackEntry> {
 /// Compute what a first claim records for an entry in `lane` (§8):
 ///
 /// - **urgent** branches from `main` (`parent = ""`), so it can merge first;
-/// - **normal** branches from the stack top, or `main` when the stack is empty;
+/// - **normal** branches from the stack top, or `main` when the stack has none;
 /// - local `base` is the cut-from branch's commit (`git rev-parse`); remote
 ///   `base` is the branch *name*.
 pub fn claim_base(
