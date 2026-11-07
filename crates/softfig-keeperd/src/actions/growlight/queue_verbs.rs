@@ -2064,12 +2064,31 @@ const RESTACK_UPSTREAM_RULE: &str = "## Before you rebase\n\n\
 /// parent's tip) before its step has run (review 055 F1). It is run per step,
 /// not as a pre-flight, because a grandchild contains its parent's tip until the
 /// parent's own step moves that tip.
+///
+/// The resume abort is keyed on the rebase's `head-name`, because a worktree
+/// mid-rebase lists as `detached`, with no `branch` line, and a rebase that isn't
+/// this stack's may hold someone's half-done resolution (review 055 F5). A branch
+/// no worktree holds runs in a scratch worktree beside the main one, because a
+/// rebase leaves its branch checked out wherever it ran. Not under `.git`: tools
+/// a project's gate runs (jest, for one) ignore any path with a `.git` component.
 const RESTACK_SAFETY_RULE: &str = "## Protect the work\n\n\
-     1. **Resume first.** A previous session may have died mid-rebase. In every \
-     worktree (`git worktree list --porcelain`), if \
-     `git -C <worktree> rev-parse --git-path rebase-merge` or `… rebase-apply` \
-     names a directory that exists, run `git -C <worktree> rebase --abort`; the \
-     branch goes back to its pre-rebase tip, so nothing is lost.\n\
+     1. **Resume first.** A previous session may have died mid-rebase on one of \
+     this restack's branches. Run this for each `<branch>` of the stack; it aborts \
+     only a rebase of that branch, which goes back to its pre-rebase tip, so \
+     nothing is lost:\n\n\
+     ```\n\
+     git worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r wt; do\n\
+     \x20\x20for dir in rebase-merge rebase-apply; do\n\
+     \x20\x20\x20\x20name=$(git -C \"$wt\" rev-parse --path-format=absolute --git-path \"$dir/head-name\")\n\
+     \x20\x20\x20\x20if [ \"$(cat \"$name\" 2>/dev/null)\" = refs/heads/<branch> ]; then git -C \"$wt\" rebase --abort; fi\n\
+     \x20\x20done\n\
+     done\n\
+     ```\n\n\
+     Leave every other rebase alone, whether it names another branch or none: \
+     it isn't this restack's, and it may hold someone's half-done resolution. \
+     Then, if `<scratch>` (step 3) is listed, run \
+     `git worktree remove --force <scratch>`: a dead session left it, and it holds \
+     no work, because a rebase moves its branch only when it finishes.\n\
      2. **Skip only a finished step.** Test each step right before you reach it, \
      once the steps above it have landed, never up front: a branch contains its \
      parent's old tip until the parent moves. `git rebase --onto <onto> <base> \
@@ -2080,8 +2099,19 @@ const RESTACK_SAFETY_RULE: &str = "## Protect the work\n\n\
      proves nothing: the child of a dropped entry contains it from the start.\n\
      3. **Use the branch's worktree.** Run each step from the worktree that has \
      the branch checked out (the `worktree` block of `git worktree list \
-     --porcelain` whose `branch` is `refs/heads/<branch>`). If none has it, run \
-     it from the repo's main worktree.\n\
+     --porcelain` whose `branch` is `refs/heads/<branch>`). If none has it, use a \
+     scratch worktree, never one you keep: a rebase leaves its branch checked out \
+     wherever it ran, and git then refuses that branch to every other worktree. \
+     `<scratch>` is the path \
+     `git worktree list --porcelain | sed -n '1s/^worktree //;1s/$/.restack-scratch/p'` \
+     prints, beside the main worktree:\n\n\
+     ```\n\
+     git worktree add --detach <scratch> <branch>\n\
+     git -C <scratch> rebase --onto <onto> <base> <branch>\n\
+     ```\n\n\
+     It is that step's `<worktree>` in the rules below, and the gate runs in it. \
+     Once the branch's gate has run, pass or fail, and before any \
+     `growlight_block`, run `git worktree remove --force <scratch>`.\n\
      4. **Clean tree.** `git -C <worktree> status --porcelain` must print \
      nothing. If it prints anything, rebase nothing: `growlight_block`, \
      `kind = human`, naming the worktree. Never stash, reset or discard.\n\
@@ -3074,8 +3104,11 @@ mod tests {
         let protect = doc.find("## Protect the work").unwrap_or_else(|| panic!("{doc}"));
         for needle in [
             "git worktree list --porcelain",
-            "rev-parse --git-path rebase-merge",
+            "--git-path \"$dir/head-name\"",
+            "= refs/heads/<branch> ]",
             "rebase --abort",
+            "git worktree add --detach <scratch> <branch>",
+            "git worktree remove --force <scratch>",
             "git merge-base --is-ancestor <onto> <branch>",
             "$(git merge-base <base> <branch>)",
             "git -C <worktree> status --porcelain",
@@ -4244,6 +4277,10 @@ mod tests {
         fn new() -> Self {
             let repo = StackRepo { dir: tempfile::tempdir().unwrap() };
             repo.git(&["init", "-q", "-b", "main"]);
+            // The doc's own commands run through `sh`, in every worktree.
+            repo.git(&["config", "user.name", "t"]);
+            repo.git(&["config", "user.email", "t@t"]);
+            repo.git(&["config", "commit.gpgsign", "false"]);
             repo.commit("root");
             repo
         }
@@ -4270,6 +4307,50 @@ mod tests {
                 .success()
         }
 
+        /// What a shell command the doc names prints here.
+        fn sh_out(&self, command: &str) -> String {
+            let out = std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(self.dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        /// The worktree `branch` is checked out in, by `git worktree list`.
+        fn holder(&self, branch: &str) -> Option<String> {
+            let listing = self.git(&["worktree", "list", "--porcelain"]);
+            let wanted = format!("branch refs/heads/{branch}");
+            listing
+                .split("\n\n")
+                .find(|block| block.lines().any(|l| l == wanted))
+                .and_then(|block| block.lines().next())
+                .and_then(|l| l.strip_prefix("worktree "))
+                .map(str::to_string)
+        }
+
+        /// A linked worktree on `branch`, stopped on a conflict partway through
+        /// rebasing it. The conflicted file is `clash`.
+        fn linked_mid_rebase(&self, branch: &str) -> tempfile::TempDir {
+            let start = self.git(&["rev-parse", "HEAD"]);
+            let onto = format!("{branch}-onto");
+            for (name, body) in [(&onto, "theirs"), (&branch.to_string(), "mine")] {
+                self.git(&["checkout", "-qb", name, &start]);
+                std::fs::write(self.dir.path().join("clash"), body).unwrap();
+                self.git(&["add", "clash"]);
+                self.git(&["commit", "-qm", body]);
+            }
+            self.git(&["checkout", "-q", "--detach", &start]);
+            let linked = tempfile::tempdir().unwrap();
+            let path = linked.path().to_str().unwrap();
+            self.git(&["worktree", "add", "-q", "--force", path, branch]);
+            let rebase = format!("git -C {path} rebase -q {onto}");
+            assert!(!self.sh(&rebase), "the rebase must stop on its conflict");
+            assert!(is_mid_rebase(linked.path()), "{path}");
+            linked
+        }
+
         /// One new file on the checked-out branch, its name as the subject.
         fn commit(&self, name: &str) -> String {
             std::fs::write(self.dir.path().join(name), name).unwrap();
@@ -4288,6 +4369,52 @@ mod tests {
                 .lines()
                 .map(str::to_string)
                 .collect()
+        }
+    }
+
+    /// Whether the worktree at `path` has a rebase in progress.
+    fn is_mid_rebase(path: &std::path::Path) -> bool {
+        let git_dir = std::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        let git_dir = String::from_utf8(git_dir.stdout).unwrap();
+        std::path::Path::new(git_dir.trim()).is_dir()
+    }
+
+    /// The fenced command block of `doc` that contains `needle`.
+    fn doc_block(doc: &str, needle: &str) -> String {
+        doc.split("```")
+            .skip(1)
+            .step_by(2)
+            .find(|block| block.contains(needle))
+            .unwrap_or_else(|| panic!("no block with {needle}\n{doc}"))
+            .trim()
+            .to_string()
+    }
+
+    /// The path the doc's `<scratch>` stands for in `repo`.
+    fn scratch_of(repo: &StackRepo, doc: &str) -> String {
+        let command = doc
+            .split('`')
+            .find(|span| span.contains("restack-scratch"))
+            .unwrap_or_else(|| panic!("the doc names no scratch worktree\n{doc}"));
+        repo.sh_out(command)
+    }
+
+    /// Step 1 of a doc, run the way a session does: its command for each branch
+    /// of the stack, then the scratch worktree's removal if one is listed.
+    fn resume_restack_doc(repo: &StackRepo, doc: &str) {
+        let resume = doc_block(doc, "rebase --abort");
+        for b in stack_of_doc(doc) {
+            assert!(repo.sh(&resume.replace("<branch>", &b.branch)), "{doc}");
+        }
+        let scratch = scratch_of(repo, doc);
+        let listed = format!("worktree {scratch}");
+        if repo.git(&["worktree", "list", "--porcelain"]).lines().any(|l| l == listed) {
+            assert!(doc.contains("`git worktree remove --force <scratch>`"), "{doc}");
+            repo.git(&["worktree", "remove", "--force", &scratch]);
         }
     }
 
@@ -4323,9 +4450,12 @@ mod tests {
     }
 
     /// Follow the first `limit` of a doc's `## Steps` the way a session does:
-    /// right before each step, run the doc's own skip test on that step's
-    /// operands, and run the step unless the test says it already happened.
+    /// resume first; right before each step, run the doc's own skip test on that
+    /// step's operands; and run the step unless the test says it already
+    /// happened, from the worktree that holds the branch or else through the
+    /// doc's scratch worktree.
     fn follow_restack_doc(repo: &StackRepo, doc: &str, limit: usize) {
+        resume_restack_doc(repo, doc);
         let rule = doc
             .lines()
             .find(|l| l.contains("skip its step"))
@@ -4345,9 +4475,24 @@ mod tests {
             let done = tests.iter().all(|test| {
                 repo.sh(&test.replace("<onto>", onto).replace("<base>", base).replace("<branch>", branch))
             });
-            if !done {
-                repo.git(&["rebase", "-q", "--onto", onto, base, branch]);
+            if done {
+                continue;
             }
+            if let Some(holder) = repo.holder(branch) {
+                repo.git(&["-C", &holder, "rebase", "-q", "--onto", onto, base, branch]);
+                continue;
+            }
+            let scratch = scratch_of(repo, doc);
+            let block = doc_block(doc, "git worktree add --detach <scratch> <branch>");
+            let run = block
+                .replace("<scratch>", &scratch)
+                .replace("<onto>", onto)
+                .replace("<base>", base)
+                .replace("<branch>", branch)
+                .replace('\n', " && ");
+            assert!(repo.sh(&run), "{run}\n{doc}");
+            assert!(doc.contains("`git worktree remove --force <scratch>`"), "{doc}");
+            repo.git(&["worktree", "remove", "--force", &scratch]);
         }
     }
 
@@ -4422,6 +4567,128 @@ mod tests {
         let tip = repo.tip("feat/b");
         follow_restack_doc(&repo, &doc, usize::MAX);
         assert_eq!(repo.tip("feat/b"), tip, "{doc}");
+    }
+
+    // ---- review 055 F5: the resume rule touches only this restack's branches ----
+
+    #[test]
+    fn resuming_a_restack_leaves_an_unrelated_rebase_alone() {
+        let repo = StackRepo::new();
+        let start = repo.tip("main");
+        let theirs = repo.linked_mid_rebase("human");
+        let resolution = theirs.path().join("clash");
+        std::fs::write(&resolution, "half-resolved").unwrap();
+        repo.git(&["branch", "feat/x", &start]);
+        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+
+        resume_restack_doc(&repo, &doc);
+
+        assert!(is_mid_rebase(theirs.path()), "someone else's rebase was aborted\n{doc}");
+        assert_eq!(std::fs::read_to_string(&resolution).unwrap(), "half-resolved");
+    }
+
+    #[test]
+    fn resuming_a_restack_leaves_a_rebase_that_names_no_branch_alone() {
+        let repo = StackRepo::new();
+        let start = repo.tip("main");
+        let theirs = repo.linked_mid_rebase("human");
+        let path = theirs.path().to_str().unwrap();
+        repo.git(&["-C", path, "rebase", "--abort"]);
+        repo.git(&["-C", path, "checkout", "-q", "--detach", "human"]);
+        assert!(!repo.sh(&format!("git -C {path} rebase -q human-onto")));
+        assert!(is_mid_rebase(theirs.path()), "{path}");
+        repo.git(&["branch", "feat/x", &start]);
+        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+
+        resume_restack_doc(&repo, &doc);
+
+        assert!(is_mid_rebase(theirs.path()), "a detached rebase was aborted\n{doc}");
+    }
+
+    #[test]
+    fn resuming_a_restack_aborts_a_rebase_of_its_own_branch() {
+        let repo = StackRepo::new();
+        let start = repo.tip("main");
+        let dead = repo.linked_mid_rebase("feat/x");
+        let tip = repo.tip("feat/x");
+        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+
+        resume_restack_doc(&repo, &doc);
+
+        assert!(!is_mid_rebase(dead.path()), "{doc}");
+        assert_eq!(repo.tip("feat/x"), tip, "back on its pre-rebase tip\n{doc}");
+        assert!(repo.holder("feat/x").is_some(), "{doc}");
+    }
+
+    #[test]
+    fn a_step_no_worktree_holds_leaves_the_branch_checked_out_nowhere() {
+        let repo = StackRepo::new();
+        let rows = cut_stack(&repo, &[("a", ""), ("b", "a")]);
+        // A parked branch: its worktree is gone. The main worktree holds other
+        // work, uncommitted, and the step must not disturb it.
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit("fix");
+        std::fs::write(repo.dir.path().join("wip"), "uncommitted").unwrap();
+        let stack = [
+            rb("feat/a", "", &rows[0].base, "main"),
+            rb("feat/b", "a", &rows[1].base, "feat/a"),
+        ];
+        let doc = restack_doc("softfig", "2026-11-07", &stack);
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+
+        assert_eq!(repo.subjects("feat/a"), ["root", "fix", "a"], "{doc}");
+        assert_eq!(repo.subjects("feat/b"), ["root", "fix", "a", "b"], "{doc}");
+        let listing = repo.git(&["worktree", "list", "--porcelain"]);
+        assert!(!listing.contains("refs/heads/feat/"), "{listing}\n{doc}");
+        assert_eq!(listing.matches("worktree ").count(), 1, "{listing}\n{doc}");
+        assert_eq!(repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]), "main", "{doc}");
+        let wip = std::fs::read_to_string(repo.dir.path().join("wip")).unwrap();
+        assert_eq!(wip, "uncommitted", "{doc}");
+    }
+
+    #[test]
+    fn a_step_a_linked_worktree_holds_runs_there_and_stays_there() {
+        let repo = StackRepo::new();
+        let rows = cut_stack(&repo, &[("a", "")]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit("fix");
+        let linked = tempfile::tempdir().unwrap();
+        let path = linked.path().to_str().unwrap();
+        repo.git(&["worktree", "add", "-q", "--force", path, "feat/a"]);
+        let holder = repo.holder("feat/a").expect("held");
+        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+
+        assert_eq!(repo.subjects("feat/a"), ["root", "fix", "a"], "{doc}");
+        assert_eq!(repo.holder("feat/a"), Some(holder), "{doc}");
+    }
+
+    #[test]
+    fn a_session_killed_in_the_scratch_worktree_leaves_nothing_behind() {
+        let repo = StackRepo::new();
+        let rows = cut_stack(&repo, &[("a", "")]);
+        repo.git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.dir.path().join("a"), "clashes with a").unwrap();
+        repo.git(&["add", "a"]);
+        repo.git(&["commit", "-qm", "fix"]);
+        let tip = repo.tip("feat/a");
+        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
+
+        // The first session stops on the conflict and dies there.
+        let scratch = scratch_of(&repo, &doc);
+        repo.git(&["worktree", "add", "-q", "--detach", &scratch, "feat/a"]);
+        let rebase = format!("git -C {scratch} rebase -q --onto main {} feat/a", rows[0].base);
+        assert!(!repo.sh(&rebase), "the rebase must stop on its conflict");
+
+        resume_restack_doc(&repo, &doc);
+
+        assert_eq!(repo.tip("feat/a"), tip, "{doc}");
+        let listing = repo.git(&["worktree", "list", "--porcelain"]);
+        assert!(!listing.contains("restack-scratch"), "{listing}\n{doc}");
+        assert!(!listing.contains("refs/heads/feat/a"), "{listing}\n{doc}");
+        assert!(!std::path::Path::new(&scratch).exists(), "{doc}");
     }
 
     // ---- review 055 F3: one restack row per project, whatever enqueued it ----
