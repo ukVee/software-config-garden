@@ -626,11 +626,12 @@ fn restack_core(
     next: &mut u32,
     stack: &[RestackBranch],
 ) -> Result<RestackStaged, (ErrorKind, String)> {
+    let main = project_main(queue, project);
     if let Some(live) = live_restack(queue, project) {
         if session_holds_doc(live) {
             return Err(refuse(QueueRefusal::Started { id: live.id.clone() }));
         }
-        return merge_into_live_restack(wt, &live.id, archive, project, stack);
+        return merge_into_live_restack(wt, &live.id, archive, project, &main, stack);
     }
 
     let number = *next;
@@ -670,7 +671,7 @@ fn restack_core(
         doc: Some(FileWrite {
             rel: rel.clone(),
             expected: None,
-            bytes: restack_doc(project, &conventions::today_hyphen(), stack).into_bytes(),
+            bytes: restack_doc(project, &main, &conventions::today_hyphen(), stack).into_bytes(),
         }),
         number: Some(number),
         rel,
@@ -687,6 +688,7 @@ fn merge_into_live_restack(
     id: &str,
     archive: &QueueArchiveToml,
     project: &str,
+    main: &str,
     stack: &[RestackBranch],
 ) -> Result<RestackStaged, (ErrorKind, String)> {
     let rel = unit_doc_rel(wt, EntryKind::Restack, id, None)?;
@@ -697,8 +699,8 @@ fn merge_into_live_restack(
     let merged = merge_stacks(&live, stack, archive);
 
     let date = conventions::today_hyphen();
-    let doc = restack_doc(project, &date, &merged);
-    let doc = (doc != restack_doc(project, &date, &live)).then(|| FileWrite {
+    let doc = restack_doc(project, main, &date, &merged);
+    let doc = (doc != restack_doc(project, main, &date, &live)).then(|| FileWrite {
         rel: rel.clone(),
         expected: Some(Hash::of(live_doc.as_bytes()).to_hex()),
         bytes: match stamped_sections(&live_doc) {
@@ -834,7 +836,9 @@ fn restack_extras(wt: &WorkTree, restacks: &[RestackStaged]) -> Vec<FileWrite> {
 /// The stack of `project` as the list records it (§8's remote proxy): every
 /// live entry with a branch that has been claimed, in claim order, each with
 /// its recorded `parent` and `base`, and `onto` from [`onto_of_parent`]. Empty
-/// when nothing of the project has been claimed.
+/// when nothing of the project has been claimed. keeperd runs no git, so a
+/// branch already merged or deleted is still here: the doc's merged rule
+/// ([`restack_doc`]) gives it no step when the session reaches it.
 fn stack_from_list(
     queue: &QueueToml,
     archive: &QueueArchiveToml,
@@ -884,14 +888,17 @@ fn onto_of_parent(
                 .map(|a| a.row.branch.clone())
         })
         .filter(|b| !b.is_empty());
-    parent_branch.unwrap_or_else(|| {
-        queue
-            .projects
-            .iter()
-            .find(|p| p.name == project)
-            .map(|p| p.main.clone())
-            .unwrap_or_else(|| "main".to_string())
-    })
+    parent_branch.unwrap_or_else(|| project_main(queue, project))
+}
+
+/// The `main` branch `project` records.
+fn project_main(queue: &QueueToml, project: &str) -> String {
+    queue
+        .projects
+        .iter()
+        .find(|p| p.name == project)
+        .map(|p| p.main.clone())
+        .unwrap_or_else(|| "main".to_string())
 }
 
 /// `queue_add_entry`, restack kind (§8): `project` only, every other arg
@@ -2044,7 +2051,9 @@ fn task_doc_v2(id: &str, title: &str, mission: &str, finish: &str) -> String {
 /// restack and a branch pushed after detection.
 const RESTACK_UPSTREAM_RULE: &str = "## Before you rebase\n\n\
      Never rewrite a branch that tracks an upstream — it may be pushed. Check \
-     every branch of the restack first, before any rebase:\n\n\
+     every branch of the restack first, before any rebase, leaving out one \
+     already merged into the project's main: nothing rewrites it, and a merged \
+     branch is often a pushed one:\n\n\
      ```\n\
      git for-each-ref --format='%(upstream)' refs/heads/<branch>\n\
      ```\n\n\
@@ -2137,13 +2146,15 @@ const RESTACK_GATE_RULE: &str = "## Gate\n\n\
 /// The §8 restack doc (queue-v2-git slice 003, V4): with a `stack` (growlightd's
 /// git-resolved one, or keeperd's list-state one for a human-enqueued restack),
 /// the full template — the stack in order (each branch's `parent` and `base`),
-/// the safety rules, the steps (one `git rebase --onto` per unmerged branch in
-/// stack order) and the gate. With an empty `stack` (nothing of the project is
+/// the safety rules, the steps (one `git rebase --onto` per branch in stack
+/// order) and the gate. With an empty `stack` (nothing of the project is
 /// claimed) the doc is a placeholder naming `queue show` as the way to re-derive
-/// it. Both forms carry [`RESTACK_UPSTREAM_RULE`] and [`RESTACK_SAFETY_RULE`]:
+/// it. A step can name a branch that has since merged: keeperd can't tell, and
+/// a merge keeps a live doc's branches. So the steps open with the merged rule,
+/// tested right before each step, against the project's `main`. Both forms carry [`RESTACK_UPSTREAM_RULE`] and [`RESTACK_SAFETY_RULE`]:
 /// the loop never rewrites a branch that tracks an upstream (§8, V1), and never
 /// rebases without a worktree, a clean tree and a backup (V4).
-fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> String {
+fn restack_doc(project: &str, main: &str, date_hyphen: &str, stack: &[RestackBranch]) -> String {
     if stack.is_empty() {
         return format!(
             "# Restack {project}\n\n\
@@ -2175,12 +2186,20 @@ fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> Str
     doc.push_str(RESTACK_UPSTREAM_RULE);
     doc.push('\n');
     doc.push_str(RESTACK_SAFETY_RULE);
-    doc.push_str(
+    doc.push_str(&format!(
         "\n## Steps\n\n\
          Rebase each branch in stack order (bottom first), each from its own \
-         worktree and after its backup ref exists. If an `--onto` branch no longer \
-         exists it was merged: use `main` instead.\n\n",
-    );
+         worktree and after its backup ref exists. Right before each step, ahead \
+         of the rules above:\n\n\
+         - **A merged branch gets no step.** If `git rev-parse --verify --quiet \
+         refs/heads/<branch>` finds nothing, or `git merge-base --is-ancestor \
+         <branch> {main}` succeeds, the branch is already in `{main}`, or was \
+         never cut. Pass over it: no backup, no worktree, no gate.\n\
+         - **A merged `--onto` means `{main}`.** If those two tests say the same \
+         of `<onto>`, use `{main}` as `<onto>`, in the skip test too. Otherwise \
+         the branch still contains the merged tip, and reads as finished while \
+         it stands behind `{main}`.\n\n",
+    ));
     for b in stack {
         if b.base.is_empty() {
             // No recorded base: the step cannot be written, and a guessed one
@@ -3124,17 +3143,18 @@ mod tests {
 
     #[test]
     fn the_restack_doc_protects_the_work_it_rewrites() {
-        let doc = restack_doc("softfig", "2026-10-30", &[rb("feat/one", "", "abc123", "main")]);
+        let doc = restack_doc("softfig", "main", "2026-10-30", &[rb("feat/one", "", "abc123", "main")]);
         assert_carries_the_safety_rules(&doc);
         assert!(doc.contains("- `git rebase --onto main abc123 feat/one`"), "{doc}");
         // The placeholder form carries them too.
-        assert_carries_the_safety_rules(&restack_doc("softfig", "2026-10-30", &[]));
+        assert_carries_the_safety_rules(&restack_doc("softfig", "main", "2026-10-30", &[]));
     }
 
     #[test]
     fn a_stack_branch_without_a_recorded_base_renders_no_broken_step() {
         let doc = restack_doc(
             "softfig",
+            "main",
             "2026-10-30",
             &[rb("feat/one", "", "", "main"), rb("feat/two", "one", "def456", "feat/one")],
         );
@@ -3209,7 +3229,7 @@ mod tests {
     fn the_placeholder_restack_doc_also_carries_the_upstream_rule() {
         // A human/drop-enqueued restack has no resolved stack, yet the agent
         // still must not rewrite a pushed branch (V1).
-        let doc = restack_doc("softfig", "2026-10-30", &[]);
+        let doc = restack_doc("softfig", "main", "2026-10-30", &[]);
         assert!(doc.contains("## Before you rebase"), "{doc}");
         assert!(doc.contains("git for-each-ref --format='%(upstream)'"), "{doc}");
         assert!(doc.contains("`growlight_block`, `kind = human`"), "{doc}");
@@ -4449,11 +4469,29 @@ mod tests {
             .expect("restack doc")
     }
 
+    /// Whether the doc's merged rule, run here, says `branch` is gone or already
+    /// in `main`. A doc with no such rule says nothing of the kind.
+    fn merged_by_doc(repo: &StackRepo, doc: &str, branch: &str) -> bool {
+        let Some(rule) = doc.lines().find(|l| l.contains("gets no step")) else {
+            return false;
+        };
+        let tests: Vec<String> = rule
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("git "))
+            .map(|span| span.replace("<branch>", branch))
+            .collect();
+        let [exists, merged] = &tests[..] else { panic!("bad merged rule\n{doc}") };
+        !repo.sh(exists) || repo.sh(merged)
+    }
+
     /// Follow the first `limit` of a doc's `## Steps` the way a session does:
-    /// resume first; right before each step, run the doc's own skip test on that
-    /// step's operands; and run the step unless the test says it already
-    /// happened, from the worktree that holds the branch or else through the
-    /// doc's scratch worktree.
+    /// resume first; right before each step, pass over a merged branch and swap
+    /// a merged `--onto` for `main` by the doc's merged rule, run the doc's own
+    /// skip test on that step's operands, and run the step unless the test says
+    /// it already happened, from the worktree that holds the branch or else
+    /// through the doc's scratch worktree.
     fn follow_restack_doc(repo: &StackRepo, doc: &str, limit: usize) {
         resume_restack_doc(repo, doc);
         let rule = doc
@@ -4472,6 +4510,10 @@ mod tests {
         for step in steps.take(limit) {
             let operands: Vec<&str> = step.trim_end_matches('`').split(' ').collect();
             let [onto, base, branch] = operands[..] else { panic!("bad step {step}\n{doc}") };
+            if merged_by_doc(repo, doc, branch) {
+                continue;
+            }
+            let onto = if merged_by_doc(repo, doc, onto) { "main" } else { onto };
             let done = tests.iter().all(|test| {
                 repo.sh(&test.replace("<onto>", onto).replace("<base>", base).replace("<branch>", branch))
             });
@@ -4560,13 +4602,109 @@ mod tests {
         repo.git(&["checkout", "-q", "feat/a"]);
         repo.git(&["commit", "-q", "--amend", "-m", "a2"]);
         let stack = [rb("feat/b", "a", &entries[1].base, "feat/a")];
-        let doc = restack_doc("softfig", "2026-11-07", &stack);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &stack);
 
         follow_restack_doc(&repo, &doc, usize::MAX);
         assert_eq!(repo.subjects("feat/b"), ["root", "a2", "b"], "{doc}");
         let tip = repo.tip("feat/b");
         follow_restack_doc(&repo, &doc, usize::MAX);
         assert_eq!(repo.tip("feat/b"), tip, "{doc}");
+    }
+
+    // ---- review 055 F8: a merged live branch is not unmerged work ----
+
+    /// The doc a human's `queue add restack` renders for `entries`.
+    fn list_doc(entries: Vec<Entry>) -> String {
+        let queue = QueueToml::new(vec![project()], entries);
+        let stack = stack_from_list(&queue, &QueueArchiveToml::new(vec![]), "softfig");
+        restack_doc("softfig", "main", "2026-11-07", &stack)
+    }
+
+    /// `feat/a` under `feat/b`, the human's ff-merge of `feat/a`, and a fix on
+    /// `main` above it that rewrites `a`'s file, so `a`'s commit no longer
+    /// replays onto `main`. Returns the live rows.
+    fn merged_under_a_moved_main(repo: &StackRepo) -> Vec<Entry> {
+        let entries = cut_stack(repo, &[("a", ""), ("b", "a")]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "-q", "--ff-only", "feat/a"]);
+        std::fs::write(repo.dir.path().join("a"), "rewritten").unwrap();
+        repo.git(&["commit", "-qam", "fix"]);
+        entries
+    }
+
+    #[test]
+    fn a_merged_live_branch_gets_no_step_and_its_child_goes_onto_main() {
+        let repo = StackRepo::new();
+        let entries = merged_under_a_moved_main(&repo);
+        let merged_tip = repo.tip("feat/a");
+        let doc = list_doc(entries);
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.tip("feat/a"), merged_tip, "a merged branch stays put\n{doc}");
+        assert_eq!(repo.subjects("feat/b"), ["root", "a", "fix", "b"], "{doc}");
+    }
+
+    #[test]
+    fn a_merged_and_deleted_live_branch_gets_no_step_either() {
+        let repo = StackRepo::new();
+        let entries = merged_under_a_moved_main(&repo);
+        repo.git(&["branch", "-qD", "feat/a"]);
+        let doc = list_doc(entries);
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.subjects("feat/b"), ["root", "a", "fix", "b"], "{doc}");
+    }
+
+    #[test]
+    fn a_step_carried_in_a_live_doc_gets_no_step_once_its_branch_merges() {
+        // The doc was rendered while `feat/a` was open. A merge keeps a live
+        // doc's branches, so only a test made at the step can catch this.
+        let repo = StackRepo::new();
+        let entries = cut_stack(&repo, &[("a", ""), ("b", "a")]);
+        let doc = list_doc(entries);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "-q", "--ff-only", "feat/a"]);
+        repo.commit("fix");
+        let merged_tip = repo.tip("feat/a");
+
+        follow_restack_doc(&repo, &doc, usize::MAX);
+        assert_eq!(repo.tip("feat/a"), merged_tip, "{doc}");
+        assert_eq!(repo.subjects("feat/b"), ["root", "a", "fix", "b"], "{doc}");
+    }
+
+    #[test]
+    fn the_merged_rule_names_the_projects_own_main() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let trunk = Project { main: "trunk".to_string(), ..project() };
+        let mut one = entry("one");
+        one.claimed = "2026-10-11T12:00:00Z".to_string();
+        one.base = "abc123".to_string();
+        seed_queue(&daemon, vec![trunk], vec![one], None);
+
+        add_entry(&daemon, restack_args("softfig", serde_json::json!({}))).expect("restack");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(doc.contains("git merge-base --is-ancestor <branch> trunk"), "{doc}");
+        assert!(doc.contains("use `trunk` as `<onto>`"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto trunk abc123 feat/one`"), "{doc}");
+    }
+
+    #[test]
+    fn the_upstream_check_leaves_out_a_merged_branch() {
+        // Merged and pushed is the ordinary end of a branch. Blocking on it
+        // would hold the whole restack for a branch nothing rewrites.
+        for doc in [
+            restack_doc("softfig", "main", "2026-11-07", &[rb("feat/one", "", "abc", "main")]),
+            restack_doc("softfig", "main", "2026-11-07", &[]),
+        ] {
+            let rule = doc.lines().find(|l| l.starts_with("Never rewrite")).expect("rule");
+            assert!(rule.contains("leaving out one already merged"), "{doc}");
+        }
     }
 
     // ---- review 055 F5: the resume rule touches only this restack's branches ----
@@ -4579,7 +4717,7 @@ mod tests {
         let resolution = theirs.path().join("clash");
         std::fs::write(&resolution, "half-resolved").unwrap();
         repo.git(&["branch", "feat/x", &start]);
-        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
 
         resume_restack_doc(&repo, &doc);
 
@@ -4598,7 +4736,7 @@ mod tests {
         assert!(!repo.sh(&format!("git -C {path} rebase -q human-onto")));
         assert!(is_mid_rebase(theirs.path()), "{path}");
         repo.git(&["branch", "feat/x", &start]);
-        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
 
         resume_restack_doc(&repo, &doc);
 
@@ -4611,7 +4749,7 @@ mod tests {
         let start = repo.tip("main");
         let dead = repo.linked_mid_rebase("feat/x");
         let tip = repo.tip("feat/x");
-        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &[rb("feat/x", "", &start, "main")]);
 
         resume_restack_doc(&repo, &doc);
 
@@ -4633,7 +4771,7 @@ mod tests {
             rb("feat/a", "", &rows[0].base, "main"),
             rb("feat/b", "a", &rows[1].base, "feat/a"),
         ];
-        let doc = restack_doc("softfig", "2026-11-07", &stack);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &stack);
 
         follow_restack_doc(&repo, &doc, usize::MAX);
 
@@ -4657,7 +4795,7 @@ mod tests {
         let path = linked.path().to_str().unwrap();
         repo.git(&["worktree", "add", "-q", "--force", path, "feat/a"]);
         let holder = repo.holder("feat/a").expect("held");
-        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
 
         follow_restack_doc(&repo, &doc, usize::MAX);
 
@@ -4674,7 +4812,7 @@ mod tests {
         repo.git(&["add", "a"]);
         repo.git(&["commit", "-qm", "fix"]);
         let tip = repo.tip("feat/a");
-        let doc = restack_doc("softfig", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &[rb("feat/a", "", &rows[0].base, "main")]);
 
         // The first session stops on the conflict and dies there.
         let scratch = scratch_of(&repo, &doc);
@@ -4953,11 +5091,11 @@ mod tests {
             rb("feat/two", "one", "", "feat/one"),
             rb("feat/three", "two", "def456", "feat/two"),
         ];
-        let doc = restack_doc("softfig", "2026-11-07", &stack);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &stack);
         let read = stack_of_doc(&doc);
-        assert_eq!(restack_doc("softfig", "2026-11-07", &read), doc);
+        assert_eq!(restack_doc("softfig", "main", "2026-11-07", &read), doc);
         assert_eq!(read[2].onto, "feat/two");
-        assert!(stack_of_doc(&restack_doc("softfig", "2026-11-07", &[])).is_empty());
+        assert!(stack_of_doc(&restack_doc("softfig", "main", "2026-11-07", &[])).is_empty());
     }
 
     #[test]
@@ -5058,7 +5196,7 @@ mod tests {
     #[test]
     fn a_stack_with_no_onto_blocks_that_branch_and_a_later_stack_fills_it() {
         let stack = [rb("feat/g", "", "feat/m", "")];
-        let doc = restack_doc("softfig", "2026-11-07", &stack);
+        let doc = restack_doc("softfig", "main", "2026-11-07", &stack);
         assert!(!doc.contains("--onto  "), "{doc}");
         assert!(doc.contains("- `feat/g`: nothing is recorded to rebase it onto"), "{doc}");
 

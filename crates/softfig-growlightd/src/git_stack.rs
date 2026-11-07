@@ -580,10 +580,11 @@ pub struct RestackEntry {
 /// left the list resolves through its archive row (`archived`: `done` rows'
 /// id → branch, V7) — the loop never merges, so an archived parent's branch is
 /// usually still unmerged work its child was cut from, and rebasing the child
-/// onto `main` would strip those commits. Such a branch is the target while it
-/// exists and is not yet in `main`; once merged (or deleted after the human
-/// merged it) `main` has the work and is the target. An unknown parent falls
-/// back to `main` (defensive).
+/// onto `main` would strip those commits. Either way the parent's branch is the
+/// target while it exists and is not yet in `main`; once merged (or deleted
+/// after the human merged it) `main` has the work and is the target, even while
+/// the parent's row is still live: its old tip would hide `main` moving on. An
+/// unknown parent falls back to `main` (defensive).
 fn resolve_onto(
     parent: &str,
     main: &str,
@@ -594,12 +595,14 @@ fn resolve_onto(
     if parent.is_empty() {
         return Ok(main.to_string());
     }
-    if let Some(branch) = branch_of.get(parent) {
-        return Ok((*branch).to_string());
-    }
-    match archived.get(parent).filter(|b| !b.is_empty()) {
+    let branch = branch_of
+        .get(parent)
+        .copied()
+        .or_else(|| archived.get(parent).map(String::as_str))
+        .filter(|b| !b.is_empty());
+    match branch {
         Some(branch) if git.branch_exists(branch)? && !git.is_ancestor(branch, main)? => {
-            Ok(branch.clone())
+            Ok(branch.to_string())
         }
         _ => Ok(main.to_string()),
     }
@@ -1285,6 +1288,37 @@ mod tests {
             .expect("a deleted archived branch must not wedge detection")
             .expect("b is still stale against main");
         assert_eq!(need[0].onto, "main", "{need:?}");
+    }
+
+    #[test]
+    fn a_merged_live_parent_resolves_to_main_so_a_moved_main_is_seen() {
+        // F8: the human merged feat/a but its row is still live. feat/b contains
+        // feat/a, so judged against it feat/b reads as healthy behind the fix.
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let a_tip = open_branch_from(repo, "feat/a", "main");
+        open_branch_from(repo, "feat/b", "feat/a");
+        sh_git(repo, &["merge", "--ff-only", "-q", "feat/a"]);
+        ff_main(repo);
+        let entries = [
+            restack_entry("a", "feat/a", "", "root", "2026-10-01T00:00:00Z"),
+            restack_entry("b", "feat/b", "a", &a_tip, "2026-10-02T00:00:00Z"),
+        ];
+        let git = Git::new(repo.to_path_buf());
+
+        let need = detect_restack(
+            &Repo::Local(repo.to_path_buf()),
+            "main",
+            &entries,
+            &BTreeMap::new(),
+            &git,
+        )
+        .unwrap()
+        .expect("feat/b lacks the urgent fix");
+        assert_eq!(need.len(), 1, "the merged branch has no step: {need:?}");
+        assert_eq!(need[0].branch, "feat/b");
+        assert_eq!(need[0].onto, "main", "{need:?}");
+        assert_eq!(need[0].base, a_tip);
     }
 
     #[test]

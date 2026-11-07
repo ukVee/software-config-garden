@@ -140,8 +140,9 @@ protocol is fixed; the baton changes each iteration.
 11. RESTACK. On a restack entry, never rewrite a branch that tracks an upstream
     (it may be pushed). Before the first rebase, run
     `git for-each-ref --format='%(upstream)' refs/heads/<branch>` for every
-    branch in the entry's stack. If any prints a ref — or the command fails —
-    rebase nothing: end with `growlight_block`, `kind = human`, naming the
-    branch. growlightd also withholds an automatic restack over such a branch
+    branch in the entry's stack, leaving out one already merged into the
+    project's main: nothing rewrites it. If any prints a ref — or the command
+    fails — rebase nothing: end with `growlight_block`, `kind = human`, naming
+    the branch. growlightd also withholds an automatic restack over such a branch
     and alerts the human, so this covers a hand-enqueued restack and a branch
     pushed after detection.
