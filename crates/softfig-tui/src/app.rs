@@ -1761,6 +1761,11 @@ impl App {
                 // Live process-state → the header. A version-skewed / malformed
                 // reply degrades to the dim line rather than a splat.
                 Ok(v) => {
+                    // growlightd came back: the v2 snapshot went with it, so
+                    // fetch it again or `v` stays inert until the tab is left.
+                    if matches!(self.fleet, FleetHeader::Unreachable) {
+                        self.mark_growlight_v2_stale();
+                    }
                     self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
                         Ok(reply) => FleetHeader::Live(reply),
                         Err(_) => FleetHeader::Unreachable,
@@ -1769,8 +1774,12 @@ impl App {
                 // Soft-fail (load-bearing): growlightd down / disarmed → the
                 // connect errors on the worker. One dim header line — deliberately
                 // NEVER `self.status` (no status splat) and never touching the
-                // garden-sourced tree/preview, so the page keeps working.
-                Err(_) => self.fleet = FleetHeader::Unreachable,
+                // garden-sourced tree/preview, so the page keeps working. The
+                // v2 view is growlightd-sourced, so it falls back to that tree.
+                Err(_) => {
+                    self.fleet = FleetHeader::Unreachable;
+                    self.leave_growlight_v2();
+                }
             },
             Tag::GrowlightRuntimeBaton => {
                 match reply.result {
@@ -1822,7 +1831,7 @@ impl App {
                         self.growlight_v2_view = false;
                     }
                 }
-                Err(_) => self.growlight_queue_v2 = None,
+                Err(_) => self.leave_growlight_v2(),
             },
             Tag::GrowlightQueueAction => {
                 // One half of a §6.9 action pair, matched to its request by id.
@@ -3856,6 +3865,14 @@ impl App {
             .as_ref()
             .map(|r| self.growlight_v2.rows(r).len())
             .unwrap_or(0)
+    }
+
+    /// growlightd stopped answering: forget the snapshot and go back to the
+    /// legacy tree. Left on, the view would be stuck, because `v` only toggles
+    /// while a snapshot says `list: true`.
+    fn leave_growlight_v2(&mut self) {
+        self.growlight_queue_v2 = None;
+        self.growlight_v2_view = false;
     }
 
     /// `v` — toggle between the legacy backlog tree and the two-lane v2 view.
@@ -8059,6 +8076,48 @@ mod tests {
         app.view = View::Growlight;
         app.growlight_v2_view = true;
         app
+    }
+
+    #[test]
+    fn a_failed_queue_show_leaves_the_v2_view() {
+        let mut app = v2_app_cursor_on_b();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueueShow,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(!app.growlight_v2_view);
+        assert!(app.growlight_queue_v2.is_none());
+    }
+
+    /// `queue_show` is one-shot, so a daemon that dies while the view is open
+    /// shows up on the status poll first.
+    #[test]
+    fn growlightd_going_down_leaves_the_v2_view_and_coming_back_refetches_it() {
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2_stale = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(!app.growlight_v2_view);
+        assert!(app.growlight_queue_v2.is_none());
+        assert!(!app.growlight_v2_stale);
+
+        app.apply_reply(
+            Reply { id: 2, tag: Tag::FleetStatus, result: Ok(json!({})) },
+            &mut ipc,
+        );
+        assert!(app.growlight_v2_stale, "the snapshot must be fetched again");
     }
 
     fn only_pending(app: &App) -> &PendingV2 {
