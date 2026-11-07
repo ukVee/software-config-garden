@@ -2402,6 +2402,12 @@ pub struct QueueUpdateEntryReply {
     pub view: String,
     /// Commit hash; on a dry run or a no-op edit the untouched tip.
     pub hash: String,
+    /// What the edit kept but does not do, one sentence each — today, a
+    /// `not_before` set on a `paused` or `active` entry, which gates only a
+    /// `queued` entry's claim (F2). Empty, and absent on the wire, otherwise;
+    /// an older daemon sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// `slice_insert({milestone, slug, title?, body, position = "back", ref?,

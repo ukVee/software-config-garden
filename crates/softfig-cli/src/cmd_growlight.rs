@@ -2610,6 +2610,14 @@ fn print_verb_reply(dry_run: bool, view: &str, hash: &str) {
     }
 }
 
+/// The edit's notes — what it kept but does not do (a start time on an
+/// entry it cannot hold, F2) — one `note:` line each, after the list.
+fn print_notes(notes: &[String]) {
+    for note in notes {
+        println!("note: {note}");
+    }
+}
+
 /// §6.9: a value starting with `@` is read from that file. Anything else
 /// passes through unchanged.
 fn value_or_file(value: &str) -> Result<String> {
@@ -3005,6 +3013,7 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3025,6 +3034,7 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3042,6 +3052,7 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3064,6 +3075,7 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3081,6 +3093,7 @@ fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3098,6 +3111,7 @@ fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 

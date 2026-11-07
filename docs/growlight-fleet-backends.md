@@ -470,6 +470,11 @@ guard stops protecting the `> Fleet:` line once `config/growlight.toml` says `qu
 Under legacy, or with a switch it can't read, the guard stays on. A member may not write
 `config/growlight.toml`.
 
+`not_before` gates only a `queued` entry's claim: a `paused` or orphaned `active` entry is
+past its claim, so a start time set on one holds nothing. `queue not-before` keeps it all
+the same (it applies if the entry is queued again) and says so with a `note:` line after
+the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent

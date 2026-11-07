@@ -1282,9 +1282,9 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
 
     // 5. not_before: the start-time hold (§3.1), also before status.
-    if let Some(not_before) = not_before {
+    if let Some(not_before) = &not_before {
         let idx = idx_of(&queue, &args.id);
-        queue.entries[idx].not_before = not_before;
+        queue.entries[idx].not_before = not_before.clone();
     }
 
     // 6. status. `done` is the human's override — no open-items check — and
@@ -1341,6 +1341,16 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         }
     }
 
+    // F2: a start time set on an entry it cannot hold is kept, and said.
+    let notes: Vec<String> = match (&not_before, archived) {
+        (Some(Some(_)), false) => {
+            inert_start_time_note(&queue.entries[idx_of(&queue, &args.id)])
+                .into_iter()
+                .collect()
+        }
+        _ => vec![],
+    };
+
     // No-op guard: an edit that changed nothing (same lane, same position,
     // same links, same holds, same status) mints no commit — the legacy reorder verb's
     // idempotence. Return the untouched tip without touching apply.
@@ -1350,6 +1360,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
             id: args.id,
             view: queue_view(&queue),
             hash,
+            notes,
         })
         .unwrap());
     }
@@ -1365,6 +1376,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
             id: args.id,
             view,
             hash,
+            notes,
         })
         .unwrap());
     }
@@ -1406,8 +1418,24 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         id: args.id,
         view,
         hash: hash.to_string(),
+        notes,
     })
     .unwrap())
+}
+
+/// Why a start time on `row` holds nothing, if it doesn't. `not_before` gates
+/// only a `queued` entry's claim (§2 **Holds**): a `paused` or orphaned
+/// `active` row is past its claim, so the scheduler reads straight past the
+/// time. It is kept all the same — it applies if the entry is queued again.
+fn inert_start_time_note(row: &Entry) -> Option<String> {
+    match row.status {
+        EntryStatus::Paused | EntryStatus::Active => Some(format!(
+            "{:?} is {}, so its start time holds nothing now: not_before gates only a \
+             queued entry's claim. It is kept and applies if the entry is queued again.",
+            row.id, row.status
+        )),
+        EntryStatus::Queued | EntryStatus::Blocked | EntryStatus::Deferred => None,
+    }
 }
 
 /// The entry's index; the verb proved the id exists, so this never misses.
@@ -2795,6 +2823,44 @@ mod tests {
         update_entry(&daemon, serde_json::json!({ "id": "a", "not_before": "" })).unwrap();
         assert_eq!(nb_of(&daemon), None, "cleared");
         assert_eq!(commit_count(&daemon), before + 2);
+    }
+
+    /// F2: a start time gates only a `queued` entry's claim, so setting one on
+    /// a `paused` or `active` entry is kept but holds nothing — and the reply
+    /// says so, rather than exiting as if the entry were now held.
+    #[test]
+    fn update_entry_says_a_start_time_holds_nothing_on_a_paused_or_active_entry() {
+        let at = "2026-11-01 02:00 -04:00";
+        for status in [EntryStatus::Active, EntryStatus::Paused] {
+            let garden = tempfile::tempdir().unwrap();
+            let daemon = unlocked(garden.path());
+            let mut m = entry("m");
+            m.status = status;
+            seed_queue(&daemon, vec![project()], vec![m], None);
+            let reply = update_entry(&daemon, serde_json::json!({ "id": "m", "not_before": at }))
+                .expect("kept, not refused");
+            assert_eq!(reply.notes.len(), 1, "{status:?}: {:?}", reply.notes);
+            assert!(
+                reply.notes[0].contains(&format!("is {status}")) && reply.notes[0].contains("queued"),
+                "{status:?}: {:?}",
+                reply.notes
+            );
+            // The same time again is a no-op, and still says so.
+            let again = update_entry(&daemon, serde_json::json!({ "id": "m", "not_before": at }))
+                .unwrap();
+            assert_eq!(again.notes, reply.notes, "{status:?}");
+            // Clearing it holds nothing to explain.
+            let cleared = update_entry(&daemon, serde_json::json!({ "id": "m", "not_before": "" }))
+                .unwrap();
+            assert!(cleared.notes.is_empty(), "{status:?}: {:?}", cleared.notes);
+        }
+        // A queued entry is held by it: nothing to say.
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![entry("q")], None);
+        let reply =
+            update_entry(&daemon, serde_json::json!({ "id": "q", "not_before": at })).unwrap();
+        assert!(reply.notes.is_empty(), "{:?}", reply.notes);
     }
 
     #[test]

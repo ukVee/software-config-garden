@@ -1587,11 +1587,24 @@ fn summarize(name: &str, data: &Value) -> String {
             head.push_str(&format!(" -> {path}"));
         }
         head.push_str(&format!("; commit {}", if hash.is_empty() { "?" } else { hash }));
+        // What the edit kept but does not do (F2), after the list as the CLI
+        // prints it.
+        let notes: String = data
+            .get("notes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str())
+            .map(|n| format!("\nnote: {n}"))
+            .collect();
         let view = g("view");
         if view.is_empty() {
-            return head;
+            return format!("{head}{notes}");
         }
-        return format!("{head}\n{view}");
+        if notes.is_empty() {
+            return format!("{head}\n{view}");
+        }
+        return format!("{head}\n{}{notes}", view.trim_end_matches('\n'));
     }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
@@ -2254,6 +2267,13 @@ mod tests {
         );
         assert!(s.contains("queue_update_entry m9; commit abc"), "{s}");
         assert!(s.contains("## urgent") && s.contains("- m9"), "{s}");
+        assert!(!s.contains("note:"), "{s}");
+        // F2: the reply's notes follow the list, one line each.
+        let s = summarize(
+            "queue_update_entry",
+            &json!({ "id": "m9", "view": "- m9\n", "hash": "abc", "notes": ["m9 is paused"] }),
+        );
+        assert!(s.ends_with("- m9\nnote: m9 is paused"), "{s}");
         // queue_add_project has no id — the project name stands in.
         let s = summarize(
             "queue_add_project",
