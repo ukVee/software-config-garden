@@ -40,6 +40,9 @@ toml and thiserror, and on no other workspace crate.
   `~/.local/state/softfig/telemetry.db` (`default_db_path`). It lives outside the
   garden, so it is never committed or replicated. That is deliberate:
   telemetry is per-device and high-churn.
+- **Permissions:** the db and its `-wal` and `-shm` sidecars are `0600`. The
+  files are created that way whatever the umask, and tightened on open if an
+  older build left them wider. Schema v5 is current.
 - **`requests`:** one row per request. The unique key is
   `(session_id, request_id)`, so re-ingesting a request adds nothing.
   - `cost_usd` is `NULL` when the model has no price, never `0`. The garden
@@ -76,8 +79,11 @@ Telemetry never blocks a member or the daemon. Any of these logs a line and
 drops rows rather than failing the session:
 
 - a db that won't open;
-- a failed batch (counted in `failed_batches`; the spec accepts the loss);
-- a missing price table.
+- a failed batch (counted in `failed_batches`; the spec accepts the loss).
+
+A missing or unparseable price table drops nothing. growlightd logs one line
+(`no price table, rows stay unpriced`) and keeps the ring recorder, so every
+row is still recorded, with `cost_usd = NULL`.
 
 ## The three capture points
 
@@ -184,6 +190,12 @@ The rest of the verb's behaviour:
 - **Pricing.** The verb reads the table from `--garden-root`. Without that flag
   it asks the running daemon for the garden root. If the table can't be found
   or parsed, it prints a line to stderr and the rows stay unpriced.
+- **Repeat `SessionEnd`.** The db keeps a per-file byte mark
+  (`transcript_marks`, schema v5). If no file of the session has grown past its
+  mark, the verb skips the parse and the insert (the retention sweep still
+  runs). If any file grew, it re-reads the whole set so `turn_index` stays
+  whole-session, then advances the marks once the batch is in. A transcript
+  rewritten to the same or a shorter length is not re-read.
 - **Idempotent and fail-soft.** Running the verb twice adds nothing. It always
   exits 0 and reports problems only on stderr, so the hook can never fail a
   session.
