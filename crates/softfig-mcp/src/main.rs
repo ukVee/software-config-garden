@@ -1143,11 +1143,9 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
         )
     };
     match name {
-        "queue_add_project" | "queue_update_entry" | "queue_drop" => Some(refused(
-            name,
-            "a fleet member may add found work with queue_add_entry, and move slices in its own \
-             entry; shaping the queue is the human's",
-        )),
+        _ if softfig_ipc::member::HUMAN_QUEUE_VERBS.contains(&name) => {
+            Some(refused(name, softfig_ipc::member::HUMAN_QUEUE_VERB_WHY))
+        }
         "queue_add_entry" => {
             let a: QueueAddEntryArgs = serde_json::from_value(args.clone()).ok()?;
             let urgent = "urgent work goes to the human instead: post_message to @human";

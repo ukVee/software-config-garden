@@ -542,7 +542,7 @@ pub(crate) fn scope_base_name(agent: &str) -> String {
             }
         })
         .collect();
-    format!("growlight-agent-{safe}")
+    format!("{}{safe}", softfig_ipc::member::SCOPE_PREFIX)
 }
 
 /// The transient-scope base unit name for THIS spawn of `agent`, with a unique
@@ -955,7 +955,7 @@ impl Harness {
         // and recorded in the shared live-scope registry (set_resources targets it).
         let generation = self.scope_gen.fetch_add(1, Ordering::Relaxed);
         let scope_base = scope_base_name_gen(&spec.agent, generation);
-        let scope_unit = format!("{scope_base}.scope");
+        let scope_unit = format!("{scope_base}{}", softfig_ipc::member::SCOPE_SUFFIX);
         let argv = spawn_argv(
             &scope_base,
             &caps,
