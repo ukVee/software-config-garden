@@ -182,6 +182,12 @@ pub struct V2Snapshot {
     /// detection resolves a child's archived parent through it (queue-v2-git
     /// §8, V7).
     pub done_branches: BTreeMap<String, String>,
+    /// The project of each archive row with `final_status = done`: the row left
+    /// `entries`, and a handoff scan still has to find its repo (§8, V17).
+    pub done_projects: BTreeMap<String, String>,
+    /// Archived restack rows still owed their §8 re-record, by project (project
+    /// → row ids). Read from the archive, so a daemon restart doesn't lose them.
+    pub re_records_due: BTreeMap<String, Vec<String>>,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -210,6 +216,12 @@ pub enum SkipReason {
     /// The repo rule: another normal-lane entry on the same repo is
     /// `active`/`paused` (§2 — only those two hold the repo).
     RepoHeld,
+    /// A restack owns this entry's repo (§2 restack rule): a normal entry
+    /// waits out any live restack there, an urgent one a started restack.
+    RestackLive,
+    /// This restack waits: another entry in its repo is `active`, so a live
+    /// session may hold a branch it would rewrite (§2 restack rule).
+    RestackWaits,
     /// An `active` entry held by a different member (§2 — an active entry is
     /// held by exactly one running member).
     Held,
@@ -249,6 +261,8 @@ impl SkipReason {
             SkipReason::NotEligible => "not_eligible",
             SkipReason::AfterNotDone => "after_not_done",
             SkipReason::RepoHeld => "repo_held",
+            SkipReason::RestackLive => "restack_live",
+            SkipReason::RestackWaits => "restack_waits",
             SkipReason::Held => "held",
             SkipReason::Remote => "remote",
             SkipReason::AmbiguousRepo => "ambiguous_repo",
@@ -291,6 +305,10 @@ impl SkipReason {
             SkipReason::AfterNotDone => "an `after` link is not archived done yet (§2)",
             SkipReason::RepoHeld => {
                 "another normal-lane entry on its repo is active or paused (§2 repo rule)"
+            }
+            SkipReason::RestackLive => "a restack owns its repo until it finishes (§2 restack rule)",
+            SkipReason::RestackWaits => {
+                "another entry on its repo is active, so a live session may hold a branch it rewrites (§2 restack rule)"
             }
             SkipReason::Held => "it is active and another running member holds it (§2)",
             SkipReason::Remote => "a remote project, which an opencode member never takes",
@@ -363,6 +381,15 @@ pub enum WalkOutcome {
     /// No unit at all — a missing tree (fail closed; a close-out is never
     /// guessed over unseen work).
     NoUnit,
+}
+
+impl V2Snapshot {
+    /// The entries on `repo`, whichever project each belongs to: the stack is
+    /// per repo (§8). Repos compare as the strings the projects record, as
+    /// [`repo_of`]'s other callers and the §3.1 per-repo invariants do.
+    pub fn entries_in_repo<'a>(&'a self, repo: &'a str) -> impl Iterator<Item = &'a EntryView> {
+        self.entries.iter().filter(move |e| repo_of(self, e) == Some(repo))
+    }
 }
 
 /// The project an entry belongs to, joined from the snapshot's projects. A
@@ -496,6 +523,35 @@ pub fn held_entries(snapshot: &V2Snapshot) -> Vec<(&EntryView, SkipReason)> {
         .collect()
 }
 
+/// The §2 restack rule: a restack rewrites branches in its repo, so it never
+/// runs beside a session that may hold one. `None` for an `active` entry, which
+/// always keeps going: a restack waits for it, and refusing it here would
+/// strand both. Otherwise a restack waits for every `active` entry in the repo,
+/// a normal entry waits out any live restack there (a blocked one included,
+/// since it stopped partway through the stack), and an urgent entry waits only
+/// for a started one, so urgent work never waits on a human.
+fn restack_hold(snapshot: &V2Snapshot, entry: &EntryView, repo: &str) -> Option<SkipReason> {
+    if entry.status == EntryStatus::Active {
+        return None;
+    }
+    let mut others = snapshot
+        .entries
+        .iter()
+        .filter(|other| other.id != entry.id && repo_of(snapshot, other) == Some(repo));
+    if entry.kind == EntryKind::Restack {
+        return others
+            .any(|other| other.status == EntryStatus::Active)
+            .then_some(SkipReason::RestackWaits);
+    }
+    others
+        .any(|other| {
+            other.kind == EntryKind::Restack
+                && (entry.lane == Lane::Normal
+                    || matches!(other.status, EntryStatus::Active | EntryStatus::Paused))
+        })
+        .then_some(SkipReason::RestackLive)
+}
+
 /// §2 eligibility for a member taking an entry: the conjunction of every
 /// clause, checked in the spec's order, with the first failure as the skip
 /// reason. On success the next unit and its declared model list come back
@@ -533,6 +589,10 @@ pub fn eligible(
         })
     {
         return Err(SkipReason::RepoHeld);
+    }
+    // 3b. The restack rule (§2).
+    if let Some(reason) = restack_hold(snapshot, entry, repo) {
+        return Err(reason);
     }
     // 4. The holder rule: an `active` entry is held by exactly one running
     // member, and no other member takes it (§2). A `paused` entry has no
@@ -789,6 +849,8 @@ mod tests {
             done_ids: BTreeSet::new(),
             now_unix: 0,
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -2314,5 +2376,216 @@ mod tests {
             }
         );
         assert_eq!(picked.declared, Some(list("reasoning, claude")));
+    }
+
+    // ---- the restack rule (§2, review 044 V8, report 123) -----------------
+
+    /// A restack row: urgent, no branch of its own, no slice tree.
+    fn restack(id: &str, status: EntryStatus) -> EntryView {
+        let mut e = entry(id);
+        e.kind = EntryKind::Restack;
+        e.lane = Lane::Urgent;
+        e.status = status;
+        e
+    }
+
+    /// One project, these rows, and an open slice tree for every milestone.
+    fn repo_snapshot(entries: Vec<EntryView>) -> V2Snapshot {
+        let ids: Vec<String> = entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Milestone)
+            .map(|e| e.id.clone())
+            .collect();
+        let mut snapshot = snap(vec![project("softfig", "~/projects/softfig")], entries);
+        for id in ids {
+            snapshot.trees.insert(id, tree(declared(None)));
+        }
+        snapshot
+    }
+
+    fn reason_for(outcome: &PickOutcome, id: &str) -> Option<SkipReason> {
+        outcome.skips.iter().find(|s| s.entry == id).map(|s| s.reason)
+    }
+
+    #[test]
+    fn a_live_restack_of_any_status_holds_its_repos_normal_entries() {
+        for status in [
+            EntryStatus::Queued,
+            EntryStatus::Active,
+            EntryStatus::Paused,
+            EntryStatus::Blocked,
+            EntryStatus::Deferred,
+        ] {
+            let mut r = restack("r", status);
+            r.holder = (status == EntryStatus::Active).then(|| "other".to_string());
+            let snapshot = repo_snapshot(vec![r, entry("n")]);
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &snapshot.entries[1]),
+                Err(SkipReason::RestackLive),
+                "a {status:?} restack",
+            );
+        }
+    }
+
+    #[test]
+    fn a_paused_normal_entry_does_not_resume_while_a_restack_is_live() {
+        let mut paused = entry("n");
+        paused.status = EntryStatus::Paused;
+        paused.holder = Some("m".into());
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), paused]);
+
+        let outcome = pick_v2(&snapshot, &member("m"));
+
+        assert_eq!(
+            outcome.picked.map(|p| p.entry),
+            Some("r".to_string()),
+            "a paused entry holds no session, so the restack starts",
+        );
+        assert_eq!(
+            eligible(&snapshot, &member("m"), &snapshot.entries[1]),
+            Err(SkipReason::RestackLive),
+        );
+    }
+
+    #[test]
+    fn queue_pick_lists_the_entry_a_live_restack_holds() {
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Blocked), entry("n")]);
+        let outcome = pick_v2(&snapshot, &member("m"));
+        assert_eq!(outcome.picked, None);
+        assert_eq!(reason_for(&outcome, "n"), Some(SkipReason::RestackLive));
+    }
+
+    #[test]
+    fn an_active_entry_keeps_going_and_the_restack_waits_for_it() {
+        let mut active = entry("n");
+        active.status = EntryStatus::Active;
+        active.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), active]);
+
+        let holder = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(
+            holder.picked.as_ref().map(|p| p.entry.as_str()),
+            Some("n"),
+            "a re-roll keeps going, so a restack can wait a whole entry",
+        );
+        assert_eq!(reason_for(&holder, "r"), Some(SkipReason::RestackWaits));
+
+        let other = pick_v2(&snapshot, &member("bob"));
+        assert_eq!(other.picked, None, "no member takes the restack");
+        assert_eq!(reason_for(&other, "r"), Some(SkipReason::RestackWaits));
+    }
+
+    #[test]
+    fn an_orphaned_active_entry_is_resumed_so_the_restack_is_not_stranded() {
+        let mut orphan = entry("n");
+        orphan.status = EntryStatus::Active;
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), orphan]);
+
+        assert_eq!(
+            pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+            Some("n".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_blocked_or_deferred_entry_does_not_hold_a_restack_back() {
+        for status in [EntryStatus::Blocked, EntryStatus::Deferred, EntryStatus::Queued] {
+            let mut waiting = entry("n");
+            waiting.status = status;
+            let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), waiting]);
+            assert_eq!(
+                pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+                Some("r".to_string()),
+                "a {status:?} entry runs no session",
+            );
+        }
+    }
+
+    #[test]
+    fn the_restack_rule_keys_on_the_repo_not_the_project() {
+        let repo = "~/projects/softfig";
+        let mut sibling = entry("n");
+        sibling.project = "sibling".into();
+        let mut elsewhere = entry("x");
+        elsewhere.project = "elsewhere".into();
+        let mut snapshot = snap(
+            vec![
+                project("softfig", repo),
+                project("sibling", repo),
+                project("elsewhere", "~/projects/elsewhere"),
+            ],
+            vec![restack("r", EntryStatus::Blocked), sibling, elsewhere],
+        );
+        snapshot.trees.insert("n".into(), tree(declared(None)));
+        snapshot.trees.insert("x".into(), tree(declared(None)));
+
+        let outcome = pick_v2(&snapshot, &member("m"));
+
+        assert_eq!(outcome.picked.as_ref().map(|p| p.entry.as_str()), Some("x"));
+        assert_eq!(reason_for(&outcome, "n"), Some(SkipReason::RestackLive));
+    }
+
+    /// A restack names urgent branches too: they are stack candidates, and
+    /// `main` moves under them like any other (§8). So the exclusion is both
+    /// ways for an urgent entry that holds a session, though only a started
+    /// restack stops one, and one waiting on a human never does.
+    #[test]
+    fn an_urgent_entry_and_a_restack_never_overlap() {
+        let mut urgent = entry("u");
+        urgent.lane = Lane::Urgent;
+        urgent.status = EntryStatus::Active;
+        urgent.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![urgent.clone(), restack("r", EntryStatus::Queued)]);
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &snapshot.entries[1]),
+            Err(SkipReason::RestackWaits),
+        );
+
+        let mut paused = urgent.clone();
+        paused.status = EntryStatus::Paused;
+        paused.holder = None;
+        for (status, verdict) in [
+            (EntryStatus::Active, Some(SkipReason::RestackLive)),
+            (EntryStatus::Paused, Some(SkipReason::RestackLive)),
+            (EntryStatus::Queued, None),
+            (EntryStatus::Blocked, None),
+        ] {
+            let snapshot = repo_snapshot(vec![restack("r", status), paused.clone()]);
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &snapshot.entries[1]).err(),
+                verdict,
+                "beside a {status:?} restack",
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_restack_waits_for_the_running_one() {
+        let mut first = restack("r1", EntryStatus::Active);
+        first.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![first, restack("r2", EntryStatus::Queued)]);
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &snapshot.entries[1]),
+            Err(SkipReason::RestackWaits),
+        );
+    }
+
+    #[test]
+    fn a_running_restack_keeps_going() {
+        let mut running = restack("r", EntryStatus::Active);
+        running.holder = Some("m".into());
+        let snapshot = repo_snapshot(vec![running, entry("n")]);
+        assert_eq!(
+            pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+            Some("r".to_string()),
+        );
+    }
+
+    #[test]
+    fn the_restack_skips_have_stable_slugs_and_say_what_they_mean() {
+        assert_eq!(SkipReason::RestackLive.as_str(), "restack_live");
+        assert_eq!(SkipReason::RestackWaits.as_str(), "restack_waits");
+        assert!(SkipReason::RestackLive.describe().contains("restack"));
+        assert!(SkipReason::RestackWaits.describe().contains("active"));
     }
 }

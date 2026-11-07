@@ -248,7 +248,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held) = {
+    let (state, garden_root, policy, paused, fleet_enabled, queue, members, lifecycles, held) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -256,6 +256,7 @@ fn status(daemon: &Daemon) -> Response {
             inner.config.policy.summary(),
             inner.control.paused,
             inner.fleet.enabled,
+            inner.fleet.queue.label().to_string(),
             inner.fleet.members.clone(),
             inner.member_lifecycles.clone(),
             inner.held_parts.clone(),
@@ -285,6 +286,7 @@ fn status(daemon: &Daemon) -> Response {
         build_caps: daemon.build_caps().summary(),
         paused,
         fleet_enabled,
+        queue,
         roster,
         agents,
         // The genuinely-running scope units (slice 006) — independent leaf lock,
@@ -1088,6 +1090,8 @@ fn queue_show(daemon: &Daemon) -> Response {
         &daemon.garden_root(),
         home.as_deref(),
         user.as_deref(),
+        &daemon.surface_probes,
+        crate::profile_pin::now_unix(),
     );
     ok_reply(&reply, "queue_show")
 }
@@ -1247,6 +1251,67 @@ mod tests {
     fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
             .with_resource_persister(persister)
+    }
+
+    /// `queue_show` reads the stack through the daemon's bounded probes: a wedged
+    /// repo answers by the deadline, as an unknown, and the hold it earns spares
+    /// the next call the wait.
+    #[test]
+    fn queue_show_answers_a_wedged_repo_through_the_bounded_probes() {
+        use softfig_ipc::queue_v2::{Entry, EntryKind, EntryStatus, Lane, Project, QueueToml, QUEUE_FILE};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (garden, repo, bin) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let queue = QueueToml::new(
+            vec![Project {
+                name: "softfig".into(),
+                repo: repo.path().display().to_string(),
+                main: "main".into(),
+            }],
+            vec![Entry {
+                id: "m".into(),
+                kind: EntryKind::Milestone,
+                title: "m".into(),
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Blocked,
+                after: vec![],
+                added: "2026-10-11T15:04:00Z".into(),
+                branch: "feat/m".into(),
+                parent: String::new(),
+                base: "abc123".into(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                follow_ups: 0,
+                pending_status: None,
+                fleet: true,
+                not_before: None,
+            }],
+        );
+        let path = garden.path().join(QUEUE_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, queue.to_toml().unwrap()).unwrap();
+        let git = bin.path().join("fake-git");
+        std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut daemon = Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), garden.path().into()));
+        daemon.surface_probes = crate::git_probe::ProbeCache::with(Duration::from_millis(300), git);
+        let show = || -> QueueShowReply {
+            serde_json::from_value(queue_show(&daemon).into_result().unwrap()).unwrap()
+        };
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("timed out"), "{reply:?}");
+        assert!(reply.entries[0].open_unknown, "{reply:?}");
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("held"), "{reply:?}");
     }
 
     /// A member's relayed slice verb (§6.7): identity, then the member's own
@@ -1439,6 +1504,22 @@ mod tests {
         assert!(!reply.fleet_enabled);
         assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
         assert_eq!(reply.roster.len(), 4, "the configured roster still reports");
+    }
+
+    #[test]
+    fn status_reports_the_queue_switch_armed_or_not() {
+        // V23: the smoke checks a flip took by reading this, and `protocol` can't
+        // show it: that is the wire version, the same under either queue.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        assert_eq!(status_reply(&daemon).queue, "legacy");
+
+        let mut config = mixed_fleet();
+        config.enabled = false;
+        config.queue = crate::fleet::QueueMode::V2;
+        daemon.set_fleet_config(config);
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.queue, "v2");
+        assert!(!reply.fleet_enabled, "the switch reads the same on a disarmed fleet");
     }
 
     #[test]

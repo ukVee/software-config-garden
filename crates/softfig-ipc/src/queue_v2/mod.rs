@@ -42,7 +42,7 @@ pub use sub_doc::{
     reserved_field, reserved_lines, sub_doc_violation, FieldViolation, SubSliceText,
     SLICE_BODY_RESERVED, SUB_DOC_RESERVED,
 };
-pub use validate::{sub_depth, QueueRefusal};
+pub use validate::{sub_depth, valid_branch_name, QueueRefusal};
 
 use std::fmt;
 
@@ -350,6 +350,12 @@ pub struct ArchivedEntry {
     /// omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A restack row that finished `done` and whose stack growlightd has not
+    /// re-recorded yet (§8). It lives on the row, not in growlightd's memory,
+    /// so a restart between the two still re-records: the commit that archives
+    /// the row sets it, the commit that writes the bases clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub re_record_due: bool,
 }
 
 /// A milestone's `slices.toml` (§3.3): the slice + sub-milestone order, in
@@ -476,6 +482,21 @@ impl QueueToml {
             projects,
             entries,
         }
+    }
+
+    /// The repo `project` names, `None` for a project not in the table.
+    pub fn repo_of(&self, project: &str) -> Option<&str> {
+        self.projects
+            .iter()
+            .find(|p| p.name == project)
+            .map(|p| p.repo.as_str())
+    }
+
+    /// Whether two projects work on one repo, so they share one stack and one
+    /// restack row (§8). Repos compare as the strings the projects record, as the
+    /// §3.1 per-repo invariants do.
+    pub fn same_repo(&self, a: &str, b: &str) -> bool {
+        a == b || (self.repo_of(a).is_some() && self.repo_of(a) == self.repo_of(b))
     }
 
     /// Parse fail-closed: malformed TOML, a missing or unknown field, and any
@@ -701,6 +722,19 @@ follow_ups = 0
     }
 
     #[test]
+    fn archive_round_trip_keeps_a_due_re_record() {
+        let arch = QueueArchiveToml::new(vec![ArchivedEntry {
+            row: entry("restack"),
+            finished: "2026-10-11T15:40:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due: true,
+        }]);
+        let back = QueueArchiveToml::parse(&arch.to_toml().expect("serialize")).expect("re-parse");
+        assert_eq!(back, arch);
+    }
+
+    #[test]
     fn archive_round_trip_done_dropped_reason() {
         let arch = QueueArchiveToml::new(vec![
             ArchivedEntry {
@@ -712,17 +746,22 @@ follow_ups = 0
                 finished: "2026-10-11T15:40:00Z".into(),
                 final_status: FinalStatus::Done,
                 reason: None,
+                re_record_due: false,
             },
             ArchivedEntry {
                 row: entry("dropped-two"),
                 finished: "2026-10-11T16:00:00Z".into(),
                 final_status: FinalStatus::Dropped,
                 reason: Some("superseded".into()),
+                re_record_due: false,
             },
         ]);
         let text = arch.to_toml().expect("serialize");
         let back = QueueArchiveToml::parse(&text).expect("re-parse");
         assert_eq!(back, arch);
+        // A row owing nothing writes no key, so an existing archive reads and
+        // writes back unchanged.
+        assert!(!text.contains("re_record_due"), "{text}");
 
         // A done row omits `reason`; a dropped row carries it; the entry's
         // own fields sit flat at the row's top level (the §3.2 "moves its
@@ -756,6 +795,7 @@ follow_ups = 0
             finished: "2026-10-11T15:40:00Z".into(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }]);
         let arch_text = arch.to_toml().expect("serialize archive");
         assert!(!arch_text.contains("\nfleet =") && !arch_text.contains("\nnot_before ="));
@@ -811,6 +851,7 @@ follow_ups = 0
             finished: "2026-10-11T15:40:00Z".into(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }]);
         let a2 = a1.to_toml().unwrap().replace("schema = 1", "schema = 7");
         assert!(matches!(

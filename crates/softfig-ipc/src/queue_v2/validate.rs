@@ -56,14 +56,16 @@ use super::{
 pub enum QueueRefusal {
     /// The id or name is already taken. Verb: `queue_add_project` /
     /// `queue_add_entry` on an existing id. Validation: an id appears twice
-    /// (in the live file, in the archive, or across the two).
+    /// (in the live file, in the archive, or across the two), or a project has
+    /// a second restack row (§3.1).
     Exists {
         /// The id (or name) that already exists.
         id: String,
     },
-    /// The name does not conform. Verb: a slug outside `[a-z0-9-]+`.
-    /// Validation: a milestone path nested deeper than §3.3 allows
-    /// (via [`sub_depth`]).
+    /// The name does not conform. Verb: a slug outside `[a-z0-9-]+`, or a
+    /// project's `main` that is no branch name ([`valid_branch_name`]).
+    /// Validation: that same `main`, or a milestone path nested deeper than
+    /// §3.3 allows (via [`sub_depth`]).
     BadName {
         /// The offending name.
         name: String,
@@ -102,7 +104,8 @@ pub enum QueueRefusal {
     /// The entry (or its repo) is already started. Verb: moving a started
     /// entry, or moving an `active`/`done`/`split` slice item (§6.8).
     /// Validation: a second normal-lane entry in the same repo is `active`
-    /// or `paused` (§3.1: at most one).
+    /// or `paused` (§3.1: at most one), or an `active` restack shares its
+    /// repo with another `active` entry (§3.1: it runs alone).
     Started {
         /// The entry that is already started.
         id: String,
@@ -254,7 +257,10 @@ impl QueueToml {
     ///    final status `done`, and the link graph has no cycle (live edges
     ///    only — an archived row's own links are history);
     /// 4. every entry's project exists in the projects table;
-    /// 5. at most one normal-lane entry per repo carries `active` or `paused`.
+    /// 5. at most one normal-lane entry per repo carries `active` or `paused`;
+    /// 6. an `active` restack shares its repo with no other `active` entry;
+    /// 7. a repo has at most one restack row, whatever its status;
+    /// 8. every project's `main` is a branch name ([`valid_branch_name`]).
     ///
     /// Invariant 6 (remote entries never get an opencode member) is not file
     /// state — see the module docs.
@@ -341,6 +347,36 @@ impl QueueToml {
             }
         }
 
+        // 6. An active restack runs alone in its repo: it rewrites branches a
+        // live session may hold, and the claim backstop is what closes the
+        // race between two members' picks. Grouped by repo path, as 5 is.
+        let active = || self.entries.iter().filter(|e| e.status == EntryStatus::Active);
+        for restack in active().filter(|e| e.kind == EntryKind::Restack) {
+            if let Some(other) = active().find(|e| {
+                e.id != restack.id && repo_of.get(e.project.as_str()) == repo_of.get(restack.project.as_str())
+            }) {
+                return Err(QueueRefusal::Started { id: other.id.clone() });
+            }
+        }
+
+        // 7. One restack row per repo: a second enqueue merges into the live
+        // row, and this is the backstop for a hand edit. Grouped by repo path,
+        // as 5 is, and 4 proved every project is in the table.
+        let mut restacked: HashSet<&str> = HashSet::new();
+        for e in self.entries.iter().filter(|e| e.kind == EntryKind::Restack) {
+            if repo_of.get(e.project.as_str()).is_some_and(|repo| !restacked.insert(repo)) {
+                return Err(QueueRefusal::Exists { id: e.id.clone() });
+            }
+        }
+
+        // 8. `main` reaches git as a rev, so a hand-edited value must not read
+        // as an option there.
+        for p in &self.projects {
+            if !valid_branch_name(&p.main) {
+                return Err(QueueRefusal::BadName { name: p.main.clone() });
+            }
+        }
+
         Ok(())
     }
 }
@@ -348,6 +384,21 @@ impl QueueToml {
 /// DFS over live `after` edges; returns an entry index on the cycle when a
 /// back edge is found. Edges to archive rows are already checked as `done`
 /// sinks and are not followed (an archived row's own links are history).
+/// Is `name` a branch name, by `git check-ref-format --branch`'s rule? keeperd
+/// runs no git, so this is that rule rather than a call to it. It refuses a
+/// leading `-`, which is what keeps a project's `main` from reading as an option.
+pub fn valid_branch_name(name: &str) -> bool {
+    let component = |c: &str| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock");
+    !name.starts_with('-')
+        && name != "HEAD"
+        && name != "@"
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.chars().any(|c| c.is_ascii_control() || " ~^:?*[\\".contains(c))
+        && name.split('/').all(component)
+}
+
 fn dfs_cycle(
     idx: usize,
     entries: &[Entry],
@@ -431,6 +482,30 @@ mod tests {
         }
     }
 
+    /// V20. Each row's verdict is what `git check-ref-format --branch` says.
+    #[test]
+    fn valid_branch_name_follows_gits_rule() {
+        for good in ["main", "trunk", "release/1.2", "feat/x-y", "refs/heads/main", "a@b"] {
+            assert!(valid_branch_name(good), "{good}");
+        }
+        for bad in [
+            "", "--show-toplevel", "-x", "HEAD", "@", "a b", " main", "a..b", "a~1", "a^", "a:b",
+            "a?", "a*", "a[b", "a\\b", "a@{1}", "a/", "/a", "a//b", ".a", "a/.b", "a.", "a.lock",
+            "a.lock/b", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(!valid_branch_name(bad), "{bad:?}");
+        }
+    }
+
+    /// V20: `queue_add_project` refuses this up front, and a hand edit lands here.
+    #[test]
+    fn a_main_git_would_read_as_an_option_fails_validation() {
+        let mut hostile = softfig_project();
+        hostile.main = "--show-toplevel".to_string();
+        let err = queue(vec![hostile], vec![]).validate(&archive(vec![])).unwrap_err();
+        assert_eq!(err, QueueRefusal::BadName { name: "--show-toplevel".into() });
+    }
+
     fn softfig_project() -> super::super::Project {
         project("softfig", "~/projects/software-config_garden/codebase/main")
     }
@@ -462,6 +537,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }
     }
 
@@ -471,6 +547,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Dropped,
             reason: Some("superseded".to_string()),
+            re_record_due: false,
         }
     }
 
@@ -657,6 +734,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".to_string(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         };
         queue(vec![softfig_project()], vec![a])
             .validate(&archive(vec![arch]))
@@ -716,6 +794,72 @@ mod tests {
         .expect("one active per repo");
     }
 
+    // -- §3.1 invariant 6: an active restack runs alone in its repo ----------
+
+    fn restack(id: &str, status: EntryStatus) -> Entry {
+        let mut r = entry(id);
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        r.status = status;
+        r
+    }
+
+    #[test]
+    fn an_active_restack_beside_any_active_entry_in_its_repo_is_refused() {
+        let mut normal = entry("n");
+        normal.status = EntryStatus::Active;
+        let mut urgent = entry("u");
+        urgent.lane = Lane::Urgent;
+        urgent.status = EntryStatus::Active;
+        for (rows, id) in [
+            (vec![restack("r", EntryStatus::Active), normal], "n"),
+            (vec![restack("r", EntryStatus::Active), urgent], "u"),
+            (
+                vec![restack("r", EntryStatus::Active), restack("s", EntryStatus::Active)],
+                "s",
+            ),
+        ] {
+            let err = queue(vec![softfig_project()], rows)
+                .validate(&archive(vec![]))
+                .unwrap_err();
+            assert_eq!(err, QueueRefusal::Started { id: id.into() });
+        }
+    }
+
+    #[test]
+    fn a_waiting_restack_or_one_beside_a_paused_entry_is_ok() {
+        let mut active = entry("n");
+        active.status = EntryStatus::Active;
+        queue(
+            vec![softfig_project()],
+            vec![restack("r", EntryStatus::Queued), active],
+        )
+        .validate(&archive(vec![]))
+        .expect("a queued restack waits beside an active entry");
+
+        let mut paused = entry("n");
+        paused.status = EntryStatus::Paused;
+        queue(
+            vec![softfig_project()],
+            vec![restack("r", EntryStatus::Active), paused],
+        )
+        .validate(&archive(vec![]))
+        .expect("a paused entry holds no session");
+    }
+
+    #[test]
+    fn an_active_restack_beside_an_active_entry_in_another_repo_is_ok() {
+        let mut other = entry("n");
+        other.status = EntryStatus::Active;
+        other.project = "other".into();
+        queue(
+            vec![softfig_project(), project("other", "host:other-repo")],
+            vec![restack("r", EntryStatus::Active), other],
+        )
+        .validate(&archive(vec![]))
+        .expect("the bound is per repo");
+    }
+
     #[test]
     fn urgent_active_alongside_normal_active_in_the_same_repo_is_ok() {
         // The bound is normal-lane only (§3.1): an urgent entry running
@@ -728,6 +872,38 @@ mod tests {
         queue(vec![softfig_project()], vec![b, a])
             .validate(&archive(vec![]))
             .expect("urgent + normal active ok");
+    }
+
+    #[test]
+    fn a_project_has_one_restack_row_whatever_its_status() {
+        let two = vec![restack("001", EntryStatus::Blocked), restack("002", EntryStatus::Queued)];
+        let err = queue(vec![softfig_project()], two).validate(&archive(vec![])).unwrap_err();
+        assert_eq!(err, QueueRefusal::Exists { id: "002".into() });
+
+        let mut other = restack("002", EntryStatus::Queued);
+        other.project = "mirror".into();
+        queue(
+            vec![softfig_project(), project("mirror", "~/elsewhere")],
+            vec![restack("001", EntryStatus::Queued), other],
+        )
+        .validate(&archive(vec![]))
+        .expect("one row each");
+    }
+
+    #[test]
+    fn two_projects_sharing_a_repo_share_the_restack_row() {
+        let mut other = restack("002", EntryStatus::Queued);
+        other.project = "mirror".into();
+        let err = queue(
+            vec![
+                softfig_project(),
+                project("mirror", "~/projects/software-config_garden/codebase/main"),
+            ],
+            vec![restack("001", EntryStatus::Queued), other],
+        )
+        .validate(&archive(vec![]))
+        .unwrap_err();
+        assert_eq!(err, QueueRefusal::Exists { id: "002".into() });
     }
 
     #[test]

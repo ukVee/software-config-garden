@@ -293,6 +293,23 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         .map(|a| (a.row.id.clone(), a.row.branch.clone()))
         .collect();
 
+    // The same rows' projects, for the handoff scan of a row that just left.
+    let done_projects: BTreeMap<String, String> = archive
+        .entries
+        .iter()
+        .filter(|a| a.final_status == FinalStatus::Done)
+        .map(|a| (a.row.id.clone(), a.row.project.clone()))
+        .collect();
+
+    // Restacks still owed their re-record (§8), whatever restarted since.
+    let mut re_records_due: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for a in archive.entries.iter().filter(|a| a.re_record_due) {
+        re_records_due
+            .entry(a.row.project.clone())
+            .or_default()
+            .push(a.row.id.clone());
+    }
+
     Ok(Some(V2Snapshot {
         projects,
         entries,
@@ -301,6 +318,8 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         // The source reads no clock; the picker stamps its own.
         now_unix: 0,
         done_branches,
+        done_projects,
+        re_records_due,
     }))
 }
 
@@ -520,6 +539,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".into(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }
     }
 
@@ -529,6 +549,7 @@ mod tests {
             finished: "2026-10-11T16:00:00Z".into(),
             final_status: FinalStatus::Dropped,
             reason: Some("superseded".into()),
+            re_record_due: false,
         }
     }
 
@@ -590,6 +611,25 @@ mod tests {
         let snapshot = assemble(garden.root()).unwrap().unwrap();
         assert!(snapshot.projects.is_empty() && snapshot.entries.is_empty());
         assert!(snapshot.trees.is_empty() && snapshot.done_ids.is_empty());
+    }
+
+    #[test]
+    fn a_due_restack_row_assembles_by_project_and_a_settled_one_does_not() {
+        let garden = TempGarden::new();
+        garden.write(QUEUE_FILE, &queue_toml(vec![softfig_project()], vec![]));
+        let mut due = archive_done("072");
+        due.re_record_due = true;
+        let archive = softfig_ipc::queue_v2::QueueArchiveToml::new(vec![due, archive_done("071")]);
+        garden.write(QUEUE_ARCHIVE_FILE, &archive.to_toml().expect("serialize archive"));
+
+        let snapshot = assemble(garden.root()).unwrap().unwrap();
+
+        let project = entry("x").project;
+        assert_eq!(
+            snapshot.re_records_due,
+            BTreeMap::from([(project.clone(), vec!["072".to_string()])]),
+        );
+        assert_eq!(snapshot.done_projects.get("071"), Some(&project));
     }
 
     // -- valid assembly ---------------------------------------------------------
@@ -712,6 +752,9 @@ mod tests {
             BTreeSet::from(["done-one".to_string()]),
             "a dropped row never satisfies a link"
         );
+        // done_projects: the same rows' projects; nothing here is a due restack.
+        assert_eq!(snapshot.done_projects.len(), snapshot.done_ids.len());
+        assert!(snapshot.re_records_due.is_empty());
         // done_branches: the same rows' branches — a dropped row's is abandoned.
         assert_eq!(
             snapshot.done_branches,

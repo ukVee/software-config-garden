@@ -45,8 +45,8 @@ pub struct FirstClaim {
 /// as one probe on a worker thread under `probes` (V13): bounded by a deadline,
 /// sharing this tick's answers, and backed off after a timeout.
 ///
-/// The stack candidates are the snapshot's live entries in the same project,
-/// in claim order. An **urgent** entry skips the stack entirely — it branches
+/// The stack candidates are the snapshot's live entries on the same repo,
+/// whichever project names it, in claim order. An **urgent** entry skips the stack entirely — it branches
 /// from `main`, so its base never depends on it and the probes are saved. A
 /// sibling whose branch is not cut yet is not a candidate (see
 /// [`git_stack::stack_candidates`]), so it never blocks a normal claim either.
@@ -67,9 +67,7 @@ pub fn first_claim(
     };
     let repo = Repo::of(project, home, user);
     let stack_entries: Vec<StackEntry> = snapshot
-        .entries
-        .iter()
-        .filter(|e| e.project == entry.project)
+        .entries_in_repo(&project.repo)
         .map(|e| StackEntry {
             id: e.id.clone(),
             branch: e.branch.clone(),
@@ -108,7 +106,7 @@ pub fn first_claim(
 mod tests {
     use super::*;
     use crate::scheduler_v2::{EntryView, ProjectView};
-    use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane};
+    use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, RepoLocality};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
@@ -199,6 +197,8 @@ mod tests {
             done_ids: BTreeSet::new(),
             done_branches: Default::default(),
             now_unix: 0,
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -233,6 +233,98 @@ mod tests {
         assert_eq!(fc.branch, "feat/three");
         assert_eq!(fc.parent, "two", "cut from the newest-claimed candidate");
         assert_eq!(fc.base, two_tip, "local base is the cut-from commit");
+    }
+
+    /// §8: the stack is per repo. A project sharing the repo is in it, and one
+    /// on another repo isn't, however new its claim.
+    #[test]
+    fn a_first_claim_stacks_across_the_projects_that_share_its_repo() {
+        let (dir, _main) = seeded_repo();
+        let (elsewhere, _) = seeded_repo();
+        let one_tip = rev_parse(dir.path(), "feat/one");
+        let repo = dir.path().display().to_string();
+        let mut one =
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z");
+        one.project = "mirror".into();
+        let mut other =
+            entry("two", "feat/two", Lane::Normal, EntryStatus::Blocked, "2026-10-02T00:00:00Z");
+        other.project = "elsewhere".into();
+        let project = |name: &str, repo: &str| ProjectView {
+            name: name.into(),
+            repo: repo.into(),
+            locality: RepoLocality::of(repo, None),
+            main: "main".into(),
+        };
+        let snapshot = snap(
+            vec![
+                project("softfig", &repo),
+                project("mirror", &repo),
+                project("elsewhere", &elsewhere.path().display().to_string()),
+            ],
+            vec![one, other, entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, "")],
+        );
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one", "the sibling project's branch is the stack top");
+        assert_eq!(fc.base, one_tip);
+    }
+
+    /// Owner ruling (V19): an urgent branch lands alone, so the newest live
+    /// claim being urgent sends a normal claim to the newest normal entry.
+    #[test]
+    fn a_normal_claim_skips_a_newer_urgent_branch_for_the_newest_normal_one() {
+        let (dir, _main) = seeded_repo();
+        let one_tip = rev_parse(dir.path(), "feat/one");
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one", "the urgent branch is never a parent");
+        assert_eq!(fc.base, one_tip);
+    }
+
+    #[test]
+    fn a_normal_claim_with_only_an_urgent_branch_live_cuts_from_main() {
+        let (dir, main_tip) = seeded_repo();
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "", "records no parent");
+        assert_eq!(fc.base, main_tip);
+    }
+
+    #[test]
+    fn a_remote_normal_claim_skips_an_urgent_branch_too() {
+        let entries = vec![
+            entry("two", "feat/two", Lane::Urgent, EntryStatus::Blocked, "2026-10-02T00:00:00Z"),
+            entry("one", "feat/one", Lane::Normal, EntryStatus::Blocked, "2026-10-01T00:00:00Z"),
+            entry("three", "feat/three", Lane::Normal, EntryStatus::Queued, ""),
+        ];
+        let snapshot = snap(
+            vec![ProjectView {
+                name: "softfig".into(),
+                repo: "host:/srv/repo".into(),
+                locality: RepoLocality::Remote,
+                main: "main".into(),
+            }],
+            entries,
+        );
+        let claiming = snapshot.entries.iter().find(|e| e.id == "three").unwrap();
+
+        let fc = first_claim(&snapshot, claiming, None, None, &ProbeCache::new()).unwrap().unwrap();
+        assert_eq!(fc.parent, "one");
+        assert_eq!(fc.base, "feat/one");
     }
 
     #[test]

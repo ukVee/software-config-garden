@@ -14,14 +14,16 @@
 //!   fails the stack. Archived entries never reach this module, so
 //!   they never pin the stack. A restack entry has no branch (`branch = ""`)
 //!   and contributes nothing.
-//! - **Stack top** ([`stack_top`]) is the newest-claimed candidate; with none,
-//!   the stack is empty and the next branch is cut from `main`.
+//! - **Stack top** ([`stack_top`]) is the newest-claimed *normal* candidate;
+//!   with none, the next branch is cut from `main`.
 //! - **Urgent entries branch from `main`**, not the stack top, so they can
-//!   merge first.
+//!   merge first. An urgent branch stays a candidate, because restack detection
+//!   walks it and `queue show` lists it, but it is never the top: it lands alone
+//!   rather than picking up dependents.
 //! - **The remote-project proxy**: a `host:path` project runs no git, so list
 //!   state stands in — every claimed entry is a candidate, and `base` records
-//!   the newest-claimed entry's branch *name* (growlightd can't resolve a
-//!   commit there). A remote repo's `git` argument is never touched.
+//!   the stack top's branch *name* (growlightd can't resolve a commit there). A
+//!   remote repo's `git` argument is never touched.
 //!
 //! ## The seam
 //!
@@ -44,6 +46,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use softfig_ipc::item_repo::scrub_git_env;
 use softfig_ipc::queue_v2::{Lane, RestackBranch};
 
 use crate::scheduler_v2::ProjectView;
@@ -159,7 +162,8 @@ impl Git {
     /// reachable from `descendant`? Exit 0 = yes, exit 1 = no, anything else is
     /// an error (a non-commit, a bad repo, a timeout).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
-        let (status, _) = self.run(&["merge-base", "--is-ancestor", ancestor, descendant])?;
+        let (status, _) =
+            self.run(&["merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant])?;
         match status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -190,10 +194,12 @@ impl Git {
         }
     }
 
-    /// `git rev-parse <rev>`: resolve a committish (a branch name or a full
-    /// hash) to its tip commit. Fails on an unknown rev.
+    /// `git rev-parse --verify <rev>`: resolve a committish (a branch name or a
+    /// full hash) to its tip commit. Fails on an unknown rev. `--verify` is what
+    /// makes `--end-of-options` hold here: without it `rev-parse` echoes the
+    /// value back, so a rev spelled like an option would still be an answer.
     pub fn rev_parse(&self, rev: &str) -> Result<String, GitError> {
-        let (status, out) = self.run(&["rev-parse", rev])?;
+        let (status, out) = self.run(&["rev-parse", "--verify", "--end-of-options", rev])?;
         if !status.success() {
             return Err(GitError::Run {
                 cmd: "rev-parse".into(),
@@ -229,7 +235,7 @@ impl Git {
     /// `git merge-base <a> <b>`: the merge base of two committishes. Fails on
     /// an unknown rev.
     pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
-        let (status, out) = self.run(&["merge-base", a, b])?;
+        let (status, out) = self.run(&["merge-base", "--end-of-options", a, b])?;
         if !status.success() {
             return Err(GitError::Run {
                 cmd: "merge-base".into(),
@@ -345,7 +351,7 @@ impl Git {
         if deadline <= start {
             return Err(timed_out()); // the chain's budget is spent: don't spawn
         }
-        let mut child = Command::new(&self.program)
+        let mut child = scrub_git_env(&mut Command::new(&self.program))
             .arg("--no-optional-locks")
             .arg("-C")
             .arg(&self.repo)
@@ -373,7 +379,8 @@ impl Git {
                 }
                 Ok(None) => {
                     // Runs on a probe worker, never the drive loop: a git in
-                    // D-state that outlives this kill only parks the worker.
+                    // D-state that outlives this kill only parks the worker, and
+                    // `git_probe` caps how many of those a repo can have.
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = reader.join();
@@ -460,10 +467,11 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// The newest-claimed candidate (the stack top), or `None` when the stack
-    /// is empty — then the next branch is cut from `main`.
+    /// The newest-claimed normal candidate (the stack top), or `None` when the
+    /// stack holds none — then the next branch is cut from `main`. An urgent
+    /// candidate is never the top: nothing stacks on an urgent branch (§8).
     pub fn top(&self) -> Option<&StackEntry> {
-        self.candidates.last()
+        self.candidates.iter().rev().find(|c| c.lane == Lane::Normal)
     }
 }
 
@@ -509,8 +517,7 @@ pub fn stack_candidates(
     Ok(Stack { candidates })
 }
 
-/// The newest-claimed candidate (the stack top), or `None` with an empty
-/// stack.
+/// The stack top ([`Stack::top`]), or `None` with no normal candidate.
 pub fn stack_top(stack: &Stack) -> Option<&StackEntry> {
     stack.top()
 }
@@ -518,7 +525,7 @@ pub fn stack_top(stack: &Stack) -> Option<&StackEntry> {
 /// Compute what a first claim records for an entry in `lane` (§8):
 ///
 /// - **urgent** branches from `main` (`parent = ""`), so it can merge first;
-/// - **normal** branches from the stack top, or `main` when the stack is empty;
+/// - **normal** branches from the stack top, or `main` when the stack has none;
 /// - local `base` is the cut-from branch's commit (`git rev-parse`); remote
 ///   `base` is the branch *name*.
 pub fn claim_base(
@@ -564,10 +571,11 @@ pub struct RestackEntry {
 /// left the list resolves through its archive row (`archived`: `done` rows'
 /// id → branch, V7) — the loop never merges, so an archived parent's branch is
 /// usually still unmerged work its child was cut from, and rebasing the child
-/// onto `main` would strip those commits. Such a branch is the target while it
-/// exists and is not yet in `main`; once merged (or deleted after the human
-/// merged it) `main` has the work and is the target. An unknown parent falls
-/// back to `main` (defensive).
+/// onto `main` would strip those commits. Either way the parent's branch is the
+/// target while it exists and is not yet in `main`; once merged (or deleted
+/// after the human merged it) `main` has the work and is the target, even while
+/// the parent's row is still live: its old tip would hide `main` moving on. An
+/// unknown parent falls back to `main` (defensive).
 fn resolve_onto(
     parent: &str,
     main: &str,
@@ -578,12 +586,14 @@ fn resolve_onto(
     if parent.is_empty() {
         return Ok(main.to_string());
     }
-    if let Some(branch) = branch_of.get(parent) {
-        return Ok((*branch).to_string());
-    }
-    match archived.get(parent).filter(|b| !b.is_empty()) {
+    let branch = branch_of
+        .get(parent)
+        .copied()
+        .or_else(|| archived.get(parent).map(String::as_str))
+        .filter(|b| !b.is_empty());
+    match branch {
         Some(branch) if git.branch_exists(branch)? && !git.is_ancestor(branch, main)? => {
-            Ok(branch.clone())
+            Ok(branch.to_string())
         }
         _ => Ok(main.to_string()),
     }
@@ -1278,6 +1288,107 @@ mod tests {
             .expect("a deleted archived branch must not wedge detection")
             .expect("b is still stale against main");
         assert_eq!(need[0].onto, "main", "{need:?}");
+    }
+
+    /// Report 095: a live parent whose branch is gone must not fail detection
+    /// for the repo, or its siblings go unseen. A repo git can't read still does.
+    #[test]
+    fn a_deleted_live_parent_does_not_disable_detection_for_its_siblings() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let a_tip = open_branch_from(repo, "feat/a", "main");
+        open_branch_from(repo, "feat/b", "feat/a");
+        open_branch_from(repo, "feat/c", "main");
+        ff_main(repo);
+        sh_git(repo, &["branch", "-q", "-D", "feat/a"]);
+        let entries = [
+            restack_entry("a", "feat/a", "", "root", "2026-10-01T00:00:00Z"),
+            restack_entry("b", "feat/b", "a", &a_tip, "2026-10-02T00:00:00Z"),
+            restack_entry("c", "feat/c", "", "root", "2026-10-03T00:00:00Z"),
+        ];
+        let local = Repo::Local(repo.to_path_buf());
+        let archived = BTreeMap::new();
+
+        let need = detect_restack(&local, "main", &entries, &archived, &Git::new(repo))
+            .expect("a deleted live parent must not fail detection")
+            .expect("both branches lack the urgent fix");
+        let onto: Vec<(&str, &str)> =
+            need.iter().map(|b| (b.branch.as_str(), b.onto.as_str())).collect();
+        assert_eq!(onto, [("feat/b", "main"), ("feat/c", "main")]);
+
+        let nowhere = tempfile::tempdir().unwrap();
+        detect_restack(&local, "main", &entries, &archived, &Git::new(nowhere.path()))
+            .expect_err("a real git failure stays an error");
+    }
+
+    /// V20: a value spelled like an option is a rev that doesn't resolve. Bare,
+    /// `rev-parse --show-toplevel` answers with a path, which a first claim would
+    /// record as the base.
+    #[test]
+    fn a_rev_spelled_like_an_option_never_reaches_git_as_one() {
+        let (dir, _main) = seeded_repo();
+        let git = Git::new(dir.path());
+        git.rev_parse("--show-toplevel").expect_err("not a rev");
+        git.merge_base("--independent", "main").expect_err("not a rev");
+        git.is_ancestor("--independent", "main").expect_err("not a rev");
+    }
+
+    /// V20: an inherited `GIT_DIR` outranks `-C`. Setting it here would race
+    /// every other test's git, so the probe runs in a child of this test binary.
+    #[test]
+    fn an_inherited_git_dir_does_not_redirect_a_probe() {
+        const REPO: &str = "SOFTFIG_TEST_PROBE_REPO";
+        if let Some(repo) = std::env::var_os(REPO) {
+            let git = Git::new(PathBuf::from(repo));
+            assert!(git.branch_exists("feat/here").unwrap(), "probed the repo it named");
+            assert!(!git.branch_exists("feat/elsewhere").unwrap(), "not the inherited one");
+            return;
+        }
+        let (here, _) = seeded_repo();
+        let (elsewhere, _) = seeded_repo();
+        open_branch_from(here.path(), "feat/here", "main");
+        open_branch_from(elsewhere.path(), "feat/elsewhere", "main");
+
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "git_stack::tests::an_inherited_git_dir_does_not_redirect_a_probe"])
+            .env(REPO, here.path())
+            .env("GIT_DIR", elsewhere.path().join(".git"))
+            .env("GIT_WORK_TREE", elsewhere.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}");
+    }
+
+    #[test]
+    fn a_merged_live_parent_resolves_to_main_so_a_moved_main_is_seen() {
+        // F8: the human merged feat/a but its row is still live. feat/b contains
+        // feat/a, so judged against it feat/b reads as healthy behind the fix.
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let a_tip = open_branch_from(repo, "feat/a", "main");
+        open_branch_from(repo, "feat/b", "feat/a");
+        sh_git(repo, &["merge", "--ff-only", "-q", "feat/a"]);
+        ff_main(repo);
+        let entries = [
+            restack_entry("a", "feat/a", "", "root", "2026-10-01T00:00:00Z"),
+            restack_entry("b", "feat/b", "a", &a_tip, "2026-10-02T00:00:00Z"),
+        ];
+        let git = Git::new(repo.to_path_buf());
+
+        let need = detect_restack(
+            &Repo::Local(repo.to_path_buf()),
+            "main",
+            &entries,
+            &BTreeMap::new(),
+            &git,
+        )
+        .unwrap()
+        .expect("feat/b lacks the urgent fix");
+        assert_eq!(need.len(), 1, "the merged branch has no step: {need:?}");
+        assert_eq!(need[0].branch, "feat/b");
+        assert_eq!(need[0].onto, "main", "{need:?}");
+        assert_eq!(need[0].base, a_tip);
     }
 
     #[test]

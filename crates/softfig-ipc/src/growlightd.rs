@@ -230,6 +230,12 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) so a pre-field decoder reads it back as `false`.
     #[serde(default)]
     pub fleet_enabled: bool,
+    /// Which queue model the §11 switch selects (`config/growlight.toml` `queue`):
+    /// `legacy` or `v2`, as read at boot. Reported whether or not the fleet is
+    /// armed. Additive (`#[serde(default)]`): an older growlightd sends nothing,
+    /// and a pre-field decoder reads it back as empty, not as `legacy`.
+    #[serde(default)]
+    pub queue: String,
     /// The configured roster from `config/growlight.toml` (`[[fleet]]` members),
     /// in config order — surfaced so `growlight status` lists the fleet even when
     /// the gate is off (the agents haven't spawned). Additive/defaulted for wire
@@ -1266,6 +1272,12 @@ pub struct QueueShowEntry {
     /// `false` for a never-claimed entry, a restack (no branch), or a local
     /// branch already fast-forwarded into `main`.
     pub open: bool,
+    /// This entry has a started branch in a repo whose stack could not be read
+    /// ([`QueueProjectStack::stack_unknown`]), so `open` says nothing about it:
+    /// a surface must not render that `false` as merged. Absent when `open` is
+    /// an answer, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_unknown: bool,
 }
 
 /// One branch of a repo's open stack, in claim order (oldest first) — the §8
@@ -1282,9 +1294,12 @@ pub struct QueueStackBranch {
     pub claimed: String,
 }
 
-/// One project's stack, as [`QueueShowReply`] carries it.
+/// One repo's stack, as [`QueueShowReply`] carries it (§8: the stack is per
+/// repo).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueProjectStack {
+    /// The project naming this repo, or all of them, comma-joined in table
+    /// order. `main` is the first one's.
     pub name: String,
     pub repo: String,
     pub main: String,
@@ -1295,6 +1310,12 @@ pub struct QueueProjectStack {
     /// The still-open branches in claim order; empty when the stack is empty
     /// (the next branch cuts from `main`).
     pub stack: Vec<QueueStackBranch>,
+    /// Why this repo's stack could not be read (a wedged repo past the probe
+    /// deadline, a path that isn't a repo). An empty `stack` then means "not
+    /// known", not "empty". Absent when the stack was read, and on a reply from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_unknown: Option<String>,
 }
 
 /// One unit's §3.5 session-log lines, verbatim (`- <ts> · …`).
@@ -1302,6 +1323,11 @@ pub struct QueueProjectStack {
 pub struct QueueShowSession {
     /// The top-level entry id.
     pub entry: String,
+    /// The sub-milestone identity (`<entry>/<sub>`) when the unit sits in a
+    /// sub-tree, where a slice NNN can repeat one in the parent. `None` for the
+    /// entry's own tree, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     /// The slice NNN, or `None` for the entry's own close-out / task / restack
     /// doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1445,6 +1471,26 @@ impl MemberVerbReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read stack leaves the unknown fields off the wire, and a reply from a
+    /// daemon that predates them still decodes as "the answer is known".
+    #[test]
+    fn stack_unknown_fields_are_absent_when_known_and_tolerated_when_missing() {
+        let project: QueueProjectStack = serde_json::from_value(serde_json::json!({
+            "name": "p", "repo": "~/p", "main": "main", "local": true, "stack": [],
+        }))
+        .unwrap();
+        assert_eq!(project.stack_unknown, None);
+        assert!(serde_json::to_value(&project).unwrap().get("stack_unknown").is_none());
+
+        let entry: QueueShowEntry = serde_json::from_value(serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "active",
+            "after": [], "branch": "feat/e", "base": "", "claimed": "", "open": false,
+        }))
+        .unwrap();
+        assert!(!entry.open_unknown);
+        assert!(serde_json::to_value(&entry).unwrap().get("open_unknown").is_none());
+    }
 
     /// The closed lists' wire names are serde's names (no drift between the
     /// `as_str` the messages print and the JSON a client decodes), and a
@@ -1814,6 +1860,7 @@ mod tests {
         let reply: FleetStatusReply = serde_json::from_str(json).unwrap();
         assert!(!reply.paused, "missing paused decodes as not-paused");
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
+        assert!(reply.queue.is_empty(), "missing queue decodes as unknown, not legacy");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
         assert!(reply.held.is_empty(), "missing held decodes as empty");
@@ -1840,6 +1887,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: true,
+            queue: "legacy".into(),
             roster: vec![
                 FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },

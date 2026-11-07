@@ -287,6 +287,10 @@ exactly when the human reaches for opencode.
   nothing is assembled then, so there is no runtime state to report and inventing a
   roster echo here would claim liveness the daemon cannot observe.
 
+Its `queue` line is the §11 switch as growlightd read it at boot, `legacy` or `v2`, armed or
+not. `protocol` is the wire version and stays `v1` under either, so read `queue` to see that a
+flip took. A growlightd older than the field prints no `queue` line.
+
 ```
 roster:
   a                pin=queue:default
@@ -451,6 +455,11 @@ second entry's first claim share the answers, and a repo whose probe misses its 
 held with a doubling backoff across ticks. A probe that cannot answer is "unknown", never
 "stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
 detection skips the repo until it answers.
+
+`queue show` and `growlight status` read the stack the same way, on a probe cache of their
+own, so a human reading the list never holds a repo for the scheduler. A repo that can't
+answer shows "stack unknown" with the reason, and its started branches show the same, never
+an empty stack or a merged branch.
 
 ## Known gaps
 

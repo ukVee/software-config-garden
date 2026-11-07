@@ -346,7 +346,7 @@ impl KeeperdV2BaseReRecorder {
 }
 
 impl V2BaseReRecorder for KeeperdV2BaseReRecorder {
-    fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
+    fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String> {
         let args = serde_json::to_value(QueueV2ReRecordBasesArgs {
             entries: entries
                 .iter()
@@ -355,6 +355,7 @@ impl V2BaseReRecorder for KeeperdV2BaseReRecorder {
                     base: base.clone(),
                 })
                 .collect(),
+            settled: settled.to_vec(),
         })
         .map_err(|e| format!("encode queue_v2_re_record_bases args: {e}"))?;
         let req = Request::new(op::QUEUE_V2_RE_RECORD_BASES, args);

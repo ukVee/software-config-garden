@@ -169,7 +169,7 @@ fn load_entry_row(
 /// `CLAUDE.md` for a close-out, its `slices/NNN-<slug>.md` for a unit (the
 /// NNN resolves through the folder, since `slices.toml` carries no slug), a
 /// task's or restack's `tasks/NNN-<slug>.md` otherwise.
-fn unit_doc_rel(
+pub(in crate::actions::growlight) fn unit_doc_rel(
     wt: &WorkTree,
     kind: EntryKind,
     entry: &str,
@@ -387,7 +387,8 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     }
 
     // Backstop: every §3.1 invariant still holds (the claim is what takes a
-    // second entry in a repo `active` — invariant 5 refuses it here).
+    // second entry in a repo `active` — invariant 5 refuses it here, and
+    // invariant 6 refuses a restack beside any active entry in its repo).
     queue.validate(&archive).map_err(refuse)?;
 
     if !entry_changed && !slice_changed {
@@ -583,11 +584,13 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
                 DaemonStatusArg::Done => {
                     let mut row = queue.entries.remove(eidx);
                     row.pending_status = None;
+                    let re_record_due = row.kind == EntryKind::Restack;
                     archive.entries.push(ArchivedEntry {
                         row,
                         finished: conventions::now_rfc3339(),
                         final_status: FinalStatus::Done,
                         reason: None,
+                        re_record_due,
                     });
                     effective = "done".to_string();
                     files.push(FileWrite {
@@ -1212,23 +1215,24 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
 /// `queue_v2_re_record_bases` (queue-v2-git slice 004): keeperd↔growlightd only —
 /// growlightd recomputed each restacked branch's base read-only after the
 /// restack completed (§8, `git merge-base`) and writes them back: each named
-/// live entry's `base` is replaced. An all-no-op write (every `base` already
-/// the given value) mints no commit. One commit, `queue_v2_bases_rerecorded`;
-/// the derived view re-renders.
+/// live entry's `base` is replaced, and each `settled` archive row stops being
+/// due, so the bases and the answered trigger can't land apart. An all-no-op
+/// write (every `base` already the given value, nothing due) mints no commit.
+/// One commit, `queue_v2_bases_rerecorded`; the derived view re-renders.
 pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueV2ReRecordBasesArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_re_record_bases args: {e}")))?;
-    if args.entries.is_empty() {
-        return Err((ErrorKind::BadArgs, "entries must be non-empty".to_string()));
+    if args.entries.is_empty() && args.settled.is_empty() {
+        return Err((ErrorKind::BadArgs, "entries and settled are both empty".to_string()));
     }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
-    let (mut queue, queue_version, archive) = {
+    let (mut queue, queue_version, mut archive, archive_version) = {
         let wt = WorkTree::new(daemon, &inner);
         match load_queue_state(&wt, &inner) {
-            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model),
+            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model, qs.archive.version),
             Ok(None) => {
                 return Err((
                     ErrorKind::NotFound,
@@ -1249,14 +1253,21 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
             changed = true;
         }
     }
+    let mut settled = false;
+    for id in &args.settled {
+        let Some(a) = archive.entries.iter_mut().find(|a| a.row.id == *id) else {
+            return Err(refuse(QueueRefusal::UnknownId { id: id.clone() }));
+        };
+        settled |= std::mem::take(&mut a.re_record_due);
+    }
     queue.validate(&archive).map_err(refuse)?;
 
-    if !changed {
+    if !changed && !settled {
         let hash = current_tip(&inner)?;
         return Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash }).unwrap());
     }
 
-    let files = [FileWrite {
+    let mut files = vec![FileWrite {
         rel: QUEUE_FILE.to_string(),
         expected: queue_version,
         bytes: queue
@@ -1264,11 +1275,21 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?
             .into_bytes(),
     }];
+    if settled {
+        files.push(FileWrite {
+            rel: QUEUE_ARCHIVE_FILE.to_string(),
+            expected: archive_version,
+            bytes: archive
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        });
+    }
     let hash = apply(
         daemon,
         &mut inner,
         "queue_v2_bases_rerecorded",
-        serde_json::json!({ "entries": args.entries.len() }),
+        serde_json::json!({ "entries": args.entries.len(), "settled": args.settled }),
         &files,
         &[ViewWrite {
             host: queue_view_host(),
@@ -1284,7 +1305,9 @@ pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> Han
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::growlight::queue_verbs::{queue_add_entry, queue_add_project, queue_update_entry, slice_update};
+    use crate::actions::growlight::queue_verbs::{
+        queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_update,
+    };
     use crate::actions::growlight::v2::write::tests::unlocked;
     use crate::actions::managed;
     use softfig_ipc::queue_v2::{Lane, Project, QueueToml, SlicesToml};
@@ -1621,6 +1644,49 @@ mod tests {
         assert!(err.1.contains("is blocked"), "{err:?}");
     }
 
+    /// F2 + V8: a drop does not refuse for an active child. It re-parents the
+    /// child in the same write, and its restack can't be claimed until the
+    /// child's session has handed off. Once the restack runs, the claim
+    /// refuses the other way round.
+    #[test]
+    fn the_restack_of_a_drop_waits_for_the_active_child() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut parent = entry("a", Lane::Normal, EntryStatus::Queued);
+        parent.branch = "feat/a".to_string();
+        parent.base = "main-commit".to_string();
+        parent.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut child = entry("b", Lane::Normal, EntryStatus::Active);
+        child.branch = "feat/b".to_string();
+        child.parent = "a".to_string();
+        child.base = "a-commit".to_string();
+        child.claimed = "2026-10-11T12:10:00Z".to_string();
+        seed_queue_rows(&daemon, vec![parent, child]);
+
+        queue_drop(&daemon, serde_json::json!({ "id": "a", "reason": "abandoned" }))
+            .expect("the drop proceeds over an active child");
+        let (queue, _) = loaded_queue(&daemon);
+        let restack = queue
+            .entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Restack)
+            .expect("the drop enqueued a restack")
+            .id
+            .clone();
+        let child = queue.entries.iter().find(|e| e.id == "b").unwrap();
+        assert_eq!(child.status, EntryStatus::Active, "the live session runs on");
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("", "a-commit"));
+
+        let err = claim(&daemon, &restack, None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
+
+        set_status(&daemon, "b", None, "paused").expect("the child hands off");
+        claim(&daemon, &restack, None).expect("no session holds a branch now");
+
+        let err = claim(&daemon, "b", None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
+    }
+
     #[test]
     fn claim_on_a_task_has_no_unit_and_flips_the_entry_alone() {
         let garden = tempfile::tempdir().unwrap();
@@ -1705,6 +1771,26 @@ mod tests {
         assert_eq!(archive.entries[0].final_status, FinalStatus::Done);
         assert_eq!(archive.entries[0].row.id, "m");
         assert!(archive.entries[0].finished.starts_with("20"), "finished stamped");
+    }
+
+    /// §8: a restack's re-record is owed from the commit that archives it, so
+    /// a restart can't lose it. Only `done` owes one, and only a restack.
+    #[test]
+    fn set_status_done_marks_a_restack_row_due_and_nothing_else() {
+        // One row per garden: a repo holds one active entry at a time.
+        let run = |kind, status| {
+            let garden = tempfile::tempdir().unwrap();
+            let daemon = unlocked(garden.path());
+            let mut row = entry("r", Lane::Urgent, EntryStatus::Active);
+            row.kind = kind;
+            row.branch = String::new();
+            seed_queue_rows(&daemon, vec![row]);
+            set_status(&daemon, "r", None, status).expect("status");
+            loaded_queue(&daemon).1.entries.first().map(|a| a.re_record_due)
+        };
+        assert_eq!(run(EntryKind::Restack, "done"), Some(true));
+        assert_eq!(run(EntryKind::Task, "done"), Some(false));
+        assert_eq!(run(EntryKind::Restack, "deferred"), None, "the row stays live");
     }
 
     #[test]
@@ -2413,5 +2499,72 @@ mod tests {
         seed_queue_rows(&daemon, vec![entry("a", Lane::Normal, EntryStatus::Queued)]);
         let err = re_record(&daemon, vec![]).unwrap_err();
         assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+    }
+
+    /// A due restack `r` archived, with one live entry `a` left on the list.
+    fn seed_due_restack(daemon: &Daemon) {
+        let mut restack = entry("r", Lane::Urgent, EntryStatus::Active);
+        restack.kind = EntryKind::Restack;
+        restack.branch = String::new();
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.base = "abc123".to_string();
+        seed_queue_rows(daemon, vec![restack, a]);
+        set_status(daemon, "r", None, "done").expect("restack done");
+    }
+
+    fn settle(
+        daemon: &Daemon,
+        entries: serde_json::Value,
+        settled: &[&str],
+    ) -> Result<serde_json::Value, (ErrorKind, String)> {
+        queue_v2_re_record_bases(daemon, serde_json::json!({ "entries": entries, "settled": settled }))
+    }
+
+    #[test]
+    fn re_record_writes_the_bases_and_settles_the_row_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        settle(&daemon, serde_json::json!([{ "entry": "a", "base": "111aaa" }]), &["r"])
+            .expect("re-record");
+
+        assert_eq!(commit_count(&daemon), before + 1, "one commit for both files");
+        let (queue, archive) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].base, "111aaa");
+        assert!(!archive.entries[0].re_record_due);
+    }
+
+    /// A pass that found nothing to move still answers the row, or it would
+    /// retry forever; repeating that answer changes nothing.
+    #[test]
+    fn re_record_settles_with_no_bases_and_a_repeat_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        settle(&daemon, serde_json::json!([]), &["r"]).expect("settle");
+        assert_eq!(commit_count(&daemon), before + 1);
+        assert!(!loaded_queue(&daemon).1.entries[0].re_record_due);
+
+        settle(&daemon, serde_json::json!([]), &["r"]).expect("repeat");
+        assert_eq!(commit_count(&daemon), before + 1, "no commit for a no-op");
+    }
+
+    #[test]
+    fn re_record_refuses_an_unknown_settled_row_and_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        let err = settle(&daemon, serde_json::json!([{ "entry": "a", "base": "111aaa" }]), &["ghost"])
+            .unwrap_err();
+
+        assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
+        assert_eq!(loaded_queue(&daemon).0.entries[0].base, "abc123");
     }
 }

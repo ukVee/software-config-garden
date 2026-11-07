@@ -435,7 +435,7 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "[a-z0-9-]+; the project name entries reference (refused bad_name; exists when already present)" },
                     "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
-                    "main": { "type": "string", "description": "the branch merges land on; defaults to main" },
+                    "main": { "type": "string", "description": "the branch merges land on, a valid git branch name; defaults to main" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -502,7 +502,9 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
                             names it, running for an active entry; if a stacked branch was cut from \
-                            it, one restack is enqueued per child project. A HUMAN verb: a fleet \
+                            it, one restack is enqueued per child repo, or merged into that \
+                            repo's live one, and the drop is refused started while a session holds \
+                            that restack. A HUMAN verb: a fleet \
                             member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
                             from keeperd.",
             "inputSchema": {
