@@ -560,6 +560,9 @@ pub fn plan(legacy: &LegacyBacklog, answers: &Answers, now: &str) -> MigrationPl
                     finished: now.to_string(),
                     final_status: FinalStatus::Done,
                     reason: None,
+                    // Legacy has no restack rows, so no archived row owes a
+                    // re-record.
+                    re_record_due: false,
                 }),
                 Planned::Skipped => {}
             }

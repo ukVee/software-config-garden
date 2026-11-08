@@ -117,6 +117,22 @@ pub fn migrate_switches(text: Option<&str>) -> Result<MigrateSwitches, String> {
     Ok(MigrateSwitches { fleet_enabled: s.fleet_enabled, queue_v2 })
 }
 
+/// Whether `config/growlight.toml`'s text sets the §11 switch to `queue =
+/// "v2"`. Fail-closed toward legacy: an absent key, any other value (growlightd
+/// refuses an unknown one at arm time) or a file that doesn't parse reads as
+/// `false`, so the guards that only legacy needs stay on whenever the switch
+/// can't be read. Like [`fleet_enabled`], a one-key reader: the roster and the
+/// rest of the schema stay growlightd's. The caller reads the file the way its
+/// context allows — [`WorkTree`](crate::actions::worktree::WorkTree) reads it
+/// mount-safe while it holds the daemon lock.
+pub fn queue_v2(raw: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Switch {
+        queue: Option<String>,
+    }
+    toml::from_str::<Switch>(raw).is_ok_and(|s| s.queue.as_deref() == Some("v2"))
+}
+
 /// On an unlock/resume: bring the growlightd unit into line with the in-garden
 /// `fleet_enabled` gate — **start** it if the gate is on, **ensure it is stopped**
 /// if the gate is off. The stop half is what makes a *live disable* take effect:
@@ -287,6 +303,16 @@ mod tests {
         let cd = garden.join(softfig_ipc::GARDEN_CONFIG_DIR);
         std::fs::create_dir_all(&cd).unwrap();
         std::fs::write(cd.join(softfig_ipc::GROWLIGHT_CONFIG_FILE), body).unwrap();
+    }
+
+    /// Only an exact `queue = "v2"` reads as v2; the key absent, `legacy`, an
+    /// unknown value and an unparseable file all read as legacy.
+    #[test]
+    fn the_queue_switch_reads_v2_only_when_set_and_parseable() {
+        assert!(queue_v2("fleet_enabled = true\nqueue = \"v2\"\n[[fleet]]\nagent = \"a\"\n"));
+        for raw in ["", "queue = \"legacy\"\n", "queue = \"V2\"\n", "queue = \"v3\"\n", "queue = 2\n", "queue = \"v2\n"] {
+            assert!(!queue_v2(raw), "{raw:?}");
+        }
     }
 
     #[test]

@@ -16,10 +16,19 @@
 //!
 //! Unlike the scheduling path, a surface must not fail because one repo is not
 //! a git repo yet (a member claimed a branch it has not cut) or a doc is
-//! missing. [`build`] therefore collapses a git error to an empty stack for
-//! that repo, and a missing doc to no session lines — it shows what it can.
-//! A v2 file that does not *parse* is still a hard error, because the writer
-//! owns that invariant; the caller (`server::queue_show`) surfaces it.
+//! missing. [`build`] therefore reports a git error as that repo's
+//! `stack_unknown`, and a missing doc as no session lines — it shows what it
+//! can. It never reports a failed read as an empty stack: that renders every
+//! started branch as merged. A v2 file that does not *parse* is still a hard
+//! error, because the writer owns that invariant; the caller
+//! (`server::queue_show`) surfaces it.
+//!
+//! ## Bounded
+//!
+//! The git runs through [`crate::git_probe`]: one probe per repo, all started
+//! before any is waited on, so wedged repos cost one deadline between them and
+//! not one each, and a repo that missed its deadline is held instead of being
+//! waited on again by the next `queue show`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -32,8 +41,9 @@ use softfig_ipc::queue_v2::{
     milestone_path, EntryKind, QueueArchiveToml, SliceKind, QUEUE_ARCHIVE_FILE,
 };
 
-use crate::git_stack::{self, Git, Repo, StackEntry};
-use crate::scheduler_v2::{EntryView, V2Snapshot};
+use crate::git_probe::{Probe, ProbeCache};
+use crate::git_stack::{self, Git, GitError, Repo, Stack, StackEntry};
+use crate::scheduler_v2::{EntryView, ProjectView, V2Snapshot};
 
 /// `growlight/backlog/tasks/` — a task or restack doc lives here as
 /// `NNN-<slug>.md` (§8; the keeperd v2 writer's `paths::tasks_dir`).
@@ -43,12 +53,15 @@ const TASKS_DIR: &str = "growlight/backlog/tasks";
 /// the live open/merged annotation), the entries in file order, and the §3.5
 /// session-log lines. Pure over the snapshot + the read-only git surface + the
 /// garden files it reads (`garden_root`, the mount in production; a temp garden
-/// in tests). `home` / `user` expand `~` repo paths ([`Repo::of`]).
+/// in tests). `home` / `user` expand `~` repo paths ([`Repo::of`]). `probes` runs
+/// the git, and `now` (Unix seconds) is the time its holds are judged by.
 pub fn build(
     snapshot: &V2Snapshot,
     garden_root: &Path,
     home: Option<&Path>,
     user: Option<&str>,
+    probes: &ProbeCache,
+    now: i64,
 ) -> QueueShowReply {
     let mut reply = QueueShowReply {
         list: true,
@@ -59,33 +72,43 @@ pub fn build(
         trees: Vec::new(),
     };
 
-    // The open branches per (project, branch) — the live annotation the entry
-    // rows and the per-repo stacks share, computed once per repo.
-    let mut open: HashSet<(String, String)> = HashSet::new();
+    // The entries whose branch is open — the live annotation the entry rows and
+    // the per-repo stacks share, computed once per repo.
+    let mut open: HashSet<String> = HashSet::new();
 
+    // The projects whose stack could not be read: their started branches are
+    // unknown, not closed.
+    let mut unknown: HashSet<String> = HashSet::new();
+
+    // One row per repo (§8): the projects naming a repo share its stack, so one
+    // read answers them all, judged against the first one's `main`.
+    let mut repos: Vec<Vec<&ProjectView>> = Vec::new();
     for project in &snapshot.projects {
-        let repo_kind = Repo::of(project, home, user);
-        let local = matches!(repo_kind, Repo::Local(_));
-        let git = match &repo_kind {
-            Repo::Local(path) => Git::new(path.clone()),
-            Repo::Remote => Git::new(PathBuf::new()),
+        match repos.iter_mut().find(|group| group[0].repo == project.repo) {
+            Some(group) => group.push(project),
+            None => repos.push(vec![project]),
+        }
+    }
+
+    probes.begin_tick(now);
+    let reads: Vec<StackRead> = repos
+        .iter()
+        .map(|group| StackRead::start(snapshot, group[0], home, user, probes))
+        .collect();
+
+    for (group, read) in repos.iter().zip(reads) {
+        let project = group[0];
+        let local = matches!(read, StackRead::Probing(_));
+        // A real git error (not-a-repo, a hung mount) is that repo's unknown: the
+        // surface shows what it can, never fails. (A not-yet-cut branch is not an
+        // error — `stack_candidates` just skips it.)
+        let (stack, stack_unknown) = match read.wait() {
+            Ok(stack) => (stack, None),
+            Err(e) => {
+                unknown.extend(group.iter().map(|p| p.name.clone()));
+                (Stack::default(), Some(e.to_string()))
+            }
         };
-        let stack_entries: Vec<StackEntry> = snapshot
-            .entries
-            .iter()
-            .filter(|e| e.project == project.name)
-            .map(|e| StackEntry {
-                id: e.id.clone(),
-                branch: e.branch.clone(),
-                lane: e.lane,
-                claimed: e.claimed.clone(),
-            })
-            .collect();
-        // A real git error (not-a-repo, a hung mount) collapses to an empty
-        // stack: the surface shows what it can, never fails. (A not-yet-cut
-        // branch is not an error — `stack_candidates` just skips it.)
-        let stack = git_stack::stack_candidates(&repo_kind, &project.main, &stack_entries, &git)
-            .unwrap_or_default();
 
         // Record each candidate's parent/base from the snapshot (the fields the
         // §8 first claim wrote), and mark its branch open.
@@ -94,10 +117,10 @@ pub fn build(
             let (parent, base) = snapshot
                 .entries
                 .iter()
-                .find(|e| e.project == project.name && e.branch == candidate.branch)
+                .find(|e| e.id == candidate.id)
                 .map(|e| (e.parent.clone(), e.base.clone()))
                 .unwrap_or_default();
-            open.insert((project.name.clone(), candidate.branch.clone()));
+            open.insert(candidate.id.clone());
             branches.push(QueueStackBranch {
                 entry: candidate.id.clone(),
                 branch: candidate.branch.clone(),
@@ -107,15 +130,17 @@ pub fn build(
             });
         }
         reply.projects.push(QueueProjectStack {
-            name: project.name.clone(),
+            name: group.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "),
             repo: project.repo.clone(),
             main: project.main.clone(),
             local,
             stack: branches,
+            stack_unknown,
         });
     }
 
     for entry in &snapshot.entries {
+        let (doc_fleet, doc_not_before) = doc_hold_lines(garden_root, entry);
         reply.entries.push(QueueShowEntry {
             id: entry.id.clone(),
             kind: entry.kind.to_string(),
@@ -127,8 +152,14 @@ pub fn build(
             base: entry.base.clone(),
             claimed: entry.claimed.clone(),
             pending_status: entry.pending.map(|s| s.to_string()),
-            open: !entry.branch.is_empty()
-                && open.contains(&(entry.project.clone(), entry.branch.clone())),
+            open: open.contains(&entry.id),
+            open_unknown: !entry.branch.is_empty()
+                && !entry.claimed.is_empty()
+                && unknown.contains(&entry.project),
+            fleet: entry.fleet,
+            not_before: entry.not_before.clone(),
+            doc_fleet,
+            doc_not_before,
         });
     }
 
@@ -175,6 +206,11 @@ pub fn build(
                 claimed: a.row.claimed,
                 pending_status: None,
                 open: false,
+                open_unknown: false,
+                fleet: a.row.fleet,
+                not_before: a.row.not_before,
+                doc_fleet: None,
+                doc_not_before: None,
             });
         }
     }
@@ -182,46 +218,128 @@ pub fn build(
     reply
 }
 
+/// One repo's stack on its way: a local repo's bounded probe, or a remote
+/// repo's list-state answer, which runs no git.
+enum StackRead {
+    Probing(Probe<Stack>),
+    Remote(Result<Stack, GitError>),
+}
+
+impl StackRead {
+    fn start(
+        snapshot: &V2Snapshot,
+        project: &ProjectView,
+        home: Option<&Path>,
+        user: Option<&str>,
+        probes: &ProbeCache,
+    ) -> Self {
+        let entries: Vec<StackEntry> = snapshot
+            .entries_in_repo(&project.repo)
+            .map(|e| StackEntry {
+                id: e.id.clone(),
+                branch: e.branch.clone(),
+                lane: e.lane,
+                claimed: e.claimed.clone(),
+            })
+            .collect();
+        let main = project.main.clone();
+        let repo = Repo::of(project, home, user);
+        match &repo {
+            Repo::Local(path) => {
+                let path = path.clone();
+                Self::Probing(probes.spawn(&path, move |git| {
+                    git_stack::stack_candidates(&repo, &main, &entries, git)
+                }))
+            }
+            Repo::Remote => {
+                let nowhere = Git::new(PathBuf::new());
+                Self::Remote(git_stack::stack_candidates(&repo, &main, &entries, &nowhere))
+            }
+        }
+    }
+
+    fn wait(self) -> Result<Stack, GitError> {
+        match self {
+            Self::Probing(probe) => probe.wait(),
+            Self::Remote(stack) => stack,
+        }
+    }
+}
+
 /// Collect one entry's §3.5 session-log lines: the entry's own doc (a
 /// milestone's `CLAUDE.md` close-out, a task/restack doc), plus — for a
-/// milestone — every slice doc in its tree and sub-trees. A missing doc (or a
-/// missing `## Sessions` section) contributes nothing.
+/// milestone — every slice doc in its tree and sub-trees, and each sub's own
+/// close-out. A missing doc (or a missing `## Sessions` section) contributes
+/// nothing.
 fn collect_sessions(
     snapshot: &V2Snapshot,
     entry: &EntryView,
     root: &Path,
     out: &mut Vec<QueueShowSession>,
 ) {
+    if let Some(doc) = entry_doc(root, entry) {
+        push_session(root, &doc, &entry.id, None, None, out);
+    }
     match entry.kind {
         EntryKind::Milestone => {
-            let close = format!("{}/CLAUDE.md", milestone_path(&entry.id));
-            push_session(root, &close, &entry.id, None, out);
             // The entry's own tree and every sub-milestone tree under it.
             let prefix = format!("{}/", entry.id);
             for (identity, tree) in &snapshot.trees {
                 if identity == &entry.id || identity.starts_with(&prefix) {
+                    let sub = (identity != &entry.id).then_some(identity.as_str());
+                    if sub.is_some() {
+                        let close = format!("{}/CLAUDE.md", milestone_path(identity));
+                        push_session(root, &close, &entry.id, sub, None, out);
+                    }
                     let dir = format!("{}/slices", milestone_path(identity));
                     for item in &tree.items {
                         if item.kind == SliceKind::Slice
                             && let Some(doc) = find_by_number(root, &dir, &item.id)
                         {
-                            push_session(root, &doc, &entry.id, Some(&item.id), out);
+                            push_session(root, &doc, &entry.id, sub, Some(&item.id), out);
                         }
                     }
                 }
             }
         }
-        EntryKind::Task | EntryKind::Restack => {
-            if let Some(doc) = find_by_number(root, TASKS_DIR, &entry.id) {
-                push_session(root, &doc, &entry.id, None, out);
-            }
-        }
+        EntryKind::Task | EntryKind::Restack => {}
     }
+}
+
+/// The garden-relative path of `entry`'s own doc: a milestone's `CLAUDE.md`
+/// (its close-out), or a task's / restack's `tasks/NNN-<slug>.md`. `None` when
+/// a task doc isn't there.
+fn entry_doc(root: &Path, entry: &EntryView) -> Option<String> {
+    match entry.kind {
+        EntryKind::Milestone => Some(format!("{}/CLAUDE.md", milestone_path(&entry.id))),
+        EntryKind::Task | EntryKind::Restack => find_by_number(root, TASKS_DIR, &entry.id),
+    }
+}
+
+/// The `> Fleet:` and `> Not before:` line values in `entry`'s own doc, read
+/// through the scanner the legacy hold reader uses (fenced examples don't
+/// count). Under v2 these lines hold nothing; they are carried so `queue show`
+/// can warn when one disagrees with the entry. A missing or unreadable doc
+/// carries neither.
+fn doc_hold_lines(root: &Path, entry: &EntryView) -> (Option<String>, Option<String>) {
+    let Some(text) = entry_doc(root, entry).and_then(|doc| std::fs::read_to_string(root.join(doc)).ok())
+    else {
+        return (None, None);
+    };
+    let line = |key| softfig_ipc::item_meta::field(&text, key).map(str::to_string);
+    (line(softfig_ipc::item_meta::FLEET), line(softfig_ipc::item_meta::NOT_BEFORE))
 }
 
 /// Read `rel`'s `## Sessions` section and append one [`QueueShowSession`] when
 /// it carries lines.
-fn push_session(root: &Path, rel: &str, entry: &str, unit: Option<&str>, out: &mut Vec<QueueShowSession>) {
+fn push_session(
+    root: &Path,
+    rel: &str,
+    entry: &str,
+    tree: Option<&str>,
+    unit: Option<&str>,
+    out: &mut Vec<QueueShowSession>,
+) {
     let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
         return;
     };
@@ -229,6 +347,7 @@ fn push_session(root: &Path, rel: &str, entry: &str, unit: Option<&str>, out: &m
     if !lines.is_empty() {
         out.push(QueueShowSession {
             entry: entry.to_string(),
+            tree: tree.map(str::to_string),
             unit: unit.map(str::to_string),
             path: rel.to_string(),
             lines,
@@ -285,7 +404,9 @@ mod tests {
     use softfig_ipc::queue_v2::{ArchivedEntry, Entry, EntryStatus, FinalStatus, Lane};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     fn sh_git(repo: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -308,10 +429,19 @@ mod tests {
         assert!(ok, "git {args:?}");
     }
 
+    /// [`build`] over real git, with no hold in play.
+    fn show(snapshot: &V2Snapshot, root: &Path) -> QueueShowReply {
+        build(snapshot, root, None, None, &ProbeCache::new(), 0)
+    }
+
     /// A repo on `main`, plus an open branch and a merged branch.
     fn seeded_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
+        seed(dir.path());
+        dir
+    }
+
+    fn seed(repo: &Path) {
         sh_git(repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join("a.txt"), "base\n").unwrap();
         sh_git(repo, &["add", "."]);
@@ -331,7 +461,6 @@ mod tests {
         sh_git(repo, &["checkout", "-q", "main"]);
         sh_git(repo, &["merge", "--ff-only", "-q", "feat/merged"]);
         sh_git(repo, &["checkout", "-q", "main"]);
-        dir
     }
 
     fn entry(id: &str, branch: &str, lane: Lane, status: EntryStatus, claimed: &str) -> EntryView {
@@ -368,6 +497,8 @@ mod tests {
             done_ids: Default::default(),
             done_branches: Default::default(),
             now_unix: 0,
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -391,7 +522,7 @@ mod tests {
             entry("queued", "feat/queued", Lane::Normal, EntryStatus::Queued, ""),
         ];
         let snapshot = snap(root, entries, BTreeMap::new());
-        let reply = build(&snapshot, root, None, None);
+        let reply = show(&snapshot, root);
 
         assert!(reply.list);
         assert_eq!(reply.entries.len(), 3, "file order is list order");
@@ -422,7 +553,7 @@ mod tests {
         let mut waiting = entry("w", "feat/w", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
         waiting.pending = Some(EntryStatus::Blocked);
         let plain = entry("p", "feat/p", Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
-        let reply = build(&snap(root, vec![waiting, plain], BTreeMap::new()), root, None, None);
+        let reply = show(&snap(root, vec![waiting, plain], BTreeMap::new()), root);
         let w = reply.entries.iter().find(|e| e.id == "w").unwrap();
         assert_eq!((w.status.as_str(), w.pending_status.as_deref()), ("active", Some("blocked")));
         let p = reply.entries.iter().find(|e| e.id == "p").unwrap();
@@ -432,6 +563,53 @@ mod tests {
         assert!(json.get("pending_status").is_none(), "{json}");
         let back: softfig_ipc::growlightd::QueueShowEntry = serde_json::from_value(json).unwrap();
         assert_eq!(back.pending_status, None);
+    }
+
+    /// The TOML holds reach the reply, and so do the entry's own doc lines —
+    /// a milestone's `CLAUDE.md` and a task's `tasks/NNN-*.md` — read as the
+    /// legacy reader reads them (a fenced example doesn't count), so `queue
+    /// show` can warn when a line disagrees with the entry. A doc without the
+    /// lines, or no doc at all, carries none.
+    #[test]
+    fn the_holds_and_the_entry_s_own_doc_lines_reach_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut held = entry("m", "feat/m", Lane::Normal, EntryStatus::Queued, "");
+        held.fleet = false;
+        held.not_before = Some("2026-11-08 09:00Z".into());
+        let habit = entry("h", "feat/h", Lane::Normal, EntryStatus::Queued, "");
+        let mut task = entry("007", "fix/007", Lane::Urgent, EntryStatus::Queued, "");
+        task.kind = EntryKind::Task;
+        let bare = entry("b", "feat/b", Lane::Normal, EntryStatus::Queued, "");
+        let gone = entry("g", "feat/g", Lane::Normal, EntryStatus::Queued, "");
+        let milestones = root.join("growlight/backlog/milestones");
+        for (id, doc) in [
+            ("m", "# m\n\n> Fleet: no\n> Not before: 2026-11-08 09:00 +00:00\n"),
+            ("h", "# h\n\n```\n> Fleet: yes\n```\n> Fleet: no\n"),
+            ("b", "# b\n\n> Model: flash\n"),
+        ] {
+            fs::create_dir_all(milestones.join(id)).unwrap();
+            fs::write(milestones.join(id).join("CLAUDE.md"), doc).unwrap();
+        }
+        fs::create_dir_all(root.join(TASKS_DIR)).unwrap();
+        fs::write(root.join(TASKS_DIR).join("007-fix.md"), "# 007\n\n> Not before: 2026-12-01 00:00Z\n").unwrap();
+
+        let reply = show(&snap(root, vec![held, habit, task, bare, gone], BTreeMap::new()), root);
+        let row = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap();
+        let m = row("m");
+        assert_eq!((m.fleet, m.not_before.as_deref()), (false, Some("2026-11-08 09:00Z")));
+        assert_eq!(m.doc_fleet.as_deref(), Some("no"));
+        assert_eq!(m.doc_not_before.as_deref(), Some("2026-11-08 09:00 +00:00"));
+        assert_eq!(m.doc_hold_warning(), None, "the doc agrees with the entry");
+        let h = row("h");
+        assert_eq!((h.fleet, h.doc_fleet.as_deref()), (true, Some("no")), "the fenced line is skipped");
+        assert!(h.doc_hold_warning().is_some(), "a habit `> Fleet: no` holds nothing under v2");
+        let t = row("007");
+        assert_eq!((t.doc_fleet.as_deref(), t.doc_not_before.as_deref()), (None, Some("2026-12-01 00:00Z")));
+        assert!(t.doc_hold_warning().is_some());
+        for id in ["b", "g"] {
+            assert_eq!((row(id).doc_fleet.as_deref(), row(id).doc_not_before.as_deref()), (None, None), "{id}");
+        }
     }
 
     #[test]
@@ -455,8 +633,10 @@ mod tests {
             done_ids: Default::default(),
             done_branches: Default::default(),
             now_unix: 0,
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         };
-        let reply = build(&snapshot, Path::new("/nonexistent"), None, None);
+        let reply = show(&snapshot, Path::new("/nonexistent"));
         assert_eq!(reply.projects.len(), 1);
         assert!(!reply.projects[0].local);
         assert_eq!(reply.projects[0].stack.len(), 2, "list state: every claimed entry");
@@ -485,12 +665,187 @@ mod tests {
             entry("real", "feat/real", Lane::Normal, EntryStatus::Active, "2026-10-02T00:00:00Z"),
         ];
         let snapshot = snap(repo.path(), entries, BTreeMap::new());
-        let reply = build(&snapshot, repo.path(), None, None);
+        let reply = show(&snapshot, repo.path());
         assert_eq!(reply.projects[0].stack.len(), 1, "only the cut branch is in the stack");
         assert_eq!(reply.projects[0].stack[0].entry, "real");
         let open = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap().open;
         assert!(!open("ghost"));
         assert!(open("real"));
+    }
+
+    /// A `git` that hangs on any repo whose path says `wedged`, until `thawed`
+    /// appears in `dir`, and is the real one everywhere else. Logs each call.
+    /// Returns `(script, log)`.
+    fn wedging_git(dir: &Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let script = dir.join("fake-git");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in *wedged*) [ -e '{thawed}' ] || exec sleep 30 ;; esac\nexec git \"$@\"\n",
+                log = log.display(),
+                thawed = dir.join("thawed").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    fn wedged_repo() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new().prefix("wedged").tempdir().unwrap();
+        seed(dir.path());
+        dir
+    }
+
+    fn project(name: &str, repo: &Path) -> ProjectView {
+        ProjectView {
+            name: name.into(),
+            repo: repo.display().to_string(),
+            locality: softfig_ipc::queue_v2::RepoLocality::Local,
+            main: "main".into(),
+        }
+    }
+
+    /// A started entry of `project`, on `branch`.
+    fn started(id: &str, project: &str, branch: &str) -> EntryView {
+        let mut e = entry(id, branch, Lane::Normal, EntryStatus::Active, "2026-10-01T00:00:00Z");
+        e.project = project.into();
+        e
+    }
+
+    fn snapshot_of(projects: Vec<ProjectView>, entries: Vec<EntryView>) -> V2Snapshot {
+        V2Snapshot {
+            projects,
+            entries,
+            trees: BTreeMap::new(),
+            done_ids: Default::default(),
+            done_branches: Default::default(),
+            now_unix: 0,
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
+        }
+    }
+
+    #[test]
+    fn wedged_repos_answer_within_one_deadline_with_an_explicit_unknown() {
+        let bin = tempfile::tempdir().unwrap();
+        let (git, _) = wedging_git(bin.path());
+        let probes = ProbeCache::with(Duration::from_secs(1), git);
+        let (one, two, three) = (wedged_repo(), wedged_repo(), wedged_repo());
+        let healthy = seeded_repo();
+        let mut never_claimed = started("queued", "one", "feat/queued");
+        never_claimed.claimed = String::new();
+        let snapshot = snapshot_of(
+            vec![
+                project("one", one.path()),
+                project("two", two.path()),
+                project("three", three.path()),
+                project("healthy", healthy.path()),
+            ],
+            vec![
+                started("a", "one", "feat/open"),
+                never_claimed,
+                started("b", "two", "feat/open"),
+                started("c", "three", "feat/open"),
+                started("open", "healthy", "feat/open"),
+                started("merged", "healthy", "feat/merged"),
+            ],
+        );
+
+        let begun = Instant::now();
+        let reply = build(&snapshot, bin.path(), None, None, &probes, 1000);
+        // One after another, these would cost three deadlines.
+        assert!(begun.elapsed() < Duration::from_secs(2), "{:?}", begun.elapsed());
+
+        let wire = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap();
+        for p in &reply.projects[..3] {
+            let why = p.stack_unknown.as_deref().unwrap_or_default();
+            assert!(why.contains("timed out"), "{p:?}");
+            assert!(p.stack.is_empty() && p.local, "{p:?}");
+        }
+        for id in ["a", "b", "c"] {
+            assert!(wire(id).open_unknown && !wire(id).open, "{:?}", wire(id));
+        }
+        assert!(!wire("queued").open_unknown, "a never-claimed entry has no branch to be unsure of");
+
+        // The wedged repos don't touch their healthy neighbour's answer.
+        assert_eq!(reply.projects[3].stack_unknown, None);
+        assert_eq!(reply.projects[3].stack.len(), 1);
+        assert!(wire("open").open && !wire("open").open_unknown);
+        assert!(!wire("merged").open && !wire("merged").open_unknown);
+    }
+
+    #[test]
+    fn a_repo_that_missed_the_deadline_is_held_then_read_again() {
+        let bin = tempfile::tempdir().unwrap();
+        let (git, log) = wedging_git(bin.path());
+        let probes = ProbeCache::with(Duration::from_millis(300), git);
+        let repo = wedged_repo();
+        let snapshot = snapshot_of(
+            vec![project("one", repo.path())],
+            vec![started("a", "one", "feat/open")],
+        );
+        let unknown = |reply: &QueueShowReply| reply.projects[0].stack_unknown.clone();
+
+        let first = build(&snapshot, bin.path(), None, None, &probes, 1000);
+        assert!(unknown(&first).is_some_and(|why| why.contains("timed out")), "{first:?}");
+        let spawned = fs::read_to_string(&log).unwrap().lines().count();
+
+        // The next `queue show` doesn't wait the deadline out again, and spawns nothing.
+        let begun = Instant::now();
+        let held = build(&snapshot, bin.path(), None, None, &probes, 1001);
+        assert!(begun.elapsed() < Duration::from_millis(250), "{:?}", begun.elapsed());
+        assert!(unknown(&held).is_some_and(|why| why.contains("held")), "{held:?}");
+        assert!(held.entries[0].open_unknown, "{held:?}");
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), spawned);
+
+        // Past the hold, a repo that recovered reads as it is.
+        fs::write(bin.path().join("thawed"), "").unwrap();
+        let back = 1000 + crate::drive_loop::v2_claim_backoff_secs(1);
+        let reply = build(&snapshot, bin.path(), None, None, &probes, back);
+        assert_eq!(unknown(&reply), None, "{reply:?}");
+        assert_eq!(reply.projects[0].stack.len(), 1);
+        assert!(reply.entries[0].open && !reply.entries[0].open_unknown, "{reply:?}");
+    }
+
+    /// §8: `queue show` lists the stack per repo, so two projects on one repo
+    /// are one row, and each one's entry reads as open from it.
+    #[test]
+    fn two_projects_on_one_repo_show_one_stack() {
+        let repo = seeded_repo();
+        sh_git(repo.path(), &["checkout", "-q", "-b", "feat/two"]);
+        fs::write(repo.path().join("two.txt"), "two\n").unwrap();
+        sh_git(repo.path(), &["add", "."]);
+        sh_git(repo.path(), &["commit", "-q", "-m", "two"]);
+        sh_git(repo.path(), &["checkout", "-q", "main"]);
+        let mut two = started("two", "mirror", "feat/two");
+        two.claimed = "2026-10-02T00:00:00Z".into();
+        let snapshot = snapshot_of(
+            vec![project("softfig", repo.path()), project("mirror", repo.path())],
+            vec![started("one", "softfig", "feat/open"), two],
+        );
+
+        let reply = show(&snapshot, repo.path());
+
+        assert_eq!(reply.projects.len(), 1, "{:?}", reply.projects);
+        assert_eq!(reply.projects[0].name, "softfig, mirror");
+        let branches: Vec<&str> =
+            reply.projects[0].stack.iter().map(|b| b.branch.as_str()).collect();
+        assert_eq!(branches, ["feat/open", "feat/two"]);
+        assert!(reply.entries.iter().all(|e| e.open), "{:?}", reply.entries);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_repo_is_unknown_not_an_empty_stack() {
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_of(
+            vec![project("one", not_a_repo.path())],
+            vec![started("a", "one", "feat/a")],
+        );
+        let reply = show(&snapshot, not_a_repo.path());
+        assert!(reply.projects[0].stack_unknown.is_some(), "{reply:?}");
+        assert!(reply.entries[0].open_unknown, "{reply:?}");
     }
 
     #[test]
@@ -535,7 +890,7 @@ mod tests {
         )
         .unwrap();
 
-        let reply = build(&snapshot, root, None, None);
+        let reply = show(&snapshot, root);
         // The slice tree is carried too — a sessionless slice (002) is still
         // visible in `trees`, so the TUI can address its `slice_update` by id.
         assert_eq!(reply.trees.len(), 1, "{:?}", reply.trees);
@@ -555,6 +910,48 @@ mod tests {
         let slice = reply.sessions.iter().find(|s| s.unit.as_deref() == Some("001")).unwrap();
         assert!(slice.path.ends_with("001-first.md"), "{slice:?}");
         assert!(slice.lines[0].contains("context_full"));
+    }
+
+    #[test]
+    fn a_sub_s_session_lines_carry_its_tree_and_stay_apart_from_the_parent_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut entries = vec![entry(
+            "m",
+            "feat/m",
+            Lane::Normal,
+            EntryStatus::Active,
+            "2026-10-01T00:00:00Z",
+        )];
+        entries[0].kind = EntryKind::Milestone;
+        let mut trees = BTreeMap::new();
+        for identity in ["m", "m/rest"] {
+            trees.insert(
+                identity.to_string(),
+                TreeView { items: vec![item(SliceKind::Slice, "001")], models: None },
+            );
+        }
+        let snapshot = snap(root, entries, trees);
+
+        let parent = root.join("growlight/backlog/milestones/m");
+        let sub = parent.join("subs/rest");
+        for d in [&parent, &sub] {
+            fs::create_dir_all(d.join("slices")).unwrap();
+        }
+        fs::write(parent.join("slices/001-a.md"), "## Sessions\n\n- parent slice\n").unwrap();
+        fs::write(sub.join("slices/001-b.md"), "## Sessions\n\n- sub slice\n").unwrap();
+        fs::write(sub.join("CLAUDE.md"), "## Sessions\n\n- sub close-out\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_sessions(&snapshot, &snapshot.entries[0], root, &mut out);
+        let of = |line: &str| out.iter().find(|s| s.lines == [line]).unwrap();
+        let parent_slice = of("- parent slice");
+        assert_eq!((parent_slice.tree.as_deref(), parent_slice.unit.as_deref()), (None, Some("001")));
+        let sub_slice = of("- sub slice");
+        assert_eq!((sub_slice.tree.as_deref(), sub_slice.unit.as_deref()), (Some("m/rest"), Some("001")));
+        let close = of("- sub close-out");
+        assert_eq!((close.tree.as_deref(), close.unit.as_deref()), (Some("m/rest"), None));
+        assert!(out.iter().all(|s| s.entry == "m"), "{out:?}");
     }
 
     #[test]
@@ -589,6 +986,7 @@ mod tests {
             finished: "2026-10-02T00:00:00Z".into(),
             final_status,
             reason: reason.map(str::to_string),
+            re_record_due: false,
         }
     }
 
@@ -609,7 +1007,7 @@ mod tests {
         )
         .unwrap();
 
-        let reply = build(&snapshot, root, None, None);
+        let reply = show(&snapshot, root);
         assert_eq!(reply.archived.len(), 2, "archive order is exit order");
         let done = &reply.archived[0];
         assert_eq!(done.id, "done-one");
@@ -626,7 +1024,7 @@ mod tests {
     fn a_missing_archive_contributes_no_rows() {
         let repo = tempfile::tempdir().unwrap();
         let snapshot = snap(repo.path(), vec![], BTreeMap::new());
-        let reply = build(&snapshot, repo.path(), None, None);
+        let reply = show(&snapshot, repo.path());
         assert!(reply.archived.is_empty(), "no archive file → empty archive");
     }
 }

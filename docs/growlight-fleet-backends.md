@@ -288,6 +288,10 @@ exactly when the human reaches for opencode.
   nothing is assembled then, so there is no runtime state to report and inventing a
   roster echo here would claim liveness the daemon cannot observe.
 
+Its `queue` line is the §11 switch as growlightd read it at boot, `legacy` or `v2`, armed or
+not. `protocol` is the wire version and stays `v1` under either, so read `queue` to see that a
+flip took. A growlightd older than the field prints no `queue` line.
+
 ```
 roster:
   a                pin=queue:default
@@ -452,6 +456,35 @@ second entry's first claim share the answers, and a repo whose probe misses its 
 held with a doubling backoff across ticks. A probe that cannot answer is "unknown", never
 "stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
 detection skips the repo until it answers.
+
+`queue show` and `growlight status` read the stack the same way, on a probe cache of their
+own, so a human reading the list never holds a repo for the scheduler. A repo that can't
+answer shows "stack unknown" with the reason, and its started branches show the same, never
+an empty stack or a merged branch.
+
+Under v2 a hold lives only in the entry's `fleet` / `not_before` fields. Both surfaces and the
+TUI print them beside the status as `(human-only)` and `(not before …)`. An item doc's
+`> Fleet:` or `> Not before:` line holds nothing, so `queue show` prints one `warning:` line
+per entry whose doc line disagrees with the entry, along with the `queue fleet` / `queue
+not-before` command that would make the entry match. For the same reason, keeperd's member
+guard stops protecting the `> Fleet:` line once `config/growlight.toml` says `queue = "v2"`.
+Under legacy, or with a switch it can't read, the guard stays on. A member may not write
+`config/growlight.toml`.
+
+`not_before` gates only a `queued` entry's claim: a `paused` or orphaned `active` entry is
+past its claim, so a start time set on one holds nothing. `queue not-before` keeps it all
+the same (it applies if the entry is queued again) and says so with a `note:` line after
+the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
+
+One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
+`slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
+held only the one item whose doc it couldn't read. The journal gets one line per incident,
+naming the file, the line and column, and the parser's reason, and the first tick after
+the fix resumes:
+
+```
+growlightd: v2 queue source failed (scheduling nothing from v2 until it is fixed): growlight/backlog/queue.toml: invalid TOML at line 9, column 9: invalid type: string "no", expected a boolean
+```
 
 ## Known gaps
 

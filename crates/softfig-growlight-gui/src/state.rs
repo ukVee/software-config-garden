@@ -381,6 +381,7 @@ mod tests {
             },
             paused: true,
             fleet_enabled: false,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: vec![
                 AgentSummary::new("a", "running", true),

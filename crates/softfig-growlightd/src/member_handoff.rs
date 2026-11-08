@@ -809,6 +809,8 @@ pub(crate) mod tests {
             done_ids: Default::default(),
             now_unix: 0,
             done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 

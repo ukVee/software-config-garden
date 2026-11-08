@@ -2218,7 +2218,8 @@ pub struct QueueAddProjectArgs {
     pub name: String,
     /// A local path (`~` allowed) or `host:path`. Non-empty.
     pub repo: String,
-    /// The branch merges land on; defaults to `"main"`.
+    /// The branch merges land on; defaults to `"main"`. Refused `bad_name` when
+    /// it is no branch name, by `git check-ref-format --branch`'s rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
@@ -2414,6 +2415,12 @@ pub struct QueueUpdateEntryReply {
     pub view: String,
     /// Commit hash; on a dry run or a no-op edit the untouched tip.
     pub hash: String,
+    /// What the edit kept but does not do, one sentence each — today, a
+    /// `not_before` set on a `paused` or `active` entry, which gates only a
+    /// `queued` entry's claim (F2). Empty, and absent on the wire, otherwise;
+    /// an older daemon sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// `slice_insert({milestone, slug, title?, body, position = "back", ref?,
@@ -2747,9 +2754,9 @@ pub struct QueueV2AddSubReply {
 /// auto-restack enqueue (`queue-v2-git` slice 003), keeperd↔growlightd only.
 /// growlightd detected a stale stack (read-only git) and passes the ordered
 /// stack; keeperd enqueues ONE urgent restack row for `project` and generates
-/// the full restack doc from `stack`. Idempotent per project: if a live restack
-/// row for `project` already exists, `id`/`path` are `None` and nothing is
-/// written.
+/// the full restack doc from `stack`, or merges `stack` into the live row's doc.
+/// Idempotent per project: if that doc already carries the stack, or a session
+/// holds it, `id`/`path` are `None` and nothing is written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2EnqueueRestackArgs {
     /// The project whose repo needs a restack.
@@ -2761,11 +2768,11 @@ pub struct QueueV2EnqueueRestackArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2EnqueueRestackReply {
-    /// The new restack entry's id (`NNN`); `None` when a live restack row for
-    /// `project` already existed (idempotent no-op).
+    /// The restack entry's id (`NNN`), new or merged into; `None` on the
+    /// idempotent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// The new restack doc (garden-relative); `None` on the idempotent no-op.
+    /// The restack doc (garden-relative); `None` on the idempotent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// The commit hash, or the untouched tip on the idempotent no-op.
@@ -2786,11 +2793,16 @@ pub struct QueueV2BaseRecord {
 /// `queue_v2_re_record_bases({entries}) -> {hash}` — the §8 re-record
 /// (`queue-v2-git` slice 004), keeperd↔growlightd only. growlightd recomputed
 /// each restacked branch's base after the restack completed and passes the
-/// `(entry, base)` pairs; keeperd replaces each named live entry's `base`.
+/// `(entry, base)` pairs; keeperd replaces each named live entry's `base` and
+/// clears `re_record_due` on each `settled` archive row, in one commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2ReRecordBasesArgs {
     /// The re-recorded `(entry, base)` pairs.
     pub entries: Vec<QueueV2BaseRecord>,
+    /// The archived restack rows this pass answers. Empty pairs with a settled
+    /// row is a pass that found nothing to move.
+    #[serde(default)]
+    pub settled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

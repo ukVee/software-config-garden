@@ -230,6 +230,12 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) so a pre-field decoder reads it back as `false`.
     #[serde(default)]
     pub fleet_enabled: bool,
+    /// Which queue model the §11 switch selects (`config/growlight.toml` `queue`):
+    /// `legacy` or `v2`, as read at boot. Reported whether or not the fleet is
+    /// armed. Additive (`#[serde(default)]`): an older growlightd sends nothing,
+    /// and a pre-field decoder reads it back as empty, not as `legacy`.
+    #[serde(default)]
+    pub queue: String,
     /// The configured roster from `config/growlight.toml` (`[[fleet]]` members),
     /// in config order — surfaced so `growlight status` lists the fleet even when
     /// the gate is off (the agents haven't spawned). Additive/defaulted for wire
@@ -1266,6 +1272,95 @@ pub struct QueueShowEntry {
     /// `false` for a never-claimed entry, a restack (no branch), or a local
     /// branch already fast-forwarded into `main`.
     pub open: bool,
+    /// This entry has a started branch in a repo whose stack could not be read
+    /// ([`QueueProjectStack::stack_unknown`]), so `open` says nothing about it:
+    /// a surface must not render that `false` as merged. Absent when `open` is
+    /// an answer, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_unknown: bool,
+    /// The row's `fleet` field (§3.1): `false` holds the entry for the human.
+    /// Absent when `true`, as in the TOML, and on a reply from a daemon that
+    /// predates the field — which reads as no hold shown, not as human-only.
+    #[serde(
+        default = "crate::queue_v2::fleet_default",
+        skip_serializing_if = "crate::queue_v2::is_fleet_default"
+    )]
+    pub fleet: bool,
+    /// The row's `not_before` start time (§3.1), as written. Absent when none,
+    /// and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    /// The entry's own doc's `> Fleet:` line value, as written (`Some("")` for
+    /// a line with no value), or `None` when the doc carries no such line or
+    /// could not be read. Under v2 the line holds nothing — the TOML is the only
+    /// source of a hold — so this is carried only for
+    /// [`doc_hold_warning`](Self::doc_hold_warning). Always `None` on an archive
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_fleet: Option<String>,
+    /// The entry's own doc's `> Not before:` line value, as written; `None` as
+    /// for [`doc_fleet`](Self::doc_fleet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_not_before: Option<String>,
+}
+
+impl QueueShowEntry {
+    /// The §2 holds as the surfaces print them beside the status
+    /// ([`crate::queue_v2::hold_annotation`]).
+    pub fn hold_annotation(&self) -> String {
+        crate::queue_v2::hold_annotation(self.fleet, self.not_before.as_deref())
+    }
+
+    /// One line when the entry's doc carries a `> Fleet:` or `> Not before:`
+    /// line that disagrees with the entry, `None` otherwise. A human who writes
+    /// `> Fleet: no` by habit gets no hold under v2, and this is what tells
+    /// them. A doc without the lines never disagrees: a new v2 doc doesn't carry
+    /// them. A `> Fleet:` value reads as the legacy reader reads it
+    /// ([`crate::fleet::holds`]), and two start times that parse are compared as
+    /// instants, so `Z` and `+00:00` agree.
+    pub fn doc_hold_warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(line) = &self.doc_fleet
+            && crate::fleet::holds(line) == self.fleet
+        {
+            let (fix, now) = if self.fleet {
+                (format!("softfig growlight queue fleet {} no", self.id), "fleet = true")
+            } else {
+                (format!("softfig growlight queue fleet {} yes", self.id), "fleet = false")
+            };
+            parts.push(format!("`> Fleet: {line}` but the entry has {now} (to match the line: `{fix}`)"));
+        }
+        if let Some(line) = &self.doc_not_before {
+            let parse = crate::fleet::parse_not_before;
+            let same = match self.not_before.as_deref() {
+                Some(at) => match (parse(line), parse(at)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => line.trim() == at.trim(),
+                },
+                None => false,
+            };
+            if !same {
+                let now = match &self.not_before {
+                    Some(at) => format!("not_before = \"{at}\""),
+                    None => "no not_before".to_string(),
+                };
+                parts.push(format!(
+                    "`> Not before: {line}` but the entry has {now} (to match the line: \
+                     `softfig growlight queue not-before {} \"{line}\"`)",
+                    self.id
+                ));
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "warning: {}: its doc says {} — under queue v2 only the entry holds, so the doc \
+             line does nothing; set the entry, or delete the line",
+            self.id,
+            parts.join("; and "),
+        ))
+    }
 }
 
 /// One branch of a repo's open stack, in claim order (oldest first) — the §8
@@ -1282,9 +1377,12 @@ pub struct QueueStackBranch {
     pub claimed: String,
 }
 
-/// One project's stack, as [`QueueShowReply`] carries it.
+/// One repo's stack, as [`QueueShowReply`] carries it (§8: the stack is per
+/// repo).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueProjectStack {
+    /// The project naming this repo, or all of them, comma-joined in table
+    /// order. `main` is the first one's.
     pub name: String,
     pub repo: String,
     pub main: String,
@@ -1295,6 +1393,12 @@ pub struct QueueProjectStack {
     /// The still-open branches in claim order; empty when the stack is empty
     /// (the next branch cuts from `main`).
     pub stack: Vec<QueueStackBranch>,
+    /// Why this repo's stack could not be read (a wedged repo past the probe
+    /// deadline, a path that isn't a repo). An empty `stack` then means "not
+    /// known", not "empty". Absent when the stack was read, and on a reply from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_unknown: Option<String>,
 }
 
 /// One unit's §3.5 session-log lines, verbatim (`- <ts> · …`).
@@ -1302,6 +1406,11 @@ pub struct QueueProjectStack {
 pub struct QueueShowSession {
     /// The top-level entry id.
     pub entry: String,
+    /// The sub-milestone identity (`<entry>/<sub>`) when the unit sits in a
+    /// sub-tree, where a slice NNN can repeat one in the parent. `None` for the
+    /// entry's own tree, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     /// The slice NNN, or `None` for the entry's own close-out / task / restack
     /// doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1445,6 +1554,118 @@ impl MemberVerbReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read stack leaves the unknown fields off the wire, and a reply from a
+    /// daemon that predates them still decodes as "the answer is known".
+    #[test]
+    fn stack_unknown_fields_are_absent_when_known_and_tolerated_when_missing() {
+        let project: QueueProjectStack = serde_json::from_value(serde_json::json!({
+            "name": "p", "repo": "~/p", "main": "main", "local": true, "stack": [],
+        }))
+        .unwrap();
+        assert_eq!(project.stack_unknown, None);
+        assert!(serde_json::to_value(&project).unwrap().get("stack_unknown").is_none());
+
+        let entry: QueueShowEntry = serde_json::from_value(serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "active",
+            "after": [], "branch": "feat/e", "base": "", "claimed": "", "open": false,
+        }))
+        .unwrap();
+        assert!(!entry.open_unknown);
+        assert!(serde_json::to_value(&entry).unwrap().get("open_unknown").is_none());
+    }
+
+    /// An older daemon's entry carries no hold fields: it decodes as no hold
+    /// (not as human-only) with no doc lines, and an entry at those defaults
+    /// leaves them off the wire, so an older client reads exactly what it did.
+    /// A hold round-trips.
+    #[test]
+    fn hold_fields_default_on_an_older_reply_and_round_trip_when_set() {
+        let old = serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "queued",
+            "after": [], "branch": "fix/e", "base": "", "claimed": "", "open": false,
+        });
+        let entry: QueueShowEntry = serde_json::from_value(old.clone()).unwrap();
+        assert!(entry.fleet, "an older reply reads as no hold");
+        assert_eq!((entry.not_before.as_deref(), entry.doc_fleet.as_deref()), (None, None));
+        assert_eq!(entry.doc_not_before, None);
+        assert_eq!(entry.hold_annotation(), "");
+        assert_eq!(entry.doc_hold_warning(), None);
+        assert_eq!(serde_json::to_value(&entry).unwrap(), old, "defaults stay off the wire");
+
+        let held = QueueShowEntry {
+            fleet: false,
+            not_before: Some("2026-11-08 09:00 +01:00".into()),
+            doc_fleet: Some("no".into()),
+            doc_not_before: Some("2026-11-08 08:00Z".into()),
+            ..entry
+        };
+        let wire = serde_json::to_value(&held).unwrap();
+        assert_eq!(wire["fleet"], false);
+        assert_eq!(serde_json::from_value::<QueueShowEntry>(wire).unwrap(), held);
+        assert_eq!(held.hold_annotation(), " (human-only) (not before 2026-11-08 09:00 +01:00)");
+        assert_eq!(held.doc_hold_warning(), None, "the line and the entry agree, as instants");
+    }
+
+    /// `queue show`'s one line per entry: a doc line that disagrees with the
+    /// entry names both sides and the command that makes the entry match, and
+    /// both lines land in the same one line. A doc with no lines never warns.
+    #[test]
+    fn a_doc_hold_line_that_disagrees_with_its_entry_warns_in_one_line() {
+        let entry = |fleet: bool, nb: Option<&str>, doc_fleet: Option<&str>, doc_nb: Option<&str>| {
+            QueueShowEntry {
+                id: "m1".into(),
+                kind: "milestone".into(),
+                project: "p".into(),
+                lane: "normal".into(),
+                status: "queued".into(),
+                after: vec![],
+                branch: "feat/m1".into(),
+                base: String::new(),
+                claimed: String::new(),
+                pending_status: None,
+                open: false,
+                open_unknown: false,
+                fleet,
+                not_before: nb.map(str::to_string),
+                doc_fleet: doc_fleet.map(str::to_string),
+                doc_not_before: doc_nb.map(str::to_string),
+            }
+        };
+        // A human's `> Fleet: no` by habit: the entry holds nothing.
+        let w = entry(true, None, Some("no"), None).doc_hold_warning().expect("warns");
+        assert!(w.starts_with("warning: m1: "), "{w}");
+        assert!(w.contains("`> Fleet: no` but the entry has fleet = true"), "{w}");
+        assert!(w.contains("`softfig growlight queue fleet m1 no`"), "{w}");
+        assert!(!w.contains('\n'), "one line: {w}");
+        // Any non-`yes` value holds, as the legacy reader reads it (a typo too).
+        assert!(entry(true, None, Some("nope"), None).doc_hold_warning().is_some());
+        assert!(entry(true, None, Some(""), None).doc_hold_warning().is_some());
+        // The other way round: the doc frees, the entry holds.
+        let w = entry(false, None, Some("YES"), None).doc_hold_warning().expect("warns");
+        assert!(w.contains("but the entry has fleet = false"), "{w}");
+        // Agreement, and no line at all, are silent.
+        assert_eq!(entry(false, None, Some("no"), None).doc_hold_warning(), None);
+        assert_eq!(entry(true, None, Some("yes"), None).doc_hold_warning(), None);
+        assert_eq!(entry(false, Some("2026-11-08 09:00Z"), None, None).doc_hold_warning(), None);
+
+        // A start time only the doc carries, or a different one.
+        let w = entry(true, None, None, Some("2026-11-08 09:00Z")).doc_hold_warning().expect("warns");
+        assert!(w.contains("`> Not before: 2026-11-08 09:00Z` but the entry has no not_before"), "{w}");
+        assert!(w.contains("`softfig growlight queue not-before m1 \"2026-11-08 09:00Z\"`"), "{w}");
+        let w = entry(true, Some("2026-11-09 09:00Z"), None, Some("2026-11-08 09:00Z"))
+            .doc_hold_warning()
+            .expect("warns");
+        assert!(w.contains("the entry has not_before = \"2026-11-09 09:00Z\""), "{w}");
+        // An unparseable pair compares as written.
+        assert_eq!(entry(true, Some("soon"), None, Some(" soon")).doc_hold_warning(), None);
+        assert!(entry(true, Some("soon"), None, Some("later")).doc_hold_warning().is_some());
+
+        // Both lines disagree: still one line, naming both.
+        let w = entry(true, None, Some("no"), Some("2026-11-08 09:00Z")).doc_hold_warning().unwrap();
+        assert!(w.contains("`> Fleet: no`") && w.contains("`> Not before:"), "{w}");
+        assert_eq!(w.lines().count(), 1, "{w}");
+    }
 
     /// The closed lists' wire names are serde's names (no drift between the
     /// `as_str` the messages print and the JSON a client decodes), and a
@@ -1814,6 +2035,7 @@ mod tests {
         let reply: FleetStatusReply = serde_json::from_str(json).unwrap();
         assert!(!reply.paused, "missing paused decodes as not-paused");
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
+        assert!(reply.queue.is_empty(), "missing queue decodes as unknown, not legacy");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
         assert!(reply.held.is_empty(), "missing held decodes as empty");
@@ -1840,6 +2062,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: true,
+            queue: "legacy".into(),
             roster: vec![
                 FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },

@@ -282,6 +282,7 @@ mod tests {
             build_caps: Default::default(),
             paused: false,
             fleet_enabled: false,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: vec![AgentSummary::new("loop-1", "running", true)],
             live_scopes: Vec::new(),

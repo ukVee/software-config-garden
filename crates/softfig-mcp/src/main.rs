@@ -435,7 +435,7 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "[a-z0-9-]+; the project name entries reference (refused bad_name; exists when already present)" },
                     "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
-                    "main": { "type": "string", "description": "the branch merges land on; defaults to main" },
+                    "main": { "type": "string", "description": "the branch merges land on, a valid git branch name; defaults to main" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -502,7 +502,9 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
                             names it, running for an active entry; if a stacked branch was cut from \
-                            it, one restack is enqueued per child project. A HUMAN verb: a fleet \
+                            it, one restack is enqueued per child repo, or merged into that \
+                            repo's live one, and the drop is refused started while a session holds \
+                            that restack. A HUMAN verb: a fleet \
                             member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
                             from keeperd.",
             "inputSchema": {
@@ -1141,11 +1143,9 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
         )
     };
     match name {
-        "queue_add_project" | "queue_update_entry" | "queue_drop" => Some(refused(
-            name,
-            "a fleet member may add found work with queue_add_entry, and move slices in its own \
-             entry; shaping the queue is the human's",
-        )),
+        _ if softfig_ipc::member::HUMAN_QUEUE_VERBS.contains(&name) => {
+            Some(refused(name, softfig_ipc::member::HUMAN_QUEUE_VERB_WHY))
+        }
         "queue_add_entry" => {
             let a: QueueAddEntryArgs = serde_json::from_value(args.clone()).ok()?;
             let urgent = "urgent work goes to the human instead: post_message to @human";
@@ -1587,11 +1587,24 @@ fn summarize(name: &str, data: &Value) -> String {
             head.push_str(&format!(" -> {path}"));
         }
         head.push_str(&format!("; commit {}", if hash.is_empty() { "?" } else { hash }));
+        // What the edit kept but does not do (F2), after the list as the CLI
+        // prints it.
+        let notes: String = data
+            .get("notes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str())
+            .map(|n| format!("\nnote: {n}"))
+            .collect();
         let view = g("view");
         if view.is_empty() {
-            return head;
+            return format!("{head}{notes}");
         }
-        return format!("{head}\n{view}");
+        if notes.is_empty() {
+            return format!("{head}\n{view}");
+        }
+        return format!("{head}\n{}{notes}", view.trim_end_matches('\n'));
     }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
@@ -2254,6 +2267,13 @@ mod tests {
         );
         assert!(s.contains("queue_update_entry m9; commit abc"), "{s}");
         assert!(s.contains("## urgent") && s.contains("- m9"), "{s}");
+        assert!(!s.contains("note:"), "{s}");
+        // F2: the reply's notes follow the list, one line each.
+        let s = summarize(
+            "queue_update_entry",
+            &json!({ "id": "m9", "view": "- m9\n", "hash": "abc", "notes": ["m9 is paused"] }),
+        );
+        assert!(s.ends_with("- m9\nnote: m9 is paused"), "{s}");
         // queue_add_project has no id — the project name stands in.
         let s = summarize(
             "queue_add_project",

@@ -1686,6 +1686,14 @@ fn fetch_queue_view(socket: &Path) -> Result<Option<QueueShowReply>> {
     }
 }
 
+/// The §11 switch's status line. `protocol` above is the wire version and stays
+/// `v1` under either queue, so this is the line that shows a flip took. A
+/// growlightd older than the field sends nothing, which says nothing about which
+/// queue it runs, so no line is printed.
+fn queue_switch_line(r: &FleetStatusReply) -> Option<String> {
+    (!r.queue.is_empty()).then(|| format!("queue         {}", r.queue))
+}
+
 /// Render a [`FleetStatusReply`] for the terminal.
 fn print_fleet_status(r: &FleetStatusReply) {
     println!("state         {}", r.state);
@@ -1694,6 +1702,9 @@ fn print_fleet_status(r: &FleetStatusReply) {
     // The config-level arm/disarm gate (`config/growlight.toml fleet_enabled`),
     // distinct from `paused` (the runtime admission gate over an armed fleet).
     println!("fleet         {}", if r.fleet_enabled { "enabled" } else { "disabled" });
+    if let Some(line) = queue_switch_line(r) {
+        println!("{line}");
+    }
     println!("paused        {}", r.paused);
     println!(
         "policy        max_agents={} ctx_roll={}% ctx_handoff={}% 5h_halt={}% 7d_halt={}%",
@@ -2201,7 +2212,8 @@ pub struct QueueArgs {
     #[arg(long)]
     pub socket: Option<PathBuf>,
     /// growlightd socket, for `show`'s live git-stack + session annotations
-    /// (growlightd runs the read-only git). Defaults to
+    /// (growlightd runs the read-only git) and for `pick`. Goes before the
+    /// subcommand, like `--socket`. Defaults to
     /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
     #[arg(long, value_name = "SOCKET")]
     pub growlightd_socket: Option<PathBuf>,
@@ -2221,16 +2233,12 @@ pub enum QueueSub {
 
     /// Read-only: what `pick_v2` assigns a member now, and why every skipped
     /// entry was skipped (§6.9). This form is **growlightd's** verb (the pick
-    /// lives there, not in keeperd), so it takes its own socket flag.
+    /// lives there, not in keeperd), so it answers on `--growlightd-socket`.
     Pick {
         /// A roster member id. Omitted: an unpinned member on the default
         /// backend.
         #[arg(long)]
         member: Option<String>,
-        /// growlightd's socket. Defaults to
-        /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
-        #[arg(long, value_name = "SOCKET")]
-        growlightd_socket: Option<PathBuf>,
     },
 
     /// Append a `[[project]]` row — `queue project add`.
@@ -2582,12 +2590,10 @@ pub struct SliceStatusArgs {
 
 fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let growlightd_socket = growlight_socket(args.growlightd_socket);
     match args.cmd.unwrap_or(QueueSub::Show) {
-        QueueSub::Show => queue_show(&socket, &growlight_socket(args.growlightd_socket)),
-        QueueSub::Pick {
-            member,
-            growlightd_socket,
-        } => queue_pick(&growlight_socket(growlightd_socket), member.as_deref()),
+        QueueSub::Show => queue_show(&socket, &growlightd_socket),
+        QueueSub::Pick { member } => queue_pick(&growlightd_socket, member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
         },
@@ -2638,6 +2644,14 @@ fn print_verb_reply(dry_run: bool, view: &str, hash: &str) {
     print!("{view}");
     if !dry_run {
         println!("commit {}", short_hash(hash));
+    }
+}
+
+/// The edit's notes — what it kept but does not do (a start time on an
+/// entry it cannot hold, F2) — one `note:` line each, after the list.
+fn print_notes(notes: &[String]) {
+    for note in notes {
+        println!("note: {note}");
     }
 }
 
@@ -2695,6 +2709,7 @@ fn queue_show(socket: &Path, growlightd_socket: &Path) -> Result<()> {
             if let Some(view) = fetch_queue_view(growlightd_socket)?
                 && view.list
             {
+                print!("{}", render_doc_hold_warnings(&view));
                 print!("{}", render_annotations(&view));
             }
             Ok(())
@@ -3099,13 +3114,11 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         // The §2 Holds beside the status: a human-only entry (`fleet = false`)
         // is left for the human whatever the status reads, and a start time
         // (`not_before`) is shown as written, whether or not it is still ahead.
-        let mut status = e.status.to_string();
-        if !e.fleet {
-            status.push_str(" (human-only)");
-        }
-        if let Some(at) = &e.not_before {
-            status.push_str(&format!(" (not before {at})"));
-        }
+        let status = format!(
+            "{}{}",
+            e.status,
+            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref())
+        );
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -3152,17 +3165,21 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
         } else {
             e.after.join(", ")
         };
-        let branch = if e.open {
+        let branch = if e.open_unknown {
+            format!("{} (stack unknown)", e.branch)
+        } else if e.open {
             format!("{} (open)", e.branch)
         } else {
             e.branch.clone()
         };
         // A recorded human status change on an `active` entry applies at the
-        // session's next handshake; show it rather than a plain `active`.
-        let status = match &e.pending_status {
+        // session's next handshake; show it rather than a plain `active`. The
+        // §2 holds follow, as `queue show` prints them.
+        let mut status = match &e.pending_status {
             Some(p) => format!("{} (→ {p} pending)", e.status),
             None => e.status.clone(),
         };
+        status.push_str(&e.hold_annotation());
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} |",
             cell(&e.id),
@@ -3173,6 +3190,19 @@ fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry
         ));
     }
     out.push('\n');
+}
+
+/// `queue show`'s doc-line warnings: one line per entry whose doc carries a
+/// `> Fleet:` or `> Not before:` line that disagrees with the entry
+/// ([`QueueShowEntry::doc_hold_warning`]). Under v2 those lines hold nothing,
+/// so a human who wrote one by habit learns it here. Empty when none disagree.
+/// The doc lines come from growlightd, so a stopped growlightd shows none.
+fn render_doc_hold_warnings(view: &QueueShowReply) -> String {
+    let lines: Vec<String> = view.entries.iter().filter_map(QueueShowEntry::doc_hold_warning).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\n{}\n", lines.join("\n"))
 }
 
 /// The §6.9 live annotations layered onto both surfaces (queue-v2-git slice
@@ -3187,7 +3217,9 @@ fn render_annotations(view: &QueueShowReply) -> String {
     for p in &view.projects {
         let kind = if p.local { "local" } else { "remote" };
         out.push_str(&format!("- {} ({}, main = {}) {}\n", p.name, kind, p.main, p.repo));
-        if p.stack.is_empty() {
+        if let Some(reason) = &p.stack_unknown {
+            out.push_str(&format!("  (stack unknown — {reason})\n"));
+        } else if p.stack.is_empty() {
             out.push_str("  (empty — the next branch cuts from main)\n");
         } else {
             for b in &p.stack {
@@ -3208,7 +3240,8 @@ fn render_annotations(view: &QueueShowReply) -> String {
             Some(u) => format!("/{u}"),
             None => String::new(),
         };
-        out.push_str(&format!("{}{} ({})\n", s.entry, unit, s.path));
+        let tree = s.tree.as_deref().unwrap_or(&s.entry);
+        out.push_str(&format!("{tree}{unit} ({})\n", s.path));
         for line in &s.lines {
             out.push_str(&format!("  {line}\n"));
         }
@@ -3289,6 +3322,7 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3309,6 +3343,7 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3326,6 +3361,7 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3348,6 +3384,7 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3365,6 +3402,7 @@ fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3382,6 +3420,7 @@ fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -3921,6 +3960,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: enabled,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: Vec::new(),
             live_scopes: live,
@@ -3940,6 +3980,36 @@ mod tests {
         // Armed but nothing running vs disarmed read differently.
         assert!(render_resources_show(&base(true, vec![])).contains("scopes        (none running)"));
         assert!(render_resources_show(&base(false, vec![])).contains("(none — fleet disarmed)"));
+    }
+
+    /// V23: the status line names the switch's value, and an older growlightd
+    /// that sends none gets no line rather than a guess.
+    #[test]
+    fn status_names_the_queue_switch_and_guesses_nothing() {
+        let reply = |queue: Option<&str>| {
+            let mut json = serde_json::json!({
+                "state": "running",
+                "garden_root": "/g",
+                "protocol_version": 1,
+                "policy": {
+                    "max_concurrent_agents": 2,
+                    "ctx_roll_pct": 50,
+                    "ctx_handoff_pct": 60,
+                    "session_5h_halt_pct": 85,
+                    "session_7d_halt_pct": 90
+                }
+            });
+            if let Some(queue) = queue {
+                json["queue"] = serde_json::json!(queue);
+            }
+            serde_json::from_value::<FleetStatusReply>(json).unwrap()
+        };
+        assert_eq!(queue_switch_line(&reply(Some("v2"))).as_deref(), Some("queue         v2"));
+        assert_eq!(
+            queue_switch_line(&reply(Some("legacy"))).as_deref(),
+            Some("queue         legacy")
+        );
+        assert_eq!(queue_switch_line(&reply(None)), None);
     }
 
     #[test]
@@ -5256,6 +5326,11 @@ mod tests {
                 claimed: "2026-10-11T15:04:00Z".into(),
                 pending_status: Some("blocked".into()),
                 open: true,
+                open_unknown: false,
+                fleet: true,
+                not_before: None,
+                doc_fleet: None,
+                doc_not_before: None,
             },
             QueueShowEntry {
                 id: "n1".into(),
@@ -5269,6 +5344,29 @@ mod tests {
                 claimed: String::new(),
                 pending_status: None,
                 open: false,
+                open_unknown: false,
+                fleet: false,
+                not_before: Some("2026-11-08 09:00Z".into()),
+                doc_fleet: None,
+                doc_not_before: None,
+            },
+            QueueShowEntry {
+                id: "w1".into(),
+                kind: "milestone".into(),
+                project: "wedged".into(),
+                lane: "normal".into(),
+                status: "active".into(),
+                after: vec![],
+                branch: "feat/w1".into(),
+                base: String::new(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                pending_status: None,
+                open: false,
+                open_unknown: true,
+                fleet: true,
+                not_before: None,
+                doc_fleet: Some("no".into()),
+                doc_not_before: None,
             },
         ];
         let view = QueueShowReply {
@@ -5288,7 +5386,113 @@ mod tests {
             body.contains("| u1 | active (→ blocked pending) | softfig | done-x | feat/u1 (open) |"),
             "{body}"
         );
-        assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
+        // The §2 holds, worded as `queue show` words them.
+        assert!(
+            body.contains("| n1 | queued (human-only) (not before 2026-11-08 09:00Z) | softfig | — | — |"),
+            "{body}"
+        );
+        // A branch whose repo couldn't be read is not shown as merged.
+        assert!(body.contains("| w1 | active | wedged | — | feat/w1 (stack unknown) |"), "{body}");
+
+        // `queue show` warns once for the entry whose doc line disagrees (w1's
+        // `> Fleet: no` on a claimable entry), and not for n1, whose doc has no
+        // lines. The lanes themselves don't carry the warning.
+        assert!(!body.contains("warning"), "{body}");
+        let warnings = render_doc_hold_warnings(&view);
+        let lines: Vec<&str> = warnings.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{warnings}");
+        assert!(lines[0].starts_with("warning: w1: its doc says `> Fleet: no`"), "{warnings}");
+        let quiet = QueueShowReply { entries: view.entries[..2].to_vec(), ..view };
+        assert_eq!(render_doc_hold_warnings(&quiet), "", "no disagreement, no output");
+    }
+
+    /// One flag, one place: `pick` reads the `queue`-level socket, and the old
+    /// per-`pick` spelling is refused rather than beating it silently (V21).
+    #[test]
+    fn queue_pick_answers_on_the_queue_level_growlightd_socket() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.sock");
+        let gone_str = gone.to_str().unwrap();
+        let cli = TestCli::try_parse_from(["g", "queue", "--growlightd-socket", gone_str, "pick"])
+            .unwrap();
+        let GrowlightCmd::Queue(args) = cli.cmd else { panic!("expected Queue") };
+        let err = client_queue(args).unwrap_err().to_string();
+        assert!(err.contains(gone_str), "{err}");
+
+        assert!(
+            TestCli::try_parse_from(["g", "queue", "pick", "--growlightd-socket", gone_str]).is_err(),
+            "a second spelling of the flag must not parse"
+        );
+    }
+
+    /// A growlightd stand-in on a real socket that answers one call with
+    /// `reply` and hands back the op it was asked for.
+    fn one_shot_growlightd(
+        dir: &Path,
+        reply: softfig_ipc::Response,
+    ) -> (PathBuf, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = dir.join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let req: softfig_ipc::Request = serde_json::from_str(&line).unwrap();
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+            req.op
+        });
+        (sock, served)
+    }
+
+    #[test]
+    fn a_queue_view_from_growlightd_is_decoded_and_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::ok(serde_json::json!({
+            "list": true,
+            "projects": [{
+                "name": "softfig", "repo": "~/p", "main": "main", "local": true, "stack": [],
+            }],
+        }));
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let view = fetch_queue_view(&sock).unwrap().expect("a reply is a view");
+        assert_eq!(served.join().unwrap(), growlightd::op::QUEUE_SHOW);
+        assert!(view.list);
+        assert_eq!(view.projects[0].name, "softfig");
+    }
+
+    #[test]
+    fn a_growlightd_too_old_for_queue_show_costs_only_the_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::BadArgs, "unknown op");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        assert_eq!(fetch_queue_view(&sock).unwrap(), None);
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn any_other_growlightd_error_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::Internal, "boom");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let err = fetch_queue_view(&sock).unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn no_growlightd_at_all_is_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch_queue_view(&dir.path().join("absent.sock")).unwrap(), None);
     }
 
     #[test]
@@ -5296,23 +5500,35 @@ mod tests {
         use softfig_ipc::growlightd::{QueueProjectStack, QueueShowSession, QueueStackBranch};
         let view = QueueShowReply {
             list: true,
-            projects: vec![QueueProjectStack {
-                name: "softfig".into(),
-                repo: "~/p".into(),
-                main: "main".into(),
-                local: true,
-                stack: vec![QueueStackBranch {
-                    entry: "one".into(),
-                    branch: "feat/one".into(),
-                    parent: String::new(),
-                    base: "abc123".into(),
-                    claimed: "2026-10-11T15:04:00Z".into(),
-                }],
-            }],
+            projects: vec![
+                QueueProjectStack {
+                    name: "softfig".into(),
+                    repo: "~/p".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: vec![QueueStackBranch {
+                        entry: "one".into(),
+                        branch: "feat/one".into(),
+                        parent: String::new(),
+                        base: "abc123".into(),
+                        claimed: "2026-10-11T15:04:00Z".into(),
+                    }],
+                    stack_unknown: None,
+                },
+                QueueProjectStack {
+                    name: "wedged".into(),
+                    repo: "~/w".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: Vec::new(),
+                    stack_unknown: Some("git probe in ~/w: timed out after 10s".into()),
+                },
+            ],
             entries: Vec::new(),
             archived: Vec::new(),
             sessions: vec![QueueShowSession {
                 entry: "one".into(),
+                tree: None,
                 unit: None,
                 path: "growlight/backlog/milestones/one/CLAUDE.md".into(),
                 lines: vec!["- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04".into()],
@@ -5327,6 +5543,11 @@ mod tests {
         );
         assert!(
             body.contains("- feat/one  parent=main  base=abc123  claimed=2026-10-11T15:04:00Z"),
+            "{body}"
+        );
+        // An unread stack says so, with the reason, and never reads as empty.
+        assert!(
+            body.contains("- wedged (local, main = main) ~/w\n  (stack unknown — git probe in ~/w: timed out after 10s)\n"),
             "{body}"
         );
         assert!(body.contains("### Sessions"), "{body}");
