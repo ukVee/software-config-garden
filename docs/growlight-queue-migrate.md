@@ -31,6 +31,13 @@ daemon. It prints:
 - every refusal;
 - `N calls need you` last.
 
+A doc whose metadata the mount hides is a refusal: a whole-file-sealed doc
+(`[sealed:<path>]`), one with a sealed `<vault id="…">` region, or one whose
+vault tags don't parse. That holds for the backlog doc, and for a live item's
+own doc and its slice docs. A `> Fleet: no` or `> Not before:` could be hiding
+there, so the row isn't migrated without it. Reveal or unseal the doc first.
+An archived (`done`) row's docs raise nothing.
+
 ## 2. Settle the calls: the answers file
 
 ```toml

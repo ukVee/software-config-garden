@@ -75,6 +75,24 @@ pub struct LegacyBacklog {
     /// legacy reader ignores them, so their rows are invisible to the loop
     /// today; the mapping must not drop them silently either.
     pub orphan_tables: Vec<String>,
+    /// The backlog doc itself, when the read view hides part of it.
+    pub unreadable: Option<Unreadable>,
+}
+
+/// A doc whose metadata the redacted read view hides
+/// ([`item_meta::unreadable_metadata`]): "no line" there is not "no
+/// declaration", so the mapping refuses rather than read a hold as absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// Garden-relative path of the doc.
+    pub path: String,
+    pub reason: &'static str,
+}
+
+impl Unreadable {
+    fn of(path: &str, content: &str) -> Option<Self> {
+        item_meta::unreadable_metadata(content).map(|reason| Unreadable { path: path.to_string(), reason })
+    }
 }
 
 /// One legacy queue: its registry repo cell (none for `default`) and its rows.
@@ -114,6 +132,9 @@ pub struct LegacyItem {
     /// Sub-milestone dirs under `milestones/<id>/subs/`, in path order. Legacy
     /// never writes one, so any is a refusal.
     pub subs: Vec<String>,
+    /// Every item doc and every file under `milestones/<id>/slices/` the read
+    /// view hides part of, in path order.
+    pub unreadable: Vec<Unreadable>,
 }
 
 /// The item-doc metadata lines the mapping reads.
@@ -171,6 +192,7 @@ pub fn read_legacy(files: &LegacyFiles) -> Result<LegacyBacklog, ReadError> {
         queues,
         batons: read_batons(&files.batons),
         orphan_tables: orphan_tables(doc, &registry),
+        unreadable: Unreadable::of(BACKLOG_DOC, doc),
     })
 }
 
@@ -191,11 +213,20 @@ fn read_items(files: &LegacyFiles, body: &str) -> Vec<LegacyItem> {
                 model: field(item_meta::MODEL),
             };
             let dir = format!("{MILESTONES_DIR}/{}/", row.id);
+            let slice_dir = format!("{dir}slices/");
+            let slice_files = files.garden.iter().filter(|(path, _)| path.starts_with(&slice_dir));
+            let unreadable = docs
+                .iter()
+                .filter_map(|path| files.garden.get_key_value(path))
+                .chain(slice_files)
+                .filter_map(|(path, content)| Unreadable::of(path, content))
+                .collect();
             LegacyItem {
                 tags: title_tags(&row.title),
                 branch_policy: doc.and_then(|d| section(d, "Branch policy")),
                 slices: slice_numbers(&files.garden, &dir),
                 subs: sub_dirs(&files.garden, &dir),
+                unreadable,
                 docs,
                 meta,
                 id: row.id,
@@ -525,6 +556,9 @@ pub fn plan(legacy: &LegacyBacklog, answers: &Answers, now: &str) -> MigrationPl
     if answers.schema != ANSWERS_SCHEMA_VERSION {
         p.refuse("answers", format!("schema {} (this build reads {ANSWERS_SCHEMA_VERSION})", answers.schema));
     }
+    if let Some(Unreadable { reason, .. }) = &legacy.unreadable {
+        p.refuse(BACKLOG_DOC, format!("{reason}; reveal or unseal it before migrating"));
+    }
     for name in &legacy.orphan_tables {
         p.refuse(
             &format!("queue:{name}"),
@@ -834,6 +868,14 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
         LegacyStatus::Done => return Planned::Done(entry),
         LegacyStatus::Live(status) => status,
     };
+    // A hidden `> Fleet: no` would migrate as claimable; growlightd holds the
+    // same doc `Unreadable` (review 042 G74-4), so the converter refuses too.
+    if !item.unreadable.is_empty() {
+        for Unreadable { path, reason } in &item.unreadable {
+            p.refuse(id, format!("{path}: {reason}; reveal or unseal it before migrating"));
+        }
+        return Planned::Skipped;
+    }
     entry.status = status;
 
     if item.docs.len() != 1 {
@@ -1259,6 +1301,7 @@ mod tests {
             branch_policy: None,
             slices: Vec::new(),
             subs: Vec::new(),
+            unreadable: Vec::new(),
         }
     }
 

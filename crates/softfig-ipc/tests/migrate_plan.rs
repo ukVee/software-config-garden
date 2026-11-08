@@ -296,6 +296,58 @@ fn r_an_unregistered_queue_table_refuses() {
     assert!(plan.queue.entries.is_empty() && !plan.applicable());
 }
 
+/// Report 128: the read view hides a doc's metadata, so its `> Fleet: no`
+/// could be anywhere. The row refuses and never lands as `fleet = true`.
+fn assert_refused_unread(plan: &MigrationPlan, id: &str, path: &str) {
+    let refusals: Vec<_> = plan.refusals.iter().filter(|r| r.subject == id).collect();
+    assert_eq!(refusals.len(), 1, "{:?}", plan.refusals);
+    assert!(refusals[0].reason.starts_with(&format!("{path}: ")), "{}", refusals[0].reason);
+    assert!(plan.queue.entries.iter().all(|e| e.id != id), "a refused row migrates nothing");
+    assert!(!plan.applicable());
+}
+
+#[test]
+fn r_a_whole_file_sealed_item_doc_refuses() {
+    let doc = table("queue", &[("x", "milestone", "X", "queued")]);
+    let m = milestone_doc("x");
+    let plan = inline_plan(&[(BACKLOG, &doc), (&m, &format!("[sealed:{m}]\n"))], &[]);
+    assert_refused_unread(&plan, "x", &m);
+}
+
+#[test]
+fn r_a_hold_inside_a_sealed_region_refuses() {
+    let doc = table("queue", &[("001", "task", "T", "queued")]);
+    let t = task_doc("001");
+    let plan = inline_plan(&[(BACKLOG, &doc), (&t, "# t\n\n<vault id=\"h\">[encrypted]</vault>\n")], &[]);
+    assert_refused_unread(&plan, "001", &t);
+}
+
+#[test]
+fn r_a_sealed_slice_doc_refuses_its_milestone() {
+    let doc = table("queue", &[("x", "milestone", "X", "active")]);
+    let s = "growlight/backlog/milestones/x/slices/001-a.md";
+    let plan = inline_plan(&[(BACKLOG, &doc), (&milestone_doc("x"), "# x\n"), (s, &format!("[sealed:{s}]\n"))], &[]);
+    assert_refused_unread(&plan, "x", s);
+}
+
+#[test]
+fn r_a_backlog_doc_with_a_sealed_region_refuses() {
+    let doc = table("queue", &[]) + "<vault id=\"q\">[encrypted]</vault>\n";
+    let plan = inline_plan(&[(BACKLOG, &doc)], &[]);
+    let subjects: Vec<_> = plan.refusals.iter().map(|r| r.subject.as_str()).collect();
+    assert_eq!(subjects, vec![BACKLOG]);
+    assert!(!plan.applicable());
+}
+
+#[test]
+fn r_an_archived_row_with_a_sealed_doc_raises_nothing() {
+    let doc = table("queue", &[("x", "milestone", "X", "done")]);
+    let m = milestone_doc("x");
+    let plan = inline_plan(&[(BACKLOG, &doc), (&m, &format!("[sealed:{m}]\n"))], &[]);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.archive.entries.len(), 1);
+}
+
 // ── one test per `CallClass` ───────────────────────────────────────────────
 
 #[test]
