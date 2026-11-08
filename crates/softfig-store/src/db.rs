@@ -5,6 +5,7 @@
 //! genesis schema and bumps `PRAGMA user_version` to `1`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -111,9 +112,19 @@ pub struct RefRow {
     pub commit_hash: Hash,
 }
 
+/// How many single-row reads a [`Db`] has served: `get_commit` and `get_tree`
+/// calls, the two lookups a history or closure walk repeats per object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadCounts {
+    pub commits: usize,
+    pub trees: usize,
+}
+
 #[derive(Debug)]
 pub struct Db {
     conn: Connection,
+    commit_reads: AtomicUsize,
+    tree_reads: AtomicUsize,
 }
 
 impl Db {
@@ -130,7 +141,7 @@ impl Db {
             return Err(StoreError::UnsupportedSchema(v));
         }
         configure(&conn)?;
-        Ok(Self { conn })
+        Ok(Self::with_conn(conn))
     }
 
     /// Create a fresh DB at `<paths>/db.sqlite`. Errors if the file
@@ -147,11 +158,28 @@ impl Db {
         configure(&conn)?;
         conn.execute_batch(SCHEMA_V1)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        let mut db = Self { conn };
+        let mut db = Self::with_conn(conn);
         db.meta_put("format_version", &SCHEMA_VERSION.to_string())?;
         db.meta_put("repo_id", repo_id)?;
         db.meta_put("created_at_unix", &created_at_unix.to_string())?;
         Ok(db)
+    }
+
+    fn with_conn(conn: Connection) -> Self {
+        Self {
+            conn,
+            commit_reads: AtomicUsize::new(0),
+            tree_reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// Commit and tree reads served by this handle so far. The counting seam
+    /// for tests that pin a walk's cost: take it before and after and compare.
+    pub fn read_counts(&self) -> ReadCounts {
+        ReadCounts {
+            commits: self.commit_reads.load(Ordering::Relaxed),
+            trees: self.tree_reads.load(Ordering::Relaxed),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -239,6 +267,7 @@ impl Db {
     }
 
     pub fn get_commit(&self, hash: &Hash) -> Result<CommitRow> {
+        self.commit_reads.fetch_add(1, Ordering::Relaxed);
         self.conn
             .query_row(
                 "SELECT hash, parent, root_tree, author_device, author_pubkey,
@@ -280,6 +309,7 @@ impl Db {
     }
 
     pub fn get_tree(&self, hash: &Hash) -> Result<Vec<TreeEntryRow>> {
+        self.tree_reads.fetch_add(1, Ordering::Relaxed);
         if !self.tree_exists(hash)? {
             return Err(StoreError::TreeNotFound(*hash));
         }

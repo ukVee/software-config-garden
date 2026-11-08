@@ -88,7 +88,7 @@ use crate::ceremony::{
 use crate::config::KeeperConfig;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::keeper_toml::CONFIG_DIR;
-use crate::replica::{self, MirrorStore, RepoSource};
+use crate::replica::{self, ClosureCache, MirrorStore, RepoSource};
 use crate::replica_health::{PushHealth, PushOutcome};
 use crate::state::State;
 
@@ -2852,6 +2852,9 @@ fn spawn_replica_loop(
             // Short settle so unlock finishes wiring before the first push; an
             // early commit during the settle brings the reconcile forward.
             signal.wait_for_commit(REPLICA_INITIAL_DELAY);
+            // The device chain's reachable closure, kept across ticks so an
+            // up-to-date host costs no history walk (report 092).
+            let closures = Arc::new(ClosureCache::default());
             while !stop.load(Ordering::SeqCst) {
                 // M5d: pending shared-key ceremonies first, so a ceremony's
                 // `shared_ceremony` commit rides this same tick's replica push.
@@ -2873,7 +2876,7 @@ fn spawn_replica_loop(
                 // rotation that just half-landed heals this same tick, and before
                 // the replica push so a heal's commit rides it.
                 crate::ceremony::reconcile_reencrypt_completeness(&daemon);
-                reconcile_replicas(&daemon, &local);
+                reconcile_replicas(&daemon, &local, &closures);
                 // M5e slice 002 part 2b-3 (A): push each shared chain's current
                 // tip to its S-members. Rides the SAME commit-driven wake as the
                 // device-chain replica push (a shared-subtree commit fires
@@ -2911,7 +2914,7 @@ fn spawn_replica_loop(
 /// failing. The health record is edge-triggered (one line entering the state,
 /// one leaving), so a month-long outage costs two journal lines rather than one
 /// every [`REPLICA_RECONCILE_INTERVAL`].
-fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
+fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice, closures: &Arc<ClosureCache>) {
     let snapshot = {
         let inner = daemon.inner.lock().unwrap();
         if inner.state != State::Unlocked {
@@ -2934,7 +2937,7 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
                 }
             return;
         }
-        let announce = match replica::build_announce(repo, session) {
+        let announce = match replica::build_announce_with(repo, session, closures) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("keeperd: net: replica announce build failed: {e}");
@@ -3015,6 +3018,7 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
             &garden_root,
             state_root.as_deref(),
             relay_client.as_ref(),
+            closures,
         ) {
             Ok(summary) if summary.commits_served > 0 => {
                 eprintln!(
@@ -3945,6 +3949,7 @@ fn relay_client_config(config: &KeeperConfig) -> Option<(String, [u8; 32])> {
 /// grant, then serve the chain while the host pulls + verifies + fast-forwards.
 /// A dial/handshake/grant failure falls through to the next route; once serving
 /// begins the result is returned (a mid-serve error is not retried elsewhere).
+#[allow(clippy::too_many_arguments)]
 fn push_to_host(
     local: &LocalDevice,
     host: &RingEntry,
@@ -3953,6 +3958,7 @@ fn push_to_host(
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
     relay_client: Option<&(String, [u8; 32])>,
+    closures: &Arc<ClosureCache>,
 ) -> Result<ServeSummary, String> {
     let routes = plan_routes(host, relay_client.is_some());
     if routes.is_empty() {
@@ -3967,7 +3973,7 @@ fn push_to_host(
                         last_err = format!("send grant (direct {endpoint}): {e}");
                         continue;
                     }
-                    return serve_chain(&mut session, announce, garden_root, state_root);
+                    return serve_chain(&mut session, announce, garden_root, state_root, closures);
                 }
                 Err(e) => {
                     last_err = e;
@@ -3984,7 +3990,7 @@ fn push_to_host(
                             last_err = format!("send grant (relay {relay_endpoint}): {e}");
                             continue;
                         }
-                        return serve_chain(&mut session, announce, garden_root, state_root);
+                        return serve_chain(&mut session, announce, garden_root, state_root, closures);
                     }
                     Err(e) => {
                         last_err = e;
@@ -4053,9 +4059,11 @@ fn serve_chain<S: std::io::Read + std::io::Write>(
     announce: &TipAnnounce,
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
+    closures: &Arc<ClosureCache>,
 ) -> Result<ServeSummary, String> {
     let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
-    let source = RepoSource::new(repo, announce.clone()).map_err(|e| format!("scope source: {e}"))?;
+    let source = RepoSource::with_cache(repo, announce.clone(), Arc::clone(closures))
+        .map_err(|e| format!("scope source: {e}"))?;
     serve_replication(session, &source).map_err(|e| e.to_string())
 }
 
@@ -4944,6 +4952,7 @@ mod tests {
             &garden,
             None,
             Some(&relay_client),
+            &Arc::new(ClosureCache::default()),
         )
         .expect("relayed push should succeed over the relay route");
         assert!(
