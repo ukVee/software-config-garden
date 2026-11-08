@@ -915,6 +915,9 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
         fleet: item.meta.fleet.as_deref().is_none_or(|v| v.eq_ignore_ascii_case("yes")),
         not_before: None,
     };
+    // Before a `done` row archives, so `queue-archive.toml` keeps the branch
+    // the work landed on: an archived parent resolves through it (F6).
+    entry.branch = plan_branch(p, item, &default_branch);
     let status = match status {
         LegacyStatus::Done => return Planned::Done(entry),
         LegacyStatus::Live(status) => status,
@@ -936,7 +939,6 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
         };
         p.call(CallClass::ItemDoc, id, evidence, item.docs.first().cloned().unwrap_or_default());
     }
-    entry.branch = plan_branch(p, item, &default_branch);
     let started = status != EntryStatus::Queued || ctx.started_by_baton;
     if started {
         plan_stack_base(p, ctx, &mut entry, item.branch_policy.as_deref());
@@ -1623,6 +1625,21 @@ mod tests {
         let call = plan.calls.iter().find(|c| c.key.class == CallClass::Branch).unwrap();
         assert_eq!(call.evidence, "`## Branch policy` names fix/009-long-name, feat/x");
         assert_eq!(plan.queue.entries[0].branch, "fix/009");
+    }
+
+    /// A `done` row archives with the branch its policy names (F6), not the
+    /// `feat/<id>` default an archived parent would then resolve wrongly.
+    #[test]
+    fn a_done_row_archives_with_its_planned_branch() {
+        let mut d = item("d", "milestone", "done");
+        d.branch_policy = Some("Commit on `feat/d-real`, never `main`.".into());
+        let mut answers = base_answers();
+        let open = plan(&backlog(vec![d.clone()], vec![]), &answers, NOW);
+        assert!(classes(&open).contains(&"branch:d".to_string()), "{:?}", classes(&open));
+        answers.call.insert("branch:d".into(), "feat/d-real".into());
+        let settled = plan(&backlog(vec![d], vec![]), &answers, NOW);
+        assert_eq!(settled.archive.entries[0].row.branch, "feat/d-real");
+        assert!(settled.applicable(), "{:?}", settled.refusals);
     }
 
     #[test]
