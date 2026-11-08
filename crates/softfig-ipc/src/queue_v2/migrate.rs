@@ -696,12 +696,18 @@ fn plan_projects(p: &mut Planner, queues: &[LegacyQueue]) -> Vec<Project> {
                     String::new(),
                 ),
                 Some(cell) if mechanical_repo(cell) => cell.to_string(),
-                Some(cell) => p.decide(
-                    CallClass::ProjectRepo,
-                    &name,
-                    format!("registry repo cell `{cell}` carries prose or is not provably local or remote"),
-                    cell.split_whitespace().next().unwrap_or_default().to_string(),
-                ),
+                Some(cell) => {
+                    let why = match is_tmp(cell) {
+                        true => "is under /tmp, which a reboot empties",
+                        false => "carries prose or is not provably local or remote",
+                    };
+                    p.decide(
+                        CallClass::ProjectRepo,
+                        &name,
+                        format!("registry repo cell `{cell}` {why}"),
+                        cell.split_whitespace().next().unwrap_or_default().to_string(),
+                    )
+                }
             };
             if !repo.is_empty() && RepoLocality::for_current_user(&repo) == RepoLocality::Ambiguous {
                 p.refuse(&name, format!("repo `{repo}` is neither provably local nor remote"));
@@ -723,11 +729,18 @@ fn project_name(queue: &str) -> &str {
     if queue == DEFAULT_QUEUE { DEFAULT_PROJECT } else { queue }
 }
 
-/// A registry cell that maps as-is: one token, local or remote.
+/// A registry cell that maps as-is: one token, local or remote, and not under
+/// `/tmp` (a smoke target there is gone after a reboot; the owner says whether
+/// it is still the project's repo).
 fn mechanical_repo(cell: &str) -> bool {
     !cell.is_empty()
         && !cell.contains(char::is_whitespace)
+        && !is_tmp(cell)
         && RepoLocality::for_current_user(cell) != RepoLocality::Ambiguous
+}
+
+fn is_tmp(cell: &str) -> bool {
+    cell == "/tmp" || cell.starts_with("/tmp/")
 }
 
 /// Projects whose repos are one path spelled two ways: `same_repo`, answered
@@ -1467,6 +1480,21 @@ mod tests {
         assert_eq!(plan.queue.projects[1].repo, "phone:/p/road", "prose proposal = the first token");
         assert!(keys.contains(&"same_repo:a+b".to_string()), "{keys:?}");
         assert_eq!(plan.queue.projects[3].repo, "~/code", "both spell it the first project's way");
+    }
+
+    /// A `/tmp` repo cell is a smoke target a reboot empties (F5): the owner
+    /// says whether it is still the project's repo.
+    #[test]
+    fn a_tmp_repo_cell_is_a_call() {
+        let b = backlog(vec![], vec![("smoke", "/tmp/sf-smoke-repo", vec![]), ("tmpdir", "/tmp", vec![])]);
+        let plan = plan(&b, &base_answers(), NOW);
+        for name in ["smoke", "tmpdir"] {
+            let call = plan.calls.iter().find(|c| c.key.to_string() == format!("project_repo:{name}")).unwrap();
+            assert!(call.evidence.contains("under /tmp"), "{}", call.evidence);
+            assert!(call.settled.is_none());
+        }
+        assert!(!plan.applicable());
+        assert!(mechanical_repo("/tmpfs/repo"), "only /tmp itself and below");
     }
 
     #[test]
