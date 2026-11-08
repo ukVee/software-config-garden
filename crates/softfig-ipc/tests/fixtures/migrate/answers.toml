@@ -9,7 +9,7 @@ baton = "skip"
 
 [call]
 "project_repo:softfig" = "~/projects/software-config_garden/codebase"
-"project_repo:roadeye" = "otg-travel:/home/sshukv/projects/roadeye"
+"project_repo:roadeye" = "build.example.invalid:/srv/roadeye"
 "stack_base:semi-auto-backend-seam" = "parent= base=5ed0ea3"
 "slice_progress:semi-auto-backend-seam" = "done"
 "stack_base:069" = "parent= base=25a4237"

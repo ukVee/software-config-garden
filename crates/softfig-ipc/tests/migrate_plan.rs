@@ -140,7 +140,7 @@ fn m_every_entry_is_on_the_normal_lane() {
 fn m_a_clean_registry_cell_is_the_project_repo() {
     let plan = fixture_plan();
     let hover = plan.queue.projects.iter().find(|p| p.name == "hoverview").unwrap();
-    assert_eq!(hover.repo, "/home/ukv/projects/hover-view");
+    assert_eq!(hover.repo, "/home/owner/projects/hover-view");
     assert!(calls_about(&plan, "hoverview").iter().all(|k| k.starts_with("project_main:")));
 }
 

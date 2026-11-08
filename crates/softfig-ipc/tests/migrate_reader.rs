@@ -27,13 +27,13 @@ fn queues_are_default_then_the_registry_in_order_with_their_repo_cells() {
         .collect();
     assert_eq!(shape, vec![
         ("default", None, vec!["semi-auto-backend-seam", "069", "folder-grants", "claude-login-pool-wiring"]),
-        ("docs", Some("/home/ukv/projects/softfig-docs"), vec![]),
+        ("docs", Some("/home/owner/projects/softfig-docs"), vec![]),
         (
             "roadeye",
-            Some("otg-travel:/home/sshukv/projects/roadeye (REMOTE — ssh otg-travel, port 42218)"),
+            Some("build.example.invalid:/srv/roadeye (REMOTE — ssh build.example.invalid, port 2222)"),
             vec!["roadeye-m2-daemon-core"],
         ),
-        ("hoverview", Some("/home/ukv/projects/hover-view"), vec!["hover-view-sticky", "hover-view-player"]),
+        ("hoverview", Some("/home/owner/projects/hover-view"), vec!["hover-view-sticky", "hover-view-player"]),
         ("fixes", Some("~/projects/software-config_garden/codebase"), vec![]),
     ]);
     assert!(backlog.orphan_tables.is_empty());

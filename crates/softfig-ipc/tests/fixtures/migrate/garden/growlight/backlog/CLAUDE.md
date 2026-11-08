@@ -23,9 +23,9 @@ Item docs live in `milestones/<id>/` and `tasks/NNN-<slug>.md`. Status + order a
 
 | queue | repo |
 |-------|------|
-| docs | /home/ukv/projects/softfig-docs |
-| roadeye | otg-travel:/home/sshukv/projects/roadeye (REMOTE — ssh otg-travel, port 42218) |
-| hoverview | /home/ukv/projects/hover-view |
+| docs | /home/owner/projects/softfig-docs |
+| roadeye | build.example.invalid:/srv/roadeye (REMOTE — ssh build.example.invalid, port 2222) |
+| hoverview | /home/owner/projects/hover-view |
 | fixes | ~/projects/software-config_garden/codebase |
 
 <!-- /softfig:queues -->

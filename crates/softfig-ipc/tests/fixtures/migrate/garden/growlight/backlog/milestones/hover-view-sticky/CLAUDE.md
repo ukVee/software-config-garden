@@ -57,7 +57,7 @@ Wayfire 0.11 (`0.11.0-d3990237`, wlroots 0.20.2). Output `eDP-1`, id 1, **logica
 | `~/projects/touch-drawer/touch-drawer/` | protocol v4: tap zones, service identity, overlap policy, lock-free hot path |
 | `~/dotfiles/` | `src/wayfire.ini` (load `wm-actions`, PiP window rules) + the session unit |
 
-Per the queue binding, `hoverview` → `/home/ukv/projects/hover-view`. Slices that build in a different repo say so in their own header; a slice never assumes the queue repo is the repo it edits.
+Per the queue binding, `hoverview` → `/home/owner/projects/hover-view`. Slices that build in a different repo say so in their own header; a slice never assumes the queue repo is the repo it edits.
 
 ## Finish criteria
 

@@ -65,11 +65,11 @@ start` now carries the seam.
 
 **CONFIRMED in-session 2026-08-12 (the human's relaunch, iteration 4) — all four
 checks pass inside the seam-launched opencode session itself:**
-1. ✅ Garden docs read with plain reads — Read tool on `/home/ukv/soft-fig_garden/…`
+1. ✅ Garden docs read with plain reads — Read tool on `/home/owner/soft-fig_garden/…`
    works directly (no `cat "$(ls -d …)"` contortion). The slice-006 garden-root
    fix is live.
 2. ✅ `~/.config/softfig/` reachable — `usage.json` + `questions.md` read via the
-   `external_directory` grant (`/home/ukv/.config/softfig/**`).
+   `external_directory` grant (`/home/owner/.config/softfig/**`).
 3. ✅ **The baton still rewrites at handoff** — proven by the iteration-4 handoff
    write to `~/.config/softfig/growlight/baton.md`; the runtime grant survives.
 4. ✅ Relaunch branch of the reseed — this session WAS a fresh relaunch (branch
@@ -88,7 +88,7 @@ Remaining — **two human-at-keyboard items, nothing blocking:**
   unit-asserted byte-identical + shim-verified, the garden cwd is the part worth
   a human's eyes).
 - Push `main` (8 ahead of `origin/main`, local-only).
-- Owed cleanup: `! rm /home/ukv/soft-fig_garden/inbox/opencode-smoke-DELETEME.md`
+- Owed cleanup: `! rm /home/owner/soft-fig_garden/inbox/opencode-smoke-DELETEME.md`
   (harness gates garden deletes).
 
 Status stays **`deferred`** rather than `done` for the same §7b reason as before

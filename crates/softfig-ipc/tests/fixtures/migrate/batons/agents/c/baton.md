@@ -6,5 +6,5 @@ status: IN_PROGRESS
 item: 069
 queue: default
 iteration: 0
-baton-path: /home/ukv/.config/softfig/growlight/agents/c/baton.md
+baton-path: /home/owner/.config/softfig/growlight/agents/c/baton.md
 ---

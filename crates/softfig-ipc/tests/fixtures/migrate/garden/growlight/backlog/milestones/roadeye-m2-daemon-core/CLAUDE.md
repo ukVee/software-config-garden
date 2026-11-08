@@ -21,7 +21,7 @@ UI is egui and not a TUI.
 
 Slice when it reaches the queue head, against the locked M1 spec.
 
-Repo: `/home/sshukv/projects/roadeye` on **`otg-travel`**. `cargo build -j2` — zram-only swap,
+Repo: `/srv/roadeye` on **`build.example.invalid`**. `cargo build -j2` — zram-only swap,
 `systemd-oomd` kills bigger link steps.
 
 ## Finish criteria
