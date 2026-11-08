@@ -2928,7 +2928,11 @@ impl DriveLoop {
                                 id: member.spec.agent.clone(),
                                 backend: member.backend.ipc_backend(),
                                 pin: member.pin.clone(),
-                                schedule: v2_schedule_gate(admission(&member.spec.agent)),
+                                schedule: v2_schedule_gate(
+                                    admission(&member.spec.agent),
+                                    &snapshot.entries,
+                                    now,
+                                ),
                             },
                         )
                     })
@@ -4947,14 +4951,33 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
 }
 
 /// The v2 eligibility clause for one member's schedule [`Admission`]
-/// (growlight-schedule §3.10). v2 entries carry no `> Not before:` field on this
-/// base — queue-v2-parity adds it — so a `TimedOnly` member has no due entry yet
-/// and takes nothing, the same as a held one.
-fn v2_schedule_gate(admission: Admission) -> ScheduleGate {
+/// (growlight-schedule §3.10). A `TimedOnly` member takes only the due timed
+/// entries: those whose `not_before` parses and has arrived by `now` (§3.5). A
+/// human-only entry (`fleet = false`) is never due — the exception opens a
+/// window for a timed item and lifts no other hold, as the legacy
+/// [`doc_timed_due`](crate::queue_source::doc_timed_due) reads it.
+fn v2_schedule_gate(
+    admission: Admission,
+    entries: &[scheduler_v2::EntryView],
+    now: i64,
+) -> ScheduleGate {
     match admission {
         Admission::Open => ScheduleGate::Open,
         Admission::Held(_) => ScheduleGate::Held,
-        Admission::TimedOnly => ScheduleGate::TimedOnly { due: BTreeSet::new() },
+        Admission::TimedOnly => ScheduleGate::TimedOnly {
+            due: entries
+                .iter()
+                .filter(|entry| {
+                    entry.fleet
+                        && entry
+                            .not_before
+                            .as_deref()
+                            .and_then(|at| softfig_ipc::fleet::parse_not_before(at).ok())
+                            .is_some_and(|at| at <= now)
+                })
+                .map(|entry| entry.id.clone())
+                .collect(),
+        },
     }
 }
 
@@ -14955,11 +14978,64 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
     #[test]
     fn the_v2_schedule_gate_mirrors_the_admission() {
-        assert_eq!(v2_schedule_gate(Admission::Open), ScheduleGate::Open);
-        assert_eq!(v2_schedule_gate(Admission::Held(HoldReason::Reserve)), ScheduleGate::Held);
+        let entry = |id: &str, not_before: Option<&str>, fleet: bool| EntryView {
+            not_before: not_before.map(str::to_string),
+            fleet,
+            ..v2_milestone(id, EntryStatus::Queued, "001", None).entries.remove(0)
+        };
+        let entries = [
+            entry("arrived", Some("2026-11-08 09:00 Z"), true),
+            entry("at-now", Some("2026-11-08 12:00 Z"), true),
+            entry("future", Some("2026-11-09 00:00 Z"), true),
+            entry("untimed", None, true),
+            entry("typo", Some("soon"), true),
+            entry("human", Some("2026-11-08 09:00 Z"), false),
+        ];
+        let now = softfig_ipc::fleet::parse_not_before("2026-11-08 12:00 Z").unwrap();
+        assert_eq!(v2_schedule_gate(Admission::Open, &entries, now), ScheduleGate::Open);
         assert_eq!(
-            v2_schedule_gate(Admission::TimedOnly),
-            ScheduleGate::TimedOnly { due: BTreeSet::new() },
+            v2_schedule_gate(Admission::Held(HoldReason::Reserve), &entries, now),
+            ScheduleGate::Held,
         );
+        assert_eq!(
+            v2_schedule_gate(Admission::TimedOnly, &entries, now),
+            ScheduleGate::TimedOnly { due: ["arrived".to_string(), "at-now".to_string()].into() },
+            "due: a start time that parses and has arrived, on an entry the fleet may take",
+        );
+    }
+
+    /// growlight-schedule step 0, the v2 timed gate: outside its window with
+    /// `tasks = true`, a member claims the v2 entry whose `not_before` has
+    /// arrived, and not the one whose start time is still ahead, though that
+    /// one comes first in the file.
+    #[test]
+    fn a_closed_v2_member_with_tasks_on_claims_only_the_arrived_timed_entry() {
+        // Midnight UTC is outside the daily 10:00-12:00 window.
+        let now = softfig_ipc::fleet::parse_not_before("2026-11-08 00:00 Z").unwrap();
+        let mut snapshot = v2_milestone("arrived", EntryStatus::Queued, "001", None);
+        snapshot.entries[0].not_before = Some("2026-11-07 09:00 Z".into());
+        let mut future = snapshot.entries[0].clone();
+        future.id = "future".into();
+        future.not_before = Some("2026-11-09 00:00 Z".into());
+        let tree = snapshot.trees["arrived"].clone();
+        snapshot.trees.insert("future".into(), tree);
+        snapshot.entries.insert(0, future);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let (loop_, d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot),
+            v2_entries_dir("timed-gate"),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let toml = format!("queue = \"v2\"\n[schedule]\n{WINDOW}tasks = true\n");
+        d.set_fleet_config(FleetConfig::from_growlight_toml(&toml).unwrap());
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+
+        let r = loop_.tick(now);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)], "closed");
+        assert_eq!(*claimer.claims.lock().unwrap(), vec![("arrived".to_string(), Some("001".to_string()))]);
+        assert_eq!(backend.spawns(), vec!["a1"]);
     }
 }
