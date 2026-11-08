@@ -428,7 +428,8 @@ pub enum CallClass {
     UnknownCell,
     /// An item id that appears in more than one queue table.
     DuplicateId,
-    /// A live item with no item doc, or more than one.
+    /// A live item with no item doc, or more than one. Acknowledgment only:
+    /// v2 finds the doc by its path, so the answer is never read.
     ItemDoc,
     /// A `[blocked on X]` tag whose X names no known item.
     BlockedOn,
@@ -932,12 +933,15 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
     }
     entry.status = status;
 
+    // v2 finds an entry's doc by its path, never by an answer, so this call
+    // only acknowledges what the entry will find there (F8): its answer is
+    // not read.
     if item.docs.len() != 1 {
         let evidence = match item.docs.as_slice() {
-            [] => "no item doc".to_string(),
-            docs => format!("{} docs: {}", docs.len(), docs.join(", ")),
+            [] => "no item doc; the entry migrates with none".to_string(),
+            docs => format!("{} docs: {}; v2 finds the doc by its number, not by this answer", docs.len(), docs.join(", ")),
         };
-        p.call(CallClass::ItemDoc, id, evidence, item.docs.first().cloned().unwrap_or_default());
+        p.call(CallClass::ItemDoc, id, evidence, "keep".to_string());
     }
     let started = status != EntryStatus::Queued || ctx.started_by_baton;
     if started {

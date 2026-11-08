@@ -402,6 +402,9 @@ fn call_item_doc() {
     let plan = inline_plan(&[(BACKLOG, &doc), (&task_doc("002"), ""), (two, "")], &[]);
     has_call(&plan, "item_doc:001");
     has_call(&plan, "item_doc:002");
+    // Acknowledgment only (F8): v2 finds the doc by its path, so the
+    // proposal names no doc to pick.
+    assert!(plan.calls.iter().filter(|c| c.key.class == CallClass::ItemDoc).all(|c| c.proposed == "keep"));
 }
 
 #[test]

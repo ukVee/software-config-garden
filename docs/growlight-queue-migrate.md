@@ -54,11 +54,36 @@ project_main = "main"
 "baton:baton.md" = "skip"
 ```
 
-Class names are `list_order`, `project_repo`, `project_main`, `same_repo`,
-`unknown_cell`, `duplicate_id`, `item_doc`, `blocked_on`, `branch`,
-`stack_base`, `slice_progress`, `not_before`, `model`, `active_per_repo` and
-`baton`. Re-run the dry run with `--answers` until no call is open and no
-refusal is left.
+Each class takes one answer shape. A malformed answer is refused at plan
+time, so the dry run shows it:
+
+| class | subject | answer |
+|---|---|---|
+| `list_order` | `list` | `default-then-registry`, or every queue name, comma-separated, in list order |
+| `project_repo` | project | the repo, as one local path (`/…`, `~/…`) or `host:/path`. A cell under `/tmp` is always a call |
+| `project_main` | project | the branch the project merges into, e.g. `main` |
+| `same_repo` | `a+b+…` | the one spelling every project in the group gets |
+| `unknown_cell` | `<id>.type` / `<id>.status` | `milestone` or `task` / a legacy status: `queued`, `active`, `deferred`, `blocked`, `done` |
+| `duplicate_id` | id | the queue whose row is kept. The evidence prints every row |
+| `item_doc` | id | `keep`. Acknowledgment only, and the answer is not read: v2 finds an entry's doc by its path |
+| `blocked_on` | id | `none` (the tag stays in the title), or the id of a known item, which becomes `after` |
+| `branch` | id | the branch name. A `done` row asks too, so the archive keeps its real branch |
+| `stack_base` | id | `parent=<id> base=<commit>`: an empty parent is `main`, and an empty base is an explicit unknown, which the restack doc blocks on. The parent must be another item in the backlog, and the base a 7–40 digit hex commit |
+| `slice_progress` | id | one slice status for every slice, or `NNN=<status>, …` (unnamed slices stay `queued`). Empty leaves all `queued` |
+| `not_before` | id | a time that parses, or `none` (drop the hold). Repeating the value keeps it, and it then holds fail-closed |
+| `model` | id | `keep`. Acknowledgment only: the `> Model:` line stays in the doc |
+| `active_per_repo` | repo | the id of the one entry that stays `active`; the others become `queued` |
+| `baton` | baton path | `copy` (only for a live entry, one baton per entry) or `skip` |
+
+The `stack_base` proposal reads the branch policy. "stacked on `feat/Y`"
+proposes `parent=Y` with the first commit the prose gives after that branch
+(its tip), ahead of any off-`main` sha in the same prose. A bare "off `main`
+`<sha>`" proposes `parent= base=<sha>`. A `## Branch policy` heading may carry
+a suffix (`(stacked)`, `(locked …)`, `— …`). A baton's quoted `item:` /
+`slice:` reads without its quotes.
+
+Re-run the dry run with `--answers` until no call is open and no refusal is
+left.
 
 ## 3. Apply
 
