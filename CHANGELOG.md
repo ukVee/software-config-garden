@@ -65,6 +65,14 @@ decision record or crate that owns it, rather than at every internal change.
   schedule (`growlight-schedule`; see `meta/spec-growlight-schedule.md`).
 - `[build_caps] test_threads` (default 2) sets `RUST_TEST_THREADS` on every
   growlight build scope, replacing the `50-test-threads.conf` drop-in.
+- Token telemetry phase 1 (`token-telemetry-p1`): every model API request a
+  growlight session makes is recorded as one row in a local sqlite db,
+  `$XDG_STATE_HOME/softfig/telemetry.db` (mode 0600, schema v5), with the
+  garden's `config/pricing.toml` pricing each row. `softfig telemetry
+  ingest-transcript` backfills a claude transcript by hand and is what the
+  semi-auto `SessionEnd` hook runs; a repeat run skips a transcript that has
+  not grown. Raw rows are kept 90 days, then rolled into a daily rollup kept
+  forever. See `docs/token-telemetry.md`.
 
 ### Fixed
 

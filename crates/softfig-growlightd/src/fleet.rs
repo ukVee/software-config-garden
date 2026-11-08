@@ -1171,6 +1171,9 @@ fn build_claude_backend(
     // The weekly reserve (growlight-schedule slice 004): the same set the
     // DriveLoop rewrites from each tick's schedule verdict.
     .with_reserve_view(reserve_held)
+    // Token telemetry (token-telemetry-p1 slice 004): one row per API request
+    // into the daemon's recorder; the default sink when `main` installed none.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// Collect the claude members' `profile_pool` roster into a
@@ -1344,6 +1347,8 @@ fn build_opencode_backend(
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
     )
+    // Token telemetry (token-telemetry-p1 slice 004), the claude backend's sink.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`

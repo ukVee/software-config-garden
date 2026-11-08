@@ -148,6 +148,10 @@ pub struct AgentSpec {
     /// extracts its own argv shape; a mismatch is ignored defensively (the
     /// drive loop never routes a claude choice to opencode or vice versa).
     pub model: Option<softfig_ipc::model_choice::ModelChoice>,
+    /// The backlog coordinates this spawn's token-telemetry rows are keyed by
+    /// (token-telemetry-p1 slice 004): the claimed item + queue, and the slice
+    /// the member's baton names. All `None` until a start sets them.
+    pub telemetry: crate::telemetry_capture::TelemetryTags,
 }
 
 impl AgentSpec {
@@ -163,6 +167,7 @@ impl AgentSpec {
             loop_settings: loop_settings.into(),
             mcp_config: mcp_config.into(),
             model: None,
+            telemetry: crate::telemetry_capture::TelemetryTags::default(),
         }
     }
 
@@ -176,6 +181,13 @@ impl AgentSpec {
         model: softfig_ipc::model_choice::ModelChoice,
     ) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Tag this spawn's telemetry rows with its backlog coordinates.
+    #[must_use]
+    pub fn with_telemetry(mut self, tags: crate::telemetry_capture::TelemetryTags) -> Self {
+        self.telemetry = tags;
         self
     }
 }
@@ -1511,13 +1523,15 @@ impl Supervisor {
         self.tick_with(budget, rate, now, workable, &|_| {})
     }
 
-    /// Like [`tick`](Self::tick), but calls `pre_spawn(agent)` for each member
-    /// it is about to re-roll — after admission admits the roll, immediately
+    /// Like [`tick`](Self::tick), but calls `pre_spawn(spec)` on a copy of each
+    /// member's spec it is about to re-roll — after admission admits the roll, immediately
     /// before the backend spawns — the re-roll twin of
     /// [`start_claiming`](Self::start_claiming)'s closure. The drive loop runs
     /// the boot dirty-tree guard here (task 064 review G64-1), so its warning is
     /// in the member's baton before the member boots; on the old post-spawn call
-    /// a claude member's SessionStart hook raced the git probe.
+    /// a claude member's SessionStart hook raced the git probe. It also
+    /// refreshes the copy's telemetry slice from the baton the member carries
+    /// forward; the copy is what spawns, and the registered spec is left as is.
     ///
     /// `budget` is a per-agent resolver (slice 001 M-A): the governor keys the
     /// 5h/7d fold on the admitting member's claude-login profile so one slot's
@@ -1530,7 +1544,7 @@ impl Supervisor {
         rate: RateState,
         now: i64,
         workable: &dyn Fn(&str) -> bool,
-        pre_spawn: &dyn Fn(&str),
+        pre_spawn: &dyn Fn(&mut AgentSpec),
     ) -> Vec<RerollOutcome> {
         let candidates: Vec<String> = self
             .agents
@@ -1569,8 +1583,8 @@ impl Supervisor {
                 out.push(RerollOutcome::HeldForAdmission { agent, decision });
                 continue;
             }
-            let spec = self.agents[&agent].spec.clone();
-            pre_spawn(&agent);
+            let mut spec = self.agents[&agent].spec.clone();
+            pre_spawn(&mut spec);
             match self.backend.spawn(&spec) {
                 Ok(child) => {
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");

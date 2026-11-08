@@ -81,6 +81,7 @@ use crate::schedule::{
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
 use crate::v2_repo;
 use crate::state::State;
+use crate::telemetry_capture::TelemetryTags;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
     Supervisor, STALL_LIMIT,
@@ -846,6 +847,14 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
     fn baton_mtime(&self, _agent: &str) -> Option<std::time::SystemTime> {
         None
     }
+
+    /// The `slice:` `agent`'s baton names, when that baton is on `item` — the
+    /// slice a spawn's token-telemetry rows are tagged with (token-telemetry-p1
+    /// slice 004). `None` when the baton is on another item, names no slice, or
+    /// is unreadable. The default is `None`, like [`baton_mtime`](Self::baton_mtime).
+    fn baton_slice(&self, _agent: &str, _item: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The result of reading an exited member's terminal baton
@@ -1329,6 +1338,10 @@ pub struct HeldPart {
 pub struct TickReport {
     /// Agents started this tick, with their scheduler assignment.
     pub started: Vec<Assignment>,
+    /// The subset of `started` whose first session's token-telemetry rows carry
+    /// no `slice_id`: the seed baton named no slice (a fresh seed never does),
+    /// so growlightd attributes nothing rather than guess one.
+    pub unattributed: Vec<Assignment>,
     /// Agents started this tick under queue v2, with their `(entry, unit)`
     /// assignment and the resolved model the spawn carried (slice 006). Empty on
     /// every legacy tick.
@@ -2982,12 +2995,13 @@ impl DriveLoop {
                     // write is the handoff.
                     let (repo_probe, baton, seeder) =
                         (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
-                    let pre_spawn = |agent: &str| {
-                        if let Some(assignment) = assignments.get(agent)
-                            && let Some(handoff) = baton.baton_mtime(agent)
+                    let pre_spawn = |spec: &mut AgentSpec| {
+                        let agent = spec.agent.clone();
+                        if let Some(assignment) = assignments.get(&agent)
+                            && let Some(handoff) = baton.baton_mtime(&agent)
                         {
                             let read = v2_repo_read(repo_probe, assignment);
-                            boot_guard(seeder, agent, &assignment.entry, read, Handoff::At(handoff));
+                            boot_guard(seeder, &agent, &assignment.entry, read, Handoff::At(handoff));
                         }
                     };
                     report.rerolls =
@@ -3115,10 +3129,6 @@ impl DriveLoop {
                             } => None,
                             other => Some(other.clone()),
                         };
-                        let spec = match override_choice {
-                            Some(c) => member.spec.clone().with_model(c),
-                            None => member.spec.clone(),
-                        };
                         // The entry id the per-entry store keys on: the TOP-LEVEL
                         // entry (a `"parent/sub"` identity shares its top-level
                         // entry's baton, §3.6). The claim op takes the unit's
@@ -3132,6 +3142,22 @@ impl DriveLoop {
                             Unit::CloseOut { milestone } => (milestone.clone(), None),
                             Unit::Entry => (pick.entry.clone(), None),
                         };
+                        // v2 has no named queues: the entry's project stands in
+                        // as the telemetry `queue` tag.
+                        let tags = TelemetryTags {
+                            item_id: Some(claim_entry.clone()),
+                            slice_id: unit_arg.clone(),
+                            queue: snapshot
+                                .entries
+                                .iter()
+                                .find(|e| e.id == pick.entry)
+                                .map(|e| e.project.clone()),
+                        };
+                        let spec = match override_choice {
+                            Some(c) => member.spec.clone().with_model(c),
+                            None => member.spec.clone(),
+                        }
+                        .with_telemetry(tags);
                         // Borrow the v2 seams as locals so the claim closure below
                         // captures disjoint fields while `start_claiming` takes
                         // `&mut self.supervisor` (the legacy seed/claim pattern).
@@ -3448,13 +3474,18 @@ impl DriveLoop {
             // readable time has nothing to compare against, so it stays silent.
             let (repo_probe, baton, seeder) =
                 (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
-            let pre_spawn = |agent: &str| {
-                if let Some((queue, part)) = assignments.get(agent)
-                    && let Some(handoff) = baton.baton_mtime(agent)
-                {
+            // The re-roll also re-reads the slice the carried baton names, so
+            // the new session's telemetry rows follow the member's handoff.
+            let pre_spawn = |spec: &mut AgentSpec| {
+                let agent = spec.agent.clone();
+                let Some((queue, part)) = assignments.get(&agent) else {
+                    return;
+                };
+                if let Some(handoff) = baton.baton_mtime(&agent) {
                     let read = repo_probe.repo_state(queue, part);
-                    boot_guard(seeder, agent, &format!("{queue}/{part}"), read, Handoff::At(handoff));
+                    boot_guard(seeder, &agent, &format!("{queue}/{part}"), read, Handoff::At(handoff));
                 }
+                spec.telemetry.slice_id = baton.baton_slice(&agent, part);
             };
             report.rerolls =
                 self.supervisor
@@ -3666,8 +3697,17 @@ impl DriveLoop {
                 // Per-member admission budget (slice 001 M-A): fold on this
                 // member's claude-login profile only.
                 let member_budget = budget_for(agent);
+                // The slice comes from the member's baton only while that baton
+                // is on this part: a kept baton carries it, a fresh seed has none.
+                let slice_id = self.baton.baton_slice(agent, &part);
+                let slice_known = slice_id.is_some();
+                let tags = TelemetryTags {
+                    item_id: Some(part.clone()),
+                    slice_id,
+                    queue: Some(queue.clone()),
+                };
                 let outcome = self.supervisor.start_claiming(
-                    member.spec.clone(),
+                    member.spec.clone().with_telemetry(tags),
                     member_budget,
                     rate,
                     now,
@@ -3695,11 +3735,15 @@ impl DriveLoop {
                         // is overwritten only on its next fresh start.
                         self.assignments
                             .insert(agent.clone(), (queue.clone(), part.clone()));
-                        report.started.push(Assignment {
+                        let assignment = Assignment {
                             agent: agent.clone(),
                             queue,
                             part,
-                        });
+                        };
+                        if !slice_known {
+                            report.unattributed.push(assignment.clone());
+                        }
+                        report.started.push(assignment);
                     }
                     // The claim landed (it precedes the spawn) even though the
                     // spawn failed — keep the part excluded this tick so no peer
@@ -5131,6 +5175,12 @@ impl TickLogger {
         let mut out = Vec::new();
         for a in &r.started {
             out.push(format!("fleet: started {} on {}/{}", a.agent, a.queue, a.part));
+        }
+        for a in &r.unattributed {
+            out.push(format!(
+                "telemetry: {}'s first session on {}/{} is unattributed to a slice (its baton names none); its rows carry slice_id null until a re-roll reads the slice it hands off",
+                a.agent, a.queue, a.part
+            ));
         }
         for a in &r.v2_started {
             // The v2 journal voice (slice 006): name the entry, unit and resolved
@@ -8032,6 +8082,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             logger.lines(&started),
             vec!["fleet: started a on default/020".to_string()],
         );
+
+        // A first spawn whose baton names no slice says so, beside its start.
+        let first = Assignment {
+            agent: "a".into(),
+            queue: "default".into(),
+            part: "020".into(),
+        };
+        let unattributed = TickReport {
+            started: vec![first.clone()],
+            unattributed: vec![first],
+            ..TickReport::default()
+        };
+        let lines = logger.lines(&unattributed);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].starts_with("telemetry: a's first session on default/020 is unattributed"));
 
         // The stall shape: held (no workable part) tick after tick → one line.
         let held = TickReport {

@@ -48,6 +48,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use crate::telemetry_capture::StepTokens;
+
 /// The database file inside opencode's data dir
 /// (`softfig_ipc::opencode::opencode_data_dir`).
 const DB_FILE: &str = "opencode.db";
@@ -72,6 +74,9 @@ pub struct SessionTotals {
     /// `input + output + reasoning + cache.read + cache.write` across the tree,
     /// the same sum the stream's per-step tokens use.
     pub tokens: u64,
+    /// The same tokens by class, so a remainder the stream never carried can be
+    /// priced per class from the garden table.
+    pub classes: StepTokens,
     /// The root session had gone idle when read, so these totals include the final
     /// step. `false`: the poll deadline passed first, and the totals may still miss
     /// it.
@@ -162,7 +167,7 @@ impl OpencodeDb {
         &self,
         conn: &Connection,
         session_id: &str,
-    ) -> Result<Option<(bool, f64, u64)>, LedgerError> {
+    ) -> Result<Option<(bool, f64, StepTokens)>, LedgerError> {
         conn.query_row(
             "WITH RECURSIVE tree(id) AS (
                  SELECT id FROM session_v2 WHERE id = ?1
@@ -172,15 +177,24 @@ impl OpencodeDb {
              SELECT
                  (SELECT time_idle IS NOT NULL FROM session_v2 WHERE id = ?1),
                  TOTAL(cost),
-                 TOTAL(tokens_input + tokens_output + tokens_reasoning
-                       + tokens_cache_read + tokens_cache_write)
+                 TOTAL(tokens_input), TOTAL(tokens_output), TOTAL(tokens_reasoning),
+                 TOTAL(tokens_cache_read), TOTAL(tokens_cache_write)
              FROM session_v2 WHERE id IN tree",
             [session_id],
             |row| {
                 let idle: Option<bool> = row.get(0)?;
                 let cost: f64 = row.get(1)?;
-                let tokens: f64 = row.get(2)?;
-                Ok(idle.map(|idle| (idle, cost, tokens.max(0.0) as u64)))
+                let class = |i| -> rusqlite::Result<u64> {
+                    row.get::<_, f64>(i).map(|t| t.max(0.0) as u64)
+                };
+                let classes = StepTokens {
+                    input: class(2)?,
+                    output: class(3)?,
+                    reasoning: class(4)?,
+                    cache_read: class(5)?,
+                    cache_write: class(6)?,
+                };
+                Ok(idle.map(|idle| (idle, cost, classes)))
             },
         )
         .optional()
@@ -198,7 +212,7 @@ impl SessionLedger for OpencodeDb {
         let conn = self.open()?;
         let mut attempt = 0;
         loop {
-            let Some((idle, cost_usd, tokens)) = self.read_once(&conn, session_id)? else {
+            let Some((idle, cost_usd, classes)) = self.read_once(&conn, session_id)? else {
                 return Err(LedgerError::NoSession {
                     path: self.path.clone(),
                     session: session_id.to_string(),
@@ -208,7 +222,8 @@ impl SessionLedger for OpencodeDb {
             if idle || attempt >= self.poll_attempts {
                 return Ok(SessionTotals {
                     cost_usd,
-                    tokens,
+                    tokens: classes.total(),
+                    classes,
                     settled: idle,
                 });
             }

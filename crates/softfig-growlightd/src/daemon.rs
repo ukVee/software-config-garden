@@ -21,6 +21,7 @@ use crate::leases::{DrainOutcome, LeaseDecision, LeaseTable, ReleaseOutcome, Thr
 use crate::persist::ResourcePersister;
 use crate::resume::{ItemResumer, ResumeOutcome};
 use crate::state::State;
+use crate::telemetry_capture::TelemetrySink;
 
 #[derive(Debug, Error)]
 pub enum GrowlightdError {
@@ -189,6 +190,12 @@ pub struct Daemon {
     /// `main` installs them; a verb that validates without them errors and
     /// leaves the session running.
     pub v2_handoff: Option<Arc<crate::member_handoff::HandoffSeams>>,
+    /// Where every backend's token-telemetry rows go (token-telemetry-p1
+    /// slice 004): the recorder `main` feeds the flush thread from, plus the
+    /// price table. `None` until `main` installs it; the fleet then builds its
+    /// backends on the default sink, which drops every row. Lives *outside*
+    /// `inner` (like `backends`) so assembly reads it without the daemon lock.
+    pub telemetry: Arc<Mutex<Option<TelemetrySink>>>,
 }
 
 /// One member's handoff as the mirror tracks it.
@@ -230,6 +237,7 @@ impl Daemon {
             backends: Arc::new(Mutex::new(None)),
             v2_mirror: Arc::new(Mutex::new(V2Mirror::default())),
             v2_handoff: None,
+            telemetry: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -361,6 +369,20 @@ impl Daemon {
     /// across a backend read.
     pub fn backend_router(&self) -> Option<Arc<BackendRouter>> {
         self.backends.lock().unwrap().clone()
+    }
+
+    /// Install the sink the fleet's backends record token-telemetry rows into
+    /// (token-telemetry-p1 slice 004). Called by `main` BEFORE
+    /// [`spawn_fleet`](crate::fleet::spawn_fleet): the backends take their copy
+    /// at assembly, so a later call reaches none of them.
+    pub fn set_telemetry(&self, sink: TelemetrySink) {
+        *self.telemetry.lock().unwrap() = Some(sink);
+    }
+
+    /// The installed telemetry sink, or the default (drop-every-row) sink when
+    /// `main` installed none.
+    pub fn telemetry(&self) -> TelemetrySink {
+        self.telemetry.lock().unwrap().clone().unwrap_or_default()
     }
 
     /// Install the §4d thrash-clear hook (builder-style). Phase 6 binds this to

@@ -474,10 +474,11 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
 
     /// Build this spawn's [`LineObserver`], installing any per-agent cell the
     /// flavor keeps (e.g. claude's account-wide reserve cell). Called once per
-    /// spawn BEFORE the reader thread starts. `rate` is the harness's meter for
-    /// this spawn — the flavor feeds it from whatever its wire format reports as
-    /// a completed turn's token cost.
-    fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver>;
+    /// spawn BEFORE the reader thread starts. `spec` is the spawn's own (its
+    /// agent, resolved model and telemetry tags). `rate` is the harness's meter
+    /// for this spawn — the flavor feeds it from whatever its wire format reports
+    /// as a completed turn's token cost.
+    fn new_observer(&self, spec: &AgentSpec, rate: Arc<AgentRateState>) -> Box<dyn LineObserver>;
 }
 
 /// Tail an agent's stdout to EOF, bumping `health`'s heartbeat on every non-empty
@@ -1036,7 +1037,7 @@ impl Harness {
         // the flavor's own per-agent cell (e.g. claude's reserve) is installed and
         // readable the moment the agent is registered — the same replace-on-re-roll
         // lifecycle as the harness cells above.
-        let observer = self.flavor.new_observer(&spec.agent, Arc::clone(&rate));
+        let observer = self.flavor.new_observer(spec, Arc::clone(&rate));
 
         // Record this spawn's running scope (slice 002), overwriting any prior
         // generation for the agent — `set_resources` pushes its live `set-property`
@@ -1486,7 +1487,7 @@ mod tests {
             fn spawned(&self, _agent: &str) {
                 self.spawned.fetch_add(1, Ordering::Relaxed);
             }
-            fn new_observer(&self, _agent: &str, _rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+            fn new_observer(&self, _spec: &AgentSpec, _rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
                 Box::new(Quiet)
             }
         }
