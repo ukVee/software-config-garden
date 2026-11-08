@@ -80,6 +80,7 @@ use softfig_ipc::verbs::{
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
 use softfig_ipc::{ErrorKind, GARDEN_CONFIG_DIR, GROWLIGHT_CONFIG_FILE};
+use softfig_fuse::SealedQuery;
 use softfig_store::Hash;
 
 use super::{
@@ -93,6 +94,7 @@ use crate::actions::sections::{self, edit};
 use crate::actions::{conventions, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
+use crate::layer_b::LayerBHook;
 use crate::server::err_to_response;
 
 /// The `queue.toml` row id for an op's `entry` argument: the first path
@@ -1325,7 +1327,8 @@ fn apply_refusal(r: ApplyRefusal, detail: impl std::fmt::Display) -> (ErrorKind,
 
 /// The apply's half of the dry run's snapshot, read through the worktree.
 struct BacklogSnapshot {
-    /// Every `.md` under the backlog dir, garden-relative path → text.
+    /// Every `.md` under the backlog dir, garden-relative path → text as the
+    /// redacted read view serves it ([`read_view`]).
     md: BTreeMap<String, String>,
     /// The v2 files already present there (`queue.toml`,
     /// `queue-archive.toml`, any `slices.toml`, sub-milestones included), in
@@ -1333,9 +1336,10 @@ struct BacklogSnapshot {
     v2_present: Vec<String>,
 }
 
-fn migrate_snapshot(wt: &WorkTree) -> Result<BacklogSnapshot, (ErrorKind, String)> {
+fn migrate_snapshot(wt: &WorkTree, hook: &LayerBHook) -> Result<BacklogSnapshot, (ErrorKind, String)> {
     fn walk(
         wt: &WorkTree,
+        hook: &LayerBHook,
         dir: &str,
         md: &mut BTreeMap<String, String>,
         v2: &mut Vec<String>,
@@ -1345,13 +1349,11 @@ fn migrate_snapshot(wt: &WorkTree) -> Result<BacklogSnapshot, (ErrorKind, String
         for child in children {
             let rel = format!("{dir}/{}", child.name);
             if child.is_dir {
-                walk(wt, &rel, md, v2)?;
+                walk(wt, hook, &rel, md, v2)?;
             } else if rel == QUEUE_FILE || rel == QUEUE_ARCHIVE_FILE || child.name == "slices.toml" {
                 v2.push(rel);
             } else if child.name.ends_with(".md") {
-                let text = wt
-                    .read_to_string(&rel)
-                    .ok_or_else(|| (ErrorKind::Io, format!("{rel}: unreadable")))?;
+                let text = read_view(wt, hook, &rel).ok_or_else(|| (ErrorKind::Io, format!("{rel}: unreadable")))?;
                 md.insert(rel, text);
             }
         }
@@ -1359,8 +1361,21 @@ fn migrate_snapshot(wt: &WorkTree) -> Result<BacklogSnapshot, (ErrorKind, String
     }
     let dir = BACKLOG_DOC.rsplit_once('/').expect("BACKLOG_DOC has a parent").0;
     let mut snap = BacklogSnapshot { md: BTreeMap::new(), v2_present: Vec::new() };
-    walk(wt, dir, &mut snap.md, &mut snap.v2_present)?;
+    walk(wt, hook, dir, &mut snap.md, &mut snap.v2_present)?;
     Ok(snap)
+}
+
+/// `rel`'s working-tree text projected the way `read_file` and the FUSE mount
+/// serve it (`reads::read_committed_file`): a whole-file-sealed doc is its
+/// `[sealed:<path>]` placeholder, an inline region's body `[encrypted]`. The
+/// converter then reads the bytes the CLI's dry run reads, so the two plans
+/// agree, and `item_meta::unreadable_metadata` sees what hides a metadata line
+/// (report 128) instead of base64 ciphertext or a sealed envelope.
+fn read_view(wt: &WorkTree, hook: &LayerBHook, rel: &str) -> Option<String> {
+    if hook.snapshot().is_sealed(rel) {
+        return Some(format!("[sealed:{rel}]\n"));
+    }
+    String::from_utf8(hook.redact_regions(rel, wt.read(rel)?)).ok()
 }
 
 /// `queue_v2_migrate_apply` (`queue-v2-migrate` slice 005, spec §11): the
@@ -1405,7 +1420,7 @@ pub fn queue_v2_migrate_apply(daemon: &Daemon, args: serde_json::Value) -> Handl
                 format!("{config} already says `queue = \"v2\"`; the migration runs before the flip"),
             ));
         }
-        let BacklogSnapshot { md: garden, v2_present } = migrate_snapshot(&wt)?;
+        let BacklogSnapshot { md: garden, v2_present } = migrate_snapshot(&wt, &inner.layer_b)?;
         if !v2_present.is_empty() {
             return Err(apply_refusal(ApplyRefusal::V2FilesPresent, v2_present.join(", ")));
         }
@@ -2854,6 +2869,29 @@ mod tests {
 
         // With every gate clear the same args apply.
         migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+    }
+
+    /// Report 128: the apply reads the backlog as the redacted view serves it,
+    /// so a `> Fleet: no` inside a sealed region refuses the plan instead of
+    /// migrating as `fleet = true` off the region's base64 ciphertext.
+    #[test]
+    fn migrate_apply_refuses_a_doc_whose_hold_sits_in_a_sealed_region() {
+        use base64::Engine as _;
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let rel = "growlight/backlog/milestones/roadeye-m2-daemon-core/CLAUDE.md";
+        let session = daemon.inner.lock().unwrap().layer_b.session().unwrap();
+        let ct = session.encrypt_layer_b_region(rel, "h", b"> Fleet: no").unwrap();
+        let region = base64::engine::general_purpose::STANDARD.encode(ct);
+        hand_write(garden.path(), rel, &format!("# roadeye\n\n<vault id=\"h\">{region}</vault>\n"));
+        let at = commit_count(&daemon);
+
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadArgs, "{msg}");
+        assert!(msg.starts_with("not_applicable: 1 refusal(s)"), "{msg}");
+        assert_eq!(commit_count(&daemon), at);
+        assert!(!garden.path().join(QUEUE_FILE).exists());
     }
 
     /// A due restack `r` archived, with one live entry `a` left on the list.

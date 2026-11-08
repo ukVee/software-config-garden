@@ -65,7 +65,8 @@ softfig growlight queue migrate --apply --answers answers.toml --expect <version
 ```
 
 `--apply` is a thin client over the keeperd op `queue_v2_migrate_apply`.
-keeperd re-reads the backlog from its own working tree, recomputes the plan
+keeperd re-reads the backlog from its own working tree, projected the way the
+mount serves it (sealed docs and regions as their placeholders), recomputes the plan
 under your answers, and writes every v2 file in **one** `queue_v2_migrated`
 commit. The same commit also renders the §3.4 views as new managed regions:
 `softfig:queue-v2` in the backlog doc and `softfig:slices-v2` in each milestone
