@@ -66,6 +66,9 @@ refusal is left.
 softfig growlight queue migrate --apply --answers answers.toml --expect <version>
 ```
 
+`--garden` is refused here: keeperd reads its own working tree, so a garden
+path would name a copy the apply never looks at.
+
 `--apply` is a thin client over the keeperd op `queue_v2_migrate_apply`.
 keeperd re-reads the backlog from its own working tree, projected the way the
 mount serves it (sealed docs and regions as their placeholders), recomputes the plan

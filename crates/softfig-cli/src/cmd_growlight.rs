@@ -2302,8 +2302,10 @@ pub struct QueueMigrateArgs {
     /// backlog file or baton has changed since.
     #[arg(long, value_name = "VERSION", requires = "apply")]
     pub expect: Option<String>,
-    /// The mounted garden. Defaults to `~/soft-fig_garden`.
-    #[arg(long, value_name = "PATH")]
+    /// The mounted garden the dry run reads. Defaults to `~/soft-fig_garden`.
+    /// Refused with `--apply`: keeperd reads its own garden, so a path here
+    /// would name a copy the apply never looks at.
+    #[arg(long, value_name = "PATH", conflicts_with = "apply")]
     pub garden: Option<PathBuf>,
     /// The growlight runtime dir the batons live in. Defaults to
     /// `$XDG_CONFIG_HOME/softfig/growlight`.
@@ -6267,6 +6269,11 @@ mod tests {
         assert!(parse(&["--apply", "--answers", "a.toml"]).is_err(), "--apply without --expect");
         assert!(parse(&["--apply", "--expect", "v"]).is_err(), "--apply without --answers");
         assert!(parse(&["--dry-run", "--expect", "v"]).is_err(), "--expect is an apply input");
+        assert!(
+            parse(&["--apply", "--answers", "a.toml", "--expect", "v", "--garden", "/tmp/copy"]).is_err(),
+            "--garden is a dry-run input; the apply reads keeperd's garden"
+        );
+        assert!(parse(&["--dry-run", "--garden", "/tmp/copy"]).unwrap().garden.is_some());
         let dry = parse(&["--dry-run", "--answers", "a.toml"]).unwrap();
         assert!(dry.dry_run && !dry.apply);
         let apply = parse(&["--apply", "--answers", "a.toml", "--expect", "v1"]).unwrap();
