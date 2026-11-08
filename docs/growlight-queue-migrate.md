@@ -23,7 +23,9 @@ This reads the backlog off the mount, plus the runtime batons (the root
 `baton.md` and each `agents/<id>/baton.md`). It writes nothing and calls no
 daemon. It prints:
 
-- `backlog doc version: <hash>`: the value to pass to `--apply --expect`;
+- `snapshot version: <hash>`: the value to pass to `--apply --expect`. It is
+  a digest over every `.md` it read under `growlight/backlog/` and every
+  baton, so editing any of them before the apply moves it;
 - the counts, the projects, the entries in list order, the `slices.toml`
   files and the baton copies;
 - every judgment call, `[open]` or `[settled]`, with its evidence and its
@@ -79,7 +81,7 @@ Before writing anything, keeperd refuses with an error that leads with the code:
 | `fleet_armed` | `config/growlight.toml` has `fleet_enabled = true` |
 | `switch_is_v2` | `config/growlight.toml` already says `queue = "v2"` |
 | `v2_files_present` | `queue.toml`, `queue-archive.toml` or a `slices.toml` exists |
-| `legacy_changed` | the backlog doc is not at the `--expect` version: re-run the dry run |
+| `legacy_changed` | the snapshot (every backlog `.md` and baton the plan reads) is not at the `--expect` version: something changed since the dry run, so re-run it |
 | `not_applicable` | the recomputed plan still has a refusal or an open call |
 
 A malformed `config/growlight.toml`, or a `queue` value keeperd doesn't know,

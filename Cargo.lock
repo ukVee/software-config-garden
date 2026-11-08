@@ -3742,6 +3742,7 @@ name = "softfig-ipc"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "libc",
  "serde",
  "serde_json",

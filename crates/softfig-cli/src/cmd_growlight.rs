@@ -2290,7 +2290,7 @@ pub struct QueueMigrateArgs {
     #[arg(long, required_unless_present = "apply", conflicts_with = "apply")]
     pub dry_run: bool,
     /// Write the v2 files in one keeperd commit. keeperd refuses while the
-    /// fleet is armed, the switch says v2, a v2 file exists, the backlog doc
+    /// fleet is armed, the switch says v2, a v2 file exists, the snapshot
     /// moved off `--expect`, or a call is still open. Never flips the switch.
     #[arg(long, requires = "answers", requires = "expect")]
     pub apply: bool,
@@ -2298,8 +2298,8 @@ pub struct QueueMigrateArgs {
     /// Omitted: every call stays open.
     #[arg(long, value_name = "TOML")]
     pub answers: Option<PathBuf>,
-    /// The backlog doc version the dry run printed; `--apply` refuses if the
-    /// doc has changed since.
+    /// The snapshot version the dry run printed; `--apply` refuses if any
+    /// backlog file or baton has changed since.
     #[arg(long, value_name = "VERSION", requires = "apply")]
     pub expect: Option<String>,
     /// The mounted garden. Defaults to `~/soft-fig_garden`.
@@ -2777,11 +2777,10 @@ fn queue_migrate(socket: &Path, args: QueueMigrateArgs) -> Result<()> {
         None => home_dir()?.join("soft-fig_garden"),
     };
     let files = migrate_snapshot(&garden, &runtime)?;
-    let doc = files
-        .garden
-        .get(BACKLOG_DOC)
-        .ok_or_else(|| anyhow!("no {BACKLOG_DOC} under {}", garden.display()))?;
-    let version = softfig_store::Hash::of(doc.as_bytes()).to_hex();
+    if !files.garden.contains_key(BACKLOG_DOC) {
+        bail!("no {BACKLOG_DOC} under {}", garden.display());
+    }
+    let version = files.digest();
     let legacy = migrate::read_legacy(&files)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2916,13 +2915,13 @@ fn migrate_batons(runtime: &Path) -> Result<std::collections::BTreeMap<String, S
     Ok(out)
 }
 
-/// The `queue migrate --dry-run` rendering: the backlog doc's version, the
+/// The `queue migrate --dry-run` rendering: the snapshot's version, the
 /// counts, the projects, the entries in list order, the slices files, the
 /// baton copies, every call (open and settled), every refusal, and the
 /// `N calls need you` line last.
 fn render_migrate_dry_run(plan: &migrate::MigrationPlan, version: &str) -> String {
     let mut out = String::from("queue migrate --dry-run — nothing written\n");
-    out.push_str(&format!("backlog doc version: {version}\n"));
+    out.push_str(&format!("snapshot version: {version}\n"));
     out.push_str(&format!(
         "plan: {} projects, {} entries, {} archived, {} slices files, {} baton copies\n",
         plan.queue.projects.len(),
@@ -6348,7 +6347,7 @@ mod tests {
         let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
         let out = render_migrate_dry_run(&plan, "v123");
 
-        assert!(out.starts_with("queue migrate --dry-run — nothing written\nbacklog doc version: v123\n"));
+        assert!(out.starts_with("queue migrate --dry-run — nothing written\nsnapshot version: v123\n"));
         assert!(out.contains("plan: 1 projects, 1 entries, 0 archived, 0 slices files, 1 baton copies\n"));
         assert!(out.contains("  001 task softfig normal "), "{out}");
         assert!(out.contains("  agents/a/baton.md -> entries/001/baton.md\n"), "{out}");

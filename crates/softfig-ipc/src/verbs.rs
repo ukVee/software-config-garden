@@ -2818,7 +2818,8 @@ pub struct QueueV2ReRecordBasesReply {
 pub struct QueueV2MigrateApplyArgs {
     /// The owner's settlements, the parsed `--answers` file.
     pub answers: migrate::Answers,
-    /// The backlog doc version the dry run printed (`--expect`), a CAS.
+    /// The snapshot version the dry run printed (`--expect`), a CAS over
+    /// every backlog file and baton the plan reads ([`migrate::LegacyFiles::digest`]).
     pub expect: String,
     /// The runtime batons (runtime-relative path → content), read by the
     /// caller as the dry run reads them; keeperd cannot see runtime state.

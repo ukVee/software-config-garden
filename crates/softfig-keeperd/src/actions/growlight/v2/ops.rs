@@ -81,7 +81,6 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::{ErrorKind, GARDEN_CONFIG_DIR, GROWLIGHT_CONFIG_FILE};
 use softfig_fuse::SealedQuery;
-use softfig_store::Hash;
 
 use super::{
     apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
@@ -1383,7 +1382,8 @@ fn read_view(wt: &WorkTree, hook: &LayerBHook, rel: &str) -> Option<String> {
 /// worktree (the runtime batons ride in the args), recomputes the plan under
 /// the owner's answers, and checks every [`ApplyRefusal`] before anything is
 /// staged: the fleet armed, the switch already `v2`, any v2 file present, the
-/// backlog doc not the `expect` version, a plan refusal or open call.
+/// snapshot (backlog files plus batons, [`migrate::LegacyFiles::digest`]) not
+/// the `expect` version, a plan refusal or open call.
 /// Otherwise `queue.toml`, `queue-archive.toml` and every `slices.toml`, with
 /// their §3.4 views, land in one commit, `queue_v2_migrated`. The legacy
 /// tables are never edited and the switch is never flipped; the reply's baton
@@ -1424,17 +1424,23 @@ pub fn queue_v2_migrate_apply(daemon: &Daemon, args: serde_json::Value) -> Handl
         if !v2_present.is_empty() {
             return Err(apply_refusal(ApplyRefusal::V2FilesPresent, v2_present.join(", ")));
         }
-        let doc = garden
-            .get(BACKLOG_DOC)
-            .ok_or_else(|| (ErrorKind::NotFound, format!("no {BACKLOG_DOC}")))?;
-        let version = Hash::of(doc.as_bytes()).to_hex();
+        if !garden.contains_key(BACKLOG_DOC) {
+            return Err((ErrorKind::NotFound, format!("no {BACKLOG_DOC}")));
+        }
+        let files = migrate::LegacyFiles { garden, batons: args.batons };
+        let version = files.digest();
         if version != args.expect {
             return Err(apply_refusal(
                 ApplyRefusal::LegacyChanged,
-                format!("{BACKLOG_DOC} is version {version}, not --expect {}; re-run the dry run", args.expect),
+                format!(
+                    "the snapshot ({} backlog files, {} batons) is version {version}, not --expect {}; \
+                     a file the plan reads changed since the dry run, so re-run it",
+                    files.garden.len(),
+                    files.batons.len(),
+                    args.expect
+                ),
             ));
         }
-        let files = migrate::LegacyFiles { garden, batons: args.batons };
         let legacy =
             migrate::read_legacy(&files).map_err(|e| apply_refusal(ApplyRefusal::NotApplicable, e))?;
         let plan = migrate::plan(&legacy, &args.answers, &conventions::now_rfc3339());
@@ -2728,24 +2734,30 @@ mod tests {
         }
     }
 
+    /// The fixture's legacy files as the CLI's dry run reads them: the garden
+    /// half off disk, the batons the apply sends.
+    fn fixture_files() -> migrate::LegacyFiles {
+        let mut files = migrate::LegacyFiles::default();
+        let root = migrate_fixture();
+        load_tree(&root.join("garden"), &root.join("garden"), &mut files.garden);
+        load_tree(&root.join("batons"), &root.join("batons"), &mut files.batons);
+        files
+    }
+
     /// Seed the fixture's legacy backlog into the garden as one commit; return
-    /// the backlog doc's version (the dry run's `--expect`).
+    /// the snapshot's version as the dry run prints it (the `--expect`).
     fn seed_legacy(daemon: &Daemon, garden: &std::path::Path) -> String {
-        let mut files = BTreeMap::new();
-        let root = migrate_fixture().join("garden");
-        load_tree(&root, &root, &mut files);
-        for (rel, text) in &files {
+        let files = fixture_files();
+        for (rel, text) in &files.garden {
             hand_write(garden, rel, text);
         }
         let mut inner = daemon.inner.lock().unwrap();
         crate::actions::commit_now(&mut inner, softfig_vcs::Intent::init("seed legacy backlog")).unwrap();
-        Hash::of(files[BACKLOG_DOC].as_bytes()).to_hex()
+        files.digest()
     }
 
     fn migrate_args(expect: &str, answers: bool) -> serde_json::Value {
-        let mut batons = BTreeMap::new();
-        let root = migrate_fixture().join("batons");
-        load_tree(&root, &root, &mut batons);
+        let batons = fixture_files().batons;
         let answers: migrate::Answers = match answers {
             true => toml::from_str(&std::fs::read_to_string(migrate_fixture().join("answers.toml")).unwrap())
                 .unwrap(),
@@ -2756,6 +2768,15 @@ mod tests {
             },
         };
         serde_json::to_value(QueueV2MigrateApplyArgs { answers, expect: expect.to_string(), batons }).unwrap()
+    }
+
+    /// The version a dry run would print now: keeperd's own read of the garden
+    /// (the bytes the mount serves, report 128) plus the fixture's batons.
+    fn snapshot_version(daemon: &Daemon) -> String {
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(daemon, &inner);
+        let garden = migrate_snapshot(&wt, &inner.layer_b).map_err(|e| e.1).unwrap().md;
+        migrate::LegacyFiles { garden, batons: fixture_files().batons }.digest()
     }
 
     fn migrate_apply(daemon: &Daemon, args: serde_json::Value) -> Result<QueueV2MigrateApplyReply, (ErrorKind, String)> {
@@ -2797,10 +2818,7 @@ mod tests {
 
         // The written files are the plan the dry run computes.
         let fixture = {
-            let mut files = migrate::LegacyFiles::default();
-            let root = migrate_fixture();
-            load_tree(&root.join("garden"), &root.join("garden"), &mut files.garden);
-            load_tree(&root.join("batons"), &root.join("batons"), &mut files.batons);
+            let files = fixture_files();
             let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
             migrate::plan(&migrate::read_legacy(&files).unwrap(), &args.answers, "2026-11-01T00:00:00Z")
         };
@@ -2871,6 +2889,44 @@ mod tests {
         migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
     }
 
+    /// Report 132: `--expect` is a CAS over every file the plan reads, not the
+    /// backlog doc alone. An item doc edited, a slice doc added or a baton
+    /// moved between the dry run and the apply each refuse `legacy_changed`;
+    /// put back, the same `--expect` applies.
+    #[test]
+    fn migrate_apply_refuses_when_any_snapshot_file_moved_since_the_dry_run() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let at = commit_count(&daemon);
+        let refused = |args: serde_json::Value, what: &str| {
+            let (kind, msg) = migrate_apply(&daemon, args).unwrap_err();
+            assert_eq!(kind, ErrorKind::Conflict, "{what}: {msg}");
+            assert!(msg.starts_with("legacy_changed: the snapshot ("), "{what}: {msg}");
+            assert!(msg.contains(&format!("not --expect {expect}")), "{what}: {msg}");
+            assert_eq!(commit_count(&daemon), at, "{what} mints no commit");
+            assert!(!garden.path().join(QUEUE_FILE).exists(), "{what} stages nothing");
+        };
+
+        let item = "growlight/backlog/milestones/roadeye-m2-daemon-core/CLAUDE.md";
+        let doc = std::fs::read_to_string(garden.path().join(item)).unwrap();
+        hand_write(garden.path(), item, &format!("{doc}\n> Fleet: no\n"));
+        refused(migrate_args(&expect, true), "item doc edited");
+        hand_write(garden.path(), item, &doc);
+
+        let slice = "growlight/backlog/milestones/roadeye-m2-daemon-core/slices/999-late.md";
+        hand_write(garden.path(), slice, "# Added after the dry run\n");
+        refused(migrate_args(&expect, true), "slice doc added");
+        std::fs::remove_file(garden.path().join(slice)).unwrap();
+
+        let mut args = migrate_args(&expect, true);
+        args["batons"]["baton.md"] = serde_json::json!("moved since the dry run\n");
+        refused(args, "baton moved");
+
+        assert_eq!(snapshot_version(&daemon), expect, "put back, the snapshot is the dry run's");
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+    }
+
     /// Report 128: the apply reads the backlog as the redacted view serves it,
     /// so a `> Fleet: no` inside a sealed region refuses the plan instead of
     /// migrating as `fleet = true` off the region's base64 ciphertext.
@@ -2879,13 +2935,14 @@ mod tests {
         use base64::Engine as _;
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
-        let expect = seed_legacy(&daemon, garden.path());
+        seed_legacy(&daemon, garden.path());
         let rel = "growlight/backlog/milestones/roadeye-m2-daemon-core/CLAUDE.md";
         let session = daemon.inner.lock().unwrap().layer_b.session().unwrap();
         let ct = session.encrypt_layer_b_region(rel, "h", b"> Fleet: no").unwrap();
         let region = base64::engine::general_purpose::STANDARD.encode(ct);
         hand_write(garden.path(), rel, &format!("# roadeye\n\n<vault id=\"h\">{region}</vault>\n"));
         let at = commit_count(&daemon);
+        let expect = snapshot_version(&daemon);
 
         let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
         assert_eq!(kind, ErrorKind::BadArgs, "{msg}");

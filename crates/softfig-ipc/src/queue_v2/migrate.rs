@@ -21,8 +21,8 @@
 //! at all is a [`Refusal`]; any refusal fails the whole plan.
 //!
 //! **It never flips `queue = "v2"`** and never edits the legacy tables. The
-//! apply refusals (fleet armed, switch already `v2`, v2 files present, legacy
-//! tables changed since the dry run) are keeperd's, at write time — see
+//! apply refusals (fleet armed, switch already `v2`, v2 files present, the
+//! snapshot changed since the dry run) are keeperd's, at write time — see
 //! [`ApplyRefusal`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +61,30 @@ pub struct LegacyFiles {
     pub garden: BTreeMap<String, String>,
     /// Runtime-relative baton path → content.
     pub batons: BTreeMap<String, String>,
+}
+
+impl LegacyFiles {
+    /// The snapshot's version, the apply's `--expect` CAS (spec §11): a
+    /// BLAKE3 digest, hex, over every garden file and then every baton, each
+    /// in path order. Every path and body is length-prefixed and each half
+    /// counted, so no two snapshots frame to the same bytes. The dry run
+    /// prints it over the files it read; keeperd recomputes it over its own
+    /// read of the garden (the same redacted bytes, report 128) plus the
+    /// batons the apply sends, so a change to anything the plan reads —
+    /// an item doc, a slice doc, a baton — refuses `legacy_changed`.
+    pub fn digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        for half in [&self.garden, &self.batons] {
+            h.update(&(half.len() as u64).to_le_bytes());
+            for (path, text) in half {
+                for part in [path.as_bytes(), text.as_bytes()] {
+                    h.update(&(part.len() as u64).to_le_bytes());
+                    h.update(part);
+                }
+            }
+        }
+        h.finalize().to_hex().to_string()
+    }
 }
 
 /// The legacy backlog, parsed (slice 002). File order is kept everywhere.
@@ -517,7 +541,8 @@ pub enum ApplyRefusal {
     SwitchIsV2,
     /// `queue.toml`, `queue-archive.toml` or a `slices.toml` already exists.
     V2FilesPresent,
-    /// The backlog doc's version is not the one the dry run read (CAS).
+    /// The snapshot's [`LegacyFiles::digest`] is not the one the dry run
+    /// printed (CAS): a backlog file or a baton changed in between.
     LegacyChanged,
     /// The recomputed plan has refusals or open calls.
     NotApplicable,
@@ -1196,6 +1221,32 @@ mod tests {
             s.push_str(&format!("\n| {} | {id} | {kind} | {title} | queued |", i + 1));
         }
         s + &format!("\n\n<!-- /softfig:{tag} -->\n")
+    }
+
+    /// Report 132: the `--expect` version covers every member the plan reads,
+    /// and the framing keeps distinct snapshots distinct.
+    #[test]
+    fn digest_moves_with_any_member_of_the_snapshot() {
+        let item = "growlight/backlog/milestones/m/CLAUDE.md";
+        let base = files(&[(BACKLOG_DOC, "doc"), (item, "> Fleet: no\n")], &[("baton.md", "b")]);
+        assert_eq!(base.digest(), base.clone().digest(), "deterministic");
+        assert_eq!(base.digest().len(), 64);
+        let moved = [
+            files(&[(BACKLOG_DOC, "doc"), (item, "")], &[("baton.md", "b")]),
+            files(&[(BACKLOG_DOC, "doc")], &[("baton.md", "b")]),
+            files(
+                &[(BACKLOG_DOC, "doc"), (item, "> Fleet: no\n"), ("growlight/backlog/milestones/m/slices/001-a.md", "")],
+                &[("baton.md", "b")],
+            ),
+            files(&[(BACKLOG_DOC, "doc"), (item, "> Fleet: no\n")], &[("baton.md", "b2")]),
+            files(&[(BACKLOG_DOC, "doc"), (item, "> Fleet: no\n")], &[]),
+        ];
+        for m in &moved {
+            assert_ne!(m.digest(), base.digest(), "{m:?}");
+        }
+        // Bytes shifted between a path and its body, or between the halves.
+        assert_ne!(files(&[("ab", "c")], &[]).digest(), files(&[("a", "bc")], &[]).digest());
+        assert_ne!(files(&[("a", "b")], &[]).digest(), files(&[], &[("a", "b")]).digest());
     }
 
     #[test]
