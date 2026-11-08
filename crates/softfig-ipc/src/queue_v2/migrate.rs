@@ -332,7 +332,9 @@ fn title_tags(title: &str) -> Vec<String> {
 }
 
 /// The body of the first `## <heading>` section outside fenced code, up to the
-/// next `#` / `##` heading, blank padding trimmed. `None` when absent.
+/// next `#` / `##` heading, blank padding trimmed. `None` when absent. The
+/// heading may carry a suffix after it: `## Branch policy (stacked)`,
+/// `## Branch policy — off main …`, `## Branch policy: …`.
 fn section(doc: &str, heading: &str) -> Option<String> {
     let mut fenced = false;
     let mut body: Option<Vec<&str>> = None;
@@ -345,7 +347,7 @@ fn section(doc: &str, heading: &str) -> Option<String> {
             .then(|| line.strip_prefix("# ").or_else(|| line.strip_prefix("## ")))
             .flatten();
         match (&mut body, level) {
-            (None, Some(title)) if line.starts_with("## ") && title.trim() == heading => {
+            (None, Some(title)) if line.starts_with("## ") && heading_is(title.trim(), heading) => {
                 body = Some(Vec::new());
             }
             (Some(_), Some(_)) => break,
@@ -355,6 +357,15 @@ fn section(doc: &str, heading: &str) -> Option<String> {
     }
     let lines = body?;
     Some(lines.join("\n").trim().to_string())
+}
+
+/// `title` is `heading`, alone or followed by a bracketed, dashed or colon
+/// suffix. `Branch policy notes` is another section.
+fn heading_is(title: &str, heading: &str) -> bool {
+    title.strip_prefix(heading).is_some_and(|rest| {
+        let rest = rest.trim_start();
+        rest.is_empty() || rest.starts_with(['(', '[', ':', '—', '–', '-'])
+    })
 }
 
 /// The batons at `baton.md` and `agents/<id>/baton.md` that name an item, in
@@ -1320,6 +1331,23 @@ mod tests {
             Some("Branch `feat/x` off `main`.\n```\n## not a heading\n```")
         );
         assert_eq!(section(doc, "Missing"), None);
+    }
+
+    /// The live suffixed headings (F2): `m5b-hardening`'s `(locked …)`,
+    /// `m5d`/`m5e`/`pairing-slice-b`'s `(stacked)`, and a dashed note.
+    #[test]
+    fn a_branch_policy_heading_may_carry_a_suffix() {
+        for heading in [
+            "## Branch policy (locked 2026-06-25)",
+            "## Branch policy (stacked)",
+            "## Branch policy — off main, stacked",
+            "## Branch policy: stacked",
+        ] {
+            let doc = format!("# t\n\n{heading}\n\nCut `feat/x` off `feat/w`.\n\n## Next\nno");
+            assert_eq!(section(&doc, "Branch policy").as_deref(), Some("Cut `feat/x` off `feat/w`."), "{heading}");
+        }
+        assert_eq!(section("## Branch policy notes\n\nx\n", "Branch policy"), None);
+        assert_eq!(section("## Branch policyx\n\nx\n", "Branch policy"), None);
     }
 
     #[test]
