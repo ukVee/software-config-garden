@@ -38,7 +38,8 @@ use softfig_ipc::growlightd::{
     QueueShowTree, QueueStackBranch,
 };
 use softfig_ipc::queue_v2::{
-    milestone_path, EntryKind, QueueArchiveToml, SliceKind, QUEUE_ARCHIVE_FILE,
+    milestone_doc, milestone_path, sessions_file, EntryKind, QueueArchiveToml, SliceKind,
+    QUEUE_ARCHIVE_FILE,
 };
 
 use crate::git_probe::{Probe, ProbeCache};
@@ -266,18 +267,22 @@ impl StackRead {
     }
 }
 
-/// Collect one entry's §3.5 session-log lines: the entry's own doc (a
-/// milestone's `CLAUDE.md` close-out, a task/restack doc), plus — for a
-/// milestone — every slice doc in its tree and sub-trees, and each sub's own
-/// close-out. A missing doc (or a missing `## Sessions` section) contributes
-/// nothing.
+/// Collect one entry's §3.5 session-log lines: the entry's close-out log (a
+/// milestone's `sessions.md`, a task/restack doc), plus — for a milestone —
+/// every slice doc in its tree and sub-trees, and each sub's own
+/// `sessions.md`. A missing doc (or a missing `## Sessions` section)
+/// contributes nothing.
 fn collect_sessions(
     snapshot: &V2Snapshot,
     entry: &EntryView,
     root: &Path,
     out: &mut Vec<QueueShowSession>,
 ) {
-    if let Some(doc) = entry_doc(root, entry) {
+    let close_out = match entry.kind {
+        EntryKind::Milestone => Some(sessions_file(&entry.id)),
+        EntryKind::Task | EntryKind::Restack => entry_doc(root, entry),
+    };
+    if let Some(doc) = close_out {
         push_session(root, &doc, &entry.id, None, None, out);
     }
     match entry.kind {
@@ -288,8 +293,7 @@ fn collect_sessions(
                 if identity == &entry.id || identity.starts_with(&prefix) {
                     let sub = (identity != &entry.id).then_some(identity.as_str());
                     if sub.is_some() {
-                        let close = format!("{}/CLAUDE.md", milestone_path(identity));
-                        push_session(root, &close, &entry.id, sub, None, out);
+                        push_session(root, &sessions_file(identity), &entry.id, sub, None, out);
                     }
                     let dir = format!("{}/slices", milestone_path(identity));
                     for item in &tree.items {
@@ -306,12 +310,12 @@ fn collect_sessions(
     }
 }
 
-/// The garden-relative path of `entry`'s own doc: a milestone's `CLAUDE.md`
-/// (its close-out), or a task's / restack's `tasks/NNN-<slug>.md`. `None` when
-/// a task doc isn't there.
+/// The garden-relative path of `entry`'s own doc: a milestone's `CLAUDE.md`,
+/// or a task's / restack's `tasks/NNN-<slug>.md`. `None` when a task doc isn't
+/// there.
 fn entry_doc(root: &Path, entry: &EntryView) -> Option<String> {
     match entry.kind {
-        EntryKind::Milestone => Some(format!("{}/CLAUDE.md", milestone_path(&entry.id))),
+        EntryKind::Milestone => Some(milestone_doc(&entry.id)),
         EntryKind::Task | EntryKind::Restack => find_by_number(root, TASKS_DIR, &entry.id),
     }
 }
@@ -871,12 +875,18 @@ mod tests {
         );
         let snapshot = snap(root, entries, trees);
 
-        // The milestone close-out doc and the two slice docs, each with a
-        // `## Sessions` section.
+        // The milestone close-out log (`sessions.md`, task 104) and the two
+        // slice docs, each with a `## Sessions` section. A `## Sessions` left
+        // in the milestone's `CLAUDE.md` is not the close-out log.
         fs::create_dir_all(root.join("growlight/backlog/milestones/m/slices")).unwrap();
         fs::write(
+            root.join("growlight/backlog/milestones/m/sessions.md"),
+            "# Sessions\n\n## Sessions\n\n- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04\n",
+        )
+        .unwrap();
+        fs::write(
             root.join("growlight/backlog/milestones/m/CLAUDE.md"),
-            "# m\n\n## Sessions\n\n- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04\n",
+            "# m\n\n## Sessions\n\n- not read: the milestone doc\n",
         )
         .unwrap();
         fs::write(
@@ -904,7 +914,7 @@ mod tests {
         // Close-out + slice 001 have lines; slice 002 has none.
         assert_eq!(reply.sessions.len(), 2, "{:?}", reply.sessions);
         let close = reply.sessions.iter().find(|s| s.unit.is_none()).unwrap();
-        assert!(close.path.ends_with("milestones/m/CLAUDE.md"), "{close:?}");
+        assert!(close.path.ends_with("milestones/m/sessions.md"), "{close:?}");
         assert_eq!(close.lines.len(), 1);
         assert!(close.lines[0].contains("completed"));
         let slice = reply.sessions.iter().find(|s| s.unit.as_deref() == Some("001")).unwrap();
@@ -940,7 +950,7 @@ mod tests {
         }
         fs::write(parent.join("slices/001-a.md"), "## Sessions\n\n- parent slice\n").unwrap();
         fs::write(sub.join("slices/001-b.md"), "## Sessions\n\n- sub slice\n").unwrap();
-        fs::write(sub.join("CLAUDE.md"), "## Sessions\n\n- sub close-out\n").unwrap();
+        fs::write(sub.join("sessions.md"), "## Sessions\n\n- sub close-out\n").unwrap();
 
         let mut out = Vec::new();
         collect_sessions(&snapshot, &snapshot.entries[0], root, &mut out);

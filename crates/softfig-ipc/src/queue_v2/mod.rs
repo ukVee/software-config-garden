@@ -87,6 +87,32 @@ pub fn slices_file(milestone: &str) -> String {
     format!("{}/slices.toml", milestone_path(milestone))
 }
 
+/// `<garden>/growlight/backlog/queue.md` — the doc hosting the derived
+/// `softfig:queue-v2` view (§3.4). A file of its own, not the backlog
+/// `CLAUDE.md`: the view is live state, and `CLAUDE.md` files are lazy
+/// pointers (owner 2026-11-07).
+pub const QUEUE_VIEW_FILE: &str = "growlight/backlog/queue.md";
+
+/// The doc hosting a milestone's (or sub-milestone's) derived
+/// `softfig:slices-v2` view (§3.4): `slices.md` beside its `slices.toml`.
+pub fn slices_view_file(milestone: &str) -> String {
+    format!("{}/slices.md", milestone_path(milestone))
+}
+
+/// A milestone's (or sub-milestone's) own doc, `CLAUDE.md`: its mission and
+/// finish criteria, its `## Deferred verification` (§6.5), and its dir's
+/// canary — never a view host or the session log.
+pub fn milestone_doc(milestone: &str) -> String {
+    format!("{}/CLAUDE.md", milestone_path(milestone))
+}
+
+/// The doc whose `## Sessions` takes a milestone's (or sub-milestone's)
+/// close-out session lines (§3.5): `sessions.md`, kept out of `CLAUDE.md` for
+/// the same reason as the views.
+pub fn sessions_file(milestone: &str) -> String {
+    format!("{}/sessions.md", milestone_path(milestone))
+}
+
 /// A v2-file read or write that failed. All failures are typed; there is no
 /// fallback value and no lossy recovery.
 #[derive(Debug, thiserror::Error)]
@@ -1009,6 +1035,25 @@ follow_ups = 0
         assert_eq!(
             milestone_path("top/a"),
             "growlight/backlog/milestones/top/subs/a"
+        );
+    }
+
+    #[test]
+    fn view_and_session_docs_stay_out_of_claude_md() {
+        // Task 104: the §3.4 views and the §3.5 close-out log are live state,
+        // so each has a file of its own; `CLAUDE.md` stays the milestone doc.
+        assert_eq!(QUEUE_VIEW_FILE, "growlight/backlog/queue.md");
+        assert_eq!(
+            slices_view_file("folder-grants/fid-pam"),
+            "growlight/backlog/milestones/folder-grants/subs/fid-pam/slices.md"
+        );
+        assert_eq!(
+            sessions_file("folder-grants/fid-pam"),
+            "growlight/backlog/milestones/folder-grants/subs/fid-pam/sessions.md"
+        );
+        assert_eq!(
+            milestone_doc("folder-grants"),
+            "growlight/backlog/milestones/folder-grants/CLAUDE.md"
         );
     }
 

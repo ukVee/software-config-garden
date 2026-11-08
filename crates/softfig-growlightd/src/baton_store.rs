@@ -550,7 +550,7 @@ fn seed_entry_baton(
          (reseed from the entry's spec on your first iteration)\n\n\
          # READ FIRST\n\
          - the entry doc for `{entry_id}` (its mission + finish criteria)\n\
-         - `growlight/backlog/CLAUDE.md` — the queue table (status + order)\n\
+         - `growlight/backlog/queue.md` — the queue view (status + order)\n\
          - `growlight/protocol-fleet-v2.md` — your operating contract\n\n\
          # STATE\n\
          Seeded by growlightd (entry `{entry_id}`).\n"

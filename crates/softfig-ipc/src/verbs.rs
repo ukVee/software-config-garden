@@ -252,8 +252,9 @@ pub mod op {
     pub const REORDER_BACKLOG_ITEM: &str = "reorder_backlog_item";
     /// queue v2 (§6.8 human verb): append a `[[project]]` row to
     /// `growlight/backlog/queue.toml` — the first v2 file creation, so the
-    /// `softfig:queue-v2` view renders from here on (§3.4). One commit,
-    /// `queue_v2_updated`. `--dry-run` computes + renders, writes nothing.
+    /// `softfig:queue-v2` view renders into `growlight/backlog/queue.md` from
+    /// here on (§3.4). One commit, `queue_v2_updated`. `--dry-run` computes +
+    /// renders, writes nothing.
     pub const QUEUE_ADD_PROJECT: &str = "queue_add_project";
     /// queue v2 (§6.8 human verb): create a backlog entry — a milestone with
     /// its docs, `slices.toml` and the generated `001-plan` slice (§4) when no
@@ -313,8 +314,8 @@ pub mod op {
     /// line to the unit doc's `## Sessions` section — keeperd stamps the
     /// `- <utc> · ` prefix and appends the caller's `<reason> · <model> ·
     /// member <id> · $cost` tail. The doc is the slice doc (`unit` given),
-    /// the milestone `CLAUDE.md` (close-out), or the task/restack doc. One
-    /// commit, `queue_v2_session_logged`.
+    /// the milestone's `sessions.md` (close-out, created by its first line),
+    /// or the task/restack doc. One commit, `queue_v2_session_logged`.
     pub const QUEUE_V2_SESSION_LOG: &str = "queue_v2_session_log";
     /// queue v2 daemon op, keeperd↔growlightd only: write the close-out's
     /// deferred tests (§6.5 `deferred_tests`, protocol §7b) into the entry
@@ -324,8 +325,8 @@ pub mod op {
     /// queue v2 daemon op, keeperd↔growlightd only: the §7 sub-milestone
     /// (`queue-v2-scheduling` slice 010, `growlight_add_sub_milestone`'s
     /// commit). Creates `milestones/<milestone>/subs/<slug>/` — its
-    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, and its
-    /// `slices.toml` (every slice `queued`) — marks the `active` slice `split`,
+    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, its
+    /// `slices.toml` (every slice `queued`) and `slices.md` view — marks the `active` slice `split`,
     /// and places the sub in the parent's `slices.toml`: right after the split
     /// slice (the front of the remaining items, the default) or at the end
     /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
@@ -2260,7 +2261,8 @@ pub struct QueueSliceSpec {
 /// `queue.toml` — one commit:
 ///
 /// - `milestone`: `milestones/<slug>/CLAUDE.md`, `slices/`, `slices.toml`
-///   (plus the generated `001-plan` slice when `slices` is empty, §4);
+///   and its `slices.md` view (plus the generated `001-plan` slice when
+///   `slices` is empty, §4);
 ///   `slug`/`title`/`mission`/`finish_criteria` required.
 /// - `task`: `tasks/NNN-<slug>.md` (NNN from the tasks `.seq`), id = the NNN,
 ///   `branch = fix/<NNN>` (§3.1: the id exists only after numbering, finding
@@ -2667,9 +2669,9 @@ pub struct QueueV2FollowUpsReply {
 /// `queue_v2_session_log({entry, unit?, line}) -> {entry, unit, path, hash}` —
 /// the §3.5 session log. keeperd stamps the `- <utc> · ` prefix and appends
 /// `line` (the `<reason> · <model ref> · member <id> · $cost` tail) to the
-/// unit doc's `## Sessions` section: the slice doc for `unit`, the milestone
-/// `CLAUDE.md` for a close-out, the task/restack doc otherwise. The section
-/// is created when absent.
+/// unit doc's `## Sessions` section: the slice doc for `unit`, the
+/// milestone's `sessions.md` for a close-out (created by its first line), the
+/// task/restack doc otherwise. The section is created when absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2SessionLogArgs {
     pub entry: String,

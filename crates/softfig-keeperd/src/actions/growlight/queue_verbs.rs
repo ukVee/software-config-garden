@@ -24,9 +24,9 @@
 use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
-    sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane,
-    Project, QueueArchiveToml, QueueRefusal, QueueToml, RepoLocality, RestackBranch, SliceItem,
-    SliceKind, SliceStatus, SlicesToml, QUEUE_ARCHIVE_FILE,
+    milestone_doc, sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus,
+    FinalStatus, Lane, Project, QueueArchiveToml, QueueRefusal, QueueToml, RepoLocality,
+    RestackBranch, SliceItem, SliceKind, SliceStatus, SlicesToml, QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
     QueueAddEntryArgs, QueueAddEntryReply, QueueAddProjectArgs, QueueAddProjectReply,
@@ -325,7 +325,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     // The milestone's main doc is the dir's canary: it and every file under
     // it (the slice docs, `.seq`, `slices.toml`) are new, so each is a
     // first-creation write.
-    let doc_rel = slices_view_host(&slug);
+    let doc_rel = milestone_doc(&slug);
     let slices_dir = format!("{}/slices", milestone_path(&slug));
 
     let (mut queue, queue_version, archive) = {
@@ -428,7 +428,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
             body: Some(view.clone()),
         },
         ViewWrite {
-            host: doc_rel.clone(),
+            host: slices_view_host(&slug),
             tag: SLICES_V2_TAG,
             body: Some(slices_view(&slices_model)),
         },
@@ -2118,9 +2118,9 @@ fn milestone_doc_v2(id: &str, title: &str, mission: &str, finish: &str) -> Strin
     format!(
         "# backlog: {title}\n\n\
          > Milestone `{id}`. Status, lane, `after` links and branch live in \
-         `queue.toml` (the derived `softfig:queue-v2` table in `../../CLAUDE.md`); \
-         slices run in `slices.toml` order (the derived table below) and this item \
-         is done only when all are done and integration is verified.\n\n\
+         `queue.toml` (the derived `softfig:queue-v2` table in `../../queue.md`); \
+         slices run in `slices.toml` order (the derived table in `slices.md`) and this \
+         item is done only when all are done and integration is verified.\n\n\
          ## Mission\n\n{}\n\n\
          ## Finish criteria\n\n{}\n",
         mission.trim_end_matches('\n'),
@@ -2134,7 +2134,7 @@ fn plan_slice_body(mission: &str) -> String {
     format!(
         "> Model: reasoning\n\n\
          This milestone was added without slices. Plan it:\n\n\
-         1. Read the mission below (it lives in `../../CLAUDE.md`) and the spec it names.\n\
+         1. Read the mission below (it lives in `../CLAUDE.md`) and the spec it names.\n\
          2. Write the milestone's slices with `slice_insert`, each sized to one \
             session (the protocol's 25–50% context band), each declaring a \
             single-entry `> Model:`.\n\
@@ -2147,12 +2147,12 @@ fn plan_slice_body(mission: &str) -> String {
 /// The v2 task doc: the legacy `task_doc` shape (notes-style heading +
 /// reviewed stamp + mission + finish criteria) plus the same queue.toml
 /// pointer the milestone doc carries — the doc never holds status, and the
-/// pointer is `../CLAUDE.md` from `tasks/`.
+/// pointer is `../queue.md` from `tasks/`.
 fn task_doc_v2(id: &str, title: &str, mission: &str, finish: &str) -> String {
     format!(
         "# {title}\n\n\
          > Task `{id}`. Status, lane, `after` links and branch live in \
-         `queue.toml` (the derived `softfig:queue-v2` table in `../CLAUDE.md`).\n\n\
+         `queue.toml` (the derived `softfig:queue-v2` table in `../queue.md`).\n\n\
          > Last reviewed: {}\n\n\
          ## Mission\n\n{}\n\n\
          ## Finish criteria\n\n{}\n",
@@ -2279,7 +2279,7 @@ fn restack_doc(project: &str, main: &str, date_hyphen: &str, stack: &[RestackBra
              > Last reviewed: {date_hyphen}\n\n\
              > Generated restack entry for project `{project}` (queue v2 §8). Lane, \
              status and branch live in `queue.toml` (the derived `softfig:queue-v2` \
-             table in `../CLAUDE.md`). No stack was recorded at enqueue — re-derive \
+             table in `../queue.md`). No stack was recorded at enqueue — re-derive \
              it from `softfig growlight queue show` before rebasing.\n\n\
              {RESTACK_UPSTREAM_RULE}\n{RESTACK_SAFETY_RULE}\n{RESTACK_GATE_RULE}"
         );
@@ -2290,7 +2290,7 @@ fn restack_doc(project: &str, main: &str, date_hyphen: &str, stack: &[RestackBra
          > Generated restack entry for project `{project}` (queue v2 §8): `main` \
          moved under an open stack, so each unmerged branch must be rebased in \
          stack order. Lane, status and branch live in `queue.toml` (the derived \
-         `softfig:queue-v2` table in `../CLAUDE.md`).\n\n\
+         `softfig:queue-v2` table in `../queue.md`).\n\n\
          ## Stack\n\n"
     );
     for b in stack {
@@ -2540,7 +2540,11 @@ mod tests {
             .expect("milestone doc");
         assert!(doc.contains("## Mission") && doc.contains("m1 mission"), "{doc}");
         assert!(doc.contains("queue.toml"), "the branch/status pointer, {doc}");
-        assert!(managed::has_region(&doc, SLICES_V2_TAG), "slices view rendered");
+        assert!(!managed::has_region(&doc, SLICES_V2_TAG), "no view in the milestone doc");
+        let view = wt
+            .read_to_string("growlight/backlog/milestones/m1/slices.md")
+            .expect("slices view doc");
+        assert!(managed::has_region(&view, SLICES_V2_TAG), "slices view rendered");
 
         let plan = wt
             .read_to_string("growlight/backlog/milestones/m1/slices/001-plan.md")
@@ -4159,9 +4163,9 @@ mod tests {
         assert_eq!(s.items[2].status, SliceStatus::Queued);
         assert_eq!(s.items[2].follow_ups, Some(0));
 
-        // The view re-rendered in the milestone doc's managed region.
+        // The view re-rendered in the milestone's `slices.md`.
         let host = wt
-            .read_to_string("growlight/backlog/milestones/m1/CLAUDE.md")
+            .read_to_string("growlight/backlog/milestones/m1/slices.md")
             .unwrap();
         let body = managed::region_body(&host, SLICES_V2_TAG).expect("slices region");
         assert!(body.contains("| 3 | slice | 003 | queued | 0 |"), "{body}");
