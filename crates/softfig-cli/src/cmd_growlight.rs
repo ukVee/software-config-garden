@@ -2307,6 +2307,11 @@ pub struct QueueMigrateArgs {
     /// would name a copy the apply never looks at.
     #[arg(long, value_name = "PATH", conflicts_with = "apply")]
     pub garden: Option<PathBuf>,
+    /// With `--dry-run`: ask git for every open `stack_base` call and write
+    /// the answers to OUT as an answers file you review, edit, and pass back
+    /// as `--answers`. Nothing applies it by itself. An existing OUT is refused.
+    #[arg(long, value_name = "OUT", requires = "dry_run", conflicts_with = "apply")]
+    pub stack_answers: Option<PathBuf>,
     /// The growlight runtime dir the batons live in. Defaults to
     /// `$XDG_CONFIG_HOME/softfig/growlight`.
     #[arg(long, value_name = "PATH")]
@@ -2790,7 +2795,120 @@ fn queue_migrate(socket: &Path, args: QueueMigrateArgs) -> Result<()> {
         .unwrap_or(0);
     let plan = migrate::plan(&legacy, &answers, &crate::cmd_repo::iso8601(now));
     print!("{}", render_migrate_dry_run(&plan, &version));
+    if let Some(out) = &args.stack_answers {
+        let home = home_dir().ok();
+        let user = std::env::var("USER").ok();
+        let lines: Vec<_> = migrate::stack_base_questions(&plan)
+            .into_iter()
+            .map(|q| {
+                let answer = stack_base_from_git(&q, home.as_deref(), user.as_deref());
+                (q.id, answer)
+            })
+            .collect();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out)
+            .with_context(|| format!("creating {} (an existing file is never overwritten)", out.display()))?;
+        file.write_all(render_stack_answers(&lines, &version).as_bytes())
+            .with_context(|| format!("writing {}", out.display()))?;
+        let count = |f: fn(&StackAnswer) -> bool| lines.iter().filter(|(_, a)| f(a)).count();
+        println!(
+            "stack answers: {} known, {} unknown base, {} left open -> {}",
+            count(|a| matches!(a, StackAnswer::Known { .. })),
+            count(|a| matches!(a, StackAnswer::Unknown { .. })),
+            count(|a| matches!(a, StackAnswer::Open { .. })),
+            out.display()
+        );
+    }
     Ok(())
+}
+
+/// The overall git budget for one `stack_base` question: each call keeps its
+/// own timeout inside it, so a wedged repo costs one budget, not one per call.
+const STACK_ANSWER_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What git says about one open `stack_base` call (slice 006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StackAnswer {
+    /// The branch is live and unmerged: `base` is its merge-base with the
+    /// parent's branch, else with `main`.
+    Known { parent: String, base: String, why: String },
+    /// The branch is gone or merged into `main`: the explicit unknown base.
+    Unknown { parent: String, why: String },
+    /// Git can't settle it here; the call stays open.
+    Open { why: String },
+}
+
+/// Ask git about `q` in the project's repo, read-only. A repo that is remote,
+/// ambiguous or unreadable leaves the call open, never guessed.
+fn stack_base_from_git(q: &migrate::StackBaseQuestion, home: Option<&Path>, user: Option<&str>) -> StackAnswer {
+    use softfig_ipc::queue_v2::RepoLocality;
+    if let Some(named) = &q.stray_parent {
+        return StackAnswer::Open { why: format!("the prose names parent `{named}`, which is no other item") };
+    }
+    let repo = match RepoLocality::of(&q.repo, user) {
+        RepoLocality::Local => softfig_ipc::item_repo::expand_home(q.repo.trim(), home, user),
+        RepoLocality::Remote => {
+            return StackAnswer::Open { why: format!("repo `{}` is on another machine; answer it there", q.repo) };
+        }
+        RepoLocality::Ambiguous => None,
+    };
+    let Some(repo) = repo else {
+        return StackAnswer::Open { why: format!("repo `{}` is not a local path here", q.repo) };
+    };
+    let git = softfig_growlightd::git_stack::Git::new(repo)
+        .with_deadline(std::time::Instant::now() + STACK_ANSWER_GIT_BUDGET);
+    stack_base_git(&git, q).unwrap_or_else(|e| StackAnswer::Open { why: e.to_string() })
+}
+
+fn stack_base_git(
+    git: &softfig_growlightd::git_stack::Git,
+    q: &migrate::StackBaseQuestion,
+) -> Result<StackAnswer, softfig_growlightd::git_stack::GitError> {
+    let parent = q.parent.as_ref().map_or("", |(id, _)| id.as_str()).to_string();
+    let (branch, main) = (q.branch.as_str(), q.main.as_str());
+    if !git.branch_exists(main)? {
+        return Ok(StackAnswer::Open { why: format!("the repo has no `{main}` branch") });
+    }
+    if !git.branch_exists(branch)? {
+        return Ok(StackAnswer::Unknown { parent, why: format!("`{branch}` is gone") });
+    }
+    if git.is_ancestor(branch, main)? {
+        return Ok(StackAnswer::Unknown { parent, why: format!("`{branch}` is merged into `{main}`") });
+    }
+    let onto = match &q.parent {
+        Some((_, theirs)) if !theirs.is_empty() && git.branch_exists(theirs)? => theirs.as_str(),
+        _ => main,
+    };
+    let base = git.merge_base(branch, onto)?;
+    Ok(StackAnswer::Known { parent, base, why: format!("merge-base of `{branch}` and `{onto}`") })
+}
+
+/// The `--stack-answers` file: an answers file (`schema`, `[call]`) with one
+/// commented line per call saying where its answer came from. A call git
+/// can't settle is written commented out, so feeding the file back leaves it
+/// open.
+fn render_stack_answers(lines: &[(String, StackAnswer)], version: &str) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let mut out = format!(
+        "# stack_base answers from git (`queue migrate --stack-answers`), snapshot {version}.\n\
+         # Review every line: nothing applies this file by itself. Pass it alone as\n\
+         # --answers, or paste the lines below `[call]` into your answers file's own\n\
+         # `[call]` table. A commented-out line is a call git could not settle here.\n\
+         schema = {}\n\n[call]\n",
+        migrate::ANSWERS_SCHEMA_VERSION
+    );
+    for (id, answer) in lines {
+        let key = quote(&format!("stack_base:{id}"));
+        let line = match answer {
+            StackAnswer::Known { parent, base, why } => format!("# {why}\n{key} = {}\n", quote(&format!("parent={parent} base={base}"))),
+            StackAnswer::Unknown { parent, why } => format!("# {why}\n{key} = {}\n", quote(&format!("parent={parent} base="))),
+            StackAnswer::Open { why } => format!("# left open: {why}\n# {key} = \"parent= base=\"\n"),
+        };
+        out.push_str(&line);
+    }
+    out
 }
 
 /// `queue migrate --apply`: a thin client. keeperd reads the garden half from
@@ -6308,6 +6426,12 @@ mod tests {
             "--garden is a dry-run input; the apply reads keeperd's garden"
         );
         assert!(parse(&["--dry-run", "--garden", "/tmp/copy"]).unwrap().garden.is_some());
+        assert!(
+            parse(&["--apply", "--answers", "a.toml", "--expect", "v", "--stack-answers", "o.toml"]).is_err(),
+            "--stack-answers never rides an apply"
+        );
+        assert!(parse(&["--stack-answers", "o.toml"]).is_err(), "--stack-answers needs --dry-run");
+        assert!(parse(&["--dry-run", "--stack-answers", "o.toml"]).unwrap().stack_answers.is_some());
         let dry = parse(&["--dry-run", "--answers", "a.toml"]).unwrap();
         assert!(dry.dry_run && !dry.apply);
         let apply = parse(&["--apply", "--answers", "a.toml", "--expect", "v1"]).unwrap();
@@ -6443,5 +6567,127 @@ mod tests {
         assert!(open > 0);
         let last = if open == 1 { "1 call needs you\n".to_string() } else { format!("{open} calls need you\n") };
         assert!(out.ends_with(&format!("1 refusal blocks the apply\n{last}")), "{out}");
+    }
+
+    /// `queue migrate --stack-answers` (queue-v2-migrate-fixes slice 006): git
+    /// answers each open `stack_base` call. A live stacked branch gets its
+    /// merge-base with the parent's branch, a live branch off `main` its
+    /// merge-base with `main`, a merged or gone branch the explicit unknown
+    /// base. Fed back as answers, no `stack_base` call stays open.
+    #[test]
+    fn stack_answers_come_from_git_and_settle_every_stack_base_call() {
+        use softfig_ipc::testing::git;
+        let repo = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let commit = |msg: &str| {
+            fs::write(r.join("f.txt"), msg).unwrap();
+            git(r, &["add", "."]);
+            git(r, &["commit", "-q", "-m", msg]);
+        };
+        let head = || {
+            let out = std::process::Command::new("git").arg("-C").arg(r).args(["rev-parse", "HEAD"]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(r, &["init", "-q", "-b", "main"]);
+        commit("c0");
+        let c0 = head();
+        git(r, &["checkout", "-q", "-b", "fix/002"]);
+        commit("parent");
+        let parent_tip = head();
+        git(r, &["checkout", "-q", "-b", "fix/001"]);
+        commit("child");
+        git(r, &["checkout", "-q", "fix/002"]);
+        commit("parent moves on");
+        git(r, &["checkout", "-q", "-b", "fix/003", "main"]);
+        commit("merged");
+        git(r, &["checkout", "-q", "main"]);
+        git(r, &["merge", "-q", "--no-ff", "-m", "merge 003", "fix/003"]);
+        // fix/004 was never cut (or was deleted after its merge).
+
+        let garden = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let backlog = garden.path().join("growlight/backlog");
+        fs::create_dir_all(backlog.join("tasks")).unwrap();
+        let doc = "# backlog\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                   |---|----|------|-------|--------|\n| 1 | 001 | task | Child | active |\n\
+                   | 2 | 002 | task | Parent | blocked |\n| 3 | 003 | task | Merged | blocked |\n\
+                   | 4 | 004 | task | Gone | blocked |\n\n<!-- /softfig:queue -->\n";
+        fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
+        let tasks = [
+            ("001-child", "Branch `fix/001`, stacked on `fix/002`."),
+            ("002-parent", "Branch `fix/002` off `main`."),
+            ("003-merged", "Branch `fix/003` off `main`."),
+            ("004-gone", "Branch `fix/004` off `main`."),
+        ];
+        for (name, policy) in tasks {
+            fs::write(backlog.join(format!("tasks/{name}.md")), format!("# t\n\n## Branch policy\n\n{policy}\n")).unwrap();
+        }
+        let mut answers = migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: [
+                ("project_main:softfig".to_string(), "main".to_string()),
+                ("project_repo:softfig".to_string(), r.display().to_string()),
+            ]
+            .into(),
+        };
+        let files = migrate_snapshot(garden.path(), runtime.path()).unwrap();
+        let legacy = migrate::read_legacy(&files).unwrap();
+        let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        let questions = migrate::stack_base_questions(&plan);
+        assert_eq!(questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["001", "002", "003", "004"]);
+        assert_eq!(questions[0].parent, Some(("002".to_string(), "fix/002".to_string())));
+
+        let lines: Vec<_> =
+            questions.iter().map(|q| (q.id.clone(), stack_base_from_git(q, None, None))).collect();
+        let answer = |id: &str| lines.iter().find(|(i, _)| i == id).map(|(_, a)| a.clone()).unwrap();
+        assert!(
+            matches!(answer("001"), StackAnswer::Known { parent, base, .. } if parent == "002" && base == parent_tip),
+            "the parent's tip the child was cut from, not the parent's moved tip: {:?}",
+            answer("001")
+        );
+        assert!(matches!(answer("002"), StackAnswer::Known { parent, base, .. } if parent.is_empty() && base == c0));
+        assert!(matches!(answer("003"), StackAnswer::Unknown { why, .. } if why.contains("merged")), "{:?}", answer("003"));
+        assert!(matches!(answer("004"), StackAnswer::Unknown { why, .. } if why.contains("gone")), "{:?}", answer("004"));
+
+        let text = render_stack_answers(&lines, "v1");
+        assert!(text.contains(&format!("\"stack_base:001\" = \"parent=002 base={parent_tip}\"\n")), "{text}");
+        assert!(text.contains("\"stack_base:004\" = \"parent= base=\"\n"), "{text}");
+        let generated: migrate::Answers = toml::from_str(&text).unwrap();
+        answers.call.extend(generated.call);
+        let settled = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
+        let open: Vec<_> = settled.open_calls().filter(|c| c.key.class == migrate::CallClass::StackBase).collect();
+        assert!(open.is_empty(), "{open:?}");
+        let child = settled.queue.entries.iter().find(|e| e.id == "001").unwrap();
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("002", parent_tip.as_str()));
+    }
+
+    /// A repo git can't read here leaves its call open with the reason, and the
+    /// rendered line is commented out, so feeding the file back keeps it open.
+    #[test]
+    fn stack_answers_leave_a_remote_or_unreadable_repo_open() {
+        let q = |repo: &str| migrate::StackBaseQuestion {
+            id: "x".into(),
+            branch: "fix/x".into(),
+            repo: repo.into(),
+            main: "main".into(),
+            parent: None,
+            stray_parent: None,
+        };
+        let remote = stack_base_from_git(&q("build-host:/srv/repo"), None, Some("u"));
+        assert!(matches!(&remote, StackAnswer::Open { why } if why.contains("another machine")), "{remote:?}");
+        let other_user = stack_base_from_git(&q("~someone/repo"), Some(Path::new("/home/u")), Some("u"));
+        assert!(matches!(&other_user, StackAnswer::Open { why } if why.contains("not a local path")), "{other_user:?}");
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let unreadable = stack_base_from_git(&q(&not_a_repo.path().display().to_string()), None, None);
+        assert!(matches!(&unreadable, StackAnswer::Open { .. }), "{unreadable:?}");
+        let stray = migrate::StackBaseQuestion { stray_parent: Some("ghost".into()), ..q("/r") };
+        assert!(matches!(stack_base_from_git(&stray, None, None), StackAnswer::Open { why } if why.contains("ghost")));
+
+        let text = render_stack_answers(&[("x".to_string(), remote)], "v1");
+        assert!(text.contains("# left open: repo `build-host:/srv/repo` is on another machine"), "{text}");
+        let parsed: migrate::Answers = toml::from_str(&text).unwrap();
+        assert!(parsed.call.is_empty(), "an open call writes no live line: {text}");
     }
 }

@@ -82,6 +82,30 @@ proposes `parent=Y` with the first commit the prose gives after that branch
 a suffix (`(stacked)`, `(locked …)`, `— …`). A baton's quoted `item:` /
 `slice:` reads without its quotes.
 
+### `stack_base` answers from git
+
+You don't have to write the `stack_base` answers by hand. Have git propose them:
+
+```sh
+softfig growlight queue migrate --dry-run --answers answers.toml --stack-answers stack.toml
+```
+
+This prints the dry run as usual. It also writes `stack.toml`, an answers
+file with one `[call]` line for every `stack_base` call that is still open.
+Each line comes with a comment that says where the answer came from. Git runs
+read-only in each project's repo, with the same probe rules growlightd uses.
+
+| the entry's branch | the line |
+|---|---|
+| live and not merged into the project's `main` | `parent=<p> base=<merge-base>`: the merge-base with the parent's branch, or with `main` when the prose names no parent or the parent's branch is gone |
+| gone, or merged into `main` | `parent=<p> base=`, the explicit unknown |
+| in a remote or ambiguous repo, in a repo git can't read, or with the prose naming a parent that isn't an item | commented out, with the reason. The call stays open |
+
+`<p>` is the parent the `stack_base` proposal names. Nothing applies the file
+by itself, and `--stack-answers` can't be combined with `--apply`. An existing
+`stack.toml` is never overwritten. Review it, then either pass it alone as
+`--answers` or paste its lines into your own answers file's `[call]` table.
+
 Re-run the dry run with `--answers` until no call is open and no refusal is
 left.
 

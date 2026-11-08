@@ -1133,6 +1133,54 @@ fn stack_proposal(policy: &str) -> String {
     String::new()
 }
 
+/// What git needs to answer one open `stack_base` call (slice 006). The plan
+/// can't run git, so `queue migrate --stack-answers` asks it these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackBaseQuestion {
+    pub id: String,
+    /// The entry's branch, as planned (an open `branch` call renders its proposal).
+    pub branch: String,
+    /// The entry's project's `repo` and `main`, as planned.
+    pub repo: String,
+    pub main: String,
+    /// The parent the branch-policy prose names and that parent's branch;
+    /// `None` when the prose names none, so the branch stacks on `main`.
+    pub parent: Option<(String, String)>,
+    /// A parent the prose names that is no other item in the plan. The answer
+    /// would be refused, so this call stays open instead.
+    pub stray_parent: Option<String>,
+}
+
+/// Every open `stack_base` call in `plan`, in call order, with the entry's
+/// branch, repo and main and the parent its proposal names.
+pub fn stack_base_questions(plan: &MigrationPlan) -> Vec<StackBaseQuestion> {
+    let entries: Vec<&Entry> =
+        plan.queue.entries.iter().chain(plan.archive.entries.iter().map(|a| &a.row)).collect();
+    plan.open_calls()
+        .filter(|c| c.key.class == CallClass::StackBase)
+        .filter_map(|call| {
+            let id = call.key.subject.as_str();
+            let entry = plan.queue.entries.iter().find(|e| e.id == id)?;
+            let project = plan.queue.projects.iter().find(|p| p.name == entry.project)?;
+            let named = call.proposed.split_whitespace().find_map(|w| w.strip_prefix("parent=")).unwrap_or_default();
+            let found = entries.iter().find(|e| e.id == named && e.id != id);
+            let (parent, stray_parent) = match (named, found) {
+                ("", _) => (None, None),
+                (_, Some(p)) => (Some((p.id.clone(), p.branch.clone())), None),
+                (named, None) => (None, Some(named.to_string())),
+            };
+            Some(StackBaseQuestion {
+                id: id.to_string(),
+                branch: entry.branch.clone(),
+                repo: project.repo.clone(),
+                main: project.main.clone(),
+                parent,
+                stray_parent,
+            })
+        })
+        .collect()
+}
+
 fn plan_not_before(p: &mut Planner, id: &str, value: Option<&str>) -> Option<String> {
     let value = value?;
     let Err(why) = fleet::parse_not_before(value) else { return Some(value.to_string()) };
