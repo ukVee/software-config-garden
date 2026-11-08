@@ -97,9 +97,11 @@ pub enum V2SourceError {
     /// or unknown field, a value outside a closed vocabulary, or a schema
     /// this build does not write. `at` is where the parser stopped (line,
     /// column, both 1-based), when it says — see [`V2SourceError::invalid_toml`].
+    /// `source` is boxed: toml's error is large, and every `Result` this error
+    /// rides in would carry its size.
     InvalidToml {
         rel: String,
-        source: QueueV2Error,
+        source: Box<QueueV2Error>,
         at: Option<(usize, usize)>,
     },
     /// Parses, but violates a §3.1/§3.3 writer invariant.
@@ -117,20 +119,19 @@ impl fmt::Display for V2SourceError {
             // One line, whatever the parser's own multi-line rendering: one
             // bad byte stops every v2 claim (§3, F6), and this is the journal
             // line the owner finds it by.
-            Self::InvalidToml {
-                rel,
-                source: QueueV2Error::InvalidToml(e),
-                at,
-            } => {
-                let reason = e.message().split_whitespace().collect::<Vec<_>>().join(" ");
-                match at {
-                    Some((line, column)) => {
-                        write!(f, "{rel}: invalid TOML at line {line}, column {column}: {reason}")
+            Self::InvalidToml { rel, source, at } => match source.as_ref() {
+                QueueV2Error::InvalidToml(e) => {
+                    let reason = e.message().split_whitespace().collect::<Vec<_>>().join(" ");
+                    match at {
+                        Some((line, column)) => write!(
+                            f,
+                            "{rel}: invalid TOML at line {line}, column {column}: {reason}"
+                        ),
+                        None => write!(f, "{rel}: invalid TOML: {reason}"),
                     }
-                    None => write!(f, "{rel}: invalid TOML: {reason}"),
                 }
-            }
-            Self::InvalidToml { rel, source, .. } => write!(f, "{rel}: {source}"),
+                source => write!(f, "{rel}: {source}"),
+            },
             Self::InvalidState { rel, refusal } => write!(f, "{rel}: {refusal}"),
             Self::InvalidModelDecl { context, message } => {
                 write!(f, "{context}: invalid `> Model:` declaration ({message})")
@@ -155,7 +156,7 @@ impl V2SourceError {
         });
         Self::InvalidToml {
             rel: rel.to_string(),
-            source,
+            source: Box::new(source),
             at,
         }
     }
@@ -959,7 +960,8 @@ mod tests {
         garden.write(QUEUE_FILE, &text);
         assert!(matches!(
             assemble(garden.root()),
-            Err(V2SourceError::InvalidToml { source: QueueV2Error::UnsupportedSchema { found: 2 }, .. })
+            Err(V2SourceError::InvalidToml { source, .. })
+                if matches!(source.as_ref(), QueueV2Error::UnsupportedSchema { found: 2 })
         ));
     }
 
