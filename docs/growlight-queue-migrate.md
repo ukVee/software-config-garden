@@ -81,6 +81,7 @@ Before writing anything, keeperd refuses with an error that leads with the code:
 
 | code | when |
 |---|---|
+| `member_not_allowed` | a fleet member calls it, by its softfig-mcp stamp or from its scope's shell: the migration is the human's |
 | `fleet_armed` | `config/growlight.toml` has `fleet_enabled = true` |
 | `switch_is_v2` | `config/growlight.toml` already says `queue = "v2"` |
 | `v2_files_present` | `queue.toml`, `queue-archive.toml` or a `slices.toml` exists: an earlier apply landed (see §4) |

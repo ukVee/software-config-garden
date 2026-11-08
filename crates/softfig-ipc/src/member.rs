@@ -59,14 +59,18 @@ pub fn cgroup_scope(cgroup: &str) -> Option<&str> {
     path.rsplit('/').find(|unit| scope_member(unit).is_some())
 }
 
-/// The queue-shaping verbs that are the human's alone (§6.7). A fleet member is
-/// refused each one, by softfig-mcp's gate and by keeperd's.
-pub const HUMAN_QUEUE_VERBS: [&str; 3] = ["queue_add_project", "queue_update_entry", "queue_drop"];
+/// The queue-shaping verbs that are the human's alone (§6.7), and the one-shot
+/// v2 migration (spec §11), which a member could otherwise reach once its
+/// `fleet_armed` barrier is down. A fleet member is refused each one, by
+/// softfig-mcp's gate and by keeperd's.
+pub const HUMAN_QUEUE_VERBS: [&str; 4] =
+    ["queue_add_project", "queue_update_entry", "queue_drop", "queue_v2_migrate_apply"];
 
 /// Why a member is refused a [`HUMAN_QUEUE_VERBS`] verb, in the words both
 /// gates use.
 pub const HUMAN_QUEUE_VERB_WHY: &str = "a fleet member may add found work with \
-    queue_add_entry, and move slices in its own entry; shaping the queue is the human's";
+    queue_add_entry, and move slices in its own entry; shaping or migrating the queue \
+    is the human's";
 
 /// Who a softfig-mcp process serves, as its launch env declares.
 #[derive(Debug, Clone, PartialEq, Eq)]

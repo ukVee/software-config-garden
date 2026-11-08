@@ -537,6 +537,31 @@ mod tests {
         assert!(!WorkTree::new(&daemon, &inner).exists(softfig_ipc::queue_v2::QUEUE_FILE));
     }
 
+    /// The v2 migration is the human's too (F13): its only other barrier is
+    /// `fleet_armed`, which a live member can outlive. A member is refused it
+    /// by stamp and by scope alike, before the handler reads its args, and
+    /// nothing is written; the same call from a human reaches the handler.
+    #[test]
+    fn a_member_is_refused_the_v2_migrate_apply_by_stamp_or_scope() {
+        let (_g, daemon) = unlocked();
+        let op = softfig_ipc::op::QUEUE_V2_MIGRATE_APPLY;
+        let args = serde_json::json!({ "expect": "0", "batons": {} });
+        let stamped = Request::new(op, args.clone()).with_member(Some("qa"));
+        for (how, resp) in [
+            ("stamp", dispatch(&daemon, stamped, None)),
+            ("scope", dispatch(&daemon, Request::new(op, args.clone()), Some("qa"))),
+        ] {
+            let (kind, msg) = err_of(resp);
+            assert_eq!(kind, ErrorKind::BadArgs, "{how}");
+            assert!(msg.starts_with("member_not_allowed:") && msg.contains(op), "{how}: {msg}");
+            assert!(msg.contains("member qa"), "{how}: {msg}");
+        }
+        let (_, human) = err_of(dispatch(&daemon, Request::new(op, args), None));
+        assert!(human.starts_with("queue_v2_migrate_apply args:"), "{human}");
+        let inner = daemon.inner.lock().unwrap();
+        assert!(!WorkTree::new(&daemon, &inner).exists(softfig_ipc::queue_v2::QUEUE_FILE));
+    }
+
     /// A human's CLI call comes from no member's scope, and still shapes the queue.
     #[test]
     fn a_humans_cli_call_still_shapes_the_queue() {
