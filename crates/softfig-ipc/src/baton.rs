@@ -128,6 +128,17 @@ impl BatonView {
     }
 }
 
+/// A frontmatter value, trimmed and unquoted once: `"005"` and `'005'` read
+/// as `005`, as YAML reads them (report 104). Empty reads as absent.
+fn scalar(raw: &str) -> Option<&str> {
+    let v = raw.trim();
+    let v = ['"', '\'']
+        .iter()
+        .find_map(|q| v.strip_prefix(*q).and_then(|rest| rest.strip_suffix(*q)))
+        .unwrap_or(v);
+    (!v.is_empty()).then_some(v)
+}
+
 /// Parse the runtime baton: `status` / `item` / `slice` / `iteration` from the
 /// YAML frontmatter and the `# NEXT ACTION` section body. Pure; a reader re-reads
 /// this after every iteration to decide whether to keep driving.
@@ -145,23 +156,14 @@ pub fn parse_baton(baton: &str) -> BatonView {
             if line == "---" {
                 break;
             }
-            if let Some(v) = line.strip_prefix("status:") {
-                let v = v.trim();
-                if !v.is_empty() {
-                    status = Some(v.to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("item:") {
-                let v = v.trim();
-                if !v.is_empty() && v != "null" {
-                    item = Some(v.to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("slice:") {
-                let v = v.trim();
-                if !v.is_empty() && v != "null" {
-                    slice = Some(v.to_string());
-                }
+            if let Some(v) = line.strip_prefix("status:").and_then(scalar) {
+                status = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("item:").and_then(scalar).filter(|v| *v != "null") {
+                item = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("slice:").and_then(scalar).filter(|v| *v != "null") {
+                slice = Some(v.to_string());
             } else if let Some(v) = line.strip_prefix("iteration:") {
-                iteration = v.trim().parse::<u64>().ok();
+                iteration = scalar(v).and_then(|v| v.parse::<u64>().ok());
             }
         }
     }
@@ -323,6 +325,21 @@ mod tests {
         // `null` and absent both read as None, never the literal string.
         assert!(parse_baton("---\nitem: 047\nslice: null\n---\n").slice.is_none());
         assert!(parse_baton("---\nitem: 047\n---\n").slice.is_none());
+    }
+
+    /// Fleet batons quote their scalars (`slice: "004"`); YAML reads the
+    /// value inside the quotes, and so does the parser (report 104, F9 of
+    /// review 059: a quoted `item:` named no item to the migration).
+    #[test]
+    fn parse_baton_unquotes_each_scalar_once() {
+        let v = parse_baton("---\nstatus: 'IN_PROGRESS'\nitem: \"028\"\nslice: \"004\"\niteration: \"4\"\n---\n");
+        assert_eq!(v.status.as_deref(), Some("IN_PROGRESS"));
+        assert_eq!(v.item.as_deref(), Some("028"));
+        assert_eq!(v.slice.as_deref(), Some("004"));
+        assert_eq!(v.iteration, Some(4));
+        assert_eq!(parse_baton("---\nitem: \"\"\n---\n").item, None, "quoted empty is absent");
+        assert_eq!(parse_baton("---\nitem: '\"x\"'\n---\n").item.as_deref(), Some("\"x\""), "once, not twice");
+        assert_eq!(parse_baton("---\nitem: \"x\n---\n").item.as_deref(), Some("\"x"), "unbalanced stays");
     }
 
     #[test]

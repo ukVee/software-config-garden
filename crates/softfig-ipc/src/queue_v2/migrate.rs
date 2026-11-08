@@ -1328,13 +1328,14 @@ mod tests {
         let read = read_legacy(&files(&[(BACKLOG_DOC, "")], &[
             ("baton.md", &head("a")),
             ("agents/b/baton.md", &head("b")),
+            ("agents/q/baton.md", &head("\"028\"")),
             ("agents/c/baton.md", "---\nstatus: IN_PROGRESS\n---\n"),
             ("agents/d/scratch/baton.md", &head("d")),
             ("baton.e.parked.md", &head("e")),
         ]))
         .unwrap();
         let named: Vec<_> = read.batons.iter().map(|b| (b.path.as_str(), b.item.as_str())).collect();
-        assert_eq!(named, vec![("agents/b/baton.md", "b"), ("baton.md", "a")]);
+        assert_eq!(named, vec![("agents/b/baton.md", "b"), ("agents/q/baton.md", "028"), ("baton.md", "a")]);
         assert_eq!(read.batons[0].status.as_deref(), Some("IN_PROGRESS"));
     }
 
