@@ -806,20 +806,22 @@ fn list_order<'a>(p: &mut Planner, queues: &'a [LegacyQueue]) -> Vec<&'a LegacyQ
 /// For each id in more than one queue table, the queue whose row is kept
 /// (`duplicate_id`; proposed: the first in list order).
 fn duplicate_owners<'a>(p: &mut Planner, order: &[&'a LegacyQueue]) -> BTreeMap<&'a str, String> {
-    let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut seen: BTreeMap<&str, Vec<(&str, &LegacyItem)>> = BTreeMap::new();
     for queue in order {
         for item in &queue.items {
-            seen.entry(item.id.as_str()).or_default().push(queue.name.as_str());
+            seen.entry(item.id.as_str()).or_default().push((queue.name.as_str(), item));
         }
     }
     let mut owners = BTreeMap::new();
-    for (id, in_queues) in seen.into_iter().filter(|(_, qs)| qs.len() > 1) {
-        let keep = p.decide(
-            CallClass::DuplicateId,
-            id,
-            format!("rows in queues {}", in_queues.join(", ")),
-            in_queues[0].to_string(),
-        );
+    for (id, rows) in seen.into_iter().filter(|(_, rows)| rows.len() > 1) {
+        let in_queues: Vec<&str> = rows.iter().map(|(queue, _)| *queue).collect();
+        // The rows themselves, so the owner can pick without opening the doc (F7).
+        let evidence = rows
+            .iter()
+            .map(|(queue, i)| format!("{queue}: `| {} | {} | {} | {} |`", i.id, i.kind, i.title, i.status))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let keep = p.decide(CallClass::DuplicateId, id, evidence, in_queues[0].to_string());
         if !in_queues.contains(&keep.as_str()) {
             p.refuse(id, format!("duplicate_id answer `{keep}` is not one of {}", in_queues.join(", ")));
         }
@@ -1652,6 +1654,8 @@ mod tests {
             assert!(keys.contains(&key.to_string()), "{key} missing from {keys:?}");
         }
         assert_eq!(plan.queue.entries.iter().filter(|e| e.id == "w").count(), 1);
+        let dup = plan.calls.iter().find(|c| c.key.to_string() == "duplicate_id:w").unwrap();
+        assert_eq!(dup.evidence, "default: `| w | task | T w | queued |`; q: `| w | task | T w | queued |`");
         assert_eq!(plan.queue.entries[0].title, "[blocked on …] odd", "an unresolved tag stays");
     }
 
