@@ -937,7 +937,7 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
     entry.branch = plan_branch(p, item, &default_branch);
     let started = status != EntryStatus::Queued || ctx.started_by_baton;
     if started {
-        plan_stack_base(p, &mut entry, item.branch_policy.as_deref(), ctx.now);
+        plan_stack_base(p, ctx, &mut entry, item.branch_policy.as_deref());
     }
     entry.not_before = plan_not_before(p, id, item.meta.not_before.as_deref());
     plan_model(p, id, item.meta.model.as_deref());
@@ -1037,46 +1037,90 @@ fn plan_branch(p: &mut Planner, item: &LegacyItem, default: &str) -> String {
     p.decide(CallClass::Branch, &item.id, evidence, proposed)
 }
 
-/// A started entry's `parent`/`base`: only from a settled `stack_base` answer
-/// (`parent=<id> base=<commit>`; an empty parent means `main`).
-fn plan_stack_base(p: &mut Planner, entry: &mut Entry, policy: Option<&str>, now: &str) {
+/// A started entry's `parent`/`base`: only from a settled `stack_base` answer,
+/// `parent=<id> base=<commit>`. An empty parent means `main`; an empty base is
+/// an explicit unknown (F4), which the restack doc blocks on rather than
+/// guessing. Anything else is refused here, at plan time, so the dry run shows
+/// it before an apply is attempted.
+fn plan_stack_base(p: &mut Planner, ctx: &ItemCtx, entry: &mut Entry, policy: Option<&str>) {
     let evidence = policy.map_or("no `## Branch policy`".to_string(), |text| format!("`## Branch policy`: {text}"));
     let proposed = policy.map(stack_proposal).unwrap_or_default();
     let Some(answer) = p.call(CallClass::StackBase, &entry.id, evidence, proposed) else { return };
-    let (mut parent, mut base, mut stray) = (None, None, false);
-    for word in answer.split_whitespace() {
-        match word.split_once('=') {
-            Some(("parent", v)) => parent = Some(v),
-            Some(("base", v)) => base = Some(v),
-            _ => stray = true,
-        }
-    }
-    match (parent, base) {
-        (Some(parent), Some(base)) if !stray && !base.is_empty() => {
+    match parse_stack_base(&answer, ctx.known, &entry.id) {
+        Ok((parent, base)) => {
             entry.parent = parent.to_string();
             entry.base = base.to_string();
-            entry.claimed = now.to_string();
+            entry.claimed = ctx.now.to_string();
         }
-        _ => p.refuse(&entry.id, format!("stack_base answer `{answer}` is not `parent=<id> base=<commit>`")),
+        Err(why) => p.refuse(
+            &entry.id,
+            format!("stack_base answer `{answer}` {why}; write `parent=<id> base=<commit>`, either side may be empty"),
+        ),
     }
 }
 
-/// The `stack_base` proposal read off branch-policy prose: "off `main`
-/// `<sha>`" → `parent= base=<sha>`; "stacked on `feat/Y`" → `parent=Y`.
+/// A `stack_base` answer's `(parent, base)`, or why it is malformed: each key
+/// exactly once and nothing else, a parent that is another known item, a base
+/// that is a 7–40 digit hex commit.
+fn parse_stack_base<'a>(answer: &'a str, known: &BTreeSet<&str>, id: &str) -> Result<(&'a str, &'a str), String> {
+    let (mut parent, mut base) = (None, None);
+    for word in answer.split_whitespace() {
+        let slot = match word.split_once('=') {
+            Some(("parent", v)) => (&mut parent, v),
+            Some(("base", v)) => (&mut base, v),
+            _ => return Err(format!("has a stray word `{word}`")),
+        };
+        if slot.0.replace(slot.1).is_some() {
+            return Err(format!("repeats `{}`", word.split('=').next().unwrap_or_default()));
+        }
+    }
+    let (Some(parent), Some(base)) = (parent, base) else { return Err("lacks `parent=` or `base=`".to_string()) };
+    if !parent.is_empty() && (parent == id || !known.contains(parent)) {
+        return Err(format!("names parent `{parent}`, which is not another item in the backlog"));
+    }
+    if !base.is_empty() && !is_commit(base) {
+        return Err(format!("names base `{base}`, which is not a 7–40 digit hex commit"));
+    }
+    Ok((parent, base))
+}
+
+fn is_commit(t: &str) -> bool {
+    (7..=40).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The `stack_base` proposal read off branch-policy prose. "Stacked on `feat/Y`"
+/// wins (F3, owner ruling): `parent=Y`, and `base=` the first commit the prose
+/// gives after that branch — its tip, as in "stacked on `feat/Y` (tip `<sha>`)"
+/// — unless `main` or another branch is named first; none leaves the base an
+/// explicit unknown. Otherwise "off `main` `<sha>`" → `parent= base=<sha>`.
 fn stack_proposal(policy: &str) -> String {
-    let tokens: Vec<&str> = policy.split('`').skip(1).step_by(2).collect();
-    let is_sha = |t: &str| (7..=40).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_hexdigit());
+    fn ticked(text: &str) -> Vec<&str> {
+        text.split('`').skip(1).step_by(2).collect()
+    }
+    let is_branch = |t: &str| t.contains('/') && !t.starts_with(['/', '~', '.']);
+    let lower = policy.to_ascii_lowercase();
+    if let Some(at) = lower.find("stacked on") {
+        let after = &policy[at..];
+        let tokens = ticked(after);
+        // The branch must sit in the same clause: "stacked on purpose on `X`".
+        let clause_ends = after.find(['.', '\n']).unwrap_or(after.len());
+        let first_tick = after.find('`').unwrap_or(after.len());
+        if let Some(branch) = tokens.first().filter(|t| is_branch(t) && first_tick < clause_ends) {
+            let parent = branch.split_once('/').map_or(*branch, |(_, id)| id);
+            let base = tokens[1..]
+                .iter()
+                .take_while(|t| **t != "main" && !is_branch(t))
+                .find(|t| is_commit(t))
+                .copied()
+                .unwrap_or_default();
+            return format!("parent={parent} base={base}");
+        }
+    }
+    let tokens = ticked(policy);
     if let Some(i) = tokens.iter().position(|t| *t == "main")
-        && let Some(sha) = tokens.get(i + 1).filter(|t| is_sha(t))
+        && let Some(sha) = tokens.get(i + 1).filter(|t| is_commit(t))
     {
         return format!("parent= base={sha}");
-    }
-    let lower = policy.to_ascii_lowercase();
-    if let Some(at) = lower.find("stacked on `") {
-        let rest = &policy[at + "stacked on `".len()..];
-        let branch = rest.split('`').next().unwrap_or_default();
-        let parent = branch.split_once('/').map_or(branch, |(_, id)| id);
-        return format!("parent={parent} base=");
     }
     String::new()
 }
@@ -1515,6 +1559,58 @@ mod tests {
         let e = &settled.queue.entries[0];
         assert_eq!((e.branch.as_str(), e.parent.as_str(), e.base.as_str(), e.claimed.as_str()), ("feat/a", "", "abc1234", NOW));
         assert!(settled.applicable(), "{:?}", settled.refusals);
+    }
+
+    /// `psy-events`' live `**Branch:**` paragraph, verbatim (F3, owner ruling):
+    /// "stacked on" wins over the off-main sha in the same prose, and the base
+    /// is the parent's tip, the merge-base §8 defines. The off-main `a52e9ea`
+    /// would replay design-system's commits in a restack.
+    #[test]
+    fn a_stacked_on_policy_proposes_its_parent_and_the_parents_tip() {
+        let live = "**Branch:** `feat/psy-events`, **stacked on purpose on `feat/psy-design-system`** (tip \
+                    `15dde47`, which is itself off `main` = `a52e9ea`). The design-system branch is parked \
+                    `deferred` and not merged.";
+        assert_eq!(stack_proposal(live), "parent=psy-design-system base=15dde47");
+        assert_eq!(stack_proposal("Stacked on `feat/y`."), "parent=y base=", "no tip given: explicit unknown");
+        assert_eq!(
+            stack_proposal("Stacked on `feat/y`, which is off `main` `abc1234`."),
+            "parent=y base=",
+            "main's sha is not the parent's tip"
+        );
+        assert_eq!(stack_proposal("An unmerged stacked chain. Cut `feat/z` off `main` `abc1234`."), "parent= base=abc1234");
+        assert_eq!(stack_proposal("Branch `feat/a` off `main` `abc1234`."), "parent= base=abc1234");
+    }
+
+    /// F4 (owner ruling): `base=` empty is an explicit unknown and settles the
+    /// call; a malformed answer is refused at plan time.
+    #[test]
+    fn a_stack_base_answer_may_leave_the_base_unknown_but_not_be_malformed() {
+        let started = |id: &str| {
+            let mut e = item(id, "task", "active");
+            e.branch_policy = Some(format!("Branch `fix/{id}` off `main`."));
+            e
+        };
+        let mut answers = base_answers();
+        answers.call.insert("stack_base:a".into(), "parent=b base=".into());
+        answers.call.insert("stack_base:b".into(), "parent= base=".into());
+        let ok = plan(&backlog(vec![started("a"), started("b")], vec![]), &answers, NOW);
+        assert!(ok.refusals.is_empty(), "{:?}", ok.refusals);
+        let a = ok.queue.entries.iter().find(|e| e.id == "a").unwrap();
+        assert_eq!((a.parent.as_str(), a.base.as_str(), a.claimed.as_str()), ("b", "", NOW));
+
+        for (bad, why) in [
+            ("parent=ghost base=", "not another item"),
+            ("parent=a base=", "not another item"),
+            ("parent= base=main", "not a 7–40 digit hex commit"),
+            ("parent= base=abc1234 base=abc1234", "repeats `base`"),
+            ("parent=b", "lacks"),
+            ("parent=b base= extra", "stray word `extra`"),
+        ] {
+            answers.call.insert("stack_base:a".into(), bad.into());
+            let refused = plan(&backlog(vec![started("a"), started("b")], vec![]), &answers, NOW);
+            let r = refused.refusals.iter().find(|r| r.subject == "a").unwrap_or_else(|| panic!("{bad}"));
+            assert!(r.reason.contains(why), "{bad}: {}", r.reason);
+        }
     }
 
     #[test]
