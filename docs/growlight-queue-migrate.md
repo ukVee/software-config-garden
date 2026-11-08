@@ -83,7 +83,7 @@ Before writing anything, keeperd refuses with an error that leads with the code:
 |---|---|
 | `fleet_armed` | `config/growlight.toml` has `fleet_enabled = true` |
 | `switch_is_v2` | `config/growlight.toml` already says `queue = "v2"` |
-| `v2_files_present` | `queue.toml`, `queue-archive.toml` or a `slices.toml` exists |
+| `v2_files_present` | `queue.toml`, `queue-archive.toml` or a `slices.toml` exists: an earlier apply landed (see §4) |
 | `legacy_changed` | the snapshot (every backlog `.md` and baton the plan reads) is not at the `--expect` version: something changed since the dry run, so re-run it |
 | `not_applicable` | the recomputed plan still has a refusal or an open call |
 
@@ -105,6 +105,20 @@ those lines by hand: the v2 files are already committed, so a second `--apply`
 refuses `v2_files_present` and won't redo the copies.
 
 ## 4. After the apply
+
+**If the apply failed**, it says which half it reached:
+
+- The keeperd op errored. Nothing was committed, and keeperd put back every
+  file it had staged, so the error ends `nothing was committed and the staged
+  files were put back`. Fix the cause and run the same `--apply` again. If a
+  file couldn't be put back, the error names it instead; remove that file
+  (or restore it with `softfig show`) before the retry.
+- The commit landed and a baton copy failed. The command exits non-zero after
+  printing a `commit <hash>` line, and it ends with the `mkdir -p … && cp -n …`
+  lines to run (§3, "Baton copies"). Don't re-run `--apply`.
+
+A later `--apply` that refuses `v2_files_present` means a migration landed:
+`softfig log` shows its `queue_v2_migrated` commit.
 
 The switch is still `legacy`. Flipping `queue = "v2"` is a separate,
 deliberate step, done with the fleet disarmed. The rest of the owner's

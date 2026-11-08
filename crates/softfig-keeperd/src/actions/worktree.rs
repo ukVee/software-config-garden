@@ -556,6 +556,34 @@ impl<'a> WorkTree<'a> {
             }
         }
     }
+
+    /// Put `rel` back the way it was before a verb that failed staged over
+    /// it: `prior`'s bytes, or absent. Every byte restored is one the tree
+    /// already held, so no write guard applies — a guard that refused the
+    /// rollback would leave the failed verb's writes staged for the next
+    /// commit. Only [`v2::apply`](super::growlight::v2::write::apply) calls it.
+    pub(crate) fn unstage(&self, rel: &str, prior: Option<&[u8]>) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        if let Some(bytes) = prior {
+            return self.stage(rel, bytes);
+        }
+        match self {
+            WorkTree::Disk { daemon, garden_root } => {
+                let abs = garden_root.join(rel);
+                daemon.mark_self_write(abs.clone());
+                match std::fs::remove_file(&abs) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err((ErrorKind::Io, format!("remove_file {rel}: {e}")))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            WorkTree::Fuse { mount } => {
+                mount.stage_remove(rel);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree

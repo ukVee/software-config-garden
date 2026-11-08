@@ -2849,6 +2849,64 @@ mod tests {
         assert_eq!(commit_count(&daemon), before + 1);
     }
 
+    /// F12: a commit that fails leaves nothing staged, so the failure is
+    /// distinguishable from a landed apply and the same args retry cleanly.
+    /// The failure is real: the object store is read-only, so the commit
+    /// can't write its blobs.
+    #[test]
+    fn a_failed_migrate_commit_unstages_so_the_retry_applies() {
+        use std::os::unix::fs::PermissionsExt;
+        fn set_mode(dir: &std::path::Path, mode: u32) {
+            for entry in walkdir_dirs(dir) {
+                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        fn walkdir_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = vec![dir.to_path_buf()];
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    out.extend(walkdir_dirs(&path));
+                }
+            }
+            out
+        }
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let before_doc = backlog_doc(garden.path());
+        let before = commit_count(&daemon);
+        let objects = garden.path().join(".softfig/objects");
+
+        set_mode(&objects, 0o555);
+        let failed = migrate_apply(&daemon, migrate_args(&expect, true));
+        set_mode(&objects, 0o755);
+        let (_, msg) = failed.unwrap_err();
+        assert!(msg.ends_with("; nothing was committed and the staged files were put back"), "{msg}");
+        assert_eq!(commit_count(&daemon), before, "nothing landed");
+        assert!(!garden.path().join(QUEUE_FILE).exists(), "queue.toml unstaged");
+        assert!(!garden.path().join(QUEUE_ARCHIVE_FILE).exists(), "queue-archive.toml unstaged");
+        assert_eq!(backlog_doc(garden.path()), before_doc, "the queue view unstaged");
+        let fixture_slices = {
+            let files = fixture_files();
+            let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
+            migrate::plan(&migrate::read_legacy(&files).unwrap(), &args.answers, "2026-11-01T00:00:00Z").slices
+        };
+        for (milestone, _) in &fixture_slices {
+            assert!(!garden.path().join(slices_file(milestone)).exists(), "{milestone}: slices.toml unstaged");
+            let host = slices_view_host(milestone);
+            let doc = std::fs::read_to_string(garden.path().join(&host)).unwrap();
+            assert!(!managed::has_region(&doc, SLICES_V2_TAG), "{host}: view unstaged");
+        }
+        assert_eq!(snapshot_version(&daemon), expect, "the tree is back at the dry run's snapshot");
+
+        // The same args now apply, and a landed apply is what refuses.
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1);
+        let (_, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert!(msg.starts_with("v2_files_present: "), "{msg}");
+    }
+
     #[test]
     fn migrate_apply_refuses_before_any_write() {
         let garden = tempfile::tempdir().unwrap();

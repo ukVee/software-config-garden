@@ -96,7 +96,7 @@ pub fn apply(
     extras: &ExtraWrites,
 ) -> Result<Hash, (ErrorKind, String)> {
     crate::handlers::require_unlocked(inner)?;
-    {
+    let (prior, intent) = {
         let wt = WorkTree::new(daemon, inner);
         // Pass 1 — refuse everything that could fail, before anything lands.
         for f in files.iter().chain(extras.writes) {
@@ -123,41 +123,97 @@ pub fn apply(
             .map(|v| read_view_host(&wt, inner, &v.host, v.body.is_some(), extras.writes))
             .collect();
         let hosts = hosts?;
-        // Pass 2 — stage every write. Extras land before the views so a view
-        // host that is itself an extra gets the region upserted on top of its
-        // staged doc, and before the backlink refresh so the new docs' refs
-        // resolve.
-        // Structured writes: every byte here is keeperd's own rendering of a
-        // verb's typed fields (`write_structured`, outside §6.7's member
-        // `> Model:` guard — the one member-callable verb that reaches here,
-        // `queue_add_entry`, holds the member's text fields to §6.7 itself, and
-        // vouches for its state writes, which pass 1 refused otherwise).
-        for f in files {
-            wt.write_structured(&f.rel, &f.bytes)?;
-        }
-        for f in extras.writes {
-            wt.write_structured(&f.rel, &f.bytes)?;
-        }
-        for (v, host) in views.iter().zip(hosts) {
-            let Some(content) = host else {
-                continue; // removing a region from a doc that doesn't exist: done
-            };
-            let new = match &v.body {
-                Some(body) => managed::upsert(&content, v.tag, body),
-                None => managed::remove(&content, v.tag),
-            };
-            if new != content {
-                wt.check_write(&v.host)?;
-                wt.write_structured(&v.host, new.as_bytes())?;
+        // What every path pass 2 may stage held before it, first touch wins:
+        // a failure from here on puts these back, so a failed verb leaves the
+        // tree as it found it and a retry is clean (queue-v2-migrate-fixes
+        // F12). Without it the staged files outlive the error, a retry
+        // refuses on its own leftovers, and "failed" reads like "landed".
+        let mut prior: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+        let mut touch = |rel: &str, bytes: Option<Vec<u8>>| {
+            if !prior.iter().any(|(r, _)| r == rel) {
+                prior.push((rel.to_string(), bytes));
             }
+        };
+        for rel in files.iter().chain(extras.writes).map(|f| f.rel.as_str()).chain(views.iter().map(|v| v.host.as_str())) {
+            touch(rel, wt.read(rel));
         }
-        if extras.refresh_backlinks {
-            backlinks::refresh_all(&wt, inner);
+        if let Err(e) = stage(&wt, inner, files, views, hosts, extras, &mut touch) {
+            return Err(rolled_back(&wt, &prior, e));
+        }
+        let intent = Intent::new(intent_name, payload)
+            .map_err(|e| rolled_back(&wt, &prior, (ErrorKind::Internal, e.to_string())))?;
+        (prior, intent)
+    };
+    let tip = |inner: &DaemonInner| inner.repo.as_ref().and_then(|r| r.tip().ok().flatten());
+    let before = tip(inner);
+    match crate::actions::commit_now(inner, intent) {
+        Ok(hash) => Ok(hash),
+        // The tip moved, so the commit landed and absorbed the staged files:
+        // there is nothing left to put back.
+        Err(e) if tip(inner) != before => Err(e),
+        Err(e) => Err(rolled_back(&WorkTree::new(daemon, inner), &prior, e)),
+    }
+}
+
+/// Pass 2 of [`apply`]: stage every write. Extras land before the views so a
+/// view host that is itself an extra gets the region upserted on top of its
+/// staged doc, and before the backlink refresh so the new docs' refs resolve.
+/// `touch` records each backlink rewrite's prior text for the rollback.
+fn stage(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    files: &[FileWrite],
+    views: &[ViewWrite],
+    hosts: Vec<Option<String>>,
+    extras: &ExtraWrites,
+    touch: &mut impl FnMut(&str, Option<Vec<u8>>),
+) -> Result<(), (ErrorKind, String)> {
+    // Structured writes: every byte here is keeperd's own rendering of a
+    // verb's typed fields (`write_structured`, outside §6.7's member
+    // `> Model:` guard — the one member-callable verb that reaches here,
+    // `queue_add_entry`, holds the member's text fields to §6.7 itself, and
+    // vouches for its state writes, which pass 1 refused otherwise).
+    for f in files.iter().chain(extras.writes) {
+        wt.write_structured(&f.rel, &f.bytes)?;
+    }
+    for (v, host) in views.iter().zip(hosts) {
+        let Some(content) = host else {
+            continue; // removing a region from a doc that doesn't exist: done
+        };
+        let new = match &v.body {
+            Some(body) => managed::upsert(&content, v.tag, body),
+            None => managed::remove(&content, v.tag),
+        };
+        if new != content {
+            wt.check_write(&v.host)?;
+            wt.write_structured(&v.host, new.as_bytes())?;
         }
     }
-    let intent = Intent::new(intent_name, payload)
-        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    crate::actions::commit_now(inner, intent)
+    if extras.refresh_backlinks {
+        for (rel, text) in backlinks::refresh_all(wt, inner) {
+            touch(&rel, Some(text.into_bytes()));
+        }
+    }
+    Ok(())
+}
+
+/// Put every path back to `prior` after a failed [`apply`], and say so in
+/// the error: the caller can retry, because nothing was committed and
+/// nothing is left staged. A path that can't be put back is named instead —
+/// that is the one case a retry may trip over.
+fn rolled_back(
+    wt: &WorkTree,
+    prior: &[(String, Option<Vec<u8>>)],
+    (kind, msg): (ErrorKind, String),
+) -> (ErrorKind, String) {
+    let stuck: Vec<String> = prior
+        .iter()
+        .filter_map(|(rel, bytes)| wt.unstage(rel, bytes.as_deref()).err().map(|(_, e)| e))
+        .collect();
+    match stuck.is_empty() {
+        true => (kind, format!("{msg}; nothing was committed and the staged files were put back")),
+        false => (kind, format!("{msg}; nothing was committed, and these stay staged: {}", stuck.join("; "))),
+    }
 }
 
 /// Read a view's host doc through the same guard the legacy verbs use. A
