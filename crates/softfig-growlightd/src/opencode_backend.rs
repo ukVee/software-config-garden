@@ -1596,6 +1596,8 @@ mod tests {
 
         // The command half is opencode's, after the `--`.
         let sep = s.iter().position(|a| a == "--").expect("a `--` separates wrapper from command");
+        // The test-thread cap is a scope option too, so opencode's tests get it.
+        assert!(s[..sep].contains(&"--setenv=RUST_TEST_THREADS=2".to_string()));
         assert_eq!(
             &s[sep + 1..],
             &[

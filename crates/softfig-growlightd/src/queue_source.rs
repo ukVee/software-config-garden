@@ -289,6 +289,15 @@ impl QueueSource for KeeperdQueueSource {
         }
     }
 
+    /// Whether the part's item doc carries a `> Not before:` that has arrived
+    /// ([`doc_timed_due`]) — the `tasks = true` exception of a closed schedule.
+    /// An unreadable doc is not due: the exception only ever widens admission,
+    /// so a read miss keeps the member held.
+    fn timed_due(&self, _queue: &str, part: &str) -> bool {
+        matches!(self.docs.read_item_doc(part), Ok(Some(doc))
+            if doc_timed_due(&doc, crate::agent_harness::unix_now()))
+    }
+
     /// The part's item doc content for the `reconcile model-refused` pass
     /// (claude-login-pool-wiring slice 004 M-E) — the same reader `claim_hold`
     /// uses, but swallowing the error back to `None`: the reconcile treats
@@ -321,6 +330,14 @@ pub(crate) fn doc_hold(doc: &str, now: i64) -> Option<ClaimHold> {
         (_, Ok(_)) => None,
         (_, Err(e)) => Some(ClaimHold::BadStartTime(e)),
     }
+}
+
+/// Does `doc` declare a `> Not before:` that has arrived by `now`? A
+/// `> Fleet:` hold or an unparseable time is never due (growlight-schedule
+/// §3.5: the exception opens a window for a timed item, it lifts no other hold).
+pub(crate) fn doc_timed_due(doc: &str, now: i64) -> bool {
+    fleet_marker(doc).is_none()
+        && matches!(softfig_ipc::fleet::not_before(doc), Some((_, Ok(at))) if at <= now)
 }
 
 /// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
@@ -617,6 +634,20 @@ mod tests {
 
     fn with_docs(docs: Result<Option<String>, String>) -> KeeperdQueueSource {
         KeeperdQueueSource { reader: Box::new(ErrReader), docs: Box::new(FixtureDocs(docs)) }
+    }
+
+    #[test]
+    fn a_timed_item_is_due_only_once_its_start_time_has_arrived() {
+        let doc = "> Not before: 2026-10-31 02:00 -04:00\n";
+        let at = softfig_ipc::fleet::parse_not_before("2026-10-31 02:00 -04:00").unwrap();
+        assert!(!doc_timed_due(doc, at - 1));
+        assert!(doc_timed_due(doc, at));
+        assert!(!doc_timed_due("# no line\n", at), "no line is not a timed item");
+        assert!(!doc_timed_due("> Not before: soon\n", at), "an unparseable time never opens");
+        assert!(
+            !doc_timed_due("> Fleet: no\n> Not before: 2020-01-01 00:00 Z\n", at),
+            "the exception lifts no `> Fleet:` hold",
+        );
     }
 
     #[test]

@@ -278,6 +278,47 @@ halts on them, and it omits the 5h/7d percentages from the baton. Without that o
 session started while the Claude window was spent would halt immediately, and that is
 exactly when the human reaches for opencode.
 
+## When members run: the `[schedule]` table
+
+`[schedule]` in `config/growlight.toml` is an admission filter on top of everything above
+(growlight-schedule spec §3). `fleet_enabled` stays the master arm. With
+`[schedule] enabled = true`, an armed fleet admits a member only while one of its windows
+is open, in local time:
+
+```toml
+[schedule]
+enabled = true
+windows = ["23:00-07:00"]          # every day, every member
+reserve_weekly_pct = { slot1 = 20, "*" = 0 }
+
+[[schedule.window]]
+days     = ["mon-fri"]
+start    = "10:00"
+end      = "20:00"
+backends = ["opencode"]            # and/or members = ["b"]
+```
+
+- **Windows union.** A member is admitted when any window whose filters match it is open.
+  `backends` and `members` must both match. A window that crosses midnight belongs to the
+  day it starts.
+- **A close never kills.** A member mid-iteration finishes, and its re-roll waits for the
+  next open window. Past `close_grace_minutes` (default 45) it is flagged `overrun`.
+- **Timed items.** With `tasks = true` (the default), an item whose `> Not before:` has
+  arrived may run outside every window.
+- **The weekly reserve** is per claude-login slot. A slot is held once its vouchable 7d
+  reading reaches `100 − reserve`, until the window resets. opencode members are never
+  reserve-held, because they draw on no weekly window.
+- **Restart after an edit.** growlightd reads `[schedule]` once, at start, so an edit
+  takes effect after `systemctl --user restart softfig-growlightd`. There is no reload.
+  Each open or close edge is one line in the journal (`schedule: window <label> opened`),
+  not on the coordination bus.
+- **Fail-closed.** An unknown key, a bad time or day, or a `members` id with no `[[fleet]]`
+  agent disables the fleet at load. An unreadable local zone closes the schedule for
+  everyone.
+
+The shipped template (`templates/default-garden/config/growlight.toml`) documents every
+key.
+
 ## Reading a mixed fleet: `growlight status`
 
 `growlight status` reports two lists, and the difference matters:
@@ -330,6 +371,50 @@ held:
   default/hover-view-sticky        human-only (> Fleet: no)
 ```
 
+Below the lists come the **`[schedule]`** block (growlight-schedule spec §3.8) and the
+live **build caps**. The schedule block is the drive loop's last verdict: whether a
+window is open, the next open or close edge in local time, each member the schedule
+holds and why, the items waiting on their `> Not before:`, and every claude-login
+slot's weekly reserve and budget projection. It reads `schedule (none)` while no
+`[schedule] enabled = true` is loaded; a disarmed fleet isn't the cause, because with no
+growlightd running `status` has nothing to answer it.
+
+```
+schedule      closed (zone America/New_York)
+  next edge     2026-10-31 23:00 -04:00
+  held          a                outside window
+  held          b                overrun
+  waiting       default/084 at 2026-11-01 02:00 -04:00
+  reserve       slot1            keep 20% · 7d used unknown · clear
+  projection    slot1            5h           resets first, resets in 2h
+  projection    slot1            7d           cap in 1d–3d, resets in 4d
+  projection    slot1            reserve 80%  cap in 18h at the earliest, or resets first, resets in 4d
+build caps    (live default — the next spawn's throttle)
+  cargo_build_jobs  2
+  …
+  test_threads      2
+```
+
+- **`overrun`** replaces a member's window reason once it has kept running more than
+  `close_grace_minutes` past its window's close. It raises one `ScheduleOverrun` alert
+  (GUI and log, not the phone). It is information only: the member still finishes its
+  iteration, and nothing is killed. A member spawned while its window was already closed
+  (a due timed item) is never flagged.
+- **A reserve reads `unknown`** when no reading can vouch for the slot's 7d percentage.
+  A headless capture records no percentage, so this is the usual state until an
+  interactive statusline writes one. An unknown reserve does not hold.
+- **`projection`** rows (spec §3.11) say when each claude-login slot's 5h and 7d windows
+  are projected to reach 100%, and, for a slot that keeps a reserve, when its 7d window
+  reaches the reserve threshold. Each row is a range, never a point. The fastest and
+  slowest burn over a few recent look-back spans give its two ends. `at the earliest,
+  or resets first` means only the fastest burn reaches the cap before the window
+  resets, and `resets first` means none does. The samples are the same per-slot
+  readings the reserve reads. They are kept in memory only, so a restarted growlightd
+  reads `unknown` until two fresh measured readings land in the current window. A
+  window reset or an expired reading (`resets_at` passed) also makes the row `unknown`.
+  The projection is information only and holds nothing. opencode (metered) members get
+  no row.
+
 ### Spend accounting is session-scoped, and it is not a cap
 
 - **In memory only.** The counters live in the backend's cells and are lost on a
@@ -351,6 +436,13 @@ kill-handle registries. So `growlight force-stop --hard-kill`, `request_restart`
 `set_resources` throttle and the boot reconciler all address it the same way. The only
 backend-specific parts are argv, the pre-approval it generates, and the wire format it
 parses.
+
+The build caps come from `[build_caps]` in `config/growlight.toml`. `test_threads`
+(default `2`) sets `RUST_TEST_THREADS` on every scope beside `CARGO_BUILD_JOBS`, so a
+member's `cargo test` runs at most that many tests at once per test binary. It
+supersedes the `softfig-growlightd.service.d/50-test-threads.conf` drop-in, which the
+growlight-schedule deploy runbook removes. A `0` disables the fleet at load, because
+libtest refuses it.
 
 Three differences worth knowing when reading logs:
 

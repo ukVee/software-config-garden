@@ -64,6 +64,10 @@ pub struct DaemonInner {
     /// last tick — what `status` lists under `held`. Empty until the loop's first
     /// tick, and always empty for a disarmed fleet (no loop runs).
     pub held_parts: Vec<softfig_ipc::growlightd::HeldPartSummary>,
+    /// The `[schedule]` block `status` reports (growlight-schedule slice 006),
+    /// as the drive loop last evaluated it. `None` until the loop's first tick,
+    /// while no schedule is enabled, and always for a disarmed fleet.
+    pub schedule_summary: Option<softfig_ipc::growlightd::ScheduleSummary>,
     // The live `claude -p` child *kill* handles do NOT live here under the daemon
     // lock — they are in [`Daemon::kill_handles`], a registry the backend shares
     // by `Arc` and fills on every spawn, so the hard-kill path never has to take
@@ -81,6 +85,7 @@ impl DaemonInner {
             fleet: crate::fleet::FleetConfig::disabled(),
             member_lifecycles: BTreeMap::new(),
             held_parts: Vec::new(),
+            schedule_summary: None,
         }
     }
 }
@@ -419,6 +424,12 @@ impl Daemon {
         self.inner.lock().unwrap().fleet = fleet;
     }
 
+    /// The fleet's `[schedule]` (growlight-schedule slice 003), read by the drive
+    /// loop once per tick. `None` when the table is absent. Brief-lock clone.
+    pub fn schedule(&self) -> Option<crate::schedule::ScheduleConfig> {
+        self.inner.lock().unwrap().fleet.schedule.clone()
+    }
+
     /// The current runtime per-device [`Policy`] — the single source of truth the
     /// `set_policy` verb mutates, `status` echoes, and the drive loop refreshes
     /// its admission governor from each tick. Brief-lock read (`Policy` is `Copy`).
@@ -593,6 +604,16 @@ impl Daemon {
     /// A brief lock write, like [`record_member_lifecycle`](Self::record_member_lifecycle).
     pub fn record_held_parts(&self, held: Vec<softfig_ipc::growlightd::HeldPartSummary>) {
         self.inner.lock().unwrap().held_parts = held;
+    }
+
+    /// Replace the `[schedule]` block `status` reports (growlight-schedule
+    /// slice 006). The drive loop calls this once per tick; `None` while no
+    /// schedule is enabled.
+    pub fn record_schedule_summary(
+        &self,
+        summary: Option<softfig_ipc::growlightd::ScheduleSummary>,
+    ) {
+        self.inner.lock().unwrap().schedule_summary = summary;
     }
 
     /// `request_lease` (spec §4c): arbitrate a lease over the shared resource

@@ -49,11 +49,13 @@ pub mod persist;
 pub mod preapproval;
 pub mod profile_budget;
 pub mod profile_pin;
+pub mod projection;
 pub mod queue_source;
 pub mod queue_show;
 pub mod rate_limit_holds;
 pub mod reconcile;
 pub mod resume;
+pub mod schedule;
 pub mod scheduler;
 pub mod scheduler_v2;
 pub mod server;
@@ -101,6 +103,7 @@ pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use profile_budget::{
     headroom_from, pool_headroom, profile_budget_path, read_profile_budget, slot_headroom,
+    slot_readings, slot_vouchable_7d, vouchable_7d,
     Headroom, STALE_FLOOR_SECS,
 };
 pub use profile_pin::{

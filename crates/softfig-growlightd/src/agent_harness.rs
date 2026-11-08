@@ -563,7 +563,8 @@ pub(crate) fn scope_base_name_gen(agent: &str, generation: u64) -> String {
 /// Build the `systemd-run` cap flags (the scope options BEFORE the `--`) that
 /// GENTLY throttle an agent's build subtree without ever aborting it
 /// (peer-isolation slice 002; human direction 2026-06-28): a low
-/// `CARGO_BUILD_JOBS` env (fewer parallel `rustc` → lower peak RAM), a SOFT
+/// `CARGO_BUILD_JOBS` env (fewer parallel `rustc` → lower peak RAM), a low
+/// `RUST_TEST_THREADS` env (fewer tests in flight per test binary), a SOFT
 /// `--property=MemoryHigh` (the kernel throttles + reclaims past it, never
 /// OOM-kills), and a deprioritizing `--property=CPUWeight`. Deliberately NEVER
 /// `MemoryMax` (the hard OOM-kill cap) nor a tight `TasksMax` (a `fork` EAGAIN) —
@@ -575,6 +576,9 @@ pub(crate) fn build_cap_args(caps: &BuildCaps) -> Vec<OsString> {
     let mut args = Vec::new();
     if let Some(jobs) = caps.cargo_build_jobs {
         args.push(format!("--setenv=CARGO_BUILD_JOBS={jobs}").into());
+    }
+    if let Some(threads) = caps.test_threads {
+        args.push(format!("--setenv=RUST_TEST_THREADS={threads}").into());
     }
     if let Some(high) = &caps.memory_high {
         args.push(format!("--property=MemoryHigh={high}").into());
@@ -1257,12 +1261,14 @@ mod tests {
 
     #[test]
     fn build_cap_args_emits_only_the_configured_gentle_caps() {
-        // The default caps render as the three GENTLE flags, in order: a low
-        // CARGO_BUILD_JOBS env + a SOFT MemoryHigh + a deprioritizing CPUWeight.
+        // The default caps render as the four GENTLE flags, in order: low
+        // CARGO_BUILD_JOBS + RUST_TEST_THREADS envs + a SOFT MemoryHigh + a
+        // deprioritizing CPUWeight.
         assert_eq!(
             build_cap_args(&BuildCaps::default()),
             vec![
                 OsString::from("--setenv=CARGO_BUILD_JOBS=2"),
+                OsString::from("--setenv=RUST_TEST_THREADS=2"),
                 OsString::from("--property=MemoryHigh=3G"),
                 OsString::from("--property=CPUWeight=50"),
             ]
@@ -1281,6 +1287,7 @@ mod tests {
             memory_high: None,
             cpu_weight: None,
             cpu_quota: None,
+            test_threads: None,
         };
         assert!(build_cap_args(&none).is_empty());
         // A partial cap emits only what's set.
@@ -1289,6 +1296,7 @@ mod tests {
             memory_high: Some("70%".to_string()),
             cpu_weight: None,
             cpu_quota: None,
+            test_threads: None,
         };
         assert_eq!(
             build_cap_args(&partial),
@@ -1403,6 +1411,7 @@ mod tests {
                 "--collect",
                 "--unit=growlight-agent-a1-7",
                 "--setenv=CARGO_BUILD_JOBS=2",
+                "--setenv=RUST_TEST_THREADS=2",
                 "--property=MemoryHigh=3G",
                 "--property=CPUWeight=50",
                 "--",

@@ -105,6 +105,11 @@ pub enum ClaimHold {
     /// The `> Not before:` value doesn't parse, so the start time is unknown —
     /// fail-closed rather than start it early. Carries the parse error.
     BadStartTime(String),
+    /// The schedule is closed to the member picking and the part is not an item
+    /// whose `> Not before:` has arrived (growlight-schedule slice 003, §3.5).
+    /// Only ever marked on one member's private pick view, never on the shared
+    /// snapshot: another member the schedule admits may claim the part.
+    OutsideWindow,
 }
 
 impl ClaimHold {
@@ -115,6 +120,7 @@ impl ClaimHold {
             Self::Unreadable(error) => format!("fleet marker unreadable: {error}"),
             Self::NotYet(value) => format!("scheduled (> Not before: {value})"),
             Self::BadStartTime(error) => format!("start time unreadable: {error}"),
+            Self::OutsideWindow => "outside the schedule window".to_string(),
         }
     }
 
@@ -122,6 +128,7 @@ impl ClaimHold {
     pub fn waits_for(&self) -> &'static str {
         match self {
             Self::NotYet(_) => "its start time",
+            Self::OutsideWindow => "its window",
             Self::HumanOnly(_) | Self::Unreadable(_) | Self::BadStartTime(_) => "the human",
         }
     }

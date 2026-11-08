@@ -1014,6 +1014,12 @@ struct ClaudeFlavor {
     /// [`ClaudeBackend::with_holds_view`]; a bare test backend leaves it unset
     /// and the pre-filter degrades to credential-only (today's behaviour).
     holds_view: OnceLock<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
+    /// A read-handle to the drive loop's reserve-held slot set
+    /// (growlight-schedule slice 004): slots at or past their weekly reserve,
+    /// rewritten every tick. The picker skips them while the pool has a clear
+    /// slot. Installed once via [`ClaudeBackend::with_reserve_view`]; unset, no
+    /// slot is reserve-held.
+    reserve_view: OnceLock<Arc<Mutex<BTreeSet<String>>>>,
 }
 
 impl ClaudeFlavor {
@@ -1230,6 +1236,33 @@ impl ClaudeFlavor {
             pool
         } else {
             survivors.as_slice()
+        };
+        // The weekly reserve (growlight-schedule slice 004, §3.6): skip a
+        // reserve-held slot while the candidates include a clear one. When
+        // every candidate is held the member waits: a sibling slot on a
+        // rate-limit hold narrows `candidates` to the reserved slot alone, so
+        // this is reached without any race, and picking it would spend the
+        // owner's reserve. The Hold names no slot, so the drive loop stamps no
+        // rate-limit entry on a slot that is only reserved; the next tick
+        // re-runs the pick and it clears when the reserve or the sibling does.
+        let reserve_held: BTreeSet<String> = self
+            .reserve_view
+            .get()
+            .map(|view| view.lock().unwrap().clone())
+            .unwrap_or_default();
+        let unreserved: Vec<String> =
+            candidates.iter().filter(|slot| !reserve_held.contains(*slot)).cloned().collect();
+        if unreserved.is_empty() && !candidates.is_empty() {
+            return Err(SpawnKind::Hold { slots: Vec::new(), until: None });
+        }
+        let candidates: &[String] = if unreserved.len() == candidates.len() {
+            candidates
+        } else {
+            eprintln!(
+                "growlightd: agent {agent:?}: skipping claude-login slot(s) at their weekly \
+                 reserve; picking from {unreserved:?}"
+            );
+            unreserved.as_slice()
         };
 
         let histories: Vec<Vec<pin::ProfilePin>> = profiles
@@ -1566,6 +1599,7 @@ impl ClaudeBackend {
             usage_capture: OnceLock::new(),
             per_slot_captures: Mutex::new(BTreeMap::new()),
             holds_view: OnceLock::new(),
+            reserve_view: OnceLock::new(),
         });
         Self {
             harness: Harness::new(
@@ -1614,6 +1648,15 @@ impl ClaudeBackend {
         holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     ) -> Self {
         let _ = self.flavor.holds_view.set(holds);
+        self
+    }
+
+    /// Share the drive loop's reserve-held slot set (growlight-schedule slice
+    /// 004) with this backend's pool-slot picker, which skips a slot at its
+    /// weekly reserve while the pool has a clear one. One-shot like
+    /// [`Self::with_holds_view`]; a bare test backend leaves it unset.
+    pub fn with_reserve_view(self, reserve_held: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        let _ = self.flavor.reserve_view.set(reserve_held);
         self
     }
 
@@ -2500,10 +2543,12 @@ mod tests {
             .expect("a `--` separates the scope wrapper from the command");
 
         // The GENTLE build caps (slice 002) are `systemd-run` scope options, so
-        // they sit BEFORE the `--`: a low CARGO_BUILD_JOBS + a SOFT MemoryHigh + a
-        // deprioritizing CPUWeight. Never a hard kill cap (MemoryMax/TasksMax).
+        // they sit BEFORE the `--`: low CARGO_BUILD_JOBS + RUST_TEST_THREADS, a SOFT
+        // MemoryHigh and a deprioritizing CPUWeight. Never a hard kill cap
+        // (MemoryMax/TasksMax).
         let scope_opts = &s[..sep];
         assert!(scope_opts.contains(&"--setenv=CARGO_BUILD_JOBS=2".to_string()));
+        assert!(scope_opts.contains(&"--setenv=RUST_TEST_THREADS=2".to_string()));
         assert!(scope_opts.contains(&"--property=MemoryHigh=3G".to_string()));
         assert!(scope_opts.contains(&"--property=CPUWeight=50".to_string()));
         assert!(
@@ -2558,6 +2603,7 @@ mod tests {
                 "--collect",
                 "--unit=growlight-agent-a1-7",
                 "--setenv=CARGO_BUILD_JOBS=2",
+                "--setenv=RUST_TEST_THREADS=2",
                 "--property=MemoryHigh=3G",
                 "--property=CPUWeight=50",
                 "--",
@@ -3140,6 +3186,44 @@ mod tests {
         // Both slots are allowed on disk (no `by_profile_dir`, so headroom
         // reads full for every slot). The picker still skips slot1.
         assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// growlight-schedule slice 004 — a slot at its weekly reserve is skipped
+    /// while the pool has a clear one.
+    #[test]
+    fn a_reserve_held_slot_is_skipped_while_the_pool_has_a_clear_one() {
+        let mut fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        reserve.lock().unwrap().insert("slot1".to_string());
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// Review 056 F8 — a candidate set that is all reserve-held waits (a quiet
+    /// `Hold` naming no slot) instead of spending a reserved slot. A
+    /// rate-limited sibling reaches this deterministically: slot1 is held, so
+    /// the pick narrows to slot2, which is at its reserve.
+    #[test]
+    fn a_pool_with_only_reserved_slots_left_holds_instead_of_picking_one() {
+        let (mut fx, holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        holds.lock().unwrap().extend("slot1", 10_000);
+        reserve.lock().unwrap().insert("slot2".to_string());
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("only a reserved slot is left") {
+            SpawnKind::Hold { slots, until } => {
+                assert!(slots.is_empty(), "no rate-limit entry is stamped on a reserved slot");
+                assert_eq!(until, None);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        assert!(fx.history("a").is_empty(), "nothing was picked");
+        // The reserve clearing releases the member.
+        reserve.lock().unwrap().clear();
+        assert!(fx.backend.flavor.child_env("a", &paths).is_ok());
     }
 
     /// M-C finish check 3a — every slot held = quiet Stall-shape, same as

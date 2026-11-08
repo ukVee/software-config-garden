@@ -21,7 +21,8 @@
 //! - **Eligibility** ([`eligible`]) is the conjunction of §2's clauses, checked
 //!   in the spec's order: status, `after` links, the repo rule, the holder
 //!   rule, the remote rule (grants §9), the unit walk, and the §6.4 backend
-//!   match.
+//!   match — plus the schedule clause ([`ScheduleGate`], growlight-schedule
+//!   §3.10) right after status.
 //! - **The four-step pick** ([`pick_v2`]): (1) urgent lane, pinned project;
 //!   (2) the member's own last `active`/`paused` entry; (3) normal lane,
 //!   pinned project; (4) fallback — 1 and 3 again, unfiltered.
@@ -53,6 +54,36 @@ pub struct Member {
     /// queue). `None` = unpinned: steps 1/3 scan with no project filter, so
     /// the urgent lane still comes first (§9) and the fallback adds nothing.
     pub pin: Option<String>,
+    /// What the `[schedule]` verdict lets this member take this tick
+    /// (growlight-schedule §3.10). The drive loop computes it, so the pick
+    /// stays pure.
+    pub schedule: ScheduleGate,
+}
+
+/// The schedule's eligibility clause for one member (growlight-schedule
+/// §3.10): the [`crate::schedule::Admission`] verdict, with the due timed
+/// entries spelled out for the `tasks = true` exception.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScheduleGate {
+    /// No schedule gates this member.
+    #[default]
+    Open,
+    /// Schedule-held: no entry is eligible.
+    Held,
+    /// Closed with `tasks = true`: only these entries — items whose
+    /// `> Not before:` has arrived — are eligible (§3.5).
+    TimedOnly { due: BTreeSet<String> },
+}
+
+impl ScheduleGate {
+    /// Does the gate let the member take `entry`?
+    pub fn admits(&self, entry: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Held => false,
+            Self::TimedOnly { due } => due.contains(entry),
+        }
+    }
 }
 
 /// One `[[project]]` row, reduced to what the pick needs (§3.1).
@@ -252,6 +283,10 @@ pub enum SkipReason {
     /// A `queued` entry whose `not_before` doesn't parse: held, so a typo
     /// never starts work early (§2 **Holds**, fail closed).
     BadStartTime,
+    /// The `[schedule]` holds the member, or is closed to it and the entry is
+    /// not an item whose `> Not before:` has arrived (growlight-schedule
+    /// §3.10).
+    Schedule,
 }
 
 impl SkipReason {
@@ -273,6 +308,7 @@ impl SkipReason {
             SkipReason::HumanOnly => "human_only",
             SkipReason::NotYet => "not_yet",
             SkipReason::BadStartTime => "bad_start_time",
+            SkipReason::Schedule => "schedule",
         }
     }
 
@@ -330,6 +366,9 @@ impl SkipReason {
             }
             SkipReason::BadStartTime => {
                 "a queued entry whose `not_before` doesn't parse, held until fixed (§2 Holds)"
+            }
+            SkipReason::Schedule => {
+                "the schedule holds this member, and this is not a due timed item"
             }
         }
     }
@@ -568,6 +607,11 @@ pub fn eligible(
     // Holds (§2), right after the status clause.
     if let Some(reason) = hold(entry, snapshot.now_unix) {
         return Err(reason);
+    }
+    // 1b. The schedule (growlight-schedule §3.10): a held member takes
+    // nothing; a closed member with `tasks = true` takes only due timed items.
+    if !member.schedule.admits(&entry.id) {
+        return Err(SkipReason::Schedule);
     }
     // 2. `after` links: every listed id is archived `done`. A `dropped` id is
     // simply absent from `done_ids`, so it never satisfies (§2).
@@ -859,6 +903,7 @@ mod tests {
             id: id.into(),
             backend: Backend::Opencode,
             pin: None,
+            schedule: ScheduleGate::Open,
         }
     }
 
@@ -868,6 +913,7 @@ mod tests {
             id: id.into(),
             backend: Backend::Claude,
             pin: None,
+            schedule: ScheduleGate::Open,
         }
     }
 
@@ -930,6 +976,32 @@ mod tests {
             snapshot.trees.insert("e".into(), tree(declared(None)));
             assert!(eligible(&snapshot, &member("m"), &e).is_ok(), "{status:?}");
         }
+    }
+
+    // ---- eligibility: the schedule (growlight-schedule §3.10) ------------
+
+    #[test]
+    fn a_schedule_held_member_takes_nothing_and_a_timed_only_one_takes_only_due_entries() {
+        let (a, b) = (entry("a"), entry("b"));
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![a.clone(), b.clone()],
+        );
+        snapshot.trees.insert("a".into(), tree(declared(None)));
+        snapshot.trees.insert("b".into(), tree(declared(None)));
+
+        let mut held = member("m");
+        held.schedule = ScheduleGate::Held;
+        assert_eq!(eligible(&snapshot, &held, &a), Err(SkipReason::Schedule));
+        assert_eq!(pick_v2(&snapshot, &held).picked, None);
+
+        let mut timed = member("m");
+        timed.schedule = ScheduleGate::TimedOnly { due: BTreeSet::from(["b".to_string()]) };
+        assert_eq!(eligible(&snapshot, &timed, &a), Err(SkipReason::Schedule));
+        assert!(eligible(&snapshot, &timed, &b).is_ok());
+        assert_eq!(pick_v2(&snapshot, &timed).picked.map(|p| p.entry), Some("b".to_string()));
+
+        assert_eq!(pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry), Some("a".to_string()));
     }
 
     // ---- eligibility: after links ---------------------------------------

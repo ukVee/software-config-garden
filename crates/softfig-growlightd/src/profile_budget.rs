@@ -218,6 +218,55 @@ pub fn slot_headroom(by_profile_dir: &Path, slot: &str, now: i64) -> Headroom {
     }
 }
 
+/// `slot`'s vouchable 7d reading for the weekly reserve
+/// (growlight-schedule slice 004, spec §3.6) — the used percentage and the
+/// window's `resets_at` — or `None` when no reading can vouch for one.
+///
+/// Two readings may name the slot: its own `<slot>.json` under
+/// `by_profile_dir`, and the shared `usage.json` beside that directory when
+/// the shared file's `profile` is `slot` (a reading without a `profile` is
+/// `home`'s, from before the field existed). An unpooled member on `home`
+/// has only the shared file. The larger vouchable percentage wins: within one
+/// live window the used share only grows, so the larger is the later truth.
+/// A missing or unreadable file contributes nothing, and the age floor
+/// [`STALE_FLOOR_SECS`] does not apply — [`RateWindow::vouchable_pct_at`]'s
+/// own `resets_at` test is the reserve's freshness rule.
+pub fn slot_vouchable_7d(
+    by_profile_dir: &Path,
+    slot: &str,
+    now: i64,
+) -> Option<crate::schedule::Reading7d> {
+    vouchable_7d(&slot_readings(by_profile_dir, slot), now)
+}
+
+/// The vouchable 7d reading among `readings` (one slot's
+/// [`slot_readings`]): the largest vouchable percentage, per
+/// [`slot_vouchable_7d`].
+pub fn vouchable_7d(readings: &[UsageSnapshot], now: i64) -> Option<crate::schedule::Reading7d> {
+    readings
+        .iter()
+        .filter_map(|snap| {
+            let week = &snap.rate_limits.seven_day;
+            week.vouchable_pct_at(now)
+                .map(|used_pct| crate::schedule::Reading7d { used_pct, resets_at: week.resets_at })
+        })
+        .max_by_key(|reading| reading.used_pct)
+}
+
+/// Every reading that names `slot`: its own `<slot>.json` under
+/// `by_profile_dir`, then the shared `usage.json` beside that directory when
+/// the shared file's `profile` is `slot` (no `profile` is `home`'s). A missing
+/// or unreadable file contributes nothing. [`slot_vouchable_7d`] reads these,
+/// and so does the budget projection's sample ring (slice 008).
+pub fn slot_readings(by_profile_dir: &Path, slot: &str) -> Vec<UsageSnapshot> {
+    let own = read_profile_budget(by_profile_dir, slot);
+    let shared = by_profile_dir
+        .parent()
+        .and_then(|runtime| UsageSnapshot::load(&runtime.join(crate::fleet::USAGE_FILE)).ok().flatten())
+        .filter(|snap| snap.profile.as_deref().unwrap_or(softfig_ipc::claude_profiles::HOME_SLOT) == slot);
+    own.into_iter().chain(shared).collect()
+}
+
 /// Snapshot every slot in `pool` to `(slot, headroom)` pairs, in pool order.
 /// One disk read per slot (file sizes are small, a few hundred bytes); called
 /// once per spawn pick and once per status render. A torn file lands in the
@@ -259,6 +308,41 @@ mod tests {
             resets_at: Some(resets_at),
             status: Some(status.to_string()),
         }
+    }
+
+    fn pct7d(dir: &Path, slot: &str, now: i64) -> Option<u8> {
+        slot_vouchable_7d(dir, slot, now).map(|reading| reading.used_pct)
+    }
+
+    #[test]
+    fn the_reserve_reads_a_slot_only_while_its_7d_reading_can_vouch() {
+        let runtime = tempfile::tempdir().unwrap();
+        let dir = runtime.path().join("usage.by-profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |path: &Path, seven: RateWindow, profile: Option<&str>| {
+            let mut s = snap(RateWindow::default(), seven, 100);
+            s.profile = profile.map(str::to_string);
+            s.write_atomic(path).unwrap();
+        };
+        assert_eq!(pct7d(&dir, "slot1", 500), None, "no reading");
+        write(&profile_budget_path(&dir, "slot1"), rw_pct(80, "allowed", 1_000), Some("slot1"));
+        assert_eq!(pct7d(&dir, "slot1", 500), Some(80));
+        assert_eq!(pct7d(&dir, "slot1", 1_000), None, "resets_at passed");
+        assert_eq!(
+            slot_vouchable_7d(&dir, "slot1", 500).and_then(|r| r.resets_at),
+            Some(1_000),
+            "the reading carries its window's reset for status",
+        );
+        write(&profile_budget_path(&dir, "slot2"), rw_status("allowed", 1_000), Some("slot2"));
+        assert_eq!(pct7d(&dir, "slot2", 500), None, "no used_percentage");
+        // The shared file counts for the slot it names; `home` when unnamed.
+        let shared = runtime.path().join(crate::fleet::USAGE_FILE);
+        write(&shared, rw_pct(90, "allowed", 1_000), Some("slot1"));
+        assert_eq!(pct7d(&dir, "slot1", 500), Some(90), "the larger reading wins");
+        assert_eq!(pct7d(&dir, "home", 500), None);
+        write(&shared, rw_pct(60, "allowed", 1_000), None);
+        assert_eq!(pct7d(&dir, "home", 500), Some(60));
+        assert_eq!(pct7d(&dir, "slot1", 500), Some(80));
     }
 
     #[test]

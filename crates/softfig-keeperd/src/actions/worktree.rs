@@ -110,7 +110,8 @@ impl<'a> WorkTree<'a> {
     /// [`check_write`](Self::check_write) plus the content check
     /// [`write`](Self::write) makes for these exact bytes: the member guards —
     /// no hand edit of a daemon-managed region ([`member_region_refusal`]),
-    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
+    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` /
+    /// `> Not before:` lines
     /// ([`member_reserved_refusal`]) and the `> Fleet:` hold
     /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
     /// this over each before its first write, like `check_write`.
@@ -126,8 +127,9 @@ impl<'a> WorkTree<'a> {
     /// The member guards for replacing `rel` with `new` (`None` = removing it).
     /// Anywhere in the garden, the caller's bytes may not change a
     /// daemon-managed region ([`member_region_refusal`]; `bytes` says whether
-    /// they are the caller's). Under `growlight/backlog/`, the three reserved
-    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`) are
+    /// they are the caller's). Under `growlight/backlog/`, the four reserved
+    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`,
+    /// `> Not before:`) are
     /// member-immutable and the `> Fleet:` line is member-tighten-only (see
     /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
     /// this request runs for a fleet member ([`crate::caller`]).
@@ -153,13 +155,16 @@ impl<'a> WorkTree<'a> {
 
     /// The same guard for removing `rel`, which may be a whole directory:
     /// refused for a member when it removes a reserved `> Model:` / `> Grants:`
-    /// / `> Worktree:` line or loosens a held `> Fleet:` line under
+    /// / `> Worktree:` / `> Not before:` line or loosens a held `> Fleet:` line under
     /// `growlight/backlog/` — a doc there carrying one, a directory holding such
     /// a doc, or an ancestor of the backlog itself.
     fn guard_member_removal(&self, rel: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
+        if spans_config(rel) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "removes")));
+        }
         let scope = if spans_backlog(rel) {
             super::growlight::paths::backlog_dir()
         } else if is_backlog_rel(rel) {
@@ -189,7 +194,8 @@ impl<'a> WorkTree<'a> {
     /// The guard for a rename: moving `from` removes its lines from where they
     /// were, moving it into the backlog adds them at `to` (whatever `from`
     /// is), and replacing an existing `to` removes the destination's. A reserved
-    /// `> Model:` / `> Grants:` / `> Worktree:` line is refused in both
+    /// `> Model:` / `> Grants:` / `> Worktree:` / `> Not before:` line is
+    /// refused in both
     /// directions; `> Fleet:` only in the loosening one (a member may move a
     /// held doc *into* the backlog — that tightens).
     fn guard_member_rename(&self, from: &str, to: &str) -> ActionResult {
@@ -214,6 +220,9 @@ impl<'a> WorkTree<'a> {
         if self.landings(from, to).iter().any(|l| *l == growlight_config_rel()) {
             return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "rename lands on")));
         }
+        if is_config_rel(to) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, to, "renames onto")));
+        }
         self.guard_member_removal(to)
     }
 
@@ -229,6 +238,9 @@ impl<'a> WorkTree<'a> {
         }
         if old != new && rel == growlight_config_rel() {
             return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "write changes")));
+        }
+        if is_config_rel(rel) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "writes")));
         }
         let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
         let (old, new) = (text(old), text(new));
@@ -267,8 +279,8 @@ impl<'a> WorkTree<'a> {
     /// read keeps the guard ([`crate::growlight_unit::queue_v2`]).
     ///
     /// A member can't move the switch: [`member_growlight_config_refusal`].
-    /// Removing the file reads as legacy, which keeps the guard, so only a write
-    /// or a rename onto it is refused.
+    /// Removing the file would read as legacy, which keeps the guard; the
+    /// `config/` guard ([`member_config_refusal`]) refuses that too.
     fn fleet_lines_hold(&self) -> bool {
         !self.read_to_string(&growlight_config_rel()).is_some_and(|raw| crate::growlight_unit::queue_v2(&raw))
     }
@@ -311,7 +323,7 @@ impl<'a> WorkTree<'a> {
     }
 
     /// The first file at or under `rel` carrying a reserved `> Model:` /
-    /// `> Grants:` / `> Worktree:` line, with its text.
+    /// `> Grants:` / `> Worktree:` / `> Not before:` line, with its text.
     fn first_reserved_doc(&self, rel: &str) -> Option<(String, String)> {
         use softfig_ipc::queue_v2::{reserved_field, SUB_DOC_RESERVED};
         self.first_doc_with(rel, |t| reserved_field(t, &SUB_DOC_RESERVED).is_some())
@@ -432,7 +444,8 @@ impl<'a> WorkTree<'a> {
     ///
     /// For a fleet member's request, a write under `growlight/backlog/` that
     /// adds, removes or changes a reserved `> Model:` / `> Grants:` /
-    /// `> Worktree:` line (or loosens a `> Fleet:` hold) is refused here
+    /// `> Worktree:` / `> Not before:` line (or loosens a `> Fleet:` hold) is
+    /// refused here
     /// (§6.7) — see [`check_write_bytes`](Self::check_write_bytes).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
@@ -633,6 +646,38 @@ fn is_backlog_rel(rel: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+/// Whether canonical `rel` lies under the garden's `config/` tree — the
+/// daemons' own settings (`growlight.toml`, `keeper.toml`, `pricing.toml`,
+/// `peers.toml`, `deploy.toml`).
+fn is_config_rel(rel: &str) -> bool {
+    rel.strip_prefix(crate::keeper_toml::CONFIG_DIR)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether `rel` is `config/`, something under it, or the garden root:
+/// removing it removes (part of) the config tree.
+fn spans_config(rel: &str) -> bool {
+    rel.is_empty() || is_config_rel(rel)
+}
+
+/// Review 056 F6 (report 121): a fleet member may not change the daemons'
+/// settings. `config/growlight.toml` is the fleet's admission control — the
+/// `[schedule]` windows, the reserve, the build caps — and growlightd reads it
+/// at its next start, so a member's `patch_file` there would widen its own
+/// window. `folder-grants` is not the general fix (its spec excludes garden
+/// writes and leaves claude members advisory), so keeperd refuses it at the
+/// write. This does not confine a member's shell, which can still write the
+/// mount directly (spec-growlight-queue §6.7). The refusal text leads with the
+/// wire code, `member_not_allowed`.
+fn member_config_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {rel}, and fleet member {member} may not change anything \
+         under config/ — growlightd and keeperd read their settings from there, so a member's \
+         edit would be its own admission control. The human edits config/; if a setting is \
+         wrong, file_report it or post_message @human. (spec-growlight-queue §6.7)"
+    )
+}
+
 /// The inline `<vault id="…">…</vault>` regions in `text` at repo-relative
 /// `rel`, as `(open tag, body)` pairs in order. One scanner for the member
 /// guard and for Layer B's own parser (`layer_b::regions::parse`), so a
@@ -686,8 +731,8 @@ pub(crate) fn member_vault_refusal(
             "member_not_allowed: this write adds, removes or changes an inline `<vault>` region in \
              {rel}, and fleet member {member} may not seal or unseal anything under \
              growlight/backlog/ — a sealed region reads as `[encrypted]` to growlightd, so it \
-             could hide a `> Fleet:` / `> Model:` / `> Worktree:` line. Write the text in the \
-             clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
+             could hide a `> Fleet:` / `> Model:` / `> Worktree:` / `> Not before:` line. Write \
+             the text in the clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
         )
     })
 }
@@ -731,7 +776,7 @@ fn spans_backlog(rel: &str) -> bool {
 
 /// [`member_reserved_refusal`] as the worktree's error, for a change the caller
 /// already knows touches a reserved `> Model:` / `> Grants:` / `> Worktree:`
-/// line.
+/// / `> Not before:` line.
 fn reserved_refusal(
     member: &str,
     rel: &str,
@@ -747,7 +792,8 @@ fn reserved_refusal(
 /// `old` with `new` at `rel` (`None` = absent / removed) adds, removes or
 /// changes a `> <key>:` line for any key in
 /// [`softfig_ipc::queue_v2::SUB_DOC_RESERVED`] — the `> Model:`, `> Grants:`
-/// and `> Worktree:` lines §6.7 reserves to humans. Two reads of the one
+/// and `> Worktree:` lines §6.7 reserves to humans, and the `> Not before:`
+/// start time (growlight-schedule slice 007). Two reads of the one
 /// scanner ([`softfig_ipc::item_meta`]) are compared: every raw line (fenced or
 /// not — an edit to a fenced example is refused too), and the value a resolver
 /// reads ([`softfig_ipc::item_meta::field`] — so a fence opened or closed
@@ -1007,6 +1053,11 @@ mod tests {
             ("Model", "# slice\n\n> Model: flash\n\nbody\n", "# slice\n\n> Model: claude\n\nbody\n"),
             ("Grants", "# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
             ("Worktree", "# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+            (
+                "Not before",
+                "# t\n\n> Not before: 2026-11-01 02:00Z\n\nbody\n",
+                "# t\n\n> Not before: 2026-11-01 03:00Z\n\nbody\n",
+            ),
         ];
         for (key, doc, changed) in cases {
             let add = member_reserved_refusal("c", rel, Some("# slice\n\nbody\n"), Some(doc)).unwrap();
@@ -1105,11 +1156,11 @@ mod tests {
     }
 
     /// The same worktree-level guard refuses a member's add, change and remove
-    /// of a `> Grants:` or `> Worktree:` line (report 020), across write,
-    /// `check_write_bytes`, `unlink` (remove) and rename-out. A human may set
-    /// and change either.
+    /// of a `> Grants:`, `> Worktree:` (report 020) or `> Not before:` line
+    /// (growlight-schedule slice 007), across write, `check_write_bytes`,
+    /// `unlink` (remove) and rename-out. A human may set and change each.
     #[test]
-    fn a_members_backlog_write_may_not_touch_a_grants_or_worktree_line() {
+    fn a_members_backlog_write_may_not_touch_a_grants_worktree_or_not_before_line() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let inner = daemon.inner.lock().unwrap();
@@ -1117,6 +1168,7 @@ mod tests {
         let cases = [
             ("# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
             ("# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+            ("# a\n\n> Not before: 2026-11-01 02:00Z\n\nbody\n", "# a\n\n> Not before: 2026-11-02 02:00Z\n\nbody\n"),
         ];
         for (doc, changed) in cases {
             wt.write(SLICE, b"# a\n\nbody\n").expect("reset");
@@ -1562,6 +1614,49 @@ Example:
             .expect("a rename outside the queue");
     }
 
+    /// Review 056 F6 (report 121): a member may not write, remove, or rename
+    /// onto anything under `config/` (nor remove the tree above it), by any
+    /// spelling of the path; a human may. The refusal names the file.
+    #[test]
+    fn a_member_may_not_change_config() {
+        assert!(is_config_rel("config/growlight.toml"));
+        assert!(is_config_rel("config/source/dots/x"));
+        assert!(is_config_rel("config"));
+        assert!(!is_config_rel("configs/x"), "a sibling that merely shares the prefix");
+        assert!(!is_config_rel("projects/p/config/x"), "only the garden's own config/");
+        assert!(spans_config("") && spans_config("config") && !spans_config("projects"));
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let toml = "config/growlight.toml";
+        wt.write(toml, b"[schedule]\nenabled = true\n").unwrap();
+        wt.write("projects/p/notes/001-x.md", b"# n\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+
+        let err = wt.write(toml, b"[schedule]\nenabled = false\n").unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains(toml), "{err:?}");
+        assert!(wt.write("config/pricing.toml", b"x = 1\n").is_err(), "creating one too");
+        assert!(wt.write("./config//growlight.toml", b"x\n").is_err(), "an alias of it");
+        assert!(wt.check_write_bytes(toml, b"x\n").is_err(), "the pre-check agrees");
+        assert!(wt.check_write_bytes_over(toml, None, b"x\n").is_err(), "so does the batch's");
+        assert!(wt.write_derived(toml, b"x\n").is_err(), "a derived write for a member too");
+        assert!(wt.remove(toml).is_err(), "removing the file");
+        assert!(wt.remove("config").is_err(), "removing the tree");
+        assert!(wt.remove("").is_err(), "removing the garden root");
+        assert!(wt.rename(toml, "projects/p/notes/002-y.md").is_err(), "renaming it away");
+        assert!(wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").is_err(), "renaming onto config/");
+        assert_eq!(wt.read_to_string(toml).as_deref(), Some("[schedule]\nenabled = true\n"));
+        assert!(!wt.exists("config/deploy.toml") && wt.exists("projects/p/notes/001-x.md"));
+        wt.write("projects/p/notes/001-x.md", b"# edited\n").expect("a notes/ write still works");
+
+        drop(_member);
+        wt.write(toml, b"[schedule]\nenabled = false\n").expect("a human's write");
+        wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").expect("a human's rename");
+        wt.remove("config/deploy.toml").expect("a human's removal");
+    }
+
     /// Review 042 G74-3: every spelling of a garden path canonicalises to one,
     /// and a member's write, removal or rename through an alias of a guarded
     /// backlog doc is refused exactly as through its canonical path.
@@ -1606,6 +1701,11 @@ Example:
         let why = member_reserved_refusal("c", rel, Some(declared), Some(hidden)).unwrap();
         assert!(why.contains("changes which `> Worktree:` line"), "{why}");
         assert!(member_reserved_refusal("c", rel, Some(hidden), Some(declared)).is_some(), "un-hiding");
+        let scheduled = "# t\n\n> Not before: 2026-11-01 02:00Z\n";
+        let unscheduled = "# t\n\n~~~\n> Not before: 2026-11-01 02:00Z\n";
+        let why = member_reserved_refusal("c", rel, Some(scheduled), Some(unscheduled)).unwrap();
+        assert!(why.contains("changes which `> Not before:` line"), "{why}");
+        assert!(member_reserved_refusal("c", rel, Some(unscheduled), Some(scheduled)).is_some(), "re-scheduling");
 
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());

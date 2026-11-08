@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use softfig_growlightd::assemble;
-use softfig_growlightd::scheduler_v2::{pick_v2, Member, SkipReason, Unit};
+use softfig_growlightd::scheduler_v2::{pick_v2, Member, ScheduleGate, SkipReason, Unit};
 use softfig_ipc::model_choice::Backend;
 use softfig_ipc::queue_v2::migrate::{plan, read_legacy, Answers, LegacyFiles};
 use softfig_ipc::queue_v2::{slices_file, QUEUE_ARCHIVE_FILE, QUEUE_FILE};
@@ -75,7 +75,7 @@ fn a_migrated_fixture_assembles_and_picks() {
     // Today's fixture holds everything: deferred and blocked entries are
     // ineligible, and `> Fleet: no` maps to a human-only hold.
     snapshot.now_unix = 1_793_491_200; // 2026-11-01T00:00:00Z
-    let member = Member { id: "a".into(), backend: Backend::Claude, pin: None };
+    let member = Member { id: "a".into(), backend: Backend::Claude, pin: None, schedule: ScheduleGate::Open };
     let outcome = pick_v2(&snapshot, &member);
     assert_eq!(outcome.picked, None);
     let skips: Vec<_> = outcome.skips.iter().map(|s| (s.entry.as_str(), s.reason)).collect();
