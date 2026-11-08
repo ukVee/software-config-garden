@@ -151,8 +151,11 @@ fn relay_recovers_after_a_target_timeout_without_a_restart() {
     let alice = device("alice", 1, 2);
     let bob = device("bob", 3, 4);
 
-    // Short registration TTL so the parked corpse ages out within the test.
-    let ttl = Duration::from_millis(300);
+    // Short registration TTL so the parked corpse ages out within the test. The
+    // same TTL covers fresh bob's slot, so it must outlast that leg until alice
+    // connects under a loaded gate (300 ms didn't: report 096), while the corpse
+    // still ages out inside `wait_until`'s 5 s deadline.
+    let ttl = Duration::from_millis(3000);
     let (relay, addr) = start_relay_with_ttl(&relay_dev, &[&alice, &bob], ttl);
     let relay_static = relay_dev.transport_pubkey;
     let bob_id = bob.local.device_id;
