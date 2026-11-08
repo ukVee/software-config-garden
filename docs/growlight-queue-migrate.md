@@ -99,6 +99,11 @@ judged. A copy **never overwrites** an existing target (that one is reported
 `skipped, target exists`) and **never removes** the source. Each copy prints
 one line: `copied`, `skipped, target exists`, or `FAILED, <reason>`.
 
+A failed copy makes the command exit non-zero. The other copies still run, and
+the output ends with a `mkdir -p … && cp -n …` line for each failed one. Run
+those lines by hand: the v2 files are already committed, so a second `--apply`
+refuses `v2_files_present` and won't redo the copies.
+
 ## 4. After the apply
 
 The switch is still `legacy`. Flipping `queue = "v2"` is a separate,

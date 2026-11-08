@@ -2813,20 +2813,50 @@ fn queue_migrate_apply(
         reply.entries, reply.archived, reply.slices
     );
     println!("baton copies: {}", reply.batons.len());
-    let entries = runtime.join("entries");
-    for mv in &reply.batons {
-        let line = match copy_migrated_baton(&entries, &batons, mv) {
-            Ok(BatonCopy::Copied) => "copied",
-            Ok(BatonCopy::TargetExists) => "skipped, target exists",
-            Err(e) => {
-                println!("  {} -> entries/{}/baton.md: FAILED, {e}", mv.from, mv.entry);
-                continue;
-            }
-        };
-        println!("  {} -> entries/{}/baton.md: {line}", mv.from, mv.entry);
-    }
+    copy_migrated_batons(runtime, &batons, &reply.batons, |line| println!("{line}"))
+        .with_context(|| format!("after commit {}", short_hash(&reply.hash)))?;
     println!("the switch is unchanged; flip `queue = \"v2\"` yourself, with the fleet disarmed");
     Ok(())
+}
+
+/// Run every §3.6 copy under `<runtime>/entries`, reporting one line each
+/// through `report`. Any failure is an error, after `report` has printed the
+/// shell command that finishes each failed copy: the commit has landed, so a
+/// second `--apply` refuses `v2_files_present` and those commands are the
+/// only way to finish. `cp -n` keeps the copy's never-overwrite rule.
+fn copy_migrated_batons(
+    runtime: &Path,
+    sent: &std::collections::BTreeMap<String, String>,
+    moves: &[migrate::BatonMove],
+    mut report: impl FnMut(String),
+) -> Result<()> {
+    let entries = runtime.join("entries");
+    let mut failed = Vec::new();
+    for mv in moves {
+        let outcome = match copy_migrated_baton(&entries, sent, mv) {
+            Ok(BatonCopy::Copied) => "copied".to_string(),
+            Ok(BatonCopy::TargetExists) => "skipped, target exists".to_string(),
+            Err(e) => {
+                let dir = entries.join(&mv.entry);
+                failed.push(format!(
+                    "mkdir -p {} && cp -n {} {}",
+                    shell_quote(&dir),
+                    shell_quote(&runtime.join(&mv.from)),
+                    shell_quote(&dir.join("baton.md")),
+                ));
+                format!("FAILED, {e:#}")
+            }
+        };
+        report(format!("  {} -> entries/{}/baton.md: {outcome}", mv.from, mv.entry));
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    report("the v2 files are committed; finish each failed copy by hand:".to_string());
+    for cmd in &failed {
+        report(format!("  {cmd}"));
+    }
+    bail!("{} of {} baton copies failed", failed.len(), moves.len())
 }
 
 /// What one §3.6 baton copy did.
@@ -2860,8 +2890,12 @@ fn copy_migrated_baton(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(BatonCopy::TargetExists),
         Err(e) => return Err(e).with_context(|| format!("creating {}", target.display())),
     };
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("writing {}", target.display()))?;
+    if let Err(e) = file.write_all(text.as_bytes()) {
+        // A partial target would read as `TargetExists` to every later copy.
+        drop(file);
+        let _ = fs::remove_file(&target);
+        return Err(e).with_context(|| format!("writing {}", target.display()));
+    }
     Ok(BatonCopy::Copied)
 }
 
@@ -6315,6 +6349,42 @@ mod tests {
         }
         assert!(copy_migrated_baton(&entries, &sent, &mv("003", "baton.md")).is_err(), "never sent");
         assert!(!entries.join("003").exists());
+    }
+
+    /// A copy that fails after the commit (queue-v2-migrate-fixes F11) is an
+    /// error, not a printed line: the others still run, and the report ends
+    /// with the exact command that finishes the failed one.
+    #[test]
+    fn a_failed_baton_copy_errors_and_prints_its_recovery() {
+        let runtime = tempfile::tempdir().unwrap();
+        let entries = runtime.path().join("entries");
+        fs::create_dir_all(&entries).unwrap();
+        // `entries/002` is a file, so its directory can't be made.
+        fs::write(entries.join("002"), "in the way\n").unwrap();
+        let sent: std::collections::BTreeMap<String, String> = [
+            ("agents/a/baton.md".to_string(), "a\n".to_string()),
+            ("agents/b/baton.md".to_string(), "b\n".to_string()),
+        ]
+        .into();
+        let moves = [
+            migrate::BatonMove { from: "agents/a/baton.md".into(), entry: "001".into() },
+            migrate::BatonMove { from: "agents/b/baton.md".into(), entry: "002".into() },
+        ];
+        let mut lines = Vec::new();
+        let err = copy_migrated_batons(runtime.path(), &sent, &moves, |l| lines.push(l)).unwrap_err();
+        assert_eq!(err.to_string(), "1 of 2 baton copies failed");
+        assert_eq!(fs::read_to_string(entries.join("001/baton.md")).unwrap(), "a\n", "the good copy ran");
+        assert_eq!(lines[0], "  agents/a/baton.md -> entries/001/baton.md: copied");
+        assert!(lines[1].starts_with("  agents/b/baton.md -> entries/002/baton.md: FAILED, "), "{lines:?}");
+        let rt = runtime.path().display();
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("  mkdir -p '{rt}/entries/002' && cp -n '{rt}/agents/b/baton.md' '{rt}/entries/002/baton.md'")
+        );
+        // Nothing failed: Ok, and no recovery block.
+        let mut quiet = Vec::new();
+        copy_migrated_batons(runtime.path(), &sent, &moves[..1], |l| quiet.push(l)).unwrap();
+        assert_eq!(quiet, ["  agents/a/baton.md -> entries/001/baton.md: skipped, target exists"]);
     }
 
     /// `queue migrate --dry-run` (queue-v2-migrate slice 004): the snapshot
