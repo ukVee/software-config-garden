@@ -108,11 +108,90 @@ pub fn unreadable_metadata(doc: &str) -> Option<&'static str> {
         Some("the doc is whole-file sealed")
     } else if first.starts_with("[malformed vault tag in ") {
         Some("the doc's <vault> tags don't parse")
-    } else if doc.contains("[encrypted]</vault>") {
+    } else if without_code_spans(doc).contains("[encrypted]</vault>") {
         Some("the doc carries a sealed <vault> region, which can hide a metadata line")
     } else {
         None
     }
+}
+
+/// `text` with fenced code blocks and inline code spans blanked out, so a doc
+/// that merely *quotes* the redacted projection shape reads as prose (the same
+/// masking the daemon's strict region grammar applies; cf. 020 slice 003).
+///
+/// Fenced lines become blank lines; inline spans become spaces, so line numbers
+/// and the single-line shapes the caller searches for are preserved.
+fn without_code_spans(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fence: Option<&'static str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```");
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+            out.push('\n');
+            continue;
+        }
+
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '`' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let mut open = 0;
+            while i + open < chars.len() && chars[i + open] == '`' {
+                open += 1;
+            }
+            // A span closes on a run of exactly the opening length.
+            let mut j = i + open;
+            let mut close = None;
+            while j < chars.len() {
+                if chars[j] == '`' {
+                    let mut run = 0;
+                    while j + run < chars.len() && chars[j + run] == '`' {
+                        run += 1;
+                    }
+                    if run == open {
+                        close = Some(j + run);
+                        break;
+                    }
+                    j += run;
+                } else {
+                    j += 1;
+                }
+            }
+            match close {
+                Some(end) => {
+                    for _ in i..end {
+                        out.push(' ');
+                    }
+                    i = end;
+                }
+                None => {
+                    for _ in 0..open {
+                        out.push('`');
+                    }
+                    i += open;
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `model` → `Model`: a key as refusal text and docs spell it.
@@ -171,6 +250,16 @@ mod tests {
             unreadable_metadata("A member could wrap it as `<vault id=\"h\">…</vault>`.\n"),
             None,
             "prose that mentions a vault tag"
+        );
+        assert_eq!(
+            unreadable_metadata("The body becomes `[encrypted]</vault>` in the projection.\n"),
+            None,
+            "prose that quotes the projection shape in an inline span"
+        );
+        assert_eq!(
+            unreadable_metadata("# t\n```\n<vault id=\"h\">[encrypted]</vault>\n```\n"),
+            None,
+            "a fenced example is not a sealed region"
         );
     }
 
