@@ -19,6 +19,30 @@ decision record or crate that owns it, rather than at every internal change.
   fleet slice 003). A claude member whose model Claude Code refuses
   (`model_not_found` / 404) parks the unit with an alert carrying the reason;
   there is no crash loop and no backoff retry.
+- **Queue v2** — one ordered list of projects and entries in `queue.toml`,
+  `queue-archive.toml` and per-milestone `slices.toml`, behind the
+  `queue = "legacy" | "v2"` switch in `config/growlight.toml` (default
+  `legacy`, unchanged). growlightd picks from it, records each started entry's
+  `parent`/`base` from git, enqueues one restack per repo when a stack goes
+  stale, and holds an entry by its `fleet` / `not_before` fields. `queue show`,
+  `queue pick` and the TUI Growlight tab show and edit it (milestones
+  `queue-v2-state`, `queue-v2-scheduling`, `queue-v2-git`, `queue-v2-parity`;
+  `meta/spec-growlight-queue.md`).
+- **`softfig growlight queue migrate`** — converts the legacy backlog tables and
+  item docs to the v2 files (`docs/growlight-queue-migrate.md`). `--dry-run`
+  prints the plan, every judgment call and refusal, and the snapshot version,
+  and writes nothing. `--answers <toml>` settles calls by `[class]` or `[call]`.
+  `--stack-answers <out>` also asks git, read-only, for every open `stack_base`
+  call and writes an answers file to review; it never overwrites `<out>` and
+  can't be combined with `--apply`. `--apply --answers <toml> --expect <version>`
+  writes every v2 file in one keeperd commit. It refuses when the fleet is armed,
+  the switch is already `v2`, v2 files exist, the snapshot moved since the dry
+  run, or a call is still open. It never flips the switch. The apply is the
+  human's: a fleet member is refused `member_not_allowed`, through its
+  softfig-mcp stamp or from its own shell. A plan built from a sealed doc or
+  region is refused. A failed apply says whether it committed, and a failed
+  baton copy exits non-zero and prints the copy to run by hand
+  (`queue-v2-migrate`, `queue-v2-migrate-fixes`).
 
 ## [1.0.0-alpha.1] - 2026-10-17
 
