@@ -397,8 +397,8 @@ pub fn runtime_entries_dir() -> PathBuf {
 /// be resumed by a different member (spec §2): the carried state follows the
 /// work, not the worker. The member's own `agents/<id>/baton.md` still exists
 /// and still feeds the SessionStart hook — at spawn, growlightd copies this
-/// store's baton into it (spec §3.6). That copy is queue-v2-scheduling's job,
-/// not this store's; and growlightd is this store's only writer (the §6.3 roll
+/// store's baton into it (spec §3.6). That copy is the drive loop's job, not
+/// this store's; and growlightd is this store's only writer (the §6.3 roll
 /// verbs), a member never touches `entries/` directly.
 #[derive(Debug, Clone)]
 pub struct FsEntryBatonStore {
@@ -434,23 +434,17 @@ impl FsEntryBatonStore {
     /// create-dir-on-seed convention (idempotent with [`Self::write`]'s
     /// create), and a failed create errors fail-closed.
     ///
-    /// `branch`/`base` carry the §8 base line's FIELDS — the concrete values
-    /// are queue-v2-scheduling's, computed at first claim, where §8 says
-    /// growlightd puts `create <branch> from <base>` in the seeded baton. A
-    /// never-claimed entry's seed passes `None` and gets the literal
-    /// `<branch>`/`<base>` tokens; this store never computes git state.
-    pub fn seed(
-        &self,
-        entry_id: &str,
-        branch: Option<&str>,
-        base: Option<&str>,
-    ) -> Result<(), String> {
+    /// `base_line` is the §8 `(branch, base)` — the drive loop's values, computed
+    /// at first claim, where §8 says growlightd puts `create <branch> from
+    /// <base>` in the seeded baton. `None` seeds no line: an entry with no branch
+    /// (a restack) has nothing to create. This store never computes git state.
+    pub fn seed(&self, entry_id: &str, base_line: Option<(&str, &str)>) -> Result<(), String> {
         let path = self.entry_path(entry_id);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("create entry dir {}: {e}", dir.display()))?;
         }
-        let body = seed_entry_baton(&self.garden_name, entry_id, branch, base, &path);
+        let body = seed_entry_baton(&self.garden_name, entry_id, base_line, &path);
         fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))
     }
 
@@ -460,6 +454,13 @@ impl FsEntryBatonStore {
     /// only creator). Same convention as the member store's missing-baton read.
     pub fn read(&self, entry_id: &str) -> Option<String> {
         fs::read_to_string(self.entry_path(entry_id)).ok()
+    }
+
+    /// When an entry's baton was last written — its last handoff, since the
+    /// §6.3 store step is this store's only post-seed writer. `None` when
+    /// there is no baton or its metadata is unreadable.
+    pub fn mtime(&self, entry_id: &str) -> Option<std::time::SystemTime> {
+        fs::metadata(self.entry_path(entry_id)).and_then(|md| md.modified()).ok()
     }
 
     /// Write an entry's baton — the §6.3 handshake's store step ("growlightd
@@ -477,6 +478,35 @@ impl FsEntryBatonStore {
     }
 }
 
+/// The heading the §8 base line sits under in an entry baton.
+const FIRST_STEP_HEADING: &str = "# FIRST STEP";
+
+/// The §8 base line.
+fn render_base_line(branch: &str, base: &str) -> String {
+    format!("create {branch} from {base}")
+}
+
+/// `baton` with its §8 base line set to `(branch, base)` (V18): the seed of a
+/// first claim that failed still names the base that attempt computed, and the
+/// retry may record another. Everything else is kept byte for byte, and a baton
+/// with no base line is returned as it is, since it states no base to disagree
+/// with.
+pub(crate) fn with_base_line(baton: &str, branch: &str, base: &str) -> String {
+    let mut out = String::with_capacity(baton.len());
+    let mut in_first_step = false;
+    for line in baton.split_inclusive('\n') {
+        if line.starts_with("# ") {
+            in_first_step = line.trim_end() == FIRST_STEP_HEADING;
+        } else if in_first_step && line.starts_with("create ") {
+            out.push_str(&render_base_line(branch, base));
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// The per-entry seed baton (pure) — queue v2 §3.6's "seeded from the
 /// template": today's member seed, re-keyed from the member to the ENTRY and
 /// stripped of the member-specific fields (no `agent:`, no `queue:` — an entry
@@ -485,19 +515,18 @@ impl FsEntryBatonStore {
 /// the NEXT ACTION is a placeholder — the entry's doc holds the real mission
 /// and finish criteria, and the working member reseeds this baton from it on
 /// its first iteration (growlightd does not embed them, matching the member
-/// seed). The §8 base line carries the `branch`/`base` fields: `None` renders
-/// the literal `<branch>`/`<base>` tokens; the concrete values are
-/// queue-v2-scheduling's, passed in at first claim (spec §8).
+/// seed). The §8 base line is the drive loop's, passed in at first claim (spec
+/// §8); `None` leaves the FIRST STEP section out.
 fn seed_entry_baton(
     garden_name: &str,
     entry_id: &str,
-    branch: Option<&str>,
-    base: Option<&str>,
+    base_line: Option<(&str, &str)>,
     baton_path: &Path,
 ) -> String {
     let baton_path = baton_path.display().to_string();
-    let branch = branch.unwrap_or("<branch>");
-    let base = base.unwrap_or("<base>");
+    let first_step = base_line.map_or(String::new(), |(branch, base)| {
+        format!("{FIRST_STEP_HEADING}\n{}\n\n", render_base_line(branch, base))
+    });
     format!(
         "---\n\
          loop: {garden_name}\n\
@@ -513,8 +542,7 @@ fn seed_entry_baton(
          > file the SessionStart hook reads.\n\n\
          # NEXT ACTION\n\
          (placeholder — reseed this baton from the entry's doc on your first iteration)\n\n\
-         # FIRST STEP\n\
-         create {branch} from {base}\n\n\
+         {first_step}\
          # MISSION\n\
          Drive backlog entry `{entry_id}` to completion, handing off via this baton instead of\n\
          `/compact`.\n\n\
@@ -947,7 +975,7 @@ mod tests {
     }
 
     /// The seed→read round-trip: a never-claimed entry's template reads back
-    /// with its continue status, the entry id, the literal §8 base-line tokens,
+    /// with its continue status, the entry id, no §8 base line (none was given),
     /// and the stamped baton path; a read of a DIFFERENT entry stays `None`.
     #[test]
     fn seed_then_read_round_trips_the_template() {
@@ -957,7 +985,7 @@ mod tests {
         // No baton yet → `None` (the caller's never-claimed signal).
         assert_eq!(s.read("queue-v2-state"), None, "no baton yet reads as None");
 
-        s.seed("queue-v2-state", None, None).expect("seeds");
+        s.seed("queue-v2-state", None).expect("seeds");
         let raw = s.read("queue-v2-state").expect("reads back the seed");
         let view = parse_baton(&raw);
         assert_eq!(
@@ -972,8 +1000,8 @@ mod tests {
         );
         assert!(raw.contains("loop: garden"), "the seed tags the garden");
         assert!(
-            raw.contains("create <branch> from <base>"),
-            "an unclaimed seed carries the literal §8 base-line tokens",
+            !raw.contains("FIRST STEP") && !raw.contains("create "),
+            "with no base line the seed names nothing to create: {raw}",
         );
         assert!(
             raw.contains("# NEXT ACTION"),
@@ -998,17 +1026,33 @@ mod tests {
     fn seed_renders_the_concrete_base_line_when_given() {
         let tmp = tempfile::tempdir().unwrap();
         let s = entry_store(tmp.path());
-        s.seed("queue-v2-state", Some("feat/queue-v2-state"), Some("main"))
+        s.seed("queue-v2-state", Some(("feat/queue-v2-state", "main")))
             .expect("seeds");
         let raw = s.read("queue-v2-state").unwrap();
         assert!(
             raw.contains("create feat/queue-v2-state from main"),
             "the concrete §8 base line lands in the baton",
         );
-        assert!(
-            !raw.contains("<branch>"),
-            "no placeholder tokens when concrete values are given",
+        assert!(raw.contains(FIRST_STEP_HEADING), "the line sits under its heading");
+    }
+
+    /// V18: a rewrite touches the base line alone, and only under FIRST STEP.
+    #[test]
+    fn with_base_line_changes_only_that_line() {
+        let baton = "# NEXT ACTION\ncreate the fixture\n\n# FIRST STEP\ncreate feat/x from old\n\n\
+                     # STATE\ncreate nothing\nno trailing newline";
+        assert_eq!(
+            with_base_line(baton, "feat/x", "new"),
+            baton.replace("from old", "from new"),
         );
+    }
+
+    /// A baton with no base line states no base, so there is nothing to rewrite.
+    #[test]
+    fn with_base_line_leaves_a_baton_without_one_alone() {
+        for baton in ["", "# NEXT ACTION\ngo\n", "# FIRST STEP\nread the doc\n# STATE\ncreate x\n"] {
+            assert_eq!(with_base_line(baton, "feat/x", "new"), baton);
+        }
     }
 
     /// Unlike the member store's same-item keep, an entry re-seed OVERWRITES:
@@ -1019,7 +1063,7 @@ mod tests {
     fn reseed_overwrites_the_stored_baton() {
         let tmp = tempfile::tempdir().unwrap();
         let s = entry_store(tmp.path());
-        s.seed("e1", None, None).expect("seeds");
+        s.seed("e1", None).expect("seeds");
 
         s.write("e1", "---\nstatus: ITEM_COMPLETE\nitem: e1\n---\n# NEXT ACTION\ndone\n")
             .expect("writes");
@@ -1029,7 +1073,7 @@ mod tests {
             "the handoff write lands",
         );
 
-        s.seed("e1", None, None).expect("re-seeds");
+        s.seed("e1", None).expect("re-seeds");
         assert_eq!(
             parse_baton(&s.read("e1").unwrap()).status.as_deref(),
             Some("IN_PROGRESS"),
@@ -1059,7 +1103,7 @@ mod tests {
         let blocker = tmp.path().join("entries");
         fs::write(&blocker, b"x").unwrap();
         let s = FsEntryBatonStore::new(&blocker, "garden");
-        assert!(s.seed("e1", None, None).is_err(), "an un-creatable dir fails the seed");
+        assert!(s.seed("e1", None).is_err(), "an un-creatable dir fails the seed");
         assert!(s.write("e1", "x").is_err(), "an un-creatable dir fails the write");
     }
 

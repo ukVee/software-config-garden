@@ -9,13 +9,15 @@
 //! handler-level round trip; this suite covers the process seam on top.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::json;
 use softfig_ipc::{
-    Request, Response, connect,
+    ErrorKind, Request, Response, connect,
     queue_v2::{QueueToml, QUEUE_ARCHIVE_FILE, QUEUE_FILE},
     verbs::{ReadFileReply, op},
 };
@@ -66,6 +68,31 @@ fn boot(socket: &Path, garden: &Path) -> softfig_keeperd::DaemonHandle {
     handle
 }
 
+fn old_growlightd_socket(keeperd_socket: &Path) -> PathBuf {
+    keeperd_socket.with_file_name("growlightd-old.sock")
+}
+
+/// A growlightd from before `QUEUE_SHOW` existed: it answers every request
+/// the way the real one answers an op (or a protocol version) it does not
+/// know — a `BadArgs` refusal.
+fn old_growlightd(keeperd_socket: &Path) {
+    let listener = UnixListener::bind(old_growlightd_socket(keeperd_socket)).expect("bind old growlightd");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let mut reply = serde_json::to_vec(&Response::err(
+                ErrorKind::BadArgs,
+                "unknown op \"queue_show\"",
+            ))
+            .unwrap();
+            reply.push(b'\n');
+            let _ = stream.write_all(&reply);
+        }
+    });
+}
+
 /// One `softfig growlight {queue|slice} …` invocation; returns the completed
 /// process output. The `--socket` flag sits at the `queue`/`slice` level, so
 /// it precedes the subcommand word (clap parses parent args before the
@@ -74,6 +101,14 @@ fn boot(socket: &Path, garden: &Path) -> softfig_keeperd::DaemonHandle {
 fn cli(socket: &Path, group: &str, args: &[&str]) -> Output {
     let sock = socket.to_str().expect("utf8 socket path");
     let mut argv: Vec<&str> = vec!["growlight", group, "--socket", sock];
+    // `queue show` layers growlightd's live stack + session annotations
+    // (queue-v2-git slice 006); this suite boots only keeperd, so point the
+    // flag at `old_growlightd`'s socket — a daemon that predates the verb —
+    // rather than the live growlightd.
+    let old_gl = old_growlightd_socket(socket);
+    if group == "queue" {
+        argv.extend_from_slice(&["--growlightd-socket", old_gl.to_str().expect("utf8 socket path")]);
+    }
     let rest = if args.first() == Some(&group) {
         &args[1..]
     } else {
@@ -128,6 +163,7 @@ fn the_six_nine_forms_round_trip_through_the_binary() {
     let garden = dir.join("garden");
     let socket = dir.join("keeperd.sock");
     let handle = boot(&socket, &garden);
+    old_growlightd(&socket);
 
     // Fresh garden: `queue show` says there is nothing v2 yet (exit 0 — §3.4).
     let out = ok(&cli(&socket, "queue", &["queue", "show"]));
@@ -139,6 +175,16 @@ fn the_six_nine_forms_round_trip_through_the_binary() {
     let err = refused(&cli(&socket, "queue", &["queue", "project", "add", "softfig", "~/p"]));
     assert!(err.contains("exists"), "{err}");
     assert_eq!(queue(&socket).projects.len(), 1);
+
+    // V15: a growlightd that predates `QUEUE_SHOW` (BadArgs) costs `queue show`
+    // its annotations, not its exit status: the TOML table still renders, with
+    // one line on stderr saying why the annotations are missing.
+    let out = cli(&socket, "queue", &["queue", "show"]);
+    let table = ok(&out);
+    assert!(table.contains("queue.toml (schema 1)"), "{table}");
+    let note = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(note.lines().count(), 1, "{note}");
+    assert!(note.contains("queue annotations unavailable"), "{note}");
 
     // add milestone — the view carries the row + its branch seed.
     let out = ok(&cli(

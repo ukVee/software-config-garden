@@ -14,7 +14,8 @@ fleet_enabled = true
 
 # Which queue model growlightd schedules from (spec-growlight-queue §11).
 # Default `legacy` (today's backlog tables + queues); `v2` reads the v2 files.
-# Unknown values are refused at arm time. The migration session flips it.
+# Unknown values are refused at arm time. The migration session flips it,
+# after `softfig growlight queue migrate` (docs/growlight-queue-migrate.md).
 # queue = "legacy"
 
 # The v2 handshake's grace: seconds a member may linger after growlightd asks
@@ -205,7 +206,8 @@ opencode 2.x loads `AGENTS.md` only. It never falls back to `CLAUDE.md`, ignores
 `agents.<id>.system` carries everything a Claude Code session would have been handed, in
 this order, every piece by `{file:}` reference (house rule 1: never copied):
 
-1. the fleet protocol, `growlight/protocol-fleet.md`;
+1. the fleet protocol, `growlight/protocol-fleet.md` (`growlight/protocol-fleet-v2.md` under
+   `queue = "v2"`);
 2. the step-0 line naming this member's own `agents/<id>/baton.md`;
 3. the garden root `CLAUDE.md` (the map and the house rules);
 4. `growlight/memory-read.md`, the read half of the memory rules;
@@ -285,6 +287,10 @@ exactly when the human reaches for opencode.
 - **`agents`** — one live row per member of an **armed** fleet. Empty while disarmed:
   nothing is assembled then, so there is no runtime state to report and inventing a
   roster echo here would claim liveness the daemon cannot observe.
+
+Its `queue` line is the §11 switch as growlightd read it at boot, `legacy` or `v2`, armed or
+not. `protocol` is the wire version and stays `v1` under either, so read `queue` to see that a
+flip took. A growlightd older than the field prints no `queue` line.
 
 ```
 roster:
@@ -379,6 +385,10 @@ signal once its doc carries `> Worktree:`, since the default queue has no regist
 The repo is read once per session exit, with `git --no-optional-locks`, never once per
 tick.
 
+Under `queue = "v2"` the guard reads the repo the member's claim resolved, the same one
+the dirty-tree guard below reads (queue-v2-parity row 7). A remote or ambiguous repo gives
+no repo signal, the same as an unprobeable legacy repo.
+
 The repo excuses at most three repeats of one NEXT ACTION, and only a repo state not
 already seen during that NEXT ACTION's run. A tree that churns forever, or flips between
 two states, still trips. On a trip (two exits on the same NEXT ACTION with nothing to
@@ -423,9 +433,58 @@ The guard is read-only: it never reverts, stages or commits, and ignored paths s
 on every boot and `/clear`, from the `softfig growlight boot-check` call in the generated
 `inject.sh`. Protocol step 1b tells the member what to do with it.
 
-Not yet covered: under `queue = "v2"` the guard is not wired (the v2 start rewrites the
-member baton from the entry baton, so the entry baton's time is the handoff there). That
-is part of `queue-v2-git-hardening`, before the v2 flip.
+Under `queue = "v2"` the guard runs on the same two spawns (queue-v2-parity row 6). The
+repo is the entry's project `repo` from `queue.toml`, resolved once when the member claims
+the entry and only when the project is local: `~`, `~/…` and `~<you>/…` expand against
+your home, and a remote or ambiguous repo gets no guard. The v2 start rewrites the member
+baton from the entry baton, so a fresh start compares against the entry baton's last
+write, which is its last handoff. An entry with no baton yet is seeded, so any dirt is
+surfaced. A re-roll compares against the member's carried baton, as under legacy. The
+line names the entry rather than `<queue>/<part>`:
+
+```
+growlightd: boot dirty tree: queue-v2-parity (a): /home/u/repo has 11 uncommitted path(s), newest ~533s newer than the baton handoff
+```
+
+## Queue v2: the stack's git probes are bounded
+
+Only under `queue = "v2"`. The §8 stack model reads git (`git_stack.rs`) to record a first
+claim's `parent`/`base`, to spot a stale stack and to decide when a restack's bases can be
+re-recorded. `git_probe.rs` keeps that from stalling the drive loop: one worker-thread probe
+per repo under one overall deadline, memoised for the tick so a claim, the handshake and a
+second entry's first claim share the answers, and a repo whose probe misses its deadline is
+held with a doubling backoff across ticks. A probe that cannot answer is "unknown", never
+"stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
+detection skips the repo until it answers.
+
+`queue show` and `growlight status` read the stack the same way, on a probe cache of their
+own, so a human reading the list never holds a repo for the scheduler. A repo that can't
+answer shows "stack unknown" with the reason, and its started branches show the same, never
+an empty stack or a merged branch.
+
+Under v2 a hold lives only in the entry's `fleet` / `not_before` fields. Both surfaces and the
+TUI print them beside the status as `(human-only)` and `(not before …)`. An item doc's
+`> Fleet:` or `> Not before:` line holds nothing, so `queue show` prints one `warning:` line
+per entry whose doc line disagrees with the entry, along with the `queue fleet` / `queue
+not-before` command that would make the entry match. For the same reason, keeperd's member
+guard stops protecting the `> Fleet:` line once `config/growlight.toml` says `queue = "v2"`.
+Under legacy, or with a switch it can't read, the guard stays on. A member may not write
+`config/growlight.toml`.
+
+`not_before` gates only a `queued` entry's claim: a `paused` or orphaned `active` entry is
+past its claim, so a start time set on one holds nothing. `queue not-before` keeps it all
+the same (it applies if the entry is queued again) and says so with a `note:` line after
+the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
+
+One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
+`slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
+held only the one item whose doc it couldn't read. The journal gets one line per incident,
+naming the file, the line and column, and the parser's reason, and the first tick after
+the fix resumes:
+
+```
+growlightd: v2 queue source failed (scheduling nothing from v2 until it is fixed): growlight/backlog/queue.toml: invalid TOML at line 9, column 9: invalid type: string "no", expected a boolean
+```
 
 ## Known gaps
 

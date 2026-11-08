@@ -75,6 +75,12 @@ pub const KNOWN_INTENTS: &[&str] = &[
     // queue-v2-scheduling slice 010: growlight_add_sub_milestone's commit —
     // the sub-milestone's docs + slices.toml, the split, the placement.
     "queue_v2_sub_added",
+    // queue-v2-git slice 004: queue_v2_re_record_bases — the §8 re-record of
+    // each restacked branch's base after the restack completed.
+    "queue_v2_bases_rerecorded",
+    // queue-v2-migrate slice 005: queue_v2_migrate_apply — the legacy→v2
+    // converter's one commit (queue.toml + queue-archive.toml + slices.toml).
+    "queue_v2_migrated",
 ];
 
 /// A name + payload pair, validated against the closed enum.
@@ -138,7 +144,7 @@ const KNOWN_INTENTS_LIST: &str =
      chat_message_posted, inbox_read, report_filed, report_updated, \
      config_migrated, \
      peers_changed, shared_subtrees_changed, shared_ceremony, shared_rekey, shared_pull, \
-     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal, queue_v2_updated, queue_v2_claimed, queue_v2_status_set, queue_v2_follow_ups_set, queue_v2_session_logged, queue_v2_deferred_set, queue_v2_sub_added";
+     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal, queue_v2_updated, queue_v2_claimed, queue_v2_status_set, queue_v2_follow_ups_set, queue_v2_session_logged, queue_v2_deferred_set, queue_v2_sub_added, queue_v2_bases_rerecorded, queue_v2_migrated";
 
 fn type_name(v: &Value) -> &'static str {
     match v {
@@ -148,5 +154,26 @@ fn type_name(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bases_rerecorded_intent_is_spelled_once_over() {
+        assert!(KNOWN_INTENTS.contains(&"queue_v2_bases_rerecorded"));
+        assert!(Intent::new("queue_v2_bases_rerecorded", serde_json::json!({})).is_ok());
+        assert!(Intent::new("queue_v2_bases_rererecorded", serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn known_intents_list_names_every_intent() {
+        let listed: Vec<&str> = KNOWN_INTENTS_LIST.split(", ").map(str::trim).collect();
+        for name in KNOWN_INTENTS {
+            assert!(listed.contains(name), "{name} missing from KNOWN_INTENTS_LIST");
+        }
+        assert_eq!(listed.len(), KNOWN_INTENTS.len());
     }
 }

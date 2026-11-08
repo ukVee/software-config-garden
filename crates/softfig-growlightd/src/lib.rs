@@ -29,7 +29,10 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod drive_loop;
+pub mod first_claim;
 pub mod fleet;
+pub mod git_probe;
+pub mod git_stack;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
@@ -47,6 +50,7 @@ pub mod preapproval;
 pub mod profile_budget;
 pub mod profile_pin;
 pub mod queue_source;
+pub mod queue_show;
 pub mod rate_limit_holds;
 pub mod reconcile;
 pub mod resume;
@@ -58,6 +62,7 @@ pub mod supervisor;
 pub mod thrash_bridge;
 pub mod usage;
 pub mod usage_file;
+pub mod v2_repo;
 pub mod v2_source;
 
 pub use admission::{

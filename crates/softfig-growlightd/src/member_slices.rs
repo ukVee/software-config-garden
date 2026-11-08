@@ -155,6 +155,7 @@ mod tests {
             entry: entry.into(),
             unit,
             resolved_model: ModelChoice::claude(),
+            repo: None,
         }
     }
 
@@ -177,6 +178,10 @@ mod tests {
             entries: vec![],
             trees,
             done_ids: BTreeSet::new(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 

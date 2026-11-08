@@ -427,7 +427,7 @@ fn prompt_passphrase(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).context("could not read passphrase from tty")
 }
 
-fn iso8601(unix: i64) -> String {
+pub(crate) fn iso8601(unix: i64) -> String {
     // Tiny formatter — avoid pulling chrono/time just for printing.
     let days = unix.div_euclid(86_400);
     let secs_in_day = unix.rem_euclid(86_400);

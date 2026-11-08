@@ -833,9 +833,14 @@ mod tests {
             lane: Lane::Normal,
             status,
             after: vec![],
+            branch: String::new(),
             claimed: "2026-10-14T00:00Z".into(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
+            fleet: true,
+            not_before: None,
             holder: None,
             models: None,
         }
@@ -865,6 +870,8 @@ mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/r".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
+                main: "main".into(),
             }],
             entries: vec![
                 entry("m", EntryKind::Milestone, EntryStatus::Active),
@@ -882,6 +889,10 @@ mod tests {
                 },
             )]),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -894,6 +905,7 @@ mod tests {
                 slice: id.into(),
             },
             resolved_model: ModelChoice::opencode(DEEPSEEK_FLASH),
+            repo: None,
         }
     }
 

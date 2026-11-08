@@ -38,7 +38,7 @@
 //! An absent queue/registry region likewise yields an empty [`QueueView`], so an
 //! unpopulated work-stream just idles instead of erroring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use softfig_ipc::fleet_marker;
 use softfig_ipc::item_repo::{item_repo_path, probe, RepoState};
@@ -48,6 +48,8 @@ use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
 
 use crate::drive_loop::{QueueSource, RepoProbe};
 use crate::scheduler::{ClaimHold, PartView, QueueView, Snapshot};
+use crate::scheduler_v2::ProjectView;
+use crate::v2_repo::local_repo;
 
 /// The garden-relative backlog doc that hosts every queue's managed region
 /// (the one definition lives in [`softfig_ipc::backlog_doc`]).
@@ -334,6 +336,8 @@ pub struct KeeperdRepoProbe {
     docs: Box<dyn ItemDocReader>,
     /// What a leading `~` expands against (`$HOME`, read once at assembly).
     home: Option<PathBuf>,
+    /// Whose `~<user>` a v2 repo may name (`$USER`, read once at assembly).
+    user: Option<String>,
 }
 
 impl KeeperdRepoProbe {
@@ -344,6 +348,7 @@ impl KeeperdRepoProbe {
             backlog: Box::new(KeeperdBacklogReader { keeperd_socket: keeperd_socket.clone() }),
             docs: Box::new(KeeperdItemDocReader { keeperd_socket }),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            user: std::env::var("USER").ok(),
         }
     }
 }
@@ -386,6 +391,16 @@ impl RepoProbe for KeeperdRepoProbe {
             .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
             .ok()?;
         Some((repo, state))
+    }
+
+    fn v2_repo(&self, project: &ProjectView) -> Option<PathBuf> {
+        local_repo(project, self.home.as_deref(), self.user.as_deref())
+    }
+
+    fn probe_repo(&self, repo: &Path) -> Option<RepoState> {
+        probe(repo)
+            .inspect_err(|e| eprintln!("growlightd: repo probe: {}: {e}", repo.display()))
+            .ok()
     }
 }
 
@@ -719,7 +734,12 @@ mod tests {
         backlog: Box<dyn BacklogReader>,
         docs: Result<Option<String>, String>,
     ) -> KeeperdRepoProbe {
-        KeeperdRepoProbe { backlog, docs: Box::new(FixtureDocs(docs)), home: Some("/home/t".into()) }
+        KeeperdRepoProbe {
+            backlog,
+            docs: Box::new(FixtureDocs(docs)),
+            home: Some("/home/t".into()),
+            user: Some("t".into()),
+        }
     }
 
     /// A git repo with one committed file and `dirty` untracked ones.

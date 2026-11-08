@@ -34,6 +34,9 @@ pub enum ListId {
     Deploy,
     Shares,
     Growlight,
+    /// The growlight queue-v2 two-lane view's list (slice 007) — a separate id
+    /// so a tap lands on the v2 selection, not the legacy tree's.
+    GrowlightV2,
     Coordination,
 }
 

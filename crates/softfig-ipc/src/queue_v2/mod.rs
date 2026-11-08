@@ -19,7 +19,9 @@
 //!   is refused, not half-read;
 //! - every field is required (no `#[serde(default)]` on the file shapes):
 //!   keeperd writes every field on every write, so a missing one means the
-//!   file was hand-edited or corrupted — refuse it;
+//!   file was hand-edited or corrupted — refuse it. The exceptions are
+//!   [`Entry`]'s three optional fields (`pending_status`, `fleet`,
+//!   `not_before`), omitted at their default so older files still parse;
 //! - the closed vocabularies (kind, lane, status, …) are enums, so a stray
 //!   string fails to parse instead of being carried as data;
 //! - unknown fields are refused ([`serde(deny_unknown_fields)`]) — one
@@ -33,6 +35,7 @@
 //! urgent-before-normal, link integrity, …) are validation, not this file —
 //! they live in [`validate`], the milestone's slice 002.
 
+pub mod migrate;
 mod sub_doc;
 mod validate;
 
@@ -40,7 +43,7 @@ pub use sub_doc::{
     reserved_field, reserved_lines, sub_doc_violation, FieldViolation, SubSliceText,
     SLICE_BODY_RESERVED, SUB_DOC_RESERVED,
 };
-pub use validate::{sub_depth, QueueRefusal};
+pub use validate::{sub_depth, valid_branch_name, QueueRefusal};
 
 use std::fmt;
 
@@ -128,6 +131,63 @@ pub struct Project {
     pub main: String,
 }
 
+impl Project {
+    /// Where [`Project::repo`] lives, for the current user.
+    pub fn locality(&self) -> RepoLocality {
+        RepoLocality::for_current_user(&self.repo)
+    }
+}
+
+/// Where a project's `repo` lives (§3.1 `repo`; report 062). The one
+/// classifier every reader of `repo` goes through — the pick's remote rule,
+/// the add verb's refusal, the git stack's repo resolver — so they cannot
+/// disagree on a spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoLocality {
+    /// On this machine: an absolute path, `~`, `~/…`, or `~<user>/…` for the
+    /// current user.
+    Local,
+    /// `host:path` on another machine (§8 remote proxy).
+    Remote,
+    /// Neither provably: `~<other user>/…`, a relative path, or `:path` with
+    /// no host. Refused, never guessed (`queue_add_project` replies
+    /// `ambiguous_repo`).
+    Ambiguous,
+}
+
+impl RepoLocality {
+    /// Classify `repo` as written. `user` is the current user's name; with
+    /// none, every `~<user>/…` is [`RepoLocality::Ambiguous`].
+    ///
+    /// A tilde or a leading `/` decides first, so a `:` later in a local path
+    /// is just a character. Otherwise `host:path` is remote when the host is
+    /// non-empty and holds no `/` (the scp rule: a `/` before the `:` makes
+    /// it a path).
+    pub fn of(repo: &str, user: Option<&str>) -> Self {
+        let repo = repo.trim();
+        if let Some(rest) = repo.strip_prefix('~') {
+            let name = rest.split('/').next().unwrap_or_default();
+            return if name.is_empty() || Some(name) == user {
+                RepoLocality::Local
+            } else {
+                RepoLocality::Ambiguous
+            };
+        }
+        if repo.starts_with('/') {
+            return RepoLocality::Local;
+        }
+        match repo.split_once(':') {
+            Some((host, _)) if !host.is_empty() && !host.contains('/') => RepoLocality::Remote,
+            _ => RepoLocality::Ambiguous,
+        }
+    }
+
+    /// [`RepoLocality::of`] against the current user, read from `$USER`.
+    pub fn for_current_user(repo: &str) -> Self {
+        RepoLocality::of(repo, std::env::var("USER").ok().as_deref())
+    }
+}
+
 /// An entry's `kind` (§1, §3.1): one milestone, task or restack in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,7 +221,9 @@ pub enum EntryStatus {
 }
 
 /// A `[[entry]]` row (§3.1) — exactly the spec's field set, every field
-/// required and written on every write.
+/// required and written on every write, except the three optional ones
+/// (`pending_status`, `fleet`, `not_before`) that are omitted at their
+/// default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -205,6 +267,65 @@ pub struct Entry {
     /// `active → …` transition).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_status: Option<EntryStatus>,
+    /// `false` marks a human-only entry (§2, §3.1): the fleet never claims
+    /// it, and never resumes it while no live member holds it — `queued`,
+    /// an orphaned `active` and `paused` are all held (legacy `> Fleet:`,
+    /// task 068; report 086's parity). Written only by the human verbs
+    /// (§6.8) and the migration; member writes are refused (§6.7). Omitted
+    /// when `true`, so a pre-parity file round-trips byte-identical.
+    #[serde(default = "fleet_default", skip_serializing_if = "is_fleet_default")]
+    pub fleet: bool,
+    /// The earliest time the fleet may start this entry (§2, §3.1), as
+    /// written; parsed by [`crate::fleet::parse_not_before`] (legacy
+    /// `> Not before:`). Holds `queued` only — an entry that has started has
+    /// started — and a value that does not parse holds fail-closed. Written
+    /// only by the human verbs (§6.8) and the migration. Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+}
+
+/// [`Entry::fleet`]'s default: an entry the fleet may claim.
+pub(crate) fn fleet_default() -> bool {
+    true
+}
+
+pub(crate) fn is_fleet_default(fleet: &bool) -> bool {
+    *fleet
+}
+
+/// The §2 holds as a surface prints them beside an entry's status:
+/// ` (human-only)` for `fleet = false`, and ` (not before <at>)` for a start
+/// time as written, whether or not it is still ahead. Empty when neither is
+/// set. The one wording, so `queue show`, the `growlight status` lanes and the
+/// TUI can't drift about the same hold.
+pub fn hold_annotation(fleet: bool, not_before: Option<&str>) -> String {
+    let mut out = String::new();
+    if !fleet {
+        out.push_str(" (human-only)");
+    }
+    if let Some(at) = not_before {
+        out.push_str(&format!(" (not before {at})"));
+    }
+    out
+}
+
+/// One branch in a restack's ordered stack (§8): what to rebase, and onto what.
+/// growlightd resolves `onto` (keeperd runs no git); the restack doc
+/// (`tasks/NNN-restack-<project>.md`) renders one step per branch from these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestackBranch {
+    /// The branch to rebase (`feat/<id>` / `fix/<id>`).
+    pub branch: String,
+    /// The recorded `parent` — the entry this branch was cut from; `""` =
+    /// `main` (§8).
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote).
+    pub base: String,
+    /// The `--onto` target: the parent's branch, or `main` for a main-rooted
+    /// branch. growlightd resolves it from the parent entry's branch.
+    pub onto: String,
 }
 
 /// The archive's outcome (§3.2): `done` satisfies `after` links, `dropped`
@@ -246,6 +367,12 @@ pub struct ArchivedEntry {
     /// omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A restack row that finished `done` and whose stack growlightd has not
+    /// re-recorded yet (§8). It lives on the row, not in growlightd's memory,
+    /// so a restart between the two still re-records: the commit that archives
+    /// the row sets it, the commit that writes the bases clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub re_record_due: bool,
 }
 
 /// A milestone's `slices.toml` (§3.3): the slice + sub-milestone order, in
@@ -372,6 +499,21 @@ impl QueueToml {
             projects,
             entries,
         }
+    }
+
+    /// The repo `project` names, `None` for a project not in the table.
+    pub fn repo_of(&self, project: &str) -> Option<&str> {
+        self.projects
+            .iter()
+            .find(|p| p.name == project)
+            .map(|p| p.repo.as_str())
+    }
+
+    /// Whether two projects work on one repo, so they share one stack and one
+    /// restack row (§8). Repos compare as the strings the projects record, as the
+    /// §3.1 per-repo invariants do.
+    pub fn same_repo(&self, a: &str, b: &str) -> bool {
+        a == b || (self.repo_of(a).is_some() && self.repo_of(a) == self.repo_of(b))
     }
 
     /// Parse fail-closed: malformed TOML, a missing or unknown field, and any
@@ -503,6 +645,8 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 
@@ -595,6 +739,19 @@ follow_ups = 0
     }
 
     #[test]
+    fn archive_round_trip_keeps_a_due_re_record() {
+        let arch = QueueArchiveToml::new(vec![ArchivedEntry {
+            row: entry("restack"),
+            finished: "2026-10-11T15:40:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due: true,
+        }]);
+        let back = QueueArchiveToml::parse(&arch.to_toml().expect("serialize")).expect("re-parse");
+        assert_eq!(back, arch);
+    }
+
+    #[test]
     fn archive_round_trip_done_dropped_reason() {
         let arch = QueueArchiveToml::new(vec![
             ArchivedEntry {
@@ -606,17 +763,22 @@ follow_ups = 0
                 finished: "2026-10-11T15:40:00Z".into(),
                 final_status: FinalStatus::Done,
                 reason: None,
+                re_record_due: false,
             },
             ArchivedEntry {
                 row: entry("dropped-two"),
                 finished: "2026-10-11T16:00:00Z".into(),
                 final_status: FinalStatus::Dropped,
                 reason: Some("superseded".into()),
+                re_record_due: false,
             },
         ]);
         let text = arch.to_toml().expect("serialize");
         let back = QueueArchiveToml::parse(&text).expect("re-parse");
         assert_eq!(back, arch);
+        // A row owing nothing writes no key, so an existing archive reads and
+        // writes back unchanged.
+        assert!(!text.contains("re_record_due"), "{text}");
 
         // A done row omits `reason`; a dropped row carries it; the entry's
         // own fields sit flat at the row's top level (the §3.2 "moves its
@@ -628,6 +790,44 @@ follow_ups = 0
         let dropped_block = text.split("[[entry]]").nth(2).expect("second row");
         assert!(dropped_block.contains("reason = \"superseded\""));
         assert!(dropped_block.contains("final_status = \"dropped\""));
+    }
+
+    // A row written before `fleet` / `not_before` existed (the §3.1 example
+    // has neither) reads as a fleet entry with no start time, and writing it
+    // back adds neither key — so a pre-parity queue file and archive
+    // re-serialize byte-identical. A held entry carries both through.
+    #[test]
+    fn fleet_and_not_before_default_when_absent_and_round_trip_when_set() {
+        let q = QueueToml::parse(SPEC_QUEUE).expect("the §3.1 example must parse");
+        assert!(q.entries[0].fleet);
+        assert_eq!(q.entries[0].not_before, None);
+        let text = q.to_toml().expect("serialize");
+        assert!(!text.contains("\nfleet ="), "default fleet is omitted:\n{text}");
+        assert!(!text.contains("\nnot_before ="), "no start time is omitted:\n{text}");
+        let again = QueueToml::parse(&text).expect("re-parse");
+        assert_eq!(again.to_toml().expect("re-serialize"), text);
+
+        let arch = QueueArchiveToml::new(vec![ArchivedEntry {
+            row: entry("done-one"),
+            finished: "2026-10-11T15:40:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due: false,
+        }]);
+        let arch_text = arch.to_toml().expect("serialize archive");
+        assert!(!arch_text.contains("\nfleet =") && !arch_text.contains("\nnot_before ="));
+        let back = QueueArchiveToml::parse(&arch_text).expect("re-parse archive");
+        assert!(back.entries[0].row.fleet);
+        assert_eq!(back.to_toml().expect("re-serialize archive"), arch_text);
+
+        let mut held = entry("held");
+        held.fleet = false;
+        held.not_before = Some("2026-11-01 09:00".into());
+        let q = QueueToml::new(vec![], vec![held.clone()]);
+        let text = q.to_toml().expect("serialize held");
+        assert!(text.contains("fleet = false"), "{text}");
+        assert!(text.contains("not_before = \"2026-11-01 09:00\""), "{text}");
+        assert_eq!(QueueToml::parse(&text).expect("re-parse held").entries, vec![held]);
     }
 
     #[test]
@@ -668,6 +868,7 @@ follow_ups = 0
             finished: "2026-10-11T15:40:00Z".into(),
             final_status: FinalStatus::Done,
             reason: None,
+            re_record_due: false,
         }]);
         let a2 = a1.to_toml().unwrap().replace("schema = 1", "schema = 7");
         assert!(matches!(
@@ -853,10 +1054,66 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         };
         let text = toml::to_string(&entry).expect("serialize");
         assert!(text.contains("kind = \"task\""), "{text}");
         assert!(text.contains("status = \"queued\""), "{text}");
         assert!(text.contains("lane = \"normal\""), "{text}");
+    }
+
+    // ---- RepoLocality (report 062) -------------------------------------
+
+    fn loc(repo: &str) -> RepoLocality {
+        RepoLocality::of(repo, Some("ukv"))
+    }
+
+    #[test]
+    fn home_tilde_forms_are_local() {
+        // §3.1's own example spelling, which report 062 found misread.
+        assert_eq!(loc("~/projects/software-config_garden/codebase/main"), RepoLocality::Local);
+        assert_eq!(loc("~"), RepoLocality::Local);
+        assert_eq!(loc("~/"), RepoLocality::Local);
+        assert_eq!(loc(" ~/p "), RepoLocality::Local, "trimmed like the add verb's check");
+    }
+
+    #[test]
+    fn the_current_users_named_home_is_local() {
+        assert_eq!(loc("~ukv/p"), RepoLocality::Local);
+        assert_eq!(loc("~ukv"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn another_users_home_is_ambiguous() {
+        assert_eq!(loc("~bob/p"), RepoLocality::Ambiguous);
+        assert_eq!(loc("~bob"), RepoLocality::Ambiguous);
+        // With no current user known, no named home can be proved ours.
+        assert_eq!(RepoLocality::of("~ukv/p", None), RepoLocality::Ambiguous);
+        // A colon inside a tilde path never makes it remote.
+        assert_eq!(loc("~bob/a:b"), RepoLocality::Ambiguous);
+        assert_eq!(loc("~/a:b"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn an_absolute_path_is_local_even_with_a_colon() {
+        assert_eq!(loc("/tmp/queue-v2-smoke"), RepoLocality::Local);
+        assert_eq!(loc("/srv/a:b"), RepoLocality::Local);
+    }
+
+    #[test]
+    fn host_path_is_remote() {
+        assert_eq!(loc("phone:roadeye"), RepoLocality::Remote);
+        assert_eq!(loc("otg-travel:/home/sshukv/projects/roadeye"), RepoLocality::Remote);
+        assert_eq!(loc("user@host:~/p"), RepoLocality::Remote);
+    }
+
+    #[test]
+    fn relative_and_hostless_forms_are_ambiguous() {
+        assert_eq!(loc("projects/x"), RepoLocality::Ambiguous);
+        assert_eq!(loc("./x"), RepoLocality::Ambiguous);
+        assert_eq!(loc(":/p"), RepoLocality::Ambiguous, "no host");
+        assert_eq!(loc("a/b:c"), RepoLocality::Ambiguous, "a `/` before the `:` is a path");
+        assert_eq!(loc(""), RepoLocality::Ambiguous);
     }
 }

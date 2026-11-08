@@ -1,0 +1,18 @@
+# The owner's answers for the migrate fixture: every call `plan` raises on
+# the fixture backlog, settled. The stack bases are fixture shas, not commits.
+schema = 1
+
+[class]
+list_order = "default-then-registry"
+project_main = "main"
+baton = "skip"
+
+[call]
+"project_repo:softfig" = "~/projects/software-config_garden/codebase"
+"project_repo:roadeye" = "build.example.invalid:/srv/roadeye"
+"stack_base:semi-auto-backend-seam" = "parent= base=5ed0ea3"
+"slice_progress:semi-auto-backend-seam" = "done"
+"stack_base:069" = "parent= base=25a4237"
+"stack_base:hover-view-sticky" = "parent= base=a1b2c3d"
+"slice_progress:hover-view-sticky" = "001=done, 002=done, 003=active"
+"stack_base:hover-view-player" = "parent=hover-view-sticky base=a1b2c3d"

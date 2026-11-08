@@ -46,14 +46,36 @@ pub fn region_body(content: &str, tag: &str) -> Option<String> {
     Some(body.join("\n"))
 }
 
-/// One queue item table's rows as `(id, status)`, in row order. Only
-/// well-formed 5-cell data rows count (`# | id | type | title | status`); the
-/// header and separator rows are skipped.
-pub fn item_rows(body: &str) -> Vec<(String, String)> {
+/// One queue item table row — every cell but the render-time `#` order, which
+/// keeperd recomputes on every render and never parses back. Mirrors keeperd's
+/// `queue::QueueRow`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRow {
+    pub id: String,
+    pub item_type: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// One queue item table's full rows, in row order — keeperd's `queue::parse`.
+/// Only well-formed 5-cell data rows count (`# | id | type | title | status`);
+/// the header and separator rows are skipped.
+pub fn item_table(body: &str) -> Vec<ItemRow> {
     table_rows(body, 5, ("#", "id"))
         .into_iter()
-        .map(|cells| (cells[1].clone(), cells[4].clone()))
+        .map(|cells| ItemRow {
+            id: cells[1].clone(),
+            item_type: cells[2].clone(),
+            title: cells[3].clone(),
+            status: cells[4].clone(),
+        })
         .collect()
+}
+
+/// One queue item table's rows as `(id, status)`, in row order (the
+/// [`item_table`] rows, narrowed).
+pub fn item_rows(body: &str) -> Vec<(String, String)> {
+    item_table(body).into_iter().map(|row| (row.id, row.status)).collect()
 }
 
 /// The queue registry region's `(queue, repo)` rows, in row order: 2-cell data
@@ -175,6 +197,19 @@ mod tests {
             ("a".to_string(), "active".to_string()),
             ("b".to_string(), "done".to_string()),
         ]);
+    }
+
+    #[test]
+    fn item_table_keeps_every_cell_but_the_order_and_unescapes_pipes() {
+        let body = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                    | 7 | seam | milestone | AgentBackend seam (claude\\|opencode) | deferred |\n\
+                    | 8 | short | task | three cells |";
+        assert_eq!(item_table(body), vec![ItemRow {
+            id: "seam".to_string(),
+            item_type: "milestone".to_string(),
+            title: "AgentBackend seam (claude|opencode)".to_string(),
+            status: "deferred".to_string(),
+        }]);
     }
 
     #[test]

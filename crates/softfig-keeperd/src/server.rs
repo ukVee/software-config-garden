@@ -134,6 +134,13 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
+    // The member this connection comes from, read once while its peer is the
+    // process that connected (§6.7, report 118).
+    let connection = match peer::peer_pid(&stream) {
+        Ok(pid) => crate::caller::peer_member(pid),
+        Err(e) => crate::caller::connection_member(Err(e), Ok(String::new())),
+    };
+
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
@@ -146,7 +153,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
     let parsed = serde_json::from_str::<Request>(line.trim_end_matches('\n'));
     let is_shutdown = matches!(&parsed, Ok(req) if req.op == softfig_ipc::op::SHUTDOWN);
     let resp = match parsed {
-        Ok(req) => dispatch(&daemon, req),
+        Ok(req) => dispatch(&daemon, req, connection.as_deref()),
         Err(e) => Response::err(ErrorKind::BadArgs, format!("decode: {e}")),
     };
 
@@ -227,7 +234,9 @@ fn op_is_local_write(op: &str) -> bool {
     )
 }
 
-fn dispatch(daemon: &Daemon, req: Request) -> Response {
+/// Serve `req`, which arrived on a connection from `connection`'s scope (`None`
+/// when it runs in no member's scope).
+fn dispatch(daemon: &Daemon, req: Request, connection: Option<&str>) -> Response {
     use softfig_ipc::op;
 
     if req.v != softfig_ipc::PROTOCOL_VERSION {
@@ -238,7 +247,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
     }
 
     // §6.7: a member session's softfig-mcp stamps its identity on every
-    // request; the write limits read it from this scope, for this request only.
+    // request, and a member's CLI call is known by its connection's scope; the
+    // write limits read the caller from this scope, for this request only.
     // A stamp that can't name a member is refused — a garbled member must not
     // be served as a human, the same fail-closed rule softfig-mcp applies.
     if let Some(member) = req.member.as_deref()
@@ -248,7 +258,27 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
                 format!("request member {member:?} is not a safe member id"),
             );
         }
-    let _caller = crate::caller::enter(req.member.clone());
+    let member = match crate::caller::resolve(req.member.as_deref(), connection) {
+        Ok(member) => member,
+        Err(refused) => return Response::err(ErrorKind::BadArgs, refused),
+    };
+    let _caller = crate::caller::enter(member.clone());
+
+    // Shaping the queue is the human's (§6.7): refused for a member however it
+    // calls, softfig-mcp or the CLI.
+    if let Some(member) = member.as_deref()
+        && softfig_ipc::member::HUMAN_QUEUE_VERBS.contains(&req.op.as_str())
+    {
+        return Response::err(
+            ErrorKind::BadArgs,
+            format!(
+                "{} — {} (spec-growlight-queue §6.7). Fleet member {member} may post_message \
+                 @human instead",
+                softfig_ipc::queue_v2::QueueRefusal::MemberNotAllowed { verb: req.op.clone() },
+                softfig_ipc::member::HUMAN_QUEUE_VERB_WHY,
+            ),
+        );
+    }
 
     let result = match req.op.as_str() {
         op::STATUS => handlers::status(daemon, req.args),
@@ -287,11 +317,11 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         // A member's slice verbs are held to its own current entry, which only
         // growlightd knows: relayed there, and growlightd issues the human verb
         // back to keeperd once it passes (§6.7).
-        op::SLICE_INSERT => match req.member.as_deref() {
+        op::SLICE_INSERT => match member.as_deref() {
             Some(member) => crate::actions::member_slice_insert(daemon, member, req.args),
             None => crate::actions::slice_insert(daemon, req.args),
         },
-        op::SLICE_UPDATE => match req.member.as_deref() {
+        op::SLICE_UPDATE => match member.as_deref() {
             Some(member) => crate::actions::member_slice_update(daemon, member, req.args),
             None => crate::actions::slice_update(daemon, req.args),
         },
@@ -302,6 +332,9 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::QUEUE_V2_SESSION_LOG => crate::actions::queue_v2_session_log(daemon, req.args),
         op::QUEUE_V2_DEFERRED => crate::actions::queue_v2_deferred(daemon, req.args),
         op::QUEUE_V2_ADD_SUB => crate::actions::queue_v2_add_sub(daemon, req.args),
+        op::QUEUE_V2_ENQUEUE_RESTACK => crate::actions::queue_v2_enqueue_restack(daemon, req.args),
+        op::QUEUE_V2_RE_RECORD_BASES => crate::actions::queue_v2_re_record_bases(daemon, req.args),
+        op::QUEUE_V2_MIGRATE_APPLY => crate::actions::queue_v2_migrate_apply(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::GROWLIGHT_SET_RESOURCES => crate::actions::growlight_set_resources(daemon, req.args),
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),
@@ -422,7 +455,7 @@ mod tests {
     fn a_garbled_member_stamp_is_refused() {
         let (_g, daemon) = unlocked();
         let req = Request::new(softfig_ipc::op::STATUS, serde_json::json!({})).with_member(Some("../x"));
-        let (kind, msg) = err_of(dispatch(&daemon, req));
+        let (kind, msg) = err_of(dispatch(&daemon, req, None));
         assert_eq!(kind, ErrorKind::BadArgs);
         assert!(msg.contains("not a safe member id"), "{msg}");
     }
@@ -438,10 +471,10 @@ mod tests {
             "content": "# a\n\n> Model: claude\n",
         });
         let member = Request::new(softfig_ipc::op::REPLACE_FILE, args.clone()).with_member(Some("c"));
-        let (_, msg) = err_of(dispatch(&daemon, member));
+        let (_, msg) = err_of(dispatch(&daemon, member, None));
         assert!(msg.starts_with("field_not_allowed:") && msg.contains("member c"), "{msg}");
         assert_eq!(crate::caller::member(), None, "the scope ended with the request");
-        let human = dispatch(&daemon, Request::new(softfig_ipc::op::REPLACE_FILE, args));
+        let human = dispatch(&daemon, Request::new(softfig_ipc::op::REPLACE_FILE, args), None);
         assert!(matches!(human, Response::Ok { .. }), "{human:?}");
     }
 
@@ -467,7 +500,7 @@ mod tests {
         });
         let args = serde_json::json!({ "milestone": "m", "slug": "found", "body": "work" });
         let req = Request::new(softfig_ipc::op::SLICE_INSERT, args.clone()).with_member(Some("c"));
-        let resp = dispatch(&daemon, req);
+        let resp = dispatch(&daemon, req, None);
         assert!(matches!(&resp, Response::Ok { data, .. } if data["relayed"] == true), "{resp:?}");
         let relayed = server.join().unwrap();
         assert_eq!(relayed.op, softfig_ipc::growlightd::op::MEMBER_SLICE_INSERT);
@@ -478,10 +511,96 @@ mod tests {
 
         // The human path never dials growlightd: the listener is gone, and
         // keeperd answers from its own v2 state (here: no queue at all).
-        let human = dispatch(&daemon, Request::new(softfig_ipc::op::SLICE_INSERT, args));
+        let human = dispatch(&daemon, Request::new(softfig_ipc::op::SLICE_INSERT, args), None);
         let (_, msg) = err_of(human);
         assert!(!msg.contains("growlightd"), "{msg}");
         let inner = daemon.inner.lock().unwrap();
         assert!(!WorkTree::new(&daemon, &inner).exists("growlight/backlog/milestones/m/slices"));
+    }
+
+    // ---- the connection's member (§6.7, report 118) ----------------------
+
+    /// `softfig growlight queue …` from a member's shell sends no stamp; its
+    /// connection's scope names the member, and each human queue verb is
+    /// refused before anything is written.
+    #[test]
+    fn an_unstamped_call_from_a_member_scope_is_refused_the_human_queue_verbs() {
+        let (_g, daemon) = unlocked();
+        let args = serde_json::json!({ "name": "softfig", "repo": "~/x", "id": "e", "fleet": true });
+        for verb in softfig_ipc::member::HUMAN_QUEUE_VERBS {
+            let (kind, msg) = err_of(dispatch(&daemon, Request::new(verb, args.clone()), Some("qa")));
+            assert_eq!(kind, ErrorKind::BadArgs, "{verb}");
+            assert!(msg.starts_with("member_not_allowed:") && msg.contains(verb), "{verb}: {msg}");
+            assert!(msg.contains("member qa"), "{verb}: {msg}");
+        }
+        let inner = daemon.inner.lock().unwrap();
+        assert!(!WorkTree::new(&daemon, &inner).exists(softfig_ipc::queue_v2::QUEUE_FILE));
+    }
+
+    /// The v2 migration is the human's too (F13): its only other barrier is
+    /// `fleet_armed`, which a live member can outlive. A member is refused it
+    /// by stamp and by scope alike, before the handler reads its args, and
+    /// nothing is written; the same call from a human reaches the handler.
+    #[test]
+    fn a_member_is_refused_the_v2_migrate_apply_by_stamp_or_scope() {
+        let (_g, daemon) = unlocked();
+        let op = softfig_ipc::op::QUEUE_V2_MIGRATE_APPLY;
+        let args = serde_json::json!({ "expect": "0", "batons": {} });
+        let stamped = Request::new(op, args.clone()).with_member(Some("qa"));
+        for (how, resp) in [
+            ("stamp", dispatch(&daemon, stamped, None)),
+            ("scope", dispatch(&daemon, Request::new(op, args.clone()), Some("qa"))),
+        ] {
+            let (kind, msg) = err_of(resp);
+            assert_eq!(kind, ErrorKind::BadArgs, "{how}");
+            assert!(msg.starts_with("member_not_allowed:") && msg.contains(op), "{how}: {msg}");
+            assert!(msg.contains("member qa"), "{how}: {msg}");
+        }
+        let (_, human) = err_of(dispatch(&daemon, Request::new(op, args), None));
+        assert!(human.starts_with("queue_v2_migrate_apply args:"), "{human}");
+        let inner = daemon.inner.lock().unwrap();
+        assert!(!WorkTree::new(&daemon, &inner).exists(softfig_ipc::queue_v2::QUEUE_FILE));
+    }
+
+    /// A human's CLI call comes from no member's scope, and still shapes the queue.
+    #[test]
+    fn a_humans_cli_call_still_shapes_the_queue() {
+        let (_g, daemon) = unlocked();
+        let args = serde_json::json!({ "name": "softfig", "repo": "~/x" });
+        let human = dispatch(&daemon, Request::new(softfig_ipc::op::QUEUE_ADD_PROJECT, args), None);
+        assert!(matches!(human, Response::Ok { .. }), "{human:?}");
+        let inner = daemon.inner.lock().unwrap();
+        assert!(WorkTree::new(&daemon, &inner).exists(softfig_ipc::queue_v2::QUEUE_FILE));
+    }
+
+    /// A stamp naming another member than the connection's scope is refused
+    /// before any verb runs, a read included.
+    #[test]
+    fn a_stamp_that_disagrees_with_the_scope_is_refused() {
+        let (_g, daemon) = unlocked();
+        let req = Request::new(softfig_ipc::op::STATUS, serde_json::json!({})).with_member(Some("other"));
+        let (kind, msg) = err_of(dispatch(&daemon, req, Some("qa")));
+        assert_eq!(kind, ErrorKind::BadArgs);
+        assert!(msg.contains("disagrees") && msg.contains("\"qa\""), "{msg}");
+        let agrees = Request::new(softfig_ipc::op::STATUS, serde_json::json!({})).with_member(Some("qa"));
+        assert!(matches!(dispatch(&daemon, agrees, Some("qa")), Response::Ok { .. }));
+    }
+
+    /// Every member guard now reaches a member's CLI call: the scope alone holds
+    /// a raw write to the `> Model:` guard, as the stamp does. A read still
+    /// answers from a member's shell.
+    #[test]
+    fn the_scope_member_holds_a_raw_write_to_the_model_guard() {
+        let (_g, daemon) = unlocked();
+        let args = serde_json::json!({
+            "path": "growlight/backlog/milestones/m/slices/001-a.md",
+            "content": "# a\n\n> Model: claude\n",
+        });
+        let cli = Request::new(softfig_ipc::op::REPLACE_FILE, args);
+        let (_, msg) = err_of(dispatch(&daemon, cli, Some("c")));
+        assert!(msg.starts_with("field_not_allowed:") && msg.contains("member c"), "{msg}");
+        assert_eq!(crate::caller::member(), None, "the scope ended with the request");
+        let status = Request::new(softfig_ipc::op::STATUS, serde_json::json!({}));
+        assert!(matches!(dispatch(&daemon, status, Some("c")), Response::Ok { .. }));
     }
 }

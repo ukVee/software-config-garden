@@ -66,6 +66,15 @@ pub fn protocol_fleet_md() -> String {
     format!("{PILLAR}/protocol-fleet.md")
 }
 
+/// The queue-v2 fleet-member operating contract (embedded-template-sourced) —
+/// the legacy [`protocol_fleet_md`] plus the §10 v2 changes (the roll verbs, the
+/// cap, planning, declared lines). growlightd injects THIS variant instead of
+/// [`protocol_fleet_md`] when `queue = "v2"` (queue-v2-git slice 005); the
+/// legacy file stays unchanged until the migration session retires it.
+pub fn protocol_fleet_v2_md() -> String {
+    format!("{PILLAR}/protocol-fleet-v2.md")
+}
+
 /// The claude-memory rules, read half (embedded-template-sourced): injected into
 /// every opencode session after the garden map (opencode-v2-repin slice 005). The
 /// path is [`softfig_ipc::opencode::MEMORY_READ_RULES`], the one the generators
@@ -245,6 +254,9 @@ pub fn pillar_claude_stub() -> String {
          - `protocol-fleet.md` — the fleet-member variant of the protocol: identical \
          through step 6, but step 7 does NOT self-pull (the orchestrator owns the \
          queue and claims each member's next part). Injected into fleet members.\n\
+         - `protocol-fleet-v2.md` — the queue-v2 fleet-member variant (queue-v2-git \
+         slice 005): `protocol-fleet.md` plus the §10 v2 changes. Injected into fleet \
+         members only when `queue = \"v2\"`; the legacy file stays unchanged.\n\
          - `memory-read.md` / `memory-write.md` — the claude-memory rules opencode \
          sessions get (Claude Code has its own): the read half always, the write half \
          only where memory is writable (interactive, not fleet members).\n\
@@ -349,6 +361,7 @@ mod tests {
         assert_eq!(pillar_claude(), "growlight/CLAUDE.md");
         assert_eq!(protocol_md(), "growlight/protocol.md");
         assert_eq!(protocol_fleet_md(), "growlight/protocol-fleet.md");
+        assert_eq!(protocol_fleet_v2_md(), "growlight/protocol-fleet-v2.md");
         assert_eq!(session_policy_md(), "growlight/session-policy.md");
         assert_eq!(backlog_claude(), "growlight/backlog/CLAUDE.md");
         assert_eq!(baton_log_claude(), "growlight/baton-log/CLAUDE.md");
@@ -369,6 +382,7 @@ mod tests {
         for child in [
             "protocol.md",
             "protocol-fleet.md",
+            "protocol-fleet-v2.md",
             "memory-read.md",
             "memory-write.md",
             "session-policy.md",

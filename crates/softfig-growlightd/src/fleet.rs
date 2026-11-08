@@ -56,7 +56,7 @@ use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
 use crate::baton_store::{runtime_entries_dir, FsBatonStore, FsEntryBatonStore};
 use crate::config::BuildCaps;
-use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker};
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2BaseReRecorder, KeeperdV2Claimer, KeeperdV2ItemParker, KeeperdV2RestackEnqueuer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
@@ -500,6 +500,16 @@ pub enum QueueMode {
     V2,
 }
 
+impl QueueMode {
+    /// The switch's value as `config/growlight.toml` spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueMode::Legacy => "legacy",
+            QueueMode::V2 => "v2",
+        }
+    }
+}
+
 /// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
 /// gate, the shared-backend `bin`/`prompt`, and the configured `members`. The
 /// keys are top-level (this is a dedicated file, not a table inside a shared one).
@@ -766,6 +776,10 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
             return FleetConfig::disabled();
         }
     };
+    if let Some(refusal) = v2_protocol_refusal(&cfg, garden_root) {
+        eprintln!("softfig-growlightd: {refusal} ({})", path.display());
+        return FleetConfig::disabled();
+    }
     // Slot presence (claude-login-switcher slices 003, 007): a member whose
     // profile_pool names a slot with no directory could never spawn, so it is
     // left out of the roster at load, by name. The rest of the fleet arms.
@@ -775,6 +789,23 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
         eprintln!("softfig-growlightd: {line} ({})", path.display());
     }
     cfg
+}
+
+/// Why an armed `queue = "v2"` fleet must not start: its members boot from
+/// `protocol-fleet-v2.md`, and without that file they would run with no operating
+/// contract. Names the file. `None` when nothing is armed, under `legacy`, or when
+/// the file is there.
+fn v2_protocol_refusal(cfg: &FleetConfig, garden_root: &Path) -> Option<String> {
+    if !cfg.enabled || cfg.queue != QueueMode::V2 {
+        return None;
+    }
+    let protocol = fleet_protocol(garden_root, cfg.queue);
+    (!protocol.is_file()).then(|| {
+        format!(
+            "queue = \"v2\" needs {}, which is missing; fleet stays OFF",
+            protocol.display()
+        )
+    })
 }
 
 /// Assemble the live [`DriveLoop`] — **iff `fleet.enabled`**. Gate off ⇒ `None`
@@ -930,6 +961,8 @@ pub fn assemble_fleet(
             member_writer: Box::new(baton_writer),
             claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
             parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
+            restacker: Box::new(KeeperdV2RestackEnqueuer::new(keeperd_socket.to_path_buf())),
+            re_recorder: Box::new(KeeperdV2BaseReRecorder::new(keeperd_socket.to_path_buf())),
         })
     })
 }
@@ -1002,7 +1035,7 @@ fn build_claude_backend(
         daemon.hub.clone(),
         PreApproval::new(
             agents_dir.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             garden_root.to_path_buf(),
             softfig_mcp_path(),
             claude_dir(),
@@ -1217,7 +1250,7 @@ fn build_opencode_backend(
         OpencodePreApproval::new(
             agents_dir.to_path_buf(),
             garden_root.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
@@ -1308,6 +1341,10 @@ const PILLAR: &str = "growlight";
 /// injects. growlightd only ever spawns fleet members, so this is the protocol
 /// every pre-approval it generates carries.
 const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
+/// The queue-v2 fleet-member protocol filename (queue-v2-git slice 005) — the
+/// legacy [`FLEET_PROTOCOL_FILE`] plus the §10 v2 changes, injected instead of it
+/// only when `queue = "v2"` (§11). The legacy file stays byte-unchanged.
+const FLEET_PROTOCOL_V2_FILE: &str = "protocol-fleet-v2.md";
 
 /// The runtime budget file inside the growlight namespace — the ONE name the
 /// headless capture writes and every reader (the loop protocol's §2b boot check,
@@ -1323,10 +1360,15 @@ const BY_PROFILE_SUBDIR: &str = "usage.by-profile";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline
-/// literal: a fleet member injects `protocol-fleet.md`, NEVER the single-agent
-/// `protocol.md`.
-fn fleet_protocol(garden_root: &Path) -> PathBuf {
-    garden_root.join(PILLAR).join(FLEET_PROTOCOL_FILE)
+/// literal: a fleet member injects `protocol-fleet.md` (or, under `queue = "v2"`,
+/// `protocol-fleet-v2.md`), NEVER the single-agent `protocol.md`. The §11 switch
+/// picks the file; the legacy file is unchanged under either mode.
+fn fleet_protocol(garden_root: &Path, queue: QueueMode) -> PathBuf {
+    let file = match queue {
+        QueueMode::V2 => FLEET_PROTOCOL_V2_FILE,
+        QueueMode::Legacy => FLEET_PROTOCOL_FILE,
+    };
+    garden_root.join(PILLAR).join(file)
 }
 
 /// Assemble (via [`assemble_fleet`]) and spawn the live drive-loop thread — iff
@@ -1394,12 +1436,36 @@ mod tests {
         // fleet variant (protocol-fleet.md) — never the single-agent protocol.md
         // that `softfig growlight start` injects. This is the slice-002 split that
         // closes the self-pull double-assignment race.
-        let p = fleet_protocol(Path::new("/garden"));
+        let p = fleet_protocol(Path::new("/garden"), QueueMode::Legacy);
         assert_eq!(p, Path::new("/garden/growlight/protocol-fleet.md"));
         assert_ne!(
             p.file_name().unwrap(),
             "protocol.md",
             "a fleet member must NOT inject the single-agent self-pull protocol",
+        );
+    }
+
+    #[test]
+    fn the_queue_switch_selects_the_v2_protocol() {
+        // The §11 switch: `queue = "legacy"` injects the legacy fleet file, `v2`
+        // injects protocol-fleet-v2.md (queue-v2-git slice 005). The legacy file
+        // is byte-unchanged under both modes.
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::Legacy),
+            Path::new("/garden/growlight/protocol-fleet.md"),
+            "legacy mode injects the legacy fleet protocol",
+        );
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2),
+            Path::new("/garden/growlight/protocol-fleet-v2.md"),
+            "v2 mode injects the v2 fleet protocol",
+        );
+        assert_ne!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2)
+                .file_name()
+                .unwrap(),
+            "protocol.md",
+            "a v2 member must NOT inject the single-agent self-pull protocol",
         );
     }
 
@@ -1583,6 +1649,31 @@ agent = "reviewer"
             FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"legacy\"\n")
                 .unwrap();
         assert_eq!(legacy.queue, QueueMode::Legacy);
+    }
+
+    #[test]
+    fn an_armed_v2_fleet_with_no_v2_protocol_stays_off_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "fleet_enabled = true\nqueue = \"v2\"\n");
+
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n").unwrap();
+        let refusal = v2_protocol_refusal(&cfg, dir.path()).expect("the file is missing");
+        assert!(refusal.contains("growlight/protocol-fleet-v2.md"), "{refusal}");
+        assert!(!load_fleet_config(dir.path()).enabled, "fail closed");
+
+        let pillar = dir.path().join(PILLAR);
+        std::fs::create_dir_all(&pillar).unwrap();
+        std::fs::write(pillar.join(FLEET_PROTOCOL_V2_FILE), "# protocol\n").unwrap();
+        assert!(load_fleet_config(dir.path()).enabled, "the file is there");
+    }
+
+    #[test]
+    fn the_v2_protocol_is_only_required_of_an_armed_v2_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        for toml in ["fleet_enabled = true\n", "fleet_enabled = false\nqueue = \"v2\"\n"] {
+            let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+            assert_eq!(v2_protocol_refusal(&cfg, dir.path()), None, "{toml}");
+        }
     }
 
     #[test]
