@@ -74,6 +74,15 @@ decision record or crate that owns it, rather than at every internal change.
   not grown. Raw rows are kept 90 days, then rolled into a daily rollup kept
   forever. See `docs/token-telemetry.md`.
 
+### Changed
+
+- The queue v2 views move out of `CLAUDE.md` files: the `softfig:queue-v2` list
+  renders into `growlight/backlog/queue.md`, each milestone's `softfig:slices-v2`
+  order into its own `slices.md`, and a milestone close-out's session line goes
+  to its `sessions.md`. keeperd creates each file on first write. No v2 write,
+  `queue migrate --apply` included, changes any `CLAUDE.md` (task 104;
+  `spec-growlight-queue` §3.4–§3.5, `decision-claude-md-lazy-pointers`).
+
 ### Fixed
 
 - keeperd no longer re-walks the whole commit and tree history on every 20 s

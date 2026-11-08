@@ -122,9 +122,10 @@ path would name a copy the apply never looks at.
 keeperd re-reads the backlog from its own working tree, projected the way the
 mount serves it (sealed docs and regions as their placeholders), recomputes the plan
 under your answers, and writes every v2 file in **one** `queue_v2_migrated`
-commit. The same commit also renders the §3.4 views as new managed regions:
-`softfig:queue-v2` in the backlog doc and `softfig:slices-v2` in each milestone
-`CLAUDE.md`. The legacy tables and the doc prose stay byte-for-byte unchanged.
+commit. The same commit also renders the §3.4 views, each into a new file of
+its own: `softfig:queue-v2` in `growlight/backlog/queue.md` and
+`softfig:slices-v2` in each milestone's `slices.md`. No `CLAUDE.md` changes:
+the legacy tables and the doc prose stay byte-for-byte unchanged.
 
 Before writing anything, keeperd refuses with an error that leads with the code:
 

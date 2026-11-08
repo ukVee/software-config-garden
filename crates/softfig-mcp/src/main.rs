@@ -426,7 +426,8 @@ fn tool_defs() -> Vec<Value> {
             "name": "queue_add_project",
             "description": "growlight queue v2: append a [[project]] row to queue.toml (name, repo, \
                             merge branch). On a fresh garden this creates the first v2 file, so the \
-                            softfig:queue-v2 view renders from then on. A HUMAN verb: a fleet member \
+                            softfig:queue-v2 view renders into growlight/backlog/queue.md from then \
+                            on. A HUMAN verb: a fleet member \
                             is refused member_not_allowed (§6.7). Refusal codes surface as-is from \
                             keeperd.",
             "inputSchema": {
@@ -443,8 +444,9 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "queue_add_entry",
             "description": "growlight queue v2: create a backlog entry and its docs in one commit. \
-                            milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml \
-                            plus the generated 001-plan slice when no slices are given); task kind \
+                            milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml, \
+                            the slices.md view, plus the generated 001-plan slice when no slices are \
+                            given); task kind \
                             writes tasks/NNN-<slug>.md (branch fix/<NNN>); restack kind writes a \
                             generated doc into the urgent lane (project only — every other arg is \
                             refused BadArgs). A fleet member may call it for found work only \

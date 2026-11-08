@@ -12,7 +12,7 @@
 //!   slice `active → done | split | blocked | deferred | queued`;
 //! - [`queue_v2_follow_ups`] — the §7 counter, written as an absolute value;
 //! - [`queue_v2_session_log`] — the §3.5 line, appended to the unit doc's
-//!   `## Sessions`;
+//!   `## Sessions` (a milestone close-out's to its `sessions.md`);
 //! - [`queue_v2_deferred`] — the §6.5/protocol §7b `## Deferred verification`
 //!   section.
 //! - [`queue_v2_add_sub`] (slice 010) — the §7 sub-milestone: its docs and
@@ -81,6 +81,8 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::{ErrorKind, GARDEN_CONFIG_DIR, GROWLIGHT_CONFIG_FILE};
 use softfig_fuse::SealedQuery;
+
+use softfig_ipc::queue_v2::{milestone_doc, sessions_file};
 
 use super::{
     apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
@@ -171,8 +173,9 @@ fn load_entry_row(
     })
 }
 
-/// The unit doc's garden-relative path for `entry`/`unit` (the `## Sessions`
-/// and `## Deferred verification` target, §3.5/§6.5): a milestone's
+/// The unit doc's garden-relative path for `entry`/`unit` (the `## Deferred
+/// verification` target, §6.5, and the `## Sessions` one, §3.5, for all but a
+/// milestone close-out — see [`session_log_rel`]): a milestone's
 /// `CLAUDE.md` for a close-out, its `slices/NNN-<slug>.md` for a unit (the
 /// NNN resolves through the folder, since `slices.toml` carries no slug), a
 /// task's or restack's `tasks/NNN-<slug>.md` otherwise.
@@ -184,7 +187,7 @@ pub(in crate::actions::growlight) fn unit_doc_rel(
 ) -> Result<String, (ErrorKind, String)> {
     match kind {
         EntryKind::Milestone => match unit {
-            None => Ok(format!("{}/CLAUDE.md", milestone_path(entry))),
+            None => Ok(milestone_doc(entry)),
             Some(id) => {
                 let n: u32 = id.parse().map_err(|_| {
                     (
@@ -223,6 +226,32 @@ pub(in crate::actions::growlight) fn unit_doc_rel(
         }
     }
 }
+
+/// Where §3.5 puts the session line for `entry`/`unit`, and whether the op
+/// may create that doc. A milestone close-out's line goes to the milestone's
+/// `sessions.md` (live state stays out of `CLAUDE.md`, task 104), which its
+/// first line creates — but only beside an existing milestone doc, so a
+/// close-out for a milestone with no doc is refused, not given a directory.
+/// Every other line goes to its [`unit_doc_rel`], which must exist.
+fn session_log_rel(
+    wt: &WorkTree,
+    kind: EntryKind,
+    entry: &str,
+    unit: Option<&str>,
+) -> Result<(String, bool), (ErrorKind, String)> {
+    let rel = unit_doc_rel(wt, kind, entry, unit)?;
+    match (kind, unit) {
+        (EntryKind::Milestone, None) => match wt.exists(&rel) {
+            true => Ok((sessions_file(entry), true)),
+            false => Err((ErrorKind::NotFound, format!("{rel}: unit doc missing"))),
+        },
+        _ => Ok((rel, false)),
+    }
+}
+
+/// What a milestone's `sessions.md` holds before its first line.
+const SESSIONS_DOC_STUB: &str = "# Session log\n\n\
+Written by keeperd when a session closes the milestone out (spec-growlight-queue §3.5).\n";
 
 /// Read a unit doc as plaintext for a doc-level op, refusing (not skipping)
 /// files that are sealed, vault-tagged or missing. Returns the content and
@@ -883,8 +912,13 @@ pub fn queue_v2_session_log(daemon: &Daemon, args: serde_json::Value) -> Handler
         let wt = WorkTree::new(daemon, &inner);
         let loaded = load_entry_row(&wt, &inner, &args.entry)?;
         let kind = loaded.queue.entries[loaded.entry_idx].kind;
-        let rel = unit_doc_rel(&wt, kind, &args.entry, args.unit.as_deref())?;
-        let (content, version) = load_unit_doc(&wt, &inner, &rel)?;
+        let (rel, creatable) = session_log_rel(&wt, kind, &args.entry, args.unit.as_deref())?;
+        // A close-out's `sessions.md` is made by its first line: `None` is the
+        // first-creation CAS token.
+        let (content, version) = match creatable && !wt.exists(&rel) {
+            true => (SESSIONS_DOC_STUB.to_string(), None),
+            false => load_unit_doc(&wt, &inner, &rel).map(|(c, v)| (c, Some(v)))?,
+        };
         (rel, content, version)
     };
 
@@ -905,7 +939,7 @@ pub fn queue_v2_session_log(daemon: &Daemon, args: serde_json::Value) -> Handler
         serde_json::json!({ "entry": args.entry, "unit": args.unit }),
         &[FileWrite {
             rel: rel.clone(),
-            expected: Some(version),
+            expected: version,
             bytes: new.into_bytes(),
         }],
         &[],
@@ -1004,8 +1038,8 @@ fn sub_doc(identity: &str, parent: &str, slice: &str, title: &str, mission: &str
          > Sub-milestone `{identity}`, filed from slice {slice} of `{parent}` when its work \
          outgrew it (spec-growlight-queue §7). It runs inside its top-level entry and \
          shares that entry's baton; its status is its item in `{parent}`'s `slices.toml`, \
-         its slices run in the order of the derived table below, and it is done when its \
-         close-out completes.\n\n\
+         its slices run in the order of the derived table in `slices.md`, and it is done \
+         when its close-out completes.\n\n\
          ## Mission\n\n{}\n\n\
          ## Finish criteria\n\n{}\n",
         mission.trim_end_matches('\n'),
@@ -1064,7 +1098,7 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
-    let doc_rel = slices_view_host(&identity);
+    let doc_rel = milestone_doc(&identity);
     let slices_dir = format!("{}/slices", milestone_path(&identity));
     let (mut parent, parent_version) = {
         let wt = WorkTree::new(daemon, &inner);
@@ -1162,7 +1196,7 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
             body: Some(slices_view(&parent)),
         },
         ViewWrite {
-            host: doc_rel.clone(),
+            host: slices_view_host(&identity),
             tag: SLICES_V2_TAG,
             body: Some(slices_view(&sub)),
         },
@@ -2205,10 +2239,28 @@ mod tests {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         seed_running_milestone(&daemon, "m");
-        // Close-out: the milestone's own CLAUDE.md.
+        let claude = "growlight/backlog/milestones/m/CLAUDE.md";
+        let doc_before = {
+            let inner = daemon.inner.lock().unwrap();
+            WorkTree::new(&daemon, &inner).read_to_string(claude).unwrap()
+        };
+        // Close-out: the milestone's `sessions.md` (task 104), created by the
+        // first line and appended to by the next; the milestone doc is left
+        // alone.
         let reply = session_log(&daemon, "m", None, "deferred · reasoning · member oc · $0.02")
             .expect("close-out log");
-        assert_eq!(reply.path, "growlight/backlog/milestones/m/CLAUDE.md");
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/sessions.md");
+        session_log(&daemon, "m", None, "completed · reasoning · member oc · $0.03")
+            .expect("second close-out log");
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            let log = wt.read_to_string(&reply.path).unwrap();
+            assert!(log.starts_with(SESSIONS_DOC_STUB), "{log}");
+            assert_eq!(log.matches("## Sessions").count(), 1, "{log}");
+            assert!(log.contains("· deferred ·") && log.contains("· completed ·"), "{log}");
+            assert_eq!(wt.read_to_string(claude).unwrap(), doc_before);
+        }
 
         // Task: the numbered task doc.
         let id = seed_task(&daemon, "fix-x");
@@ -2423,10 +2475,63 @@ mod tests {
         let (queue, _) = loaded_queue(&daemon);
         assert_eq!(queue.entries[0].status, EntryStatus::Active, "the top-level row is active");
         assert_eq!(loaded_slices(&daemon, "m/sub-a").items[0].status, SliceStatus::Active);
-        // The sub's close-out session-log lands in the sub's own CLAUDE.md.
+        // The sub's close-out session-log lands in the sub's own sessions.md.
         let reply = session_log(&daemon, "m/sub-a", None, "completed · reasoning · member oc · $0.00")
             .expect("sub close-out log");
-        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/sub-a/CLAUDE.md");
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/sub-a/sessions.md");
+    }
+
+    // ---- view hosts (task 104) ---------------------------------------------
+
+    /// Every `.md` under the garden, garden-relative, skipping keeperd's state.
+    fn garden_docs(root: &std::path::Path) -> Vec<String> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                let path = e.path();
+                if e.file_name() == ".softfig" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if path.extension().is_some_and(|x| x == "md") {
+                    out.push(path.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[test]
+    fn no_v2_write_adds_a_region_to_any_claude_md() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // Project, milestone (with its generated views), task, claim, a sub,
+        // status and follow-up writes, and both kinds of session line.
+        seed_running_milestone(&daemon, "m");
+        let task = seed_task(&daemon, "fix-x");
+        add_sub(&daemon, sub_args("m", "001", "deeper", false)).expect("add_sub");
+        follow_ups(&daemon, "m", Some("002"), 1).expect("follow_ups");
+        session_log(&daemon, "m", None, "completed · reasoning · member oc · $0.01").expect("close-out");
+        session_log(&daemon, &task, None, "blocked · claude · member a · $0.00").expect("task log");
+
+        let docs = garden_docs(garden.path());
+        for rel in docs.iter().filter(|r| r.ends_with("CLAUDE.md")) {
+            let text = std::fs::read_to_string(garden.path().join(rel)).unwrap();
+            for tag in [QUEUE_V2_TAG, SLICES_V2_TAG] {
+                assert!(!managed::has_region(&text, tag), "{rel} carries softfig:{tag}:\n{text}");
+            }
+        }
+        // The views live in their own docs instead.
+        let has = |rel: &str, tag| {
+            let text = std::fs::read_to_string(garden.path().join(rel)).unwrap_or_default();
+            managed::has_region(&text, tag)
+        };
+        assert!(has("growlight/backlog/queue.md", QUEUE_V2_TAG), "{docs:?}");
+        assert!(has("growlight/backlog/milestones/m/slices.md", SLICES_V2_TAG), "{docs:?}");
+        assert!(has("growlight/backlog/milestones/m/subs/deeper/slices.md", SLICES_V2_TAG), "{docs:?}");
+        assert!(docs.iter().any(|r| r == "growlight/backlog/milestones/m/sessions.md"), "{docs:?}");
     }
 
     // ---- add_sub (slice 010) ----------------------------------------------
@@ -2499,7 +2604,9 @@ mod tests {
             None,
             "the generated doc declares no model, so the sub inherits the parent's chain",
         );
-        let region = managed::region_body(&doc, SLICES_V2_TAG).unwrap();
+        assert!(!managed::has_region(&doc, SLICES_V2_TAG), "the view is in slices.md: {doc}");
+        let view = wt.read_to_string(&slices_view_host("m/deeper")).unwrap();
+        let region = managed::region_body(&view, SLICES_V2_TAG).unwrap();
         assert!(region.contains("| slice | 001 | queued |"), "{region}");
         let parent = wt.read_to_string(&slices_view_host("m")).unwrap();
         let region = managed::region_body(&parent, SLICES_V2_TAG).unwrap();
@@ -2792,7 +2899,20 @@ mod tests {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let expect = seed_legacy(&daemon, garden.path());
-        let before_doc = backlog_doc(garden.path());
+        let claude_docs = |root: &std::path::Path| -> Vec<(String, String)> {
+            let mut docs: Vec<_> = garden_docs(root)
+                .into_iter()
+                .filter(|r| r.ends_with("CLAUDE.md"))
+                .map(|r| {
+                    let text = std::fs::read_to_string(root.join(&r)).unwrap();
+                    (r, text)
+                })
+                .collect();
+            docs.sort();
+            docs
+        };
+        let before_claude = claude_docs(garden.path());
+
         let before = commit_count(&daemon);
 
         let reply = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
@@ -2836,10 +2956,12 @@ mod tests {
         }
         assert_eq!(reply.batons, fixture.batons, "the caller's baton copies");
 
-        // Legacy untouched: the backlog doc only gained the derived queue view.
-        let after_doc = backlog_doc(garden.path());
-        assert_eq!(managed::changed_regions(&before_doc, &after_doc), vec![QUEUE_V2_TAG.to_string()]);
-        assert!(after_doc.starts_with(before_doc.trim_end()), "the legacy text is a prefix, byte for byte");
+        // Legacy untouched: no `CLAUDE.md` changed at all (task 104) — the
+        // views went to `queue.md` and each milestone's `slices.md`.
+        assert!(before_claude.iter().any(|(r, _)| r == "growlight/backlog/CLAUDE.md"));
+        assert_eq!(claude_docs(garden.path()), before_claude, "no CLAUDE.md changes");
+        let view = std::fs::read_to_string(garden.path().join(queue_view_host())).unwrap();
+        assert!(managed::has_region(&view, QUEUE_V2_TAG), "{view}");
         assert!(!garden.path().join("config/growlight.toml").exists(), "the switch is never written");
 
         // A second apply refuses: the v2 files exist now.
@@ -2886,7 +3008,8 @@ mod tests {
         assert_eq!(commit_count(&daemon), before, "nothing landed");
         assert!(!garden.path().join(QUEUE_FILE).exists(), "queue.toml unstaged");
         assert!(!garden.path().join(QUEUE_ARCHIVE_FILE).exists(), "queue-archive.toml unstaged");
-        assert_eq!(backlog_doc(garden.path()), before_doc, "the queue view unstaged");
+        assert_eq!(backlog_doc(garden.path()), before_doc, "the backlog doc untouched");
+        assert!(!garden.path().join(queue_view_host()).exists(), "queue.md unstaged");
         let fixture_slices = {
             let files = fixture_files();
             let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
@@ -2895,8 +3018,7 @@ mod tests {
         for (milestone, _) in &fixture_slices {
             assert!(!garden.path().join(slices_file(milestone)).exists(), "{milestone}: slices.toml unstaged");
             let host = slices_view_host(milestone);
-            let doc = std::fs::read_to_string(garden.path().join(&host)).unwrap();
-            assert!(!managed::has_region(&doc, SLICES_V2_TAG), "{host}: view unstaged");
+            assert!(!garden.path().join(&host).exists(), "{host}: view unstaged");
         }
         assert_eq!(snapshot_version(&daemon), expect, "the tree is back at the dry run's snapshot");
 
