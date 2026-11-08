@@ -2847,6 +2847,9 @@ fn stack_base_from_git(q: &migrate::StackBaseQuestion, home: Option<&Path>, user
     if let Some(named) = &q.stray_parent {
         return StackAnswer::Open { why: format!("the prose names parent `{named}`, which is no other item") };
     }
+    if q.repo.trim().is_empty() {
+        return StackAnswer::Open { why: "the project has no repo yet; settle its `project_repo` call and re-run".into() };
+    }
     let repo = match RepoLocality::of(&q.repo, user) {
         RepoLocality::Local => softfig_ipc::item_repo::expand_home(q.repo.trim(), home, user),
         RepoLocality::Remote => {
@@ -2859,7 +2862,7 @@ fn stack_base_from_git(q: &migrate::StackBaseQuestion, home: Option<&Path>, user
     };
     let git = softfig_growlightd::git_stack::Git::new(repo)
         .with_deadline(std::time::Instant::now() + STACK_ANSWER_GIT_BUDGET);
-    stack_base_git(&git, q).unwrap_or_else(|e| StackAnswer::Open { why: e.to_string() })
+    stack_base_git(&git, q).unwrap_or_else(|e| StackAnswer::Open { why: format!("git can't read the repo ({e})") })
 }
 
 fn stack_base_git(
@@ -2872,6 +2875,12 @@ fn stack_base_git(
         return Ok(StackAnswer::Open { why: format!("the repo has no `{main}` branch") });
     }
     if !git.branch_exists(branch)? {
+        // A missing branch says nothing about a name the owner hasn't settled.
+        if q.branch_open {
+            return Ok(StackAnswer::Open {
+                why: format!("`{branch}` is not in the repo, and it is only the open `branch:{}` call's proposal; settle that and re-run", q.id),
+            });
+        }
         return Ok(StackAnswer::Unknown { parent, why: format!("`{branch}` is gone") });
     }
     if git.is_ancestor(branch, main)? {
@@ -6611,13 +6620,15 @@ mod tests {
         let doc = "# backlog\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
                    |---|----|------|-------|--------|\n| 1 | 001 | task | Child | active |\n\
                    | 2 | 002 | task | Parent | blocked |\n| 3 | 003 | task | Merged | blocked |\n\
-                   | 4 | 004 | task | Gone | blocked |\n\n<!-- /softfig:queue -->\n";
+                   | 4 | 004 | task | Gone | blocked |\n| 5 | 005 | task | Unsettled | blocked |\n\n\
+                   <!-- /softfig:queue -->\n";
         fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
         let tasks = [
             ("001-child", "Branch `fix/001`, stacked on `fix/002`."),
             ("002-parent", "Branch `fix/002` off `main`."),
             ("003-merged", "Branch `fix/003` off `main`."),
             ("004-gone", "Branch `fix/004` off `main`."),
+            ("005-unsettled", "Branch `fix/005` or `fix/005-b`."),
         ];
         for (name, policy) in tasks {
             fs::write(backlog.join(format!("tasks/{name}.md")), format!("# t\n\n## Branch policy\n\n{policy}\n")).unwrap();
@@ -6635,7 +6646,7 @@ mod tests {
         let legacy = migrate::read_legacy(&files).unwrap();
         let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
         let questions = migrate::stack_base_questions(&plan);
-        assert_eq!(questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["001", "002", "003", "004"]);
+        assert_eq!(questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["001", "002", "003", "004", "005"]);
         assert_eq!(questions[0].parent, Some(("002".to_string(), "fix/002".to_string())));
 
         let lines: Vec<_> =
@@ -6649,6 +6660,8 @@ mod tests {
         assert!(matches!(answer("002"), StackAnswer::Known { parent, base, .. } if parent.is_empty() && base == c0));
         assert!(matches!(answer("003"), StackAnswer::Unknown { why, .. } if why.contains("merged")), "{:?}", answer("003"));
         assert!(matches!(answer("004"), StackAnswer::Unknown { why, .. } if why.contains("gone")), "{:?}", answer("004"));
+        // 005's branch is an open `branch` call: a missing proposal is no verdict.
+        assert!(matches!(answer("005"), StackAnswer::Open { why } if why.contains("branch:005")), "{:?}", answer("005"));
 
         let text = render_stack_answers(&lines, "v1");
         assert!(text.contains(&format!("\"stack_base:001\" = \"parent=002 base={parent_tip}\"\n")), "{text}");
@@ -6657,8 +6670,12 @@ mod tests {
         answers.call.extend(generated.call);
         let settled = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
         assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
-        let open: Vec<_> = settled.open_calls().filter(|c| c.key.class == migrate::CallClass::StackBase).collect();
-        assert!(open.is_empty(), "{open:?}");
+        let open: Vec<_> = settled
+            .open_calls()
+            .filter(|c| c.key.class == migrate::CallClass::StackBase)
+            .map(|c| c.key.subject.as_str())
+            .collect();
+        assert_eq!(open, ["005"], "only the call git left open");
         let child = settled.queue.entries.iter().find(|e| e.id == "001").unwrap();
         assert_eq!((child.parent.as_str(), child.base.as_str()), ("002", parent_tip.as_str()));
     }
@@ -6670,6 +6687,7 @@ mod tests {
         let q = |repo: &str| migrate::StackBaseQuestion {
             id: "x".into(),
             branch: "fix/x".into(),
+            branch_open: false,
             repo: repo.into(),
             main: "main".into(),
             parent: None,
@@ -6682,6 +6700,9 @@ mod tests {
         let not_a_repo = tempfile::tempdir().unwrap();
         let unreadable = stack_base_from_git(&q(&not_a_repo.path().display().to_string()), None, None);
         assert!(matches!(&unreadable, StackAnswer::Open { .. }), "{unreadable:?}");
+        assert!(matches!(&unreadable, StackAnswer::Open { why } if why.starts_with("git can't read the repo")));
+        let unsettled = stack_base_from_git(&q(""), None, None);
+        assert!(matches!(&unsettled, StackAnswer::Open { why } if why.contains("project_repo")), "{unsettled:?}");
         let stray = migrate::StackBaseQuestion { stray_parent: Some("ghost".into()), ..q("/r") };
         assert!(matches!(stack_base_from_git(&stray, None, None), StackAnswer::Open { why } if why.contains("ghost")));
 

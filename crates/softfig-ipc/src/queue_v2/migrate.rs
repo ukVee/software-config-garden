@@ -1140,6 +1140,8 @@ pub struct StackBaseQuestion {
     pub id: String,
     /// The entry's branch, as planned (an open `branch` call renders its proposal).
     pub branch: String,
+    /// The `branch` call is still open, so `branch` is only its proposal.
+    pub branch_open: bool,
     /// The entry's project's `repo` and `main`, as planned.
     pub repo: String,
     pub main: String,
@@ -1169,9 +1171,11 @@ pub fn stack_base_questions(plan: &MigrationPlan) -> Vec<StackBaseQuestion> {
                 (_, Some(p)) => (Some((p.id.clone(), p.branch.clone())), None),
                 (named, None) => (None, Some(named.to_string())),
             };
+            let branch_open = plan.open_calls().any(|c| c.key.class == CallClass::Branch && c.key.subject == id);
             Some(StackBaseQuestion {
                 id: id.to_string(),
                 branch: entry.branch.clone(),
+                branch_open,
                 repo: project.repo.clone(),
                 main: project.main.clone(),
                 parent,

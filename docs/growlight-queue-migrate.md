@@ -99,7 +99,7 @@ read-only in each project's repo, with the same probe rules growlightd uses.
 |---|---|
 | live and not merged into the project's `main` | `parent=<p> base=<merge-base>`: the merge-base with the parent's branch, or with `main` when the prose names no parent or the parent's branch is gone |
 | gone, or merged into `main` | `parent=<p> base=`, the explicit unknown |
-| in a remote or ambiguous repo, in a repo git can't read, or with the prose naming a parent that isn't an item | commented out, with the reason. The call stays open |
+| in a remote or ambiguous repo, in a repo git can't read, or with the prose naming a parent that isn't an item; or missing while its name is still an open `branch` call's proposal; or the project's `repo` is still unsettled | commented out, with the reason. The call stays open: settle the other call and re-run |
 
 `<p>` is the parent the `stack_base` proposal names. Nothing applies the file
 by itself, and `--stack-answers` can't be combined with `--apply`. An existing
