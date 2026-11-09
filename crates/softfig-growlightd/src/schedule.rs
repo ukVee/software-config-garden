@@ -236,8 +236,8 @@ impl ScheduleConfig {
             let (start, end) = span
                 .split_once('-')
                 .ok_or_else(|| bad(format!("windows entry {span:?} is not \"HH:MM-HH:MM\"")))?;
-            let start_min = parse_hhmm(start).map_err(&bad)?;
-            let end_min = parse_hhmm(end).map_err(&bad)?;
+            let start_min = parse_hhmm(start).map_err(bad)?;
+            let end_min = parse_hhmm(end).map_err(bad)?;
             windows.push(Window {
                 label: format!("daily {}-{}", hhmm(start_min), hhmm(end_min)),
                 days: DaySet::ALL,
@@ -249,12 +249,12 @@ impl ScheduleConfig {
         }
         for (i, w) in doc.window.iter().enumerate() {
             let bad = |why: String| bad(format!("window #{}: {why}", i + 1));
-            let start_min = parse_hhmm(&w.start).map_err(&bad)?;
-            let end_min = parse_hhmm(&w.end).map_err(&bad)?;
+            let start_min = parse_hhmm(&w.start).map_err(bad)?;
+            let end_min = parse_hhmm(&w.end).map_err(bad)?;
             let (days, days_label) = match &w.days {
                 None => (DaySet::ALL, "daily".to_string()),
                 Some(list) => {
-                    let set = parse_days(list).map_err(&bad)?;
+                    let set = parse_days(list).map_err(bad)?;
                     let label = if set == DaySet::ALL { "daily".to_string() } else { list.join(",") };
                     (set, label)
                 }
