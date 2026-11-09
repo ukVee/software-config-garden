@@ -13,7 +13,15 @@
 /// or an empty value fails closed. See `growlight/backlog/CLAUDE.md` "Marking an item
 /// human-only".
 pub fn fleet_marker(doc: &str) -> Option<&str> {
-    crate::item_meta::field(doc, crate::item_meta::FLEET).filter(|v| !v.eq_ignore_ascii_case("yes"))
+    crate::item_meta::field(doc, crate::item_meta::FLEET).filter(|v| holds(v))
+}
+
+/// Whether a `> Fleet:` line's value holds the item: anything but `yes`,
+/// case-insensitive (an empty value or a typo fails closed). The one value
+/// rule, so a surface comparing a doc's line with a v2 entry reads the line as
+/// [`fleet_marker`] does.
+pub fn holds(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("yes")
 }
 
 /// Whether `doc` is held human-only: [`fleet_marker`] returned a non-`yes`
@@ -95,7 +103,7 @@ pub fn parse_not_before(value: &str) -> Result<i64, String> {
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;

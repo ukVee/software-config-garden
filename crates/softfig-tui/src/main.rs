@@ -22,6 +22,7 @@ use ratatui::Terminal;
 
 use softfig_tui::app::App;
 use softfig_tui::ipc::IpcClient;
+use softfig_tui::redraw::RedrawGate;
 use softfig_tui::ui;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -103,16 +104,25 @@ fn run(
     // `None` whenever we're off the Growlight tab, so re-entering it polls the
     // fleet header immediately instead of waiting out the interval.
     let mut last_fleet_poll: Option<Instant> = None;
+    // Draw only when something visible can have changed (report 093): the
+    // unconditional per-iteration `draw` was ~8 % of a core while idle.
+    let mut gate = RedrawGate::new();
     loop {
-        terminal.draw(|f| ui::render(f, app))?;
+        if gate.take() {
+            terminal.draw(|f| ui::render(f, app))?;
+        }
 
-        for reply in ipc.drain() {
+        let replies = ipc.drain();
+        gate.on_replies(replies.len());
+        for reply in replies {
             app.apply_reply(reply, ipc);
         }
         // The growlightd channel only ever carries `FleetStatus` replies; route
         // them through the same sink (the keeperd `ipc` is unused by that arm).
         // An unreachable socket comes back as an `Err` and soft-fails there.
-        for reply in growlightd.drain() {
+        let fleet_replies = growlightd.drain();
+        gate.on_replies(fleet_replies.len());
+        for reply in fleet_replies {
             app.apply_reply(reply, ipc);
         }
         // Poll the live fleet header on a ~1.5 s cadence, but only while the
@@ -131,8 +141,21 @@ fn run(
             last_fleet_poll = None;
         }
 
+        // The queue-v2 two-lane snapshot (slice 007) is a heavier garden read
+        // than the status poll, so it is one-shot: fired when marked stale (tab
+        // entry / refresh / a confirmed action), then the run loop clears the
+        // mark. It rides the same growlightd channel as the fleet/baton poll.
+        if app.should_poll_queue_v2() {
+            app.poll_queue_v2(growlightd);
+            app.growlight_v2_stale = false;
+        }
+
+        // The 100 ms poll stays: it is how IPC replies (an mpsc channel crossterm
+        // can't wait on) are noticed. It is cheap; the draw above is not.
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
+            let ev = event::read()?;
+            gate.on_event(&ev);
+            match ev {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key, ipc);
                 }

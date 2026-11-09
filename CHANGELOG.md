@@ -56,6 +56,11 @@ decision record or crate that owns it, rather than at every internal change.
   `softfig upgrade --rollback` restores it (then cycle the daemon), and
   `--force` re-installs even an identical build. `uninstall` removes the kept set
   and the install lock too.
+- keeperd refuses a write that grows a routing `CLAUDE.md` past 8 KB of hand-written
+  text. Managed regions don't count, and an over-limit doc may always shrink.
+  `growlight/backlog/` is exempt for now. See `decision-claude-md-lazy-pointers`.
+- The growlight reports index and tag reference now live in `growlight/reports/index.md`,
+  and an existing garden's `reports/CLAUDE.md` migrates at its first report or edit.
 - `claude:<alias|id>[1m] [effort=<low|medium|high|xhigh|max>]` grammar across
   `softfig growlight start --model`, the interactive picker, `> Model:` lines
   and `[[fleet]] model` entries, so the claude backend's model and effort are
@@ -64,6 +69,73 @@ decision record or crate that owns it, rather than at every internal change.
   fleet slice 003). A claude member whose model Claude Code refuses
   (`model_not_found` / 404) parks the unit with an alert carrying the reason;
   there is no crash loop and no backoff retry.
+- **Queue v2** — one ordered list of projects and entries in `queue.toml`,
+  `queue-archive.toml` and per-milestone `slices.toml`, behind the
+  `queue = "legacy" | "v2"` switch in `config/growlight.toml` (default
+  `legacy`, unchanged). growlightd picks from it, records each started entry's
+  `parent`/`base` from git, enqueues one restack per repo when a stack goes
+  stale, and holds an entry by its `fleet` / `not_before` fields. `queue show`,
+  `queue pick` and the TUI Growlight tab show and edit it (milestones
+  `queue-v2-state`, `queue-v2-scheduling`, `queue-v2-git`, `queue-v2-parity`;
+  `meta/spec-growlight-queue.md`).
+- **`softfig growlight queue migrate`** — converts the legacy backlog tables and
+  item docs to the v2 files (`docs/growlight-queue-migrate.md`). `--dry-run`
+  prints the plan, every judgment call and refusal, and the snapshot version,
+  and writes nothing. `--answers <toml>` settles calls by `[class]` or `[call]`.
+  `--stack-answers <out>` also asks git, read-only, for every open `stack_base`
+  call and writes an answers file to review; it never overwrites `<out>` and
+  can't be combined with `--apply`. `--apply --answers <toml> --expect <version>`
+  writes every v2 file in one keeperd commit. It refuses when the fleet is armed,
+  the switch is already `v2`, v2 files exist, the snapshot moved since the dry
+  run, or a call is still open. It never flips the switch. The apply is the
+  human's: a fleet member is refused `member_not_allowed`, through its
+  softfig-mcp stamp or from its own shell. A plan built from a sealed doc or
+  region is refused. A failed apply says whether it committed, and a failed
+  baton copy exits non-zero and prints the copy to run by hand
+  (`queue-v2-migrate`, `queue-v2-migrate-fixes`).
+- growlightd's own schedule (`growlight-schedule`): a `[schedule]` table in
+  `config/growlight.toml` decides when the fleet may start or re-roll a
+  member, replacing the interim `growlight-window` timer that flipped
+  `fleet_enabled`. Plain `windows = ["HH:MM-HH:MM"]` strings and
+  `[[schedule.window]]` rows (`days`, `backends`, `members`) are accepted;
+  overlapping windows union, and an unknown key or an unreadable time zone
+  fails closed. A close never kills a member mid-iteration; one still running
+  `close_grace_minutes` later raises an information-only alert. With
+  `tasks = true` an item whose `> Not before:` has arrived may run outside
+  every window. `reserve_weekly_pct` keeps a share of each claude-login slot's
+  week for the owner, and a key naming no slot refuses to load the fleet.
+  `growlight status` gains a schedule block (open or closed, the next edge in
+  local time, held members and items, each slot's reserve and a budget
+  projection range). `softfig growlight queue pick` says it does not apply the
+  schedule (`growlight-schedule`; see `meta/spec-growlight-schedule.md`).
+- `[build_caps] test_threads` (default 2) sets `RUST_TEST_THREADS` on every
+  growlight build scope, replacing the `50-test-threads.conf` drop-in.
+- Token telemetry phase 1 (`token-telemetry-p1`): every model API request a
+  growlight session makes is recorded as one row in a local sqlite db,
+  `$XDG_STATE_HOME/softfig/telemetry.db` (mode 0600, schema v5), with the
+  garden's `config/pricing.toml` pricing each row. `softfig telemetry
+  ingest-transcript` backfills a claude transcript by hand and is what the
+  semi-auto `SessionEnd` hook runs; a repeat run skips a transcript that has
+  not grown. Raw rows are kept 90 days, then rolled into a daily rollup kept
+  forever. See `docs/token-telemetry.md`.
+
+### Changed
+
+- The queue v2 views move out of `CLAUDE.md` files: the `softfig:queue-v2` list
+  renders into `growlight/backlog/queue.md`, each milestone's `softfig:slices-v2`
+  order into its own `slices.md`, and a milestone close-out's session line goes
+  to its `sessions.md`. keeperd creates each file on first write. No v2 write,
+  `queue migrate --apply` included, changes any `CLAUDE.md` (task 104;
+  `spec-growlight-queue` §3.4–§3.5, `decision-claude-md-lazy-pointers`).
+
+### Fixed
+
+- keeperd no longer re-walks the whole commit and tree history on every 20 s
+  replica sync. The served closure is built only when a host actually asks for
+  an object and is kept across ticks, and so is the height the announce signs,
+  so an up-to-date host costs no walk and no commit read and a new commit reads
+  only what is new (about 4.5 % of a core around the clock before; growlight
+  report 092).
 
 ### Protocol
 

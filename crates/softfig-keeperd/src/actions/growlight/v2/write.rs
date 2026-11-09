@@ -24,12 +24,13 @@ use softfig_ipc::ErrorKind;
 use softfig_store::Hash;
 use softfig_vcs::Intent;
 
-use crate::actions::growlight::paths;
+use crate::actions::growlight::v2::views;
 use crate::actions::{backlinks, managed, sections, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 
 /// One v2 file to write: the path, the CAS token from the load, and the
 /// serialized bytes.
+#[derive(Clone)]
 pub struct FileWrite {
     pub rel: String,
     /// [`LoadedFile::version`](super::state::LoadedFile::version) from the
@@ -95,11 +96,11 @@ pub fn apply(
     extras: &ExtraWrites,
 ) -> Result<Hash, (ErrorKind, String)> {
     crate::handlers::require_unlocked(inner)?;
-    {
+    let (prior, intent) = {
         let wt = WorkTree::new(daemon, inner);
         // Pass 1 — refuse everything that could fail, before anything lands.
         for f in files.iter().chain(extras.writes) {
-            wt.check_write(&f.rel)?;
+            wt.check_structured(&f.rel)?;
             match &f.expected {
                 Some(_) => crate::handlers::cas_check_whole_file(&wt, &f.rel, &f.expected)?,
                 None => {
@@ -119,62 +120,121 @@ pub fn apply(
         }
         let hosts: Result<Vec<Option<String>>, (ErrorKind, String)> = views
             .iter()
-            .map(|v| read_view_host(&wt, inner, &v.host, v.body.is_some(), extras.writes))
+            .map(|v| read_view_host(&wt, inner, v, extras.writes))
             .collect();
         let hosts = hosts?;
-        // Pass 2 — stage every write. Extras land before the views so a view
-        // host that is itself an extra gets the region upserted on top of its
-        // staged doc, and before the backlink refresh so the new docs' refs
-        // resolve.
-        // Structured writes: every byte here is keeperd's own rendering of a
-        // verb's typed fields (`write_structured`, outside §6.7's member
-        // `> Model:` guard — the one member-callable verb that reaches here,
-        // `queue_add_entry`, holds the member's text fields to §6.7 itself).
-        for f in files {
-            wt.write_structured(&f.rel, &f.bytes)?;
-        }
-        for f in extras.writes {
-            wt.write_structured(&f.rel, &f.bytes)?;
-        }
-        for (v, host) in views.iter().zip(hosts) {
-            let Some(content) = host else {
-                continue; // removing a region from a doc that doesn't exist: done
-            };
-            let new = match &v.body {
-                Some(body) => managed::upsert(&content, v.tag, body),
-                None => managed::remove(&content, v.tag),
-            };
-            if new != content {
-                wt.check_write(&v.host)?;
-                wt.write_structured(&v.host, new.as_bytes())?;
+        // What every path pass 2 may stage held before it, first touch wins:
+        // a failure from here on puts these back, so a failed verb leaves the
+        // tree as it found it and a retry is clean (queue-v2-migrate-fixes
+        // F12). Without it the staged files outlive the error, a retry
+        // refuses on its own leftovers, and "failed" reads like "landed".
+        let mut prior: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+        let mut touch = |rel: &str, bytes: Option<Vec<u8>>| {
+            if !prior.iter().any(|(r, _)| r == rel) {
+                prior.push((rel.to_string(), bytes));
             }
+        };
+        for rel in files.iter().chain(extras.writes).map(|f| f.rel.as_str()).chain(views.iter().map(|v| v.host.as_str())) {
+            touch(rel, wt.read(rel));
         }
-        if extras.refresh_backlinks {
-            backlinks::refresh_all(&wt, inner);
+        if let Err(e) = stage(&wt, inner, files, views, hosts, extras, &mut touch) {
+            return Err(rolled_back(&wt, &prior, e));
+        }
+        let intent = Intent::new(intent_name, payload)
+            .map_err(|e| rolled_back(&wt, &prior, (ErrorKind::Internal, e.to_string())))?;
+        (prior, intent)
+    };
+    let tip = |inner: &DaemonInner| inner.repo.as_ref().and_then(|r| r.tip().ok().flatten());
+    let before = tip(inner);
+    match crate::actions::commit_now(inner, intent) {
+        Ok(hash) => Ok(hash),
+        // The tip moved, so the commit landed and absorbed the staged files:
+        // there is nothing left to put back.
+        Err(e) if tip(inner) != before => Err(e),
+        Err(e) => Err(rolled_back(&WorkTree::new(daemon, inner), &prior, e)),
+    }
+}
+
+/// Pass 2 of [`apply`]: stage every write. Extras land before the views so a
+/// view host that is itself an extra gets the region upserted on top of its
+/// staged doc, and before the backlink refresh so the new docs' refs resolve.
+/// `touch` records each backlink rewrite's prior text for the rollback.
+fn stage(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    files: &[FileWrite],
+    views: &[ViewWrite],
+    hosts: Vec<Option<String>>,
+    extras: &ExtraWrites,
+    touch: &mut impl FnMut(&str, Option<Vec<u8>>),
+) -> Result<(), (ErrorKind, String)> {
+    // Structured writes: every byte here is keeperd's own rendering of a
+    // verb's typed fields (`write_structured`, outside §6.7's member
+    // `> Model:` guard — the one member-callable verb that reaches here,
+    // `queue_add_entry`, holds the member's text fields to §6.7 itself, and
+    // vouches for its state writes, which pass 1 refused otherwise).
+    for f in files.iter().chain(extras.writes) {
+        wt.write_structured(&f.rel, &f.bytes)?;
+    }
+    for (v, host) in views.iter().zip(hosts) {
+        let Some(content) = host else {
+            continue; // removing a region from a doc that doesn't exist: done
+        };
+        let new = match &v.body {
+            Some(body) => managed::upsert(&content, v.tag, body),
+            None => managed::remove(&content, v.tag),
+        };
+        if new != content {
+            wt.check_write(&v.host)?;
+            wt.write_structured(&v.host, new.as_bytes())?;
         }
     }
-    let intent = Intent::new(intent_name, payload)
-        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    crate::actions::commit_now(inner, intent)
+    if extras.refresh_backlinks {
+        for (rel, text) in backlinks::refresh_all(wt, inner) {
+            touch(&rel, Some(text.into_bytes()));
+        }
+    }
+    Ok(())
+}
+
+/// Put every path back to `prior` after a failed [`apply`], and say so in
+/// the error: the caller can retry, because nothing was committed and
+/// nothing is left staged. A path that can't be put back is named instead —
+/// that is the one case a retry may trip over.
+fn rolled_back(
+    wt: &WorkTree,
+    prior: &[(String, Option<Vec<u8>>)],
+    (kind, msg): (ErrorKind, String),
+) -> (ErrorKind, String) {
+    let stuck: Vec<String> = prior
+        .iter()
+        .filter_map(|(rel, bytes)| wt.unstage(rel, bytes.as_deref()).err().map(|(_, e)| e))
+        .collect();
+    match stuck.is_empty() {
+        true => (kind, format!("{msg}; nothing was committed and the staged files were put back")),
+        false => (kind, format!("{msg}; nothing was committed, and these stay staged: {}", stuck.join("; "))),
+    }
 }
 
 /// Read a view's host doc through the same guard the legacy verbs use. A
-/// missing host is created from the backlog stub only for the queue view
-/// (mirroring `add_backlog_item` self-materializing its routing doc); any
-/// other missing host is the verb's bug — refuse, never fabricate a doc —
-/// unless the verb itself stages it this commit (`extras`, e.g. the milestone
-/// doc hosting the slices view), whose bytes stand in for the disk read.
+/// view host is a generated doc of its own (`queue.md`, a milestone's
+/// `slices.md`; task 104), so the first upsert creates a missing one from
+/// [`views::view_host_stub`] — or, when the verb itself stages it this commit
+/// (`extras`), takes those bytes in place of the disk read. A slices view
+/// still needs its milestone: the milestone doc must exist or be staged, so a
+/// verb's bad name never fabricates a milestone directory.
 fn read_view_host(
     wt: &WorkTree,
     inner: &DaemonInner,
-    host: &str,
-    upserting: bool,
+    view: &ViewWrite,
     extras: &[FileWrite],
 ) -> Result<Option<String>, (ErrorKind, String)> {
+    let host = view.host.as_str();
     if let Some(content) = sections::read_if_unprotected(wt, inner, host) {
         return Ok(Some(content));
     }
-    if let Some(extra) = extras.iter().find(|f| f.rel == host) {
+    let staged = |rel: &str| extras.iter().find(|f| f.rel == rel);
+    if let Some(extra) = staged(host) {
         return String::from_utf8(extra.bytes.clone())
             .map(Some)
             .map_err(|_| (ErrorKind::Internal, format!("{host}: staged bytes are not UTF-8")));
@@ -185,21 +245,26 @@ fn read_view_host(
             format!("{host}: unreadable or vault-protected"),
         ));
     }
-    if !upserting {
+    if view.body.is_none() {
         return Ok(None);
     }
-    if host == paths::backlog_claude() {
-        return Ok(Some(paths::backlog_claude_stub()));
+    if view.tag == views::SLICES_V2_TAG {
+        let dir = host.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let doc = format!("{dir}/CLAUDE.md");
+        if !wt.exists(&doc) && staged(&doc).is_none() {
+            return Err((
+                ErrorKind::NotFound,
+                format!("{host}: no milestone doc {doc} — the verb must create the milestone first"),
+            ));
+        }
     }
-    Err((
-        ErrorKind::NotFound,
-        format!("{host}: view host missing — the verb must create the doc first"),
-    ))
+    Ok(Some(views::view_host_stub(view.tag)))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::actions::growlight::paths;
     use crate::actions::growlight::v2::{state, views};
     use crate::actions::WorkTree;
     use crate::config::KeeperConfig;
@@ -263,6 +328,8 @@ pub(crate) mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 
@@ -453,6 +520,61 @@ pub(crate) mod tests {
         );
     }
 
+    /// Review 054 F8: a member's request that reaches `apply` through a verb
+    /// that never vouched for it writes no state file — none of the three, nor
+    /// the doc riding the same envelope — and commits nothing. The vouch is
+    /// what `queue_add_entry` gives after its own §6.7 checks.
+    #[test]
+    fn a_member_route_into_apply_writes_no_state_file_unless_vouched() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
+        create_queue(&daemon, &q, None);
+        let doc = "growlight/backlog/milestones/b/CLAUDE.md";
+        // `expected: None` (first creation) even for the live queue.toml: the
+        // member refusal runs before the CAS check, so it is what answers.
+        let write_one = |daemon: &Daemon, rel: String, doc: &str| {
+            let mut inner = daemon.inner.lock().unwrap();
+            apply(
+                daemon,
+                &mut inner,
+                "queue_v2_updated",
+                serde_json::json!({ "test": true }),
+                &[FileWrite { rel, expected: None, bytes: b"schema = 1\n".to_vec() }],
+                &[],
+                &ExtraWrites {
+                    writes: &[FileWrite { rel: doc.into(), expected: None, bytes: b"# b\n".to_vec() }],
+                    refresh_backlinks: false,
+                },
+            )
+        };
+        let before = commit_count(&daemon);
+        let state_files = [
+            QUEUE_FILE.to_string(),
+            state::QUEUE_ARCHIVE_FILE.to_string(),
+            softfig_ipc::queue_v2::slices_file("b"),
+        ];
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for rel in state_files.clone() {
+                let err = write_one(&daemon, rel.clone(), doc).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs, "{rel}: {err:?}");
+                assert!(err.1.starts_with("member_not_allowed:") && err.1.contains(&rel), "{err:?}");
+            }
+            assert!(!garden.path().join(doc).exists(), "nothing staged beside the refusal");
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+
+            let _vouch = crate::caller::vouch_for_state("queue_add_entry");
+            write_one(&daemon, softfig_ipc::queue_v2::slices_file("b"), doc)
+                .expect("a vouched verb's write");
+        }
+        assert!(garden.path().join(doc).exists());
+        assert_eq!(commit_count(&daemon), before + 1);
+        // A human's request needs no vouch.
+        write_one(&daemon, state::QUEUE_ARCHIVE_FILE.to_string(), "growlight/backlog/milestones/c/CLAUDE.md")
+            .expect("a human's verb");
+    }
+
     #[test]
     fn cas_refuses_a_stale_write_and_leaves_the_file_untouched() {
         let garden = tempfile::tempdir().unwrap();
@@ -528,8 +650,9 @@ pub(crate) mod tests {
     fn one_verb_two_files_one_commit_and_both_views_render() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
-        // The milestone doc the slices view hosts (queue_add_entry creates it
-        // in slice 004; here the harness seeds it like the verb would).
+        // The milestone doc the slices view needs beside it (queue_add_entry
+        // creates it in slice 004; here the harness seeds it like the verb
+        // would).
         let milestone_doc_rel = "growlight/backlog/milestones/m/CLAUDE.md";
         {
             let mut inner = daemon.inner.lock().unwrap();
@@ -598,6 +721,11 @@ pub(crate) mod tests {
             views::QUEUE_V2_TAG
         ));
         assert!(managed::has_region(
+            &wt.read_to_string(&views::slices_view_host("m")).unwrap(),
+            views::SLICES_V2_TAG
+        ));
+        // The milestone doc only lets the view in beside it; it gains nothing.
+        assert!(!managed::has_region(
             &wt.read_to_string(milestone_doc_rel).unwrap(),
             views::SLICES_V2_TAG
         ));
@@ -639,8 +767,8 @@ pub(crate) mod tests {
                 !managed::has_region(&backlog, views::QUEUE_V2_TAG),
                 "region removed: {backlog}"
             );
-            // The doc still exists and kept its prose.
-            assert!(backlog.contains("growlight/backlog"), "{backlog}");
+            // The doc still exists and kept its stub prose.
+            assert!(backlog.starts_with(&views::view_host_stub(views::QUEUE_V2_TAG)), "{backlog}");
         }
 
         // A missing milestone host with an upsert is refused, not fabricated.
@@ -925,13 +1053,14 @@ pub(crate) mod tests {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
-        // No backlog doc exists; apply creates the stub and renders into it.
+        // No `queue.md` exists; apply creates it from the stub and renders
+        // into it — and creates no backlog `CLAUDE.md` (task 104).
         create_queue(&daemon, &q, None);
         let inner = daemon.inner.lock().unwrap();
         let wt = WorkTree::new(&daemon, &inner);
-        let backlog = wt.read_to_string(&views::queue_view_host()).unwrap();
-        assert!(managed::has_region(&backlog, views::QUEUE_V2_TAG));
-        // The pre-existing legacy prose comes from the stub, untouched.
-        assert!(backlog.contains("The growlight work queue."), "{backlog}");
+        let view = wt.read_to_string(&views::queue_view_host()).unwrap();
+        assert!(view.starts_with(&views::view_host_stub(views::QUEUE_V2_TAG)), "{view}");
+        assert!(managed::has_region(&view, views::QUEUE_V2_TAG));
+        assert!(!wt.exists(&paths::backlog_claude()));
     }
 }

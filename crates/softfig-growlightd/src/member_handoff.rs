@@ -776,6 +776,8 @@ pub(crate) mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/garden".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
+                main: "main".into(),
             }],
             entries: vec![EntryView {
                 id: "m1".into(),
@@ -784,9 +786,14 @@ pub(crate) mod tests {
                 lane: Lane::Normal,
                 status: EntryStatus::Active,
                 after: vec![],
+                branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: String::new(),
                 follow_ups: 2,
                 pending: None,
+                fleet: true,
+                not_before: None,
                 holder: None,
                 models: None,
             }],
@@ -800,6 +807,10 @@ pub(crate) mod tests {
             .into_iter()
             .collect(),
             done_ids: Default::default(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -809,6 +820,7 @@ pub(crate) mod tests {
             entry: "m1".into(),
             unit,
             resolved_model: ModelChoice::opencode("deepseek/deepseek-flash"),
+            repo: None,
         }
     }
 

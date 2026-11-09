@@ -38,7 +38,7 @@
 //! An absent queue/registry region likewise yields an empty [`QueueView`], so an
 //! unpopulated work-stream just idles instead of erroring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use softfig_ipc::fleet_marker;
 use softfig_ipc::item_repo::{item_repo_path, probe, RepoState};
@@ -48,6 +48,8 @@ use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
 
 use crate::drive_loop::{QueueSource, RepoProbe};
 use crate::scheduler::{ClaimHold, PartView, QueueView, Snapshot};
+use crate::scheduler_v2::ProjectView;
+use crate::v2_repo::local_repo;
 
 /// The garden-relative backlog doc that hosts every queue's managed region
 /// (the one definition lives in [`softfig_ipc::backlog_doc`]).
@@ -287,6 +289,15 @@ impl QueueSource for KeeperdQueueSource {
         }
     }
 
+    /// Whether the part's item doc carries a `> Not before:` that has arrived
+    /// ([`doc_timed_due`]) — the `tasks = true` exception of a closed schedule.
+    /// An unreadable doc is not due: the exception only ever widens admission,
+    /// so a read miss keeps the member held.
+    fn timed_due(&self, _queue: &str, part: &str) -> bool {
+        matches!(self.docs.read_item_doc(part), Ok(Some(doc))
+            if doc_timed_due(&doc, crate::agent_harness::unix_now()))
+    }
+
     /// The part's item doc content for the `reconcile model-refused` pass
     /// (claude-login-pool-wiring slice 004 M-E) — the same reader `claim_hold`
     /// uses, but swallowing the error back to `None`: the reconcile treats
@@ -321,6 +332,14 @@ pub(crate) fn doc_hold(doc: &str, now: i64) -> Option<ClaimHold> {
     }
 }
 
+/// Does `doc` declare a `> Not before:` that has arrived by `now`? A
+/// `> Fleet:` hold or an unparseable time is never due (growlight-schedule
+/// §3.5: the exception opens a window for a timed item, it lifts no other hold).
+pub(crate) fn doc_timed_due(doc: &str, now: i64) -> bool {
+    fleet_marker(doc).is_none()
+        && matches!(softfig_ipc::fleet::not_before(doc), Some((_, Ok(at))) if at <= now)
+}
+
 /// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
 /// through the same two keeperd docs the queue source reads — the item doc's
 /// `> Worktree:` first, then the queue registry's `repo` cell — and how far it has
@@ -334,6 +353,8 @@ pub struct KeeperdRepoProbe {
     docs: Box<dyn ItemDocReader>,
     /// What a leading `~` expands against (`$HOME`, read once at assembly).
     home: Option<PathBuf>,
+    /// Whose `~<user>` a v2 repo may name (`$USER`, read once at assembly).
+    user: Option<String>,
 }
 
 impl KeeperdRepoProbe {
@@ -344,6 +365,7 @@ impl KeeperdRepoProbe {
             backlog: Box::new(KeeperdBacklogReader { keeperd_socket: keeperd_socket.clone() }),
             docs: Box::new(KeeperdItemDocReader { keeperd_socket }),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            user: std::env::var("USER").ok(),
         }
     }
 }
@@ -386,6 +408,16 @@ impl RepoProbe for KeeperdRepoProbe {
             .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
             .ok()?;
         Some((repo, state))
+    }
+
+    fn v2_repo(&self, project: &ProjectView) -> Option<PathBuf> {
+        local_repo(project, self.home.as_deref(), self.user.as_deref())
+    }
+
+    fn probe_repo(&self, repo: &Path) -> Option<RepoState> {
+        probe(repo)
+            .inspect_err(|e| eprintln!("growlightd: repo probe: {}: {e}", repo.display()))
+            .ok()
     }
 }
 
@@ -605,6 +637,20 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_item_is_due_only_once_its_start_time_has_arrived() {
+        let doc = "> Not before: 2026-10-31 02:00 -04:00\n";
+        let at = softfig_ipc::fleet::parse_not_before("2026-10-31 02:00 -04:00").unwrap();
+        assert!(!doc_timed_due(doc, at - 1));
+        assert!(doc_timed_due(doc, at));
+        assert!(!doc_timed_due("# no line\n", at), "no line is not a timed item");
+        assert!(!doc_timed_due("> Not before: soon\n", at), "an unparseable time never opens");
+        assert!(
+            !doc_timed_due("> Fleet: no\n> Not before: 2020-01-01 00:00 Z\n", at),
+            "the exception lifts no `> Fleet:` hold",
+        );
+    }
+
+    #[test]
     fn claim_hold_reads_the_marker_from_the_item_doc() {
         let marked = with_docs(Ok(Some("# x\n> Fleet: no\n".into())));
         assert_eq!(marked.claim_hold("default", "x"), Some(ClaimHold::HumanOnly("no".into())));
@@ -719,7 +765,12 @@ mod tests {
         backlog: Box<dyn BacklogReader>,
         docs: Result<Option<String>, String>,
     ) -> KeeperdRepoProbe {
-        KeeperdRepoProbe { backlog, docs: Box::new(FixtureDocs(docs)), home: Some("/home/t".into()) }
+        KeeperdRepoProbe {
+            backlog,
+            docs: Box::new(FixtureDocs(docs)),
+            home: Some("/home/t".into()),
+            user: Some("t".into()),
+        }
     }
 
     /// A git repo with one committed file and `dirty` untracked ones.

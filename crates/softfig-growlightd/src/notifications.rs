@@ -196,6 +196,15 @@ pub enum NotifyEvent {
     /// alert (network-failsafe slice 003): the fleet's spawns resume. Info only (NOT
     /// human-attention) — it clears the outage on `growlight watch` / the log.
     NetworkRecovered,
+    /// A member is still running more than `close_grace_minutes` past its
+    /// `[schedule]` window's close (growlight-schedule §3.4). Information only:
+    /// growlightd never kills it, and raises this once per overrun.
+    ScheduleOverrun {
+        /// The member still running.
+        agent: String,
+        /// The configured grace it ran past.
+        grace_minutes: u32,
+    },
     /// growlightd caught a stop signal (SIGTERM/SIGINT) while the fleet was armed
     /// (task 032). A graceful teardown exits 0, so systemd's `Restart=on-failure`
     /// will NOT revive it — the whole fleet stays parked until the next garden
@@ -266,7 +275,8 @@ impl NotifyEvent {
             Self::SliceComplete { .. }
             | Self::ThrashDetected { .. }
             | Self::LeaseDenied { .. }
-            | Self::NetworkRecovered => false,
+            | Self::NetworkRecovered
+            | Self::ScheduleOverrun { .. } => false,
         }
     }
 
@@ -299,6 +309,7 @@ impl NotifyEvent {
             // fleet-park at a time (the park's process is exiting anyway).
             Self::NetworkOffline { .. } => "network-offline".to_string(),
             Self::NetworkRecovered => "network-recovered".to_string(),
+            Self::ScheduleOverrun { agent, .. } => format!("schedule-overrun:{agent}"),
             Self::FleetParked { .. } => "fleet-parked".to_string(),
         }
     }
@@ -359,6 +370,10 @@ impl NotifyEvent {
                 format!("network offline for {secs}s — fleet spawns held")
             }
             Self::NetworkRecovered => "network recovered — fleet spawns resumed".to_string(),
+            Self::ScheduleOverrun { agent, grace_minutes } => format!(
+                "`{agent}` still running {grace_minutes} min past its schedule window's close \
+                 (overrun; it finishes its iteration, nothing is killed)"
+            ),
             Self::FleetParked { members } => format!(
                 "growlightd stopped while the fleet was armed — {members} member(s) parked; \
                  Restart=on-failure will NOT revive it, so restart softfig-growlightd or unlock \

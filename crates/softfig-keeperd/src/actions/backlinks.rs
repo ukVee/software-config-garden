@@ -44,7 +44,10 @@ const BACKLINKS_TAG: &str = "backlinks";
 /// [`WorkTree`] — in FUSE mode this whole-garden walk runs against the
 /// in-memory (tip ∪ overlay) state, not by recursively self-reading the mount
 /// under `daemon.inner` (the 2026-06-21 deadlock's worst self-read).
-pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
+///
+/// Returns each doc it rewrote with the text it held before, so a caller
+/// whose commit then fails can put them back (`v2::apply`).
+pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) -> Vec<(String, String)> {
     let files = collect_md(wt);
     let exists = |rel: &str| wt.exists(rel) && !wt.is_dir(rel);
 
@@ -75,6 +78,7 @@ pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
     let mut targets: BTreeSet<String> = graph.keys().cloned().collect();
     targets.extend(current_hosts);
 
+    let mut rewritten = Vec::new();
     for target in targets {
         // Skip targets we couldn't read safely (vault-protected/unreadable);
         // they were never inserted into `contents`.
@@ -85,10 +89,11 @@ pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
             Some(sources) => managed::upsert(content, BACKLINKS_TAG, &refs::render(sources)),
             None => managed::remove(content, BACKLINKS_TAG),
         };
-        if &new != content {
-            let _ = wt.write_derived(&target, new.as_bytes());
+        if &new != content && wt.write_derived(&target, new.as_bytes()).is_ok() {
+            rewritten.push((target, content.clone()));
         }
     }
+    rewritten
 }
 
 /// Rewrite every inbound `[[…]]` reference that resolved to `src_rel` so it

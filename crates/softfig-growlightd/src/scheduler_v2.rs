@@ -21,7 +21,8 @@
 //! - **Eligibility** ([`eligible`]) is the conjunction of §2's clauses, checked
 //!   in the spec's order: status, `after` links, the repo rule, the holder
 //!   rule, the remote rule (grants §9), the unit walk, and the §6.4 backend
-//!   match.
+//!   match — plus the schedule clause ([`ScheduleGate`], growlight-schedule
+//!   §3.10) right after status.
 //! - **The four-step pick** ([`pick_v2`]): (1) urgent lane, pinned project;
 //!   (2) the member's own last `active`/`paused` entry; (3) normal lane,
 //!   pinned project; (4) fallback — 1 and 3 again, unfiltered.
@@ -37,7 +38,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use softfig_ipc::model_choice::{Backend, ModelList};
-use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, SliceKind, SliceStatus};
+use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, RepoLocality, SliceKind, SliceStatus};
 
 /// A member asking the scheduler what to run next — the `pick_v2(member)`
 /// input (§2). Pure data; the caller fills it from the roster and runtime
@@ -53,15 +54,51 @@ pub struct Member {
     /// queue). `None` = unpinned: steps 1/3 scan with no project filter, so
     /// the urgent lane still comes first (§9) and the fallback adds nothing.
     pub pin: Option<String>,
+    /// What the `[schedule]` verdict lets this member take this tick
+    /// (growlight-schedule §3.10). The drive loop computes it, so the pick
+    /// stays pure.
+    pub schedule: ScheduleGate,
+}
+
+/// The schedule's eligibility clause for one member (growlight-schedule
+/// §3.10): the [`crate::schedule::Admission`] verdict, with the due timed
+/// entries spelled out for the `tasks = true` exception.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScheduleGate {
+    /// No schedule gates this member.
+    #[default]
+    Open,
+    /// Schedule-held: no entry is eligible.
+    Held,
+    /// Closed with `tasks = true`: only these entries — items whose
+    /// `> Not before:` has arrived — are eligible (§3.5).
+    TimedOnly { due: BTreeSet<String> },
+}
+
+impl ScheduleGate {
+    /// Does the gate let the member take `entry`?
+    pub fn admits(&self, entry: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Held => false,
+            Self::TimedOnly { due } => due.contains(entry),
+        }
+    }
 }
 
 /// One `[[project]]` row, reduced to what the pick needs (§3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectView {
     pub name: String,
-    /// The repo path or `host:path`. The repo rule keys on this; a value
-    /// containing `:` is a remote project (grants §9).
+    /// The repo path or `host:path`, as written. The repo rule keys on this.
     pub repo: String,
+    /// Where `repo` lives, classified once by the v2 source
+    /// ([`Project::locality`](softfig_ipc::queue_v2::Project::locality),
+    /// report 062) — the remote rule reads this, never the string.
+    pub locality: RepoLocality,
+    /// The branch merges land on (§3.1). The stack computation (queue-v2-git
+    /// §8) reads it as the cut-from branch when the stack is empty.
+    pub main: String,
 }
 
 /// One `[[entry]]` row plus the runtime fields the pick needs (§3.1). The v2
@@ -77,9 +114,21 @@ pub struct EntryView {
     pub status: EntryStatus,
     /// Ids that must be archived `done` first (§2 links).
     pub after: Vec<String>,
+    /// The entry's branch (`feat/<id>` / `fix/<id>`; `""` for a restack) — set
+    /// at enqueue (§3.1). Carried so the first-claim stack computation
+    /// (queue-v2-git §8) sees each live entry's branch; the pick ignores it.
+    pub branch: String,
     /// First-claim time, UTC (§3.1). Carried for completeness; the pick does
     /// not order by it (stack order is `queue-v2-git`'s row).
     pub claimed: String,
+    /// The recorded `parent` — the entry whose branch this was cut from;
+    /// `""` = `main` (§8). Carried so restack detection (`queue-v2-git` slice
+    /// 003) can compare each branch's recorded base against its parent's tip.
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote) (§8). `""` = never claimed. Carried for restack
+    /// detection.
+    pub base: String,
     /// Consecutive follow-ups (§7) — the cap's count for a task, restack or
     /// close-out unit ([`crate::member_verbs`]); the pick itself ignores it.
     pub follow_ups: u64,
@@ -87,6 +136,14 @@ pub struct EntryView {
     /// applied (finding 8, §6.8): the handshake applies it at the boundary.
     /// The pick ignores it — the entry is `active` until then.
     pub pending: Option<EntryStatus>,
+    /// `false` marks a human-only entry (§2 **Holds**, §3.1 `fleet`): the
+    /// fleet never claims it and never resumes it while no live member holds
+    /// it. Default `true`.
+    pub fleet: bool,
+    /// The entry's start time as written (§2 **Holds**, §3.1 `not_before`):
+    /// a `queued` entry is not claimed before it. Kept raw, so a malformed
+    /// value reaches the pick and holds (fail closed) rather than vanishing.
+    pub not_before: Option<String>,
     /// Who holds the entry. An `active` entry → the running member, or `None`
     /// when no running member holds it (an orphan any member resumes); a
     /// `paused` entry → the member that paused it (the step-2 resume
@@ -144,6 +201,24 @@ pub struct V2Snapshot {
     /// these (§3.2). A `dropped` row is deliberately absent, so it never
     /// satisfies a link (§2).
     pub done_ids: BTreeSet<String>,
+    /// The clock the `not_before` hold reads, UNIX seconds. The v2 source
+    /// leaves it 0; whoever picks stamps it from its own clock — the drive
+    /// loop's injected `now`, `queue pick`'s wall clock. Unstamped, every
+    /// start time is still ahead, so a forgotten stamp holds, never starts
+    /// early.
+    pub now_unix: i64,
+    /// The branch of each archive row with `final_status = done` (id →
+    /// branch; rows that never got a branch are absent). The loop never merges,
+    /// so a `done` entry's branch is usually still unmerged work: restack
+    /// detection resolves a child's archived parent through it (queue-v2-git
+    /// §8, V7).
+    pub done_branches: BTreeMap<String, String>,
+    /// The project of each archive row with `final_status = done`: the row left
+    /// `entries`, and a handoff scan still has to find its repo (§8, V17).
+    pub done_projects: BTreeMap<String, String>,
+    /// Archived restack rows still owed their §8 re-record, by project (project
+    /// → row ids). Read from the archive, so a daemon restart doesn't lose them.
+    pub re_records_due: BTreeMap<String, Vec<String>>,
 }
 
 /// One unit of work growlightd assigns (§4): a slice, a close-out, or the
@@ -172,12 +247,21 @@ pub enum SkipReason {
     /// The repo rule: another normal-lane entry on the same repo is
     /// `active`/`paused` (§2 — only those two hold the repo).
     RepoHeld,
+    /// A restack owns this entry's repo (§2 restack rule): a normal entry
+    /// waits out any live restack there, an urgent one a started restack.
+    RestackLive,
+    /// This restack waits: another entry in its repo is `active`, so a live
+    /// session may hold a branch it would rewrite (§2 restack rule).
+    RestackWaits,
     /// An `active` entry held by a different member (§2 — an active entry is
     /// held by exactly one running member).
     Held,
     /// The entry's project is remote and the member runs opencode (grants §9,
     /// queue-v2-state finding 1).
     Remote,
+    /// The entry's project repo is neither provably local nor `host:path`
+    /// (report 062) and the member runs opencode — never guessed local.
+    AmbiguousRepo,
     /// No next unit: the walk found neither a slice nor a close-out — e.g. the
     /// milestone's tree is missing from the snapshot. Fail closed, never
     /// guessed.
@@ -190,6 +274,19 @@ pub enum SkipReason {
     BackendMismatch,
     /// The entry's project is not the member's pinned project (steps 1/3).
     NotPinned,
+    /// A human-only entry (`fleet = false`, §2 **Holds**) that no live member
+    /// holds: `queued`, `paused`, or an orphaned `active` entry.
+    HumanOnly,
+    /// A `queued` entry whose `not_before` start time is still ahead (§2
+    /// **Holds**).
+    NotYet,
+    /// A `queued` entry whose `not_before` doesn't parse: held, so a typo
+    /// never starts work early (§2 **Holds**, fail closed).
+    BadStartTime,
+    /// The `[schedule]` holds the member, or is closed to it and the entry is
+    /// not an item whose `> Not before:` has arrived (growlight-schedule
+    /// §3.10).
+    Schedule,
 }
 
 impl SkipReason {
@@ -199,12 +296,41 @@ impl SkipReason {
             SkipReason::NotEligible => "not_eligible",
             SkipReason::AfterNotDone => "after_not_done",
             SkipReason::RepoHeld => "repo_held",
+            SkipReason::RestackLive => "restack_live",
+            SkipReason::RestackWaits => "restack_waits",
             SkipReason::Held => "held",
             SkipReason::Remote => "remote",
+            SkipReason::AmbiguousRepo => "ambiguous_repo",
             SkipReason::NoUnit => "no_unit",
             SkipReason::BlockedWalk => "blocked_walk",
             SkipReason::BackendMismatch => "backend_mismatch",
             SkipReason::NotPinned => "not_pinned",
+            SkipReason::HumanOnly => "human_only",
+            SkipReason::NotYet => "not_yet",
+            SkipReason::BadStartTime => "bad_start_time",
+            SkipReason::Schedule => "schedule",
+        }
+    }
+
+    /// How `growlight status` lists a hold under `held:`, beside the legacy
+    /// pass's `human-only (> Fleet: no)`. `None` for every reason that is not
+    /// a §2 hold, which is what makes a reason a hold.
+    pub fn hold_label(self) -> Option<&'static str> {
+        match self {
+            SkipReason::HumanOnly => Some("human-only (fleet = false)"),
+            SkipReason::NotYet => Some("not yet (not_before)"),
+            SkipReason::BadStartTime => Some("bad start time (not_before)"),
+            _ => None,
+        }
+    }
+
+    /// The `held:` row for `entry` held for this reason: the label, with the
+    /// start time as written for a `NotYet` hold, the way the legacy pass
+    /// carries `> Not before:`. `None` exactly when the reason is not a hold.
+    pub fn hold_text(self, entry: &EntryView) -> Option<String> {
+        match (self, entry.not_before.as_deref()) {
+            (SkipReason::NotYet, Some(at)) => Some(format!("not yet (not_before {at})")),
+            _ => self.hold_label().map(str::to_string),
         }
     }
 
@@ -216,14 +342,34 @@ impl SkipReason {
             SkipReason::RepoHeld => {
                 "another normal-lane entry on its repo is active or paused (§2 repo rule)"
             }
+            SkipReason::RestackLive => "a restack owns its repo until it finishes (§2 restack rule)",
+            SkipReason::RestackWaits => {
+                "another entry on its repo is active, so a live session may hold a branch it rewrites (§2 restack rule)"
+            }
             SkipReason::Held => "it is active and another running member holds it (§2)",
             SkipReason::Remote => "a remote project, which an opencode member never takes",
+            SkipReason::AmbiguousRepo => {
+                "its repo is neither provably local nor host:path, so an opencode member \
+                 never takes it (report 062)"
+            }
             SkipReason::NoUnit => "no next unit: its slice list is missing (§4, fail closed)",
             SkipReason::BlockedWalk => "its walk stops at a blocked item, which needs a human (§2)",
             SkipReason::BackendMismatch => {
                 "its next unit declares no model this member's backend runs (§6.4)"
             }
             SkipReason::NotPinned => "outside the member's pinned project (§2 steps 1 and 3)",
+            SkipReason::HumanOnly => {
+                "a human-only entry (`fleet = false`) that no live member holds (§2 Holds)"
+            }
+            SkipReason::NotYet => {
+                "a queued entry whose `not_before` start time is still ahead (§2 Holds)"
+            }
+            SkipReason::BadStartTime => {
+                "a queued entry whose `not_before` doesn't parse, held until fixed (§2 Holds)"
+            }
+            SkipReason::Schedule => {
+                "the schedule holds this member, and this is not a due timed item"
+            }
         }
     }
 }
@@ -276,15 +422,30 @@ pub enum WalkOutcome {
     NoUnit,
 }
 
-/// The repo an entry works on, joined from the snapshot's projects. A
+impl V2Snapshot {
+    /// The entries on `repo`, whichever project each belongs to: the stack is
+    /// per repo (§8). Repos compare as the strings the projects record, as
+    /// [`repo_of`]'s other callers and the §3.1 per-repo invariants do.
+    pub fn entries_in_repo<'a>(&'a self, repo: &'a str) -> impl Iterator<Item = &'a EntryView> {
+        self.entries.iter().filter(move |e| repo_of(self, e) == Some(repo))
+    }
+}
+
+/// The project an entry belongs to, joined from the snapshot's projects. A
 /// validated snapshot guarantees every entry's project exists (writer
 /// invariant 4); `None` is the defensive, fail-closed case.
+pub(crate) fn project_of<'a>(snapshot: &'a V2Snapshot, entry: &EntryView) -> Option<&'a ProjectView> {
+    snapshot.projects.iter().find(|p| p.name == entry.project)
+}
+
+/// The repo an entry works on ([`project_of`]'s `repo`).
 fn repo_of<'a>(snapshot: &'a V2Snapshot, entry: &EntryView) -> Option<&'a str> {
-    snapshot
-        .projects
-        .iter()
-        .find(|p| p.name == entry.project)
-        .map(|p| p.repo.as_str())
+    project_of(snapshot, entry).map(|p| p.repo.as_str())
+}
+
+/// [`repo_of`]'s locality: where the entry's project repo lives.
+fn locality_of(snapshot: &V2Snapshot, entry: &EntryView) -> Option<RepoLocality> {
+    project_of(snapshot, entry).map(|p| p.locality)
 }
 
 /// The §4 unit walk for a picked entry: a milestone walks its slice tree (in
@@ -357,6 +518,79 @@ fn walk_tree(snapshot: &V2Snapshot, milestone: &str) -> WalkOutcome {
     }
 }
 
+/// §2 clause 1: only a `queued`, `active` or `paused` entry is ever eligible.
+fn status_eligible(entry: &EntryView) -> bool {
+    matches!(
+        entry.status,
+        EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
+    )
+}
+
+/// The §2 **Holds**, which depend on the entry alone, never on the member. A
+/// human-only entry is never claimed, and never resumed while no live member
+/// holds it — so `queued`, `paused` and an orphaned `active` entry are all held
+/// (report 086). Only an `active` entry a live member still holds runs on, to
+/// its next handshake; whether *this* member is that holder is clause 4's call.
+/// Then the start time, which only gates a claim: a `queued` entry is held
+/// before its `not_before` (`now` is UNIX seconds), and one whose value doesn't
+/// parse is held outright. An `active` or `paused` entry is past its claim, so
+/// the time no longer applies. Human-only wins when both hold.
+fn hold(entry: &EntryView, now: i64) -> Option<SkipReason> {
+    let live_held = entry.status == EntryStatus::Active && entry.holder.is_some();
+    if !entry.fleet && !live_held {
+        return Some(SkipReason::HumanOnly);
+    }
+    if entry.status != EntryStatus::Queued {
+        return None;
+    }
+    match softfig_ipc::fleet::parse_not_before(entry.not_before.as_deref()?) {
+        Ok(at) if now < at => Some(SkipReason::NotYet),
+        Ok(_) => None,
+        Err(_) => Some(SkipReason::BadStartTime),
+    }
+}
+
+/// Every status-eligible entry a §2 hold keeps from every member, in file
+/// order: what `growlight status` lists under `held:`. The same two checks
+/// `eligible` opens with, so the list and the pick can't disagree.
+pub fn held_entries(snapshot: &V2Snapshot) -> Vec<(&EntryView, SkipReason)> {
+    snapshot
+        .entries
+        .iter()
+        .filter(|entry| status_eligible(entry))
+        .filter_map(|entry| hold(entry, snapshot.now_unix).map(|reason| (entry, reason)))
+        .collect()
+}
+
+/// The §2 restack rule: a restack rewrites branches in its repo, so it never
+/// runs beside a session that may hold one. `None` for an `active` entry, which
+/// always keeps going: a restack waits for it, and refusing it here would
+/// strand both. Otherwise a restack waits for every `active` entry in the repo,
+/// a normal entry waits out any live restack there (a blocked one included,
+/// since it stopped partway through the stack), and an urgent entry waits only
+/// for a started one, so urgent work never waits on a human.
+fn restack_hold(snapshot: &V2Snapshot, entry: &EntryView, repo: &str) -> Option<SkipReason> {
+    if entry.status == EntryStatus::Active {
+        return None;
+    }
+    let mut others = snapshot
+        .entries
+        .iter()
+        .filter(|other| other.id != entry.id && repo_of(snapshot, other) == Some(repo));
+    if entry.kind == EntryKind::Restack {
+        return others
+            .any(|other| other.status == EntryStatus::Active)
+            .then_some(SkipReason::RestackWaits);
+    }
+    others
+        .any(|other| {
+            other.kind == EntryKind::Restack
+                && (entry.lane == Lane::Normal
+                    || matches!(other.status, EntryStatus::Active | EntryStatus::Paused))
+        })
+        .then_some(SkipReason::RestackLive)
+}
+
 /// §2 eligibility for a member taking an entry: the conjunction of every
 /// clause, checked in the spec's order, with the first failure as the skip
 /// reason. On success the next unit and its declared model list come back
@@ -367,11 +601,17 @@ pub fn eligible(
     entry: &EntryView,
 ) -> Result<(Unit, Option<ModelList>), SkipReason> {
     // 1. Status.
-    if !matches!(
-        entry.status,
-        EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
-    ) {
+    if !status_eligible(entry) {
         return Err(SkipReason::NotEligible);
+    }
+    // Holds (§2), right after the status clause.
+    if let Some(reason) = hold(entry, snapshot.now_unix) {
+        return Err(reason);
+    }
+    // 1b. The schedule (growlight-schedule §3.10): a held member takes
+    // nothing; a closed member with `tasks = true` takes only due timed items.
+    if !member.schedule.admits(&entry.id) {
+        return Err(SkipReason::Schedule);
     }
     // 2. `after` links: every listed id is archived `done`. A `dropped` id is
     // simply absent from `done_ids`, so it never satisfies (§2).
@@ -394,6 +634,10 @@ pub fn eligible(
     {
         return Err(SkipReason::RepoHeld);
     }
+    // 3b. The restack rule (§2).
+    if let Some(reason) = restack_hold(snapshot, entry, repo) {
+        return Err(reason);
+    }
     // 4. The holder rule: an `active` entry is held by exactly one running
     // member, and no other member takes it (§2). A `paused` entry has no
     // holder — anyone may resume it. `holder` is runtime state the drive loop
@@ -410,11 +654,16 @@ pub fn eligible(
     {
         return Err(SkipReason::Held);
     }
-    // 5. The remote rule: an opencode member never takes a remote project's
-    // entries (grants §9; queue-v2-state finding 1 — the repo is `host:path`).
-    // A claude member is unaffected.
-    if member.backend == Backend::Opencode && repo.contains(':') {
-        return Err(SkipReason::Remote);
+    // 5. The remote rule: an opencode member takes only a project provably on
+    // this machine (grants §9; queue-v2-state finding 1). A `host:path` repo
+    // is remote; one neither local nor remote (report 062) is never guessed
+    // local. A claude member is unaffected.
+    if member.backend == Backend::Opencode {
+        match locality_of(snapshot, entry) {
+            Some(RepoLocality::Local) => {}
+            Some(RepoLocality::Remote) => return Err(SkipReason::Remote),
+            Some(RepoLocality::Ambiguous) | None => return Err(SkipReason::AmbiguousRepo),
+        }
     }
     // 6 + 7. The next unit, then the §6.4 backend match on its declared list
     // (`None` = the member default, which always runs on the member's own
@@ -593,6 +842,8 @@ mod tests {
         ProjectView {
             name: name.into(),
             repo: repo.into(),
+            locality: RepoLocality::of(repo, Some("u")),
+            main: "main".into(),
         }
     }
 
@@ -604,9 +855,14 @@ mod tests {
             lane: Lane::Normal,
             status: EntryStatus::Queued,
             after: vec![],
+            branch: String::new(),
             claimed: String::new(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
+            fleet: true,
+            not_before: None,
             holder: None,
             models: None,
         }
@@ -635,6 +891,10 @@ mod tests {
             entries,
             trees: BTreeMap::new(),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -643,6 +903,7 @@ mod tests {
             id: id.into(),
             backend: Backend::Opencode,
             pin: None,
+            schedule: ScheduleGate::Open,
         }
     }
 
@@ -652,6 +913,7 @@ mod tests {
             id: id.into(),
             backend: Backend::Claude,
             pin: None,
+            schedule: ScheduleGate::Open,
         }
     }
 
@@ -714,6 +976,32 @@ mod tests {
             snapshot.trees.insert("e".into(), tree(declared(None)));
             assert!(eligible(&snapshot, &member("m"), &e).is_ok(), "{status:?}");
         }
+    }
+
+    // ---- eligibility: the schedule (growlight-schedule §3.10) ------------
+
+    #[test]
+    fn a_schedule_held_member_takes_nothing_and_a_timed_only_one_takes_only_due_entries() {
+        let (a, b) = (entry("a"), entry("b"));
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![a.clone(), b.clone()],
+        );
+        snapshot.trees.insert("a".into(), tree(declared(None)));
+        snapshot.trees.insert("b".into(), tree(declared(None)));
+
+        let mut held = member("m");
+        held.schedule = ScheduleGate::Held;
+        assert_eq!(eligible(&snapshot, &held, &a), Err(SkipReason::Schedule));
+        assert_eq!(pick_v2(&snapshot, &held).picked, None);
+
+        let mut timed = member("m");
+        timed.schedule = ScheduleGate::TimedOnly { due: BTreeSet::from(["b".to_string()]) };
+        assert_eq!(eligible(&snapshot, &timed, &a), Err(SkipReason::Schedule));
+        assert!(eligible(&snapshot, &timed, &b).is_ok());
+        assert_eq!(pick_v2(&snapshot, &timed).picked.map(|p| p.entry), Some("b".to_string()));
+
+        assert_eq!(pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry), Some("a".to_string()));
     }
 
     // ---- eligibility: after links ---------------------------------------
@@ -960,6 +1248,312 @@ mod tests {
         assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
     }
 
+    // ---- holds: human-only (`fleet = false`) -----------------------------
+
+    /// §2 **Holds**: a queued human-only entry is rolled past like a deferred
+    /// one — it is not claimed, it holds no repo, and the entry behind it on
+    /// the same repo is picked.
+    #[test]
+    fn a_human_only_entry_is_rolled_past_and_the_next_one_is_picked() {
+        let mut held = entry("held");
+        held.fleet = false;
+        let next = entry("next");
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![held.clone(), next.clone()],
+        );
+        snapshot.trees.insert("held".into(), tree(declared(None)));
+        snapshot.trees.insert("next".into(), tree(declared(None)));
+        let outcome = pick_v2(&snapshot, &member("m"));
+        assert_eq!(outcome.picked.map(|p| p.entry), Some("next".to_string()));
+        assert_eq!(
+            outcome.skips,
+            vec![Skip {
+                entry: "held".into(),
+                reason: SkipReason::HumanOnly,
+            }],
+        );
+    }
+
+    /// Task 068's parity: a pinned member whose project has nothing workable
+    /// falls back across projects (step 4), and that fallback never lands on a
+    /// human-only entry — the reason it records is the hold, not `NotPinned`.
+    #[test]
+    fn a_fallback_member_never_lands_on_a_human_only_entry() {
+        let mut pinned = entry("pinned");
+        pinned.status = EntryStatus::Blocked; // nothing in-pin is eligible
+        let mut held = entry("held");
+        held.project = "other".into();
+        held.fleet = false;
+        let mut snapshot = snap(
+            vec![
+                project("softfig", "~/projects/softfig"),
+                project("other", "~/projects/other"),
+            ],
+            vec![pinned.clone(), held.clone()],
+        );
+        snapshot.trees.insert("pinned".into(), tree(declared(None)));
+        snapshot.trees.insert("held".into(), tree(declared(None)));
+
+        let mut m = member("m");
+        m.pin = Some("softfig".into());
+        let outcome = pick_v2(&snapshot, &m);
+        assert_eq!(outcome.picked, None);
+        assert_eq!(
+            outcome.skips,
+            vec![
+                Skip {
+                    entry: "pinned".into(),
+                    reason: SkipReason::NotEligible,
+                },
+                Skip {
+                    entry: "held".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+            ]
+        );
+    }
+
+    /// Report 086's parity: a human-only entry no live member holds is never
+    /// resumed — neither an orphaned `active` one (holder `None`) nor a
+    /// `paused` one, not even by the member that paused it. Both still hold
+    /// their repo, which they held already.
+    #[test]
+    fn a_human_only_orphaned_active_or_paused_entry_is_not_resumed() {
+        let mut orphan = entry("orphan");
+        orphan.status = EntryStatus::Active;
+        orphan.fleet = false;
+        let mut paused = entry("paused");
+        paused.project = "other".into();
+        paused.status = EntryStatus::Paused;
+        paused.holder = Some("alice".into());
+        paused.fleet = false;
+        let next = entry("next");
+        let mut snapshot = snap(
+            vec![
+                project("softfig", "~/projects/softfig"),
+                project("other", "~/projects/other"),
+            ],
+            vec![orphan.clone(), paused.clone(), next.clone()],
+        );
+        for id in ["orphan", "paused", "next"] {
+            snapshot.trees.insert(id.into(), tree(declared(None)));
+        }
+        for who in ["alice", "bob"] {
+            assert_eq!(
+                eligible(&snapshot, &member(who), &orphan),
+                Err(SkipReason::HumanOnly)
+            );
+            assert_eq!(
+                eligible(&snapshot, &member(who), &paused),
+                Err(SkipReason::HumanOnly)
+            );
+        }
+        // Through the pick: alice's step-2 resume of her own paused entry is
+        // held too, and the orphan still holds `next`'s repo.
+        let outcome = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(outcome.picked, None);
+        assert_eq!(
+            outcome.skips,
+            vec![
+                Skip {
+                    entry: "orphan".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+                Skip {
+                    entry: "paused".into(),
+                    reason: SkipReason::HumanOnly,
+                },
+                Skip {
+                    entry: "next".into(),
+                    reason: SkipReason::RepoHeld,
+                },
+            ]
+        );
+    }
+
+    /// The hold's one exception: an `active` human-only entry a live member
+    /// still holds runs on, to its next handshake. Its holder keeps it; any
+    /// other member is refused by the holder rule, as for any active entry.
+    #[test]
+    fn a_live_held_human_only_active_entry_keeps_its_holder() {
+        let mut e = entry("e");
+        e.status = EntryStatus::Active;
+        e.holder = Some("alice".into());
+        e.fleet = false;
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![e.clone()],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &e),
+            Err(SkipReason::Held)
+        );
+        let outcome = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(outcome.picked.map(|p| p.entry), Some("e".to_string()));
+        // So `growlight status` doesn't list it as held either.
+        assert!(held_entries(&snapshot).is_empty());
+    }
+
+    /// `growlight status`'s v2 `held:` list (slice 002, row 2): exactly the
+    /// status-eligible entries the hold keeps from every member, in file order,
+    /// each labelled. A `deferred` human-only entry is ineligible on status, not
+    /// held; a fleet entry is never held.
+    #[test]
+    fn held_entries_lists_each_held_entry_in_file_order() {
+        let human_only = |id: &str, status| {
+            let mut e = entry(id);
+            e.status = status;
+            e.fleet = false;
+            e
+        };
+        let snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![
+                human_only("paused", EntryStatus::Paused),
+                entry("free"),
+                human_only("parked", EntryStatus::Deferred),
+                human_only("queued", EntryStatus::Queued),
+            ],
+        );
+        let held: Vec<(&str, Option<&str>)> = held_entries(&snapshot)
+            .into_iter()
+            .map(|(e, reason)| (e.id.as_str(), reason.hold_label()))
+            .collect();
+        let label = Some("human-only (fleet = false)");
+        assert_eq!(held, vec![("paused", label), ("queued", label)]);
+        assert_eq!(SkipReason::Held.hold_label(), None, "not every skip is a hold");
+    }
+
+    /// The slice 003 start time, and its UNIX seconds through the one parser.
+    const START: &str = "2026-10-31 02:00 -04:00";
+
+    fn start_unix() -> i64 {
+        softfig_ipc::fleet::parse_not_before(START).expect("valid start time")
+    }
+
+    fn starting(id: &str, at: &str) -> EntryView {
+        let mut e = entry(id);
+        e.not_before = Some(at.into());
+        e
+    }
+
+    /// Two queued entries on one repo, the first not due yet: the pick rolls
+    /// past it to the second, and `growlight status` lists it as held. An
+    /// unstamped snapshot (`now_unix` 0) holds it too: a forgotten clock never
+    /// starts work early.
+    #[test]
+    fn a_queued_entry_before_its_start_time_is_rolled_past() {
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![starting("later", START), entry("now")],
+        );
+        snapshot.trees.insert("later".into(), tree(declared(None)));
+        snapshot.trees.insert("now".into(), tree(declared(None)));
+        for now in [0, start_unix() - 1] {
+            snapshot.now_unix = now;
+            let outcome = pick_v2(&snapshot, &member("m"));
+            assert_eq!(outcome.picked.map(|p| p.entry), Some("now".to_string()));
+            assert_eq!(
+                outcome.skips,
+                vec![Skip {
+                    entry: "later".into(),
+                    reason: SkipReason::NotYet,
+                }]
+            );
+            let held: Vec<(&str, Option<String>)> = held_entries(&snapshot)
+                .into_iter()
+                .map(|(e, reason)| (e.id.as_str(), reason.hold_text(e)))
+                .collect();
+            let text = Some(format!("not yet (not_before {START})"));
+            assert_eq!(held, vec![("later", text)]);
+        }
+    }
+
+    /// The start time is inclusive: at it, and after it, the entry is picked
+    /// and nothing is held.
+    #[test]
+    fn at_and_after_the_start_time_it_is_picked() {
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![starting("e", START)],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        for now in [start_unix(), start_unix() + 1] {
+            snapshot.now_unix = now;
+            let outcome = pick_v2(&snapshot, &member("m"));
+            assert_eq!(outcome.picked.map(|p| p.entry), Some("e".to_string()));
+            assert!(outcome.skips.is_empty());
+            assert!(held_entries(&snapshot).is_empty());
+        }
+    }
+
+    /// A start time that doesn't parse (here, no offset) holds at any clock,
+    /// so a typo never starts an entry early.
+    #[test]
+    fn a_bad_start_time_holds_fail_closed() {
+        let bad = starting("e", "2026-10-31 02:00");
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![bad.clone()],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        snapshot.now_unix = i64::MAX;
+        assert_eq!(
+            eligible(&snapshot, &member("m"), &bad),
+            Err(SkipReason::BadStartTime)
+        );
+        let held: Vec<(&str, Option<String>)> = held_entries(&snapshot)
+            .into_iter()
+            .map(|(e, reason)| (e.id.as_str(), reason.hold_text(e)))
+            .collect();
+        assert_eq!(held, vec![("e", Some("bad start time (not_before)".into()))]);
+    }
+
+    /// A human-only entry with a start time reads human-only, whether the time
+    /// is ahead or doesn't parse: lifting the time alone would not free it.
+    #[test]
+    fn human_only_wins_over_not_before() {
+        for at in [START, "not a time"] {
+            let mut e = starting("e", at);
+            e.fleet = false;
+            let mut snapshot = snap(
+                vec![project("softfig", "~/projects/softfig")],
+                vec![e.clone()],
+            );
+            snapshot.trees.insert("e".into(), tree(declared(None)));
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &e),
+                Err(SkipReason::HumanOnly)
+            );
+        }
+    }
+
+    /// The start time gates only a claim. An orphaned `active` entry and a
+    /// `paused` one are past theirs, so neither a time still ahead nor one
+    /// that doesn't parse holds them.
+    #[test]
+    fn an_active_or_paused_entry_ignores_not_before() {
+        for status in [EntryStatus::Active, EntryStatus::Paused] {
+            for at in [START, "not a time"] {
+                let mut e = starting("e", at);
+                e.status = status;
+                let mut snapshot = snap(
+                    vec![project("softfig", "~/projects/softfig")],
+                    vec![e.clone()],
+                );
+                snapshot.trees.insert("e".into(), tree(declared(None)));
+                assert!(
+                    eligible(&snapshot, &member("m"), &e).is_ok(),
+                    "{status:?} with not_before {at:?}"
+                );
+                assert!(held_entries(&snapshot).is_empty());
+            }
+        }
+    }
+
     #[test]
     fn a_remote_project_is_never_eligible_for_an_opencode_member() {
         // Grants §9 / queue-v2-state finding 1: repo contains ':' → remote.
@@ -975,6 +1569,29 @@ mod tests {
         );
         // A claude member is unaffected.
         assert!(eligible(&snapshot, &claude("m"), &remote).is_ok());
+    }
+
+    #[test]
+    fn the_remote_rule_reads_the_classified_locality() {
+        // Report 062: the clause goes through `RepoLocality`, not a `:` test.
+        // Home-tilde, the current user's named home and an absolute path with
+        // a colon are local; another user's home and a relative path are
+        // ambiguous, which an opencode member never takes either.
+        let cases = [
+            ("~/projects/softfig", Ok(())),
+            ("~u/projects/softfig", Ok(())),
+            ("/srv/a:b", Ok(())),
+            ("host:/srv/p", Err(SkipReason::Remote)),
+            ("~bob/projects/softfig", Err(SkipReason::AmbiguousRepo)),
+            ("projects/softfig", Err(SkipReason::AmbiguousRepo)),
+        ];
+        for (repo, want) in cases {
+            let e = entry("e");
+            let mut snapshot = snap(vec![project("softfig", repo)], vec![e.clone()]);
+            snapshot.trees.insert("e".into(), tree(declared(None)));
+            assert_eq!(eligible(&snapshot, &member("m"), &e).map(|_| ()), want, "{repo}");
+            assert!(eligible(&snapshot, &claude("m"), &e).is_ok(), "{repo}: claude unaffected");
+        }
     }
 
     // ---- eligibility: backend match (§6.4) -------------------------------
@@ -1831,5 +2448,256 @@ mod tests {
             }
         );
         assert_eq!(picked.declared, Some(list("reasoning, claude")));
+    }
+
+    // ---- the restack rule (§2, review 044 V8, report 123) -----------------
+
+    /// A restack row: urgent, no branch of its own, no slice tree.
+    fn restack(id: &str, status: EntryStatus) -> EntryView {
+        let mut e = entry(id);
+        e.kind = EntryKind::Restack;
+        e.lane = Lane::Urgent;
+        e.status = status;
+        e
+    }
+
+    /// One project, these rows, and an open slice tree for every milestone.
+    fn repo_snapshot(entries: Vec<EntryView>) -> V2Snapshot {
+        let ids: Vec<String> = entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Milestone)
+            .map(|e| e.id.clone())
+            .collect();
+        let mut snapshot = snap(vec![project("softfig", "~/projects/softfig")], entries);
+        for id in ids {
+            snapshot.trees.insert(id, tree(declared(None)));
+        }
+        snapshot
+    }
+
+    fn reason_for(outcome: &PickOutcome, id: &str) -> Option<SkipReason> {
+        outcome.skips.iter().find(|s| s.entry == id).map(|s| s.reason)
+    }
+
+    #[test]
+    fn a_live_restack_of_any_status_holds_its_repos_normal_entries() {
+        for status in [
+            EntryStatus::Queued,
+            EntryStatus::Active,
+            EntryStatus::Paused,
+            EntryStatus::Blocked,
+            EntryStatus::Deferred,
+        ] {
+            let mut r = restack("r", status);
+            r.holder = (status == EntryStatus::Active).then(|| "other".to_string());
+            let snapshot = repo_snapshot(vec![r, entry("n")]);
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &snapshot.entries[1]),
+                Err(SkipReason::RestackLive),
+                "a {status:?} restack",
+            );
+        }
+    }
+
+    #[test]
+    fn a_paused_normal_entry_does_not_resume_while_a_restack_is_live() {
+        let mut paused = entry("n");
+        paused.status = EntryStatus::Paused;
+        paused.holder = Some("m".into());
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), paused]);
+
+        let outcome = pick_v2(&snapshot, &member("m"));
+
+        assert_eq!(
+            outcome.picked.map(|p| p.entry),
+            Some("r".to_string()),
+            "a paused entry holds no session, so the restack starts",
+        );
+        assert_eq!(
+            eligible(&snapshot, &member("m"), &snapshot.entries[1]),
+            Err(SkipReason::RestackLive),
+        );
+    }
+
+    #[test]
+    fn queue_pick_lists_the_entry_a_live_restack_holds() {
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Blocked), entry("n")]);
+        let outcome = pick_v2(&snapshot, &member("m"));
+        assert_eq!(outcome.picked, None);
+        assert_eq!(reason_for(&outcome, "n"), Some(SkipReason::RestackLive));
+    }
+
+    #[test]
+    fn an_active_entry_keeps_going_and_the_restack_waits_for_it() {
+        let mut active = entry("n");
+        active.status = EntryStatus::Active;
+        active.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), active]);
+
+        let holder = pick_v2(&snapshot, &member("alice"));
+        assert_eq!(
+            holder.picked.as_ref().map(|p| p.entry.as_str()),
+            Some("n"),
+            "a re-roll keeps going, so a restack can wait a whole entry",
+        );
+        assert_eq!(reason_for(&holder, "r"), Some(SkipReason::RestackWaits));
+
+        let other = pick_v2(&snapshot, &member("bob"));
+        assert_eq!(other.picked, None, "no member takes the restack");
+        assert_eq!(reason_for(&other, "r"), Some(SkipReason::RestackWaits));
+    }
+
+    #[test]
+    fn an_orphaned_active_entry_is_resumed_so_the_restack_is_not_stranded() {
+        let mut orphan = entry("n");
+        orphan.status = EntryStatus::Active;
+        let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), orphan]);
+
+        assert_eq!(
+            pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+            Some("n".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_blocked_or_deferred_entry_does_not_hold_a_restack_back() {
+        for status in [EntryStatus::Blocked, EntryStatus::Deferred, EntryStatus::Queued] {
+            let mut waiting = entry("n");
+            waiting.status = status;
+            let snapshot = repo_snapshot(vec![restack("r", EntryStatus::Queued), waiting]);
+            assert_eq!(
+                pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+                Some("r".to_string()),
+                "a {status:?} entry runs no session",
+            );
+        }
+    }
+
+    #[test]
+    fn the_restack_rule_keys_on_the_repo_not_the_project() {
+        let repo = "~/projects/softfig";
+        let mut sibling = entry("n");
+        sibling.project = "sibling".into();
+        let mut elsewhere = entry("x");
+        elsewhere.project = "elsewhere".into();
+        let mut snapshot = snap(
+            vec![
+                project("softfig", repo),
+                project("sibling", repo),
+                project("elsewhere", "~/projects/elsewhere"),
+            ],
+            vec![restack("r", EntryStatus::Blocked), sibling, elsewhere],
+        );
+        snapshot.trees.insert("n".into(), tree(declared(None)));
+        snapshot.trees.insert("x".into(), tree(declared(None)));
+
+        let outcome = pick_v2(&snapshot, &member("m"));
+
+        assert_eq!(outcome.picked.as_ref().map(|p| p.entry.as_str()), Some("x"));
+        assert_eq!(reason_for(&outcome, "n"), Some(SkipReason::RestackLive));
+    }
+
+    /// A restack names urgent branches too: they are stack candidates, and
+    /// `main` moves under them like any other (§8). So the exclusion is both
+    /// ways for an urgent entry that holds a session, though only a started
+    /// restack stops one, and one waiting on a human never does.
+    #[test]
+    fn an_urgent_entry_and_a_restack_never_overlap() {
+        let mut urgent = entry("u");
+        urgent.lane = Lane::Urgent;
+        urgent.status = EntryStatus::Active;
+        urgent.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![urgent.clone(), restack("r", EntryStatus::Queued)]);
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &snapshot.entries[1]),
+            Err(SkipReason::RestackWaits),
+        );
+
+        let mut paused = urgent.clone();
+        paused.status = EntryStatus::Paused;
+        paused.holder = None;
+        for (status, verdict) in [
+            (EntryStatus::Active, Some(SkipReason::RestackLive)),
+            (EntryStatus::Paused, Some(SkipReason::RestackLive)),
+            (EntryStatus::Queued, None),
+            (EntryStatus::Blocked, None),
+        ] {
+            let snapshot = repo_snapshot(vec![restack("r", status), paused.clone()]);
+            assert_eq!(
+                eligible(&snapshot, &member("m"), &snapshot.entries[1]).err(),
+                verdict,
+                "beside a {status:?} restack",
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_restack_waits_for_the_running_one() {
+        let mut first = restack("r1", EntryStatus::Active);
+        first.holder = Some("alice".into());
+        let snapshot = repo_snapshot(vec![first, restack("r2", EntryStatus::Queued)]);
+        assert_eq!(
+            eligible(&snapshot, &member("bob"), &snapshot.entries[1]),
+            Err(SkipReason::RestackWaits),
+        );
+    }
+
+    #[test]
+    fn a_running_restack_keeps_going() {
+        let mut running = restack("r", EntryStatus::Active);
+        running.holder = Some("m".into());
+        let snapshot = repo_snapshot(vec![running, entry("n")]);
+        assert_eq!(
+            pick_v2(&snapshot, &member("m")).picked.map(|p| p.entry),
+            Some("r".to_string()),
+        );
+    }
+
+    /// Parity's §2 holds and hardening's restack rule both keep an entry back,
+    /// and they are checked one after the other: an entry under both is held
+    /// by whichever fires first, and stays held when either one lifts alone.
+    #[test]
+    fn a_held_entry_stays_held_whichever_rule_fires_first() {
+        let human_only = |id: &str| {
+            let mut e = entry(id);
+            e.fleet = false;
+            e
+        };
+        let not_yet = |id: &str| starting(id, START);
+        for (held, hold) in [
+            (human_only("n"), SkipReason::HumanOnly),
+            (not_yet("n"), SkipReason::NotYet),
+        ] {
+            let both = repo_snapshot(vec![restack("r", EntryStatus::Blocked), held.clone()]);
+            assert_eq!(eligible(&both, &member("m"), &both.entries[1]), Err(hold));
+            assert!(
+                held_entries(&both).iter().any(|(e, _)| e.id == "n"),
+                "{hold:?}: listed held while a restack is live too",
+            );
+
+            let restack_lifted = repo_snapshot(vec![held.clone()]);
+            assert_eq!(
+                eligible(&restack_lifted, &member("m"), &restack_lifted.entries[0]),
+                Err(hold),
+                "{hold:?}: the hold outlasts the restack",
+            );
+
+            let hold_lifted = repo_snapshot(vec![restack("r", EntryStatus::Blocked), entry("n")]);
+            assert_eq!(
+                eligible(&hold_lifted, &member("m"), &hold_lifted.entries[1]),
+                Err(SkipReason::RestackLive),
+                "{hold:?}: the restack outlasts the hold",
+            );
+
+            assert_eq!(pick_v2(&both, &member("m")).picked, None);
+        }
+    }
+
+    #[test]
+    fn the_restack_skips_have_stable_slugs_and_say_what_they_mean() {
+        assert_eq!(SkipReason::RestackLive.as_str(), "restack_live");
+        assert_eq!(SkipReason::RestackWaits.as_str(), "restack_waits");
+        assert!(SkipReason::RestackLive.describe().contains("restack"));
+        assert!(SkipReason::RestackWaits.describe().contains("active"));
     }
 }

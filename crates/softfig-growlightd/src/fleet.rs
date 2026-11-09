@@ -56,7 +56,7 @@ use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
 use crate::baton_store::{runtime_entries_dir, FsBatonStore, FsEntryBatonStore};
 use crate::config::BuildCaps;
-use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker};
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2BaseReRecorder, KeeperdV2Claimer, KeeperdV2ItemParker, KeeperdV2RestackEnqueuer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
@@ -500,6 +500,16 @@ pub enum QueueMode {
     V2,
 }
 
+impl QueueMode {
+    /// The switch's value as `config/growlight.toml` spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueMode::Legacy => "legacy",
+            QueueMode::V2 => "v2",
+        }
+    }
+}
+
 /// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
 /// gate, the shared-backend `bin`/`prompt`, and the configured `members`. The
 /// keys are top-level (this is a dedicated file, not a table inside a shared one).
@@ -541,6 +551,10 @@ pub struct FleetConfig {
     /// before growlightd terminates the session (§6.3 step 4: on exit or after
     /// the grace, whichever comes first). Absent ⇒ [`DEFAULT_ROLL_GRACE_SECS`].
     pub roll_grace_secs: u64,
+    /// `[schedule]` — growlightd's clock (milestone `growlight-schedule`),
+    /// validated against the members. `None` when the table is absent: no
+    /// schedule gate. The drive loop evaluates it every tick.
+    pub schedule: Option<crate::schedule::ScheduleConfig>,
 }
 
 /// §6.3 step 4's default grace between a member's handshake and growlightd
@@ -561,6 +575,7 @@ impl FleetConfig {
             max_iterations: None,
             queue: QueueMode::Legacy,
             roll_grace_secs: DEFAULT_ROLL_GRACE_SECS,
+            schedule: None,
         }
     }
 
@@ -588,6 +603,9 @@ impl FleetConfig {
             queue: QueueMode,
             /// §6.3 step 4's grace. Absent ⇒ the default.
             roll_grace_secs: Option<u64>,
+            /// `[schedule]`. Absent ⇒ `None`; an unknown key inside it is a
+            /// TOML parse error (fail-closed at the loader).
+            schedule: Option<crate::schedule::ScheduleDoc>,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -622,6 +640,11 @@ impl FleetConfig {
                  (want a positive percentage like \"50%\")"
             ));
         }
+        // libtest refuses `RUST_TEST_THREADS=0`, so a 0 would fail every agent's
+        // `cargo test`; refuse it at load like the CPUQuota above.
+        if doc.build_caps.test_threads == Some(0) {
+            return Err("[build_caps] test_threads must be >= 1 (libtest refuses 0)".to_string());
+        }
         // Validate each member's backend declaration (slice 005) — an unknown
         // backend, or an opencode-only key on a claude member, is REPORTED AND
         // REFUSED here rather than defaulted, because both mistakes end the same
@@ -632,6 +655,13 @@ impl FleetConfig {
             .into_iter()
             .map(FleetMemberDoc::validate)
             .collect::<Result<Vec<_>, _>>()?;
+        // `[schedule]` validates against the members it may name (§3.1): an
+        // out-of-range time, unknown day or member is refused, never widened.
+        let schedule = doc
+            .schedule
+            .as_ref()
+            .map(|s| crate::schedule::ScheduleConfig::from_doc(s, &members))
+            .transpose()?;
         Ok(Self {
             enabled: doc.fleet_enabled,
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
@@ -644,6 +674,7 @@ impl FleetConfig {
             max_iterations: doc.max_iterations,
             queue: doc.queue,
             roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
+            schedule,
         })
     }
 
@@ -694,6 +725,41 @@ impl FleetConfig {
             }
         }
         missing
+    }
+
+    /// The first `[schedule] reserve_weekly_pct` key that names no slot in the
+    /// slot `store` (§3.1). `"*"` and `home` always exist; any other key must
+    /// be a well-formed slot name with a directory in `store`. A typo is
+    /// otherwise inert and never reaches `growlight status`, so the loader
+    /// fails closed on it, like an unknown `members` entry. Separate from
+    /// [`from_growlight_toml`] for the same reason as
+    /// [`missing_profile_pool_slots`](Self::missing_profile_pool_slots): the
+    /// parser reads no filesystem.
+    pub fn unknown_reserve_slot(&self, store: Option<&Path>) -> Option<String> {
+        let schedule = self.schedule.as_ref()?;
+        schedule.reserve_weekly_pct.keys().find_map(|key| {
+            if key == crate::schedule::RESERVE_DEFAULT_KEY {
+                return None;
+            }
+            let Some(store) = store else {
+                return (key != claude_profiles::HOME_SLOT).then(|| {
+                    format!("reserve_weekly_pct names slot {key:?} but no claude-login store can be named (is $HOME set?)")
+                });
+            };
+            match claude_profiles::slot_dir(store, key) {
+                Ok(SlotDir::Home) => None,
+                Ok(SlotDir::Store(dir))
+                    if std::fs::symlink_metadata(&dir).is_ok_and(|md| md.is_dir()) =>
+                {
+                    None
+                }
+                Ok(SlotDir::Store(dir)) => Some(format!(
+                    "reserve_weekly_pct names slot {key:?}, which has no directory at {}",
+                    dir.display()
+                )),
+                Err(e) => Some(format!("reserve_weekly_pct slot {key:?}: {e}")),
+            }
+        })
     }
 
     /// Drop the members [`Self::missing_profile_pool_slots`] names, returning one
@@ -766,15 +832,43 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
             return FleetConfig::disabled();
         }
     };
+    if let Some(refusal) = v2_protocol_refusal(&cfg, garden_root) {
+        eprintln!("softfig-growlightd: {refusal} ({})", path.display());
+        return FleetConfig::disabled();
+    }
     // Slot presence (claude-login-switcher slices 003, 007): a member whose
     // profile_pool names a slot with no directory could never spawn, so it is
     // left out of the roster at load, by name. The rest of the fleet arms.
     // Byte-identical to today when no member declares a pool.
     let store = claude_profiles::store_root_from_env();
+    if let Some(why) = cfg.unknown_reserve_slot(store.as_deref()) {
+        eprintln!(
+            "softfig-growlightd: ignoring fleet config at {} ([schedule] {why}); fleet stays OFF",
+            path.display()
+        );
+        return FleetConfig::disabled();
+    }
     for line in cfg.disable_members_with_missing_slots(store.as_deref()) {
         eprintln!("softfig-growlightd: {line} ({})", path.display());
     }
     cfg
+}
+
+/// Why an armed `queue = "v2"` fleet must not start: its members boot from
+/// `protocol-fleet-v2.md`, and without that file they would run with no operating
+/// contract. Names the file. `None` when nothing is armed, under `legacy`, or when
+/// the file is there.
+fn v2_protocol_refusal(cfg: &FleetConfig, garden_root: &Path) -> Option<String> {
+    if !cfg.enabled || cfg.queue != QueueMode::V2 {
+        return None;
+    }
+    let protocol = fleet_protocol(garden_root, cfg.queue);
+    (!protocol.is_file()).then(|| {
+        format!(
+            "queue = \"v2\" needs {}, which is missing; fleet stays OFF",
+            protocol.display()
+        )
+    })
 }
 
 /// Assemble the live [`DriveLoop`] — **iff `fleet.enabled`**. Gate off ⇒ `None`
@@ -840,12 +934,17 @@ pub fn assemble_fleet(
     // circuits the whole member.
     let rate_limit_holds =
         Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+    // The reserve-held slot set (growlight-schedule slice 004): the DriveLoop
+    // rewrites it from each tick's schedule verdict and the same pool-slot
+    // picker skips its slots, so the weekly reserve and the pick agree.
+    let reserve_held: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
     let router = Arc::new(build_member_backends(
         daemon,
         fleet,
         &agents_dir,
         &garden_root,
         Arc::clone(&rate_limit_holds),
+        Arc::clone(&reserve_held),
     ));
     // Let `status` see the SAME router (slice 006). Registered here rather than in
     // `main` so the observation seam cannot be forgotten or built twice: the view
@@ -916,7 +1015,8 @@ pub fn assemble_fleet(
     // claude backend's pool-slot picker reads. Without this call the DriveLoop
     // keeps its own owned map (the pre-slice-003 posture) and the backend's
     // pre-filter degrades to credential-only.
-    .with_rate_limit_holds(rate_limit_holds))
+    .with_rate_limit_holds(rate_limit_holds)
+    .with_reserve_view(reserve_held))
     .map(|drive| {
         // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
         // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a
@@ -930,6 +1030,8 @@ pub fn assemble_fleet(
             member_writer: Box::new(baton_writer),
             claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
             parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
+            restacker: Box::new(KeeperdV2RestackEnqueuer::new(keeperd_socket.to_path_buf())),
+            re_recorder: Box::new(KeeperdV2BaseReRecorder::new(keeperd_socket.to_path_buf())),
         })
     })
 }
@@ -967,13 +1069,23 @@ fn build_member_backends(
     agents_dir: &Path,
     garden_root: &Path,
     rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
+    reserve_held: Arc<Mutex<std::collections::BTreeSet<String>>>,
 ) -> BackendRouter {
     let mut router = BackendRouter::new();
     let mut claude: Option<Arc<ClaudeBackend>> = None;
     for member in &fleet.members {
         let handle = match &member.backend {
             MemberBackend::Claude { .. } => BackendHandle::Claude(Arc::clone(claude.get_or_insert_with(
-                || Arc::new(build_claude_backend(daemon, fleet, agents_dir, garden_root, Arc::clone(&rate_limit_holds))),
+                || {
+                    Arc::new(build_claude_backend(
+                        daemon,
+                        fleet,
+                        agents_dir,
+                        garden_root,
+                        Arc::clone(&rate_limit_holds),
+                        Arc::clone(&reserve_held),
+                    ))
+                },
             ))),
             MemberBackend::Opencode(model) => BackendHandle::Opencode(Arc::new(
                 build_opencode_backend(daemon, fleet, agents_dir, garden_root, model),
@@ -995,6 +1107,7 @@ fn build_claude_backend(
     agents_dir: &Path,
     garden_root: &Path,
     rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
+    reserve_held: Arc<Mutex<std::collections::BTreeSet<String>>>,
 ) -> ClaudeBackend {
     ClaudeBackend::new(
         fleet.bin.clone(),
@@ -1002,7 +1115,7 @@ fn build_claude_backend(
         daemon.hub.clone(),
         PreApproval::new(
             agents_dir.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             garden_root.to_path_buf(),
             softfig_mcp_path(),
             claude_dir(),
@@ -1055,6 +1168,12 @@ fn build_claude_backend(
     // (built once in `assemble_fleet` and cloned here), so a stdout-only 429
     // (no on-disk `rate_limit_event`) deprioritises its slot immediately.
     .with_holds_view(rate_limit_holds)
+    // The weekly reserve (growlight-schedule slice 004): the same set the
+    // DriveLoop rewrites from each tick's schedule verdict.
+    .with_reserve_view(reserve_held)
+    // Token telemetry (token-telemetry-p1 slice 004): one row per API request
+    // into the daemon's recorder; the default sink when `main` installed none.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// Collect the claude members' `profile_pool` roster into a
@@ -1217,7 +1336,7 @@ fn build_opencode_backend(
         OpencodePreApproval::new(
             agents_dir.to_path_buf(),
             garden_root.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
@@ -1228,6 +1347,8 @@ fn build_opencode_backend(
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
     )
+    // Token telemetry (token-telemetry-p1 slice 004), the claude backend's sink.
+    .with_telemetry(daemon.telemetry())
 }
 
 /// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`
@@ -1308,12 +1429,16 @@ const PILLAR: &str = "growlight";
 /// injects. growlightd only ever spawns fleet members, so this is the protocol
 /// every pre-approval it generates carries.
 const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
+/// The queue-v2 fleet-member protocol filename (queue-v2-git slice 005) — the
+/// legacy [`FLEET_PROTOCOL_FILE`] plus the §10 v2 changes, injected instead of it
+/// only when `queue = "v2"` (§11). The legacy file stays byte-unchanged.
+const FLEET_PROTOCOL_V2_FILE: &str = "protocol-fleet-v2.md";
 
 /// The runtime budget file inside the growlight namespace — the ONE name the
 /// headless capture writes and every reader (the loop protocol's §2b boot check,
 /// the `--auto` governor, the human) reads. Named here rather than inline so the
 /// writer and `softfig growlight start`'s statusline tee cannot drift apart.
-const USAGE_FILE: &str = "usage.json";
+pub(crate) const USAGE_FILE: &str = "usage.json";
 
 /// Where per-profile budget samples live under the runtime pillar
 /// (`<pillar>/usage.by-profile/<slot>.json`) — claude-login-switcher slice 004.
@@ -1323,10 +1448,15 @@ const BY_PROFILE_SUBDIR: &str = "usage.by-profile";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline
-/// literal: a fleet member injects `protocol-fleet.md`, NEVER the single-agent
-/// `protocol.md`.
-fn fleet_protocol(garden_root: &Path) -> PathBuf {
-    garden_root.join(PILLAR).join(FLEET_PROTOCOL_FILE)
+/// literal: a fleet member injects `protocol-fleet.md` (or, under `queue = "v2"`,
+/// `protocol-fleet-v2.md`), NEVER the single-agent `protocol.md`. The §11 switch
+/// picks the file; the legacy file is unchanged under either mode.
+fn fleet_protocol(garden_root: &Path, queue: QueueMode) -> PathBuf {
+    let file = match queue {
+        QueueMode::V2 => FLEET_PROTOCOL_V2_FILE,
+        QueueMode::Legacy => FLEET_PROTOCOL_FILE,
+    };
+    garden_root.join(PILLAR).join(file)
 }
 
 /// Assemble (via [`assemble_fleet`]) and spawn the live drive-loop thread — iff
@@ -1394,12 +1524,36 @@ mod tests {
         // fleet variant (protocol-fleet.md) — never the single-agent protocol.md
         // that `softfig growlight start` injects. This is the slice-002 split that
         // closes the self-pull double-assignment race.
-        let p = fleet_protocol(Path::new("/garden"));
+        let p = fleet_protocol(Path::new("/garden"), QueueMode::Legacy);
         assert_eq!(p, Path::new("/garden/growlight/protocol-fleet.md"));
         assert_ne!(
             p.file_name().unwrap(),
             "protocol.md",
             "a fleet member must NOT inject the single-agent self-pull protocol",
+        );
+    }
+
+    #[test]
+    fn the_queue_switch_selects_the_v2_protocol() {
+        // The §11 switch: `queue = "legacy"` injects the legacy fleet file, `v2`
+        // injects protocol-fleet-v2.md (queue-v2-git slice 005). The legacy file
+        // is byte-unchanged under both modes.
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::Legacy),
+            Path::new("/garden/growlight/protocol-fleet.md"),
+            "legacy mode injects the legacy fleet protocol",
+        );
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2),
+            Path::new("/garden/growlight/protocol-fleet-v2.md"),
+            "v2 mode injects the v2 fleet protocol",
+        );
+        assert_ne!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2)
+                .file_name()
+                .unwrap(),
+            "protocol.md",
+            "a v2 member must NOT inject the single-agent self-pull protocol",
         );
     }
 
@@ -1586,6 +1740,31 @@ agent = "reviewer"
     }
 
     #[test]
+    fn an_armed_v2_fleet_with_no_v2_protocol_stays_off_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "fleet_enabled = true\nqueue = \"v2\"\n");
+
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n").unwrap();
+        let refusal = v2_protocol_refusal(&cfg, dir.path()).expect("the file is missing");
+        assert!(refusal.contains("growlight/protocol-fleet-v2.md"), "{refusal}");
+        assert!(!load_fleet_config(dir.path()).enabled, "fail closed");
+
+        let pillar = dir.path().join(PILLAR);
+        std::fs::create_dir_all(&pillar).unwrap();
+        std::fs::write(pillar.join(FLEET_PROTOCOL_V2_FILE), "# protocol\n").unwrap();
+        assert!(load_fleet_config(dir.path()).enabled, "the file is there");
+    }
+
+    #[test]
+    fn the_v2_protocol_is_only_required_of_an_armed_v2_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        for toml in ["fleet_enabled = true\n", "fleet_enabled = false\nqueue = \"v2\"\n"] {
+            let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+            assert_eq!(v2_protocol_refusal(&cfg, dir.path()), None, "{toml}");
+        }
+    }
+
+    #[test]
     fn queue_switch_unknown_value_is_refused_fail_closed() {
         // An unknown VALUE is a serde enum parse error → Err → the loader turns it
         // into a disabled fleet. This is the arm-time refusal §11 wants: the `Doc`
@@ -1631,6 +1810,7 @@ agent = "reviewer"
                 memory_high: Some("5G".to_string()),
                 cpu_weight: Some(80),
                 cpu_quota: None,
+                test_threads: Some(2),
             }
         );
 
@@ -1649,6 +1829,7 @@ agent = "reviewer"
                 memory_high: Some("6G".to_string()),
                 cpu_weight: Some(50),
                 cpu_quota: None,
+                test_threads: Some(2),
             },
             "an unset field falls back to the conservative default",
         );
@@ -1668,6 +1849,21 @@ agent = "reviewer"
         )
         .unwrap_err();
         assert!(err.contains("cpu_quota"), "names the bad key: {err}");
+    }
+
+    #[test]
+    fn test_threads_parses_and_a_zero_disables_the_fleet() {
+        let cfg = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ntest_threads = 1\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.build_caps.test_threads, Some(1));
+
+        let err = FleetConfig::from_growlight_toml(
+            "fleet_enabled = true\n[build_caps]\ntest_threads = 0\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("test_threads"), "names the bad key: {err}");
     }
 
     #[test]
@@ -2081,7 +2277,7 @@ agent = "reviewer"
         let d = daemon();
         let cfg = mixed_roster();
         let agents = Path::new("/cfg/agents");
-        let router = build_member_backends(&d, &cfg, agents, Path::new("/garden"), test_holds());
+        let router = build_member_backends(&d, &cfg, agents, Path::new("/garden"), test_holds(), Arc::default());
 
         // 1. Each member's argv is its OWN backend's — the only honest proof that a
         //    member routes where the operator asked, short of spawning it.
@@ -2169,7 +2365,7 @@ agent = "reviewer"
         // silently, since nothing else observes them. Counting the daemon's Arc is
         // the structural proof: a fresh cell would not bump it.
         let d = daemon();
-        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds(), Arc::default());
         let backends = router.distinct().len();
         // The claude flavor reads `live_scopes` too (claude-login-switcher slice
         // 007: a live member's slot is demoted for the next pick), so each claude
@@ -2204,7 +2400,7 @@ agent = "reviewer"
             "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\nmodel = \"deepseek/deepseek-flash\"\n",
         ))
         .unwrap();
-        let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
+        let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"), test_holds(), Arc::default());
         assert_eq!(router.distinct().len(), 2);
         assert!(
             router
@@ -2234,7 +2430,7 @@ agent = "reviewer"
         // member that is in fact burning the shared reserve: a precise inversion of
         // the bug this slice exists to fix.
         let d = daemon();
-        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds());
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds(), Arc::default());
 
         // Both metered members do real work (folded through the same
         // `AgentSpendState` methods a streamed step drives).
@@ -2271,7 +2467,7 @@ agent = "reviewer"
         // actively billing at the time — so what is proven is the mechanism, not a
         // restatement of the posture.
         let d = daemon();
-        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds()));
+        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"), test_holds(), Arc::default()));
         opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.07);
         opencode_backend_for(&router, "c").accrue_spend_for_test("c", 2.5);
         assert!(
@@ -2455,6 +2651,30 @@ agent = "reviewer"
         std::fs::remove_dir(store.path().join("slot2")).unwrap();
         std::os::unix::fs::symlink(store.path().join("slot1"), store.path().join("slot2")).unwrap();
         assert_eq!(cfg.missing_profile_pool_slots(Some(store.path())).len(), 1);
+    }
+
+    #[test]
+    fn a_reserve_key_must_name_a_real_slot() {
+        let cfg = |keys: &str| {
+            FleetConfig::from_growlight_toml(&format!(
+                "[[fleet]]\nagent = \"a\"\n[schedule]\nenabled = true\nreserve_weekly_pct = {keys}\n"
+            ))
+            .unwrap()
+        };
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(store.path().join("slot1")).unwrap();
+        let ok = cfg("{ slot1 = 20, home = 10, \"*\" = 5 }");
+        assert_eq!(ok.unknown_reserve_slot(Some(store.path())), None);
+        let typo = cfg("{ slot1 = 20, slott2 = 20 }");
+        let why = typo.unknown_reserve_slot(Some(store.path())).expect("a typo is named");
+        assert!(why.contains("slott2"), "{why}");
+        let shape = cfg("{ \"../x\" = 20 }");
+        assert!(shape.unknown_reserve_slot(Some(store.path())).is_some());
+        // With no store only `home` and `*` can be real.
+        assert_eq!(cfg("{ home = 10, \"*\" = 5 }").unknown_reserve_slot(None), None);
+        assert!(cfg("{ slot1 = 20 }").unknown_reserve_slot(None).is_some());
+        // No [schedule] table: nothing to check.
+        assert_eq!(FleetConfig::disabled().unknown_reserve_slot(Some(store.path())), None);
     }
 
     #[test]

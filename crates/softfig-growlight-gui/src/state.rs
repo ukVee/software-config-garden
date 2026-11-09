@@ -379,9 +379,12 @@ mod tests {
                 cargo_build_jobs: Some(2),
                 memory_high: Some("3G".into()),
                 cpu_weight: None,
+                cpu_quota: None,
+                test_threads: None,
             },
             paused: true,
             fleet_enabled: false,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: vec![
                 AgentSummary::new("a", "running", true),
@@ -389,6 +392,7 @@ mod tests {
             ],
             live_scopes: Vec::new(),
             held: Vec::new(),
+            schedule: None,
         };
         app.apply_status(reply);
 
@@ -415,6 +419,8 @@ mod tests {
                 cargo_build_jobs: Some(1),
                 memory_high: Some("2G".into()),
                 cpu_weight: Some(50),
+                cpu_quota: None,
+                test_threads: None,
             },
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
@@ -442,6 +448,8 @@ mod tests {
                 cargo_build_jobs: Some(2),
                 memory_high: Some("3G".into()),
                 cpu_weight: Some(50),
+                cpu_quota: None,
+                test_threads: None,
             },
             applied_live: vec![],
             next_spawn: vec![],

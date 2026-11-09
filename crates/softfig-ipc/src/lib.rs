@@ -25,6 +25,7 @@ pub mod queue_v2;
 pub mod slot_name;
 pub mod socket;
 pub mod testing;
+pub mod tz;
 pub mod usage;
 pub mod verbs;
 

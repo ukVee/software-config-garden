@@ -11,9 +11,12 @@
 //! The writer and the reader share [`MEMBER_ENV`] and [`is_safe_member_id`] from
 //! here, so the key both sides spell and the ids both sides accept cannot drift.
 //!
-//! What this does NOT guard: a member's own shell can launch softfig-mcp (or the
-//! `softfig` CLI) with any env. That is the §6.7 honest gap, closed by grants
-//! step 4, not by this seam.
+//! A member's own shell can launch softfig-mcp (or the `softfig` CLI) with any
+//! env, so the env alone can't stop it. keeperd therefore also reads a
+//! connection's member from the peer's cgroup: every member session runs in a
+//! `growlight-agent-<id>-<gen>.scope` ([`SCOPE_PREFIX`], [`cgroup_scope`],
+//! [`scope_member`]), and everything it forks stays there. What stays open is a
+//! member's shell writing the mount directly (§6.7), closed by grants step 4.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -28,6 +31,46 @@ pub const MEMBER_ENV: &str = "SOFTFIG_MEMBER";
 pub fn is_safe_member_id(id: &str) -> bool {
     !(id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']))
 }
+
+/// The unit-name bounds of a member's transient scope,
+/// `growlight-agent-<id>-<gen>.scope`. growlightd names every member session's
+/// scope this way and its boot reconcile globs for it, and keeperd reads a
+/// connection's member out of it ([`scope_member`]).
+pub const SCOPE_PREFIX: &str = "growlight-agent-";
+/// See [`SCOPE_PREFIX`].
+pub const SCOPE_SUFFIX: &str = ".scope";
+
+/// The member a `growlight-agent-<id>-<gen>.scope` unit runs, or `None` for any
+/// other unit. `<id>` may itself hold `-`, so the prefix and the last `-<gen>`
+/// are what come off. A roster id is `[a-z0-9-]` (growlightd refuses any
+/// other), so what is left is the id exactly.
+pub fn scope_member(unit: &str) -> Option<&str> {
+    let base = unit.strip_prefix(SCOPE_PREFIX)?.strip_suffix(SCOPE_SUFFIX)?;
+    let (id, generation) = base.rsplit_once('-')?;
+    let numbered = !generation.is_empty() && generation.bytes().all(|b| b.is_ascii_digit());
+    (!id.is_empty() && numbered).then_some(id)
+}
+
+/// The member scope unit a `/proc/<pid>/cgroup` body places its process in, or
+/// `None` when it runs in no member's scope. The unified (v2) line's path is
+/// searched from the leaf up, so a sub-cgroup made under the scope still counts.
+pub fn cgroup_scope(cgroup: &str) -> Option<&str> {
+    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    path.rsplit('/').find(|unit| scope_member(unit).is_some())
+}
+
+/// The queue-shaping verbs that are the human's alone (§6.7), and the one-shot
+/// v2 migration (spec §11), which a member could otherwise reach once its
+/// `fleet_armed` barrier is down. A fleet member is refused each one, by
+/// softfig-mcp's gate and by keeperd's.
+pub const HUMAN_QUEUE_VERBS: [&str; 4] =
+    ["queue_add_project", "queue_update_entry", "queue_drop", "queue_v2_migrate_apply"];
+
+/// Why a member is refused a [`HUMAN_QUEUE_VERBS`] verb, in the words both
+/// gates use.
+pub const HUMAN_QUEUE_VERB_WHY: &str = "a fleet member may add found work with \
+    queue_add_entry, and move slices in its own entry; shaping or migrating the queue \
+    is the human's";
 
 /// Who a softfig-mcp process serves, as its launch env declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,5 +164,36 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "../escape", "x\0y", "a\\b"] {
             assert!(!is_safe_member_id(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_scope_unit_names_its_member_hyphens_and_all() {
+        assert_eq!(scope_member("growlight-agent-qa-33.scope"), Some("qa"));
+        assert_eq!(scope_member("growlight-agent-oc-1-7.scope"), Some("oc-1"));
+        assert_eq!(scope_member("growlight-agent-two-agents-x-0.scope"), Some("two-agents-x"));
+        for not_a_member in [
+            "growlight-agent-qa.scope",
+            "growlight-agent--3.scope",
+            "growlight-agent-qa-.scope",
+            "growlight-agent-qa-3x.scope",
+            "growlight-agent-qa-3",
+            "growlightd.service",
+            "growlight-thermal-guard.service",
+        ] {
+            assert_eq!(scope_member(not_a_member), None, "{not_a_member:?}");
+        }
+    }
+
+    #[test]
+    fn a_cgroup_body_places_its_process_in_a_member_scope_or_none() {
+        let base = "0::/user.slice/user-1000.slice/user@1000.service/app.slice";
+        let member = format!("{base}/growlight-agent-qa-33.scope\n");
+        assert_eq!(cgroup_scope(&member), Some("growlight-agent-qa-33.scope"));
+        let nested = format!("{base}/growlight-agent-oc-1-2.scope/build\n");
+        assert_eq!(cgroup_scope(&nested), Some("growlight-agent-oc-1-2.scope"));
+        let human = format!("{base}/wayfire.service\n");
+        assert_eq!(cgroup_scope(&human), None);
+        assert_eq!(cgroup_scope("12:pids:/growlight-agent-qa-1.scope\n"), None, "v1 lines are not read");
+        assert_eq!(cgroup_scope(""), None);
     }
 }

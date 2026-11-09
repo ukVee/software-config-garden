@@ -19,7 +19,7 @@ use softfig_ipc::growlightd::{
     QueuePickAssignment, QueuePickReply, QueuePickSkip, RefusalCode, ReleaseLeaseArgs,
     RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs,
     SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
-    BACKEND_CLAUDE, BACKEND_OPENCODE,
+    QueueShowReply, BACKEND_CLAUDE, BACKEND_OPENCODE,
 };
 use softfig_ipc::model_choice::{Backend, ModelList};
 use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
@@ -33,7 +33,7 @@ use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
 use crate::member_slices;
 use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
-use crate::scheduler_v2::{self, Member, Unit};
+use crate::scheduler_v2::{self, Member, ScheduleGate, Unit};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
@@ -172,6 +172,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         // Read-only queue-v2 surface (spec-growlight-queue §6.9): what `pick_v2`
         // assigns a member now, and why each skipped entry was skipped.
         op::QUEUE_PICK => write_one_shot(&mut stream, queue_pick(&daemon, &req)),
+        op::QUEUE_SHOW => write_one_shot(&mut stream, queue_show(&daemon)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -258,7 +259,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held) = {
+    let (state, garden_root, policy, paused, fleet_enabled, queue, members, lifecycles, held, schedule) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -266,9 +267,11 @@ fn status(daemon: &Daemon) -> Response {
             inner.config.policy.summary(),
             inner.control.paused,
             inner.fleet.enabled,
+            inner.fleet.queue.label().to_string(),
             inner.fleet.members.clone(),
             inner.member_lifecycles.clone(),
             inner.held_parts.clone(),
+            inner.schedule_summary.clone(),
         )
     };
     let roster = members
@@ -296,12 +299,14 @@ fn status(daemon: &Daemon) -> Response {
         build_caps: daemon.build_caps().summary(),
         paused,
         fleet_enabled,
+        queue,
         roster,
         agents,
         // The genuinely-running scope units (slice 006) — independent leaf lock,
         // like build_caps above; never reconstructed CLI-side.
         live_scopes: daemon.live_scope_units(),
         held,
+        schedule,
     };
     ok_reply(&reply, "status")
 }
@@ -1038,6 +1043,8 @@ pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
     // The runtime holders and accepted model changes, as of the loop's last tick
     // — the same overlay the loop's own pick sees (slice 012).
     crate::drive_loop::apply_v2_overlay(&mut snapshot, &daemon.v2_overlay());
+    // The `not_before` hold reads the clock as of now, not the loop's last tick.
+    snapshot.now_unix = crate::drive_loop::unix_now();
     let outcome = scheduler_v2::pick_v2(&snapshot, &member);
     let reply = QueuePickReply {
         list: true,
@@ -1060,6 +1067,49 @@ pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
     ok_reply(&reply, "queue_pick")
 }
 
+/// `queue_show` (§6.9): the live v2 list reduced for the `growlight status`
+/// and `queue show` surfaces — the entries (lanes, statuses, links), the
+/// per-repo stack with its live git-stack annotations, and the §3.5 session
+/// log. growlightd answers it because the stack model and the read-only git
+/// surface live here. A garden with no v2 file answers `list: false` (not an
+/// error, §3.4); a v2 file that fails to parse is surfaced as an error (the
+/// writer owns that invariant).
+fn queue_show(daemon: &Daemon) -> Response {
+    let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return ok_reply(
+                &QueueShowReply {
+                    list: false,
+                    projects: Vec::new(),
+                    entries: Vec::new(),
+                    archived: Vec::new(),
+                    sessions: Vec::new(),
+                    trees: Vec::new(),
+                },
+                "queue_show",
+            )
+        }
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("queue_show: the queue-v2 list can't be read: {e}"),
+            )
+        }
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let user = std::env::var("USER").ok();
+    let reply = crate::queue_show::build(
+        &snapshot,
+        &daemon.garden_root(),
+        home.as_deref(),
+        user.as_deref(),
+        &daemon.surface_probes,
+        crate::profile_pin::now_unix(),
+    );
+    ok_reply(&reply, "queue_show")
+}
+
 /// The member a pick runs for: a roster row (its id, backend and pin), or an
 /// unnamed unpinned member on the default backend.
 ///
@@ -1075,6 +1125,7 @@ fn resolve_pick_member(
             id: String::new(),
             backend: Backend::Claude,
             pin: None,
+            schedule: ScheduleGate::Open,
         });
     };
     let Some(row) = members.iter().find(|m| m.agent == id) else {
@@ -1096,6 +1147,9 @@ fn resolve_pick_member(
         id: row.agent.clone(),
         backend: row.backend.ipc_backend(),
         pin: row.pin.clone(),
+        // The dry-run answers what the queue would hand the member; the
+        // `[schedule]` is a per-tick admission state, not queue state.
+        schedule: ScheduleGate::Open,
     })
 }
 
@@ -1217,6 +1271,71 @@ mod tests {
             .with_resource_persister(persister)
     }
 
+    /// `queue_show` reads the stack through the daemon's bounded probes: a wedged
+    /// repo answers by the deadline, as an unknown, and the hold it earns spares
+    /// the next call the wait.
+    #[test]
+    fn queue_show_answers_a_wedged_repo_through_the_bounded_probes() {
+        use softfig_ipc::queue_v2::{Entry, EntryKind, EntryStatus, Lane, Project, QueueToml, QUEUE_FILE};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (garden, repo, bin) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let queue = QueueToml::new(
+            vec![Project {
+                name: "softfig".into(),
+                repo: repo.path().display().to_string(),
+                main: "main".into(),
+            }],
+            vec![Entry {
+                id: "m".into(),
+                kind: EntryKind::Milestone,
+                title: "m".into(),
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Blocked,
+                after: vec![],
+                added: "2026-10-11T15:04:00Z".into(),
+                branch: "feat/m".into(),
+                parent: String::new(),
+                base: "abc123".into(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                follow_ups: 0,
+                pending_status: None,
+                fleet: false,
+                not_before: Some("2026-11-08 09:00Z".into()),
+            }],
+        );
+        let path = garden.path().join(QUEUE_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, queue.to_toml().unwrap()).unwrap();
+        let git = bin.path().join("fake-git");
+        std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut daemon = Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), garden.path().into()));
+        daemon.surface_probes = crate::git_probe::ProbeCache::with(Duration::from_millis(300), git);
+        let show = || -> QueueShowReply {
+            serde_json::from_value(queue_show(&daemon).into_result().unwrap()).unwrap()
+        };
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("timed out"), "{reply:?}");
+        assert!(reply.entries[0].open_unknown, "{reply:?}");
+        // The holds come straight from `queue.toml` through `assemble` — no
+        // runtime overlay is needed for them to reach the surfaces.
+        let e = &reply.entries[0];
+        assert_eq!((e.fleet, e.not_before.as_deref()), (false, Some("2026-11-08 09:00Z")), "{e:?}");
+
+        let reply = show();
+        let why = reply.projects[0].stack_unknown.clone().unwrap_or_default();
+        assert!(why.contains("held"), "{reply:?}");
+    }
+
     /// A member's relayed slice verb (§6.7): identity, then the member's own
     /// entry, then keeperd as growlightd's own client — the relayed request
     /// is the plain human verb with no member on it, and keeperd's reply comes
@@ -1238,6 +1357,7 @@ mod tests {
             entry: "m1".into(),
             unit: Unit::Slice { milestone: "m1".into(), slice: "001".into() },
             resolved_model: softfig_ipc::model_choice::ModelChoice::claude(),
+            repo: None,
         };
         daemon.publish_v2_assignments(&std::iter::once(("c".to_string(), assignment)).collect());
 
@@ -1409,6 +1529,22 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_the_queue_switch_armed_or_not() {
+        // V23: the smoke checks a flip took by reading this, and `protocol` can't
+        // show it: that is the wire version, the same under either queue.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        assert_eq!(status_reply(&daemon).queue, "legacy");
+
+        let mut config = mixed_fleet();
+        config.enabled = false;
+        config.queue = crate::fleet::QueueMode::V2;
+        daemon.set_fleet_config(config);
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.queue, "v2");
+        assert!(!reply.fleet_enabled, "the switch reads the same on a disarmed fleet");
+    }
+
+    #[test]
     fn status_lists_the_parts_the_loop_left_for_the_human() {
         // Task 068: a hold leaves the item `queued` and pages no one, so `status` is
         // where it shows: whatever the drive loop last recorded, reason included.
@@ -1425,6 +1561,31 @@ mod tests {
 
         daemon.record_held_parts(Vec::new());
         assert!(status_reply(&daemon).held.is_empty(), "a freed part leaves the list");
+    }
+
+    #[test]
+    fn status_shows_the_schedule_the_loop_last_evaluated_and_the_build_caps() {
+        // Slice 006: the drive loop records its verdict; `status` renders it.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.schedule, None, "no schedule before a tick");
+        assert_eq!(reply.build_caps.test_threads, Some(2), "the default test-thread cap");
+        assert_eq!(reply.build_caps.cpu_quota, None);
+
+        let schedule = softfig_ipc::growlightd::ScheduleSummary {
+            open: false,
+            zone: "UTC".into(),
+            held_members: vec![softfig_ipc::growlightd::ScheduleHeld {
+                agent: "a1".into(),
+                reason: "outside window".into(),
+            }],
+            ..Default::default()
+        };
+        daemon.record_schedule_summary(Some(schedule.clone()));
+        assert_eq!(status_reply(&daemon).schedule, Some(schedule));
+
+        daemon.record_schedule_summary(None);
+        assert_eq!(status_reply(&daemon).schedule, None, "a disabled schedule leaves status");
     }
 
     #[test]

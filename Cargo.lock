@@ -3661,6 +3661,7 @@ dependencies = [
  "hex",
  "hostname",
  "rpassword",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -3672,6 +3673,7 @@ dependencies = [
  "softfig-keeperd",
  "softfig-onboard",
  "softfig-store",
+ "softfig-telemetry",
  "softfig-vault",
  "softfig-vcs",
  "tempfile",
@@ -3725,6 +3727,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "softfig-ipc",
+ "softfig-telemetry",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3758,6 +3761,7 @@ name = "softfig-ipc"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "libc",
  "memchr",
  "semver",
@@ -3870,6 +3874,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "softfig-telemetry"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

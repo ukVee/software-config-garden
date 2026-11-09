@@ -92,6 +92,17 @@ fn locate(lines: &[&str], tag: &str) -> Option<(usize, usize)> {
         .map(|s| (s.open, s.close))
 }
 
+/// Bytes of `content` outside its managed regions, marker lines counted as
+/// part of the region: the hand-written text a doc carries.
+pub fn prose_len(content: &str) -> usize {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let managed: usize = spans_of(&lines)
+        .iter()
+        .map(|s| lines[s.open..=s.close].iter().map(|l| l.len() + 1).sum::<usize>())
+        .sum();
+    content.len().saturating_sub(managed)
+}
+
 /// Whether `content` already hosts a region tagged `tag`.
 pub fn has_region(content: &str, tag: &str) -> bool {
     locate(&content.split('\n').collect::<Vec<_>>(), tag).is_some()

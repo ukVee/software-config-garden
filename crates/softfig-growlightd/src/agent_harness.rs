@@ -474,10 +474,11 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
 
     /// Build this spawn's [`LineObserver`], installing any per-agent cell the
     /// flavor keeps (e.g. claude's account-wide reserve cell). Called once per
-    /// spawn BEFORE the reader thread starts. `rate` is the harness's meter for
-    /// this spawn — the flavor feeds it from whatever its wire format reports as
-    /// a completed turn's token cost.
-    fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver>;
+    /// spawn BEFORE the reader thread starts. `spec` is the spawn's own (its
+    /// agent, resolved model and telemetry tags). `rate` is the harness's meter
+    /// for this spawn — the flavor feeds it from whatever its wire format reports
+    /// as a completed turn's token cost.
+    fn new_observer(&self, spec: &AgentSpec, rate: Arc<AgentRateState>) -> Box<dyn LineObserver>;
 }
 
 /// Tail an agent's stdout to EOF, bumping `health`'s heartbeat on every non-empty
@@ -542,7 +543,7 @@ pub(crate) fn scope_base_name(agent: &str) -> String {
             }
         })
         .collect();
-    format!("growlight-agent-{safe}")
+    format!("{}{safe}", softfig_ipc::member::SCOPE_PREFIX)
 }
 
 /// The transient-scope base unit name for THIS spawn of `agent`, with a unique
@@ -563,7 +564,8 @@ pub(crate) fn scope_base_name_gen(agent: &str, generation: u64) -> String {
 /// Build the `systemd-run` cap flags (the scope options BEFORE the `--`) that
 /// GENTLY throttle an agent's build subtree without ever aborting it
 /// (peer-isolation slice 002; human direction 2026-06-28): a low
-/// `CARGO_BUILD_JOBS` env (fewer parallel `rustc` → lower peak RAM), a SOFT
+/// `CARGO_BUILD_JOBS` env (fewer parallel `rustc` → lower peak RAM), a low
+/// `RUST_TEST_THREADS` env (fewer tests in flight per test binary), a SOFT
 /// `--property=MemoryHigh` (the kernel throttles + reclaims past it, never
 /// OOM-kills), and a deprioritizing `--property=CPUWeight`. Deliberately NEVER
 /// `MemoryMax` (the hard OOM-kill cap) nor a tight `TasksMax` (a `fork` EAGAIN) —
@@ -575,6 +577,9 @@ pub(crate) fn build_cap_args(caps: &BuildCaps) -> Vec<OsString> {
     let mut args = Vec::new();
     if let Some(jobs) = caps.cargo_build_jobs {
         args.push(format!("--setenv=CARGO_BUILD_JOBS={jobs}").into());
+    }
+    if let Some(threads) = caps.test_threads {
+        args.push(format!("--setenv=RUST_TEST_THREADS={threads}").into());
     }
     if let Some(high) = &caps.memory_high {
         args.push(format!("--property=MemoryHigh={high}").into());
@@ -955,7 +960,7 @@ impl Harness {
         // and recorded in the shared live-scope registry (set_resources targets it).
         let generation = self.scope_gen.fetch_add(1, Ordering::Relaxed);
         let scope_base = scope_base_name_gen(&spec.agent, generation);
-        let scope_unit = format!("{scope_base}.scope");
+        let scope_unit = format!("{scope_base}{}", softfig_ipc::member::SCOPE_SUFFIX);
         let argv = spawn_argv(
             &scope_base,
             &caps,
@@ -1032,7 +1037,7 @@ impl Harness {
         // the flavor's own per-agent cell (e.g. claude's reserve) is installed and
         // readable the moment the agent is registered — the same replace-on-re-roll
         // lifecycle as the harness cells above.
-        let observer = self.flavor.new_observer(&spec.agent, Arc::clone(&rate));
+        let observer = self.flavor.new_observer(spec, Arc::clone(&rate));
 
         // Record this spawn's running scope (slice 002), overwriting any prior
         // generation for the agent — `set_resources` pushes its live `set-property`
@@ -1257,12 +1262,14 @@ mod tests {
 
     #[test]
     fn build_cap_args_emits_only_the_configured_gentle_caps() {
-        // The default caps render as the three GENTLE flags, in order: a low
-        // CARGO_BUILD_JOBS env + a SOFT MemoryHigh + a deprioritizing CPUWeight.
+        // The default caps render as the four GENTLE flags, in order: low
+        // CARGO_BUILD_JOBS + RUST_TEST_THREADS envs + a SOFT MemoryHigh + a
+        // deprioritizing CPUWeight.
         assert_eq!(
             build_cap_args(&BuildCaps::default()),
             vec![
                 OsString::from("--setenv=CARGO_BUILD_JOBS=2"),
+                OsString::from("--setenv=RUST_TEST_THREADS=2"),
                 OsString::from("--property=MemoryHigh=3G"),
                 OsString::from("--property=CPUWeight=50"),
             ]
@@ -1281,6 +1288,7 @@ mod tests {
             memory_high: None,
             cpu_weight: None,
             cpu_quota: None,
+            test_threads: None,
         };
         assert!(build_cap_args(&none).is_empty());
         // A partial cap emits only what's set.
@@ -1289,6 +1297,7 @@ mod tests {
             memory_high: Some("70%".to_string()),
             cpu_weight: None,
             cpu_quota: None,
+            test_threads: None,
         };
         assert_eq!(
             build_cap_args(&partial),
@@ -1403,6 +1412,7 @@ mod tests {
                 "--collect",
                 "--unit=growlight-agent-a1-7",
                 "--setenv=CARGO_BUILD_JOBS=2",
+                "--setenv=RUST_TEST_THREADS=2",
                 "--property=MemoryHigh=3G",
                 "--property=CPUWeight=50",
                 "--",
@@ -1477,7 +1487,7 @@ mod tests {
             fn spawned(&self, _agent: &str) {
                 self.spawned.fetch_add(1, Ordering::Relaxed);
             }
-            fn new_observer(&self, _agent: &str, _rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+            fn new_observer(&self, _spec: &AgentSpec, _rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
                 Box::new(Quiet)
             }
         }

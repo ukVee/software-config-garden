@@ -4,10 +4,12 @@
 //! shapes are convenience helpers on both ends. Mismatched shapes surface
 //! as `ErrorKind::BadArgs` in the daemon.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::queue_v2::{EntryKind, Lane, SliceStatus};
+use crate::queue_v2::{migrate, EntryKind, Lane, RestackBranch, SliceStatus};
 
 pub mod op {
     pub const STATUS: &str = "status";
@@ -250,8 +252,9 @@ pub mod op {
     pub const REORDER_BACKLOG_ITEM: &str = "reorder_backlog_item";
     /// queue v2 (§6.8 human verb): append a `[[project]]` row to
     /// `growlight/backlog/queue.toml` — the first v2 file creation, so the
-    /// `softfig:queue-v2` view renders from here on (§3.4). One commit,
-    /// `queue_v2_updated`. `--dry-run` computes + renders, writes nothing.
+    /// `softfig:queue-v2` view renders into `growlight/backlog/queue.md` from
+    /// here on (§3.4). One commit, `queue_v2_updated`. `--dry-run` computes +
+    /// renders, writes nothing.
     pub const QUEUE_ADD_PROJECT: &str = "queue_add_project";
     /// queue v2 (§6.8 human verb): create a backlog entry — a milestone with
     /// its docs, `slices.toml` and the generated `001-plan` slice (§4) when no
@@ -311,8 +314,8 @@ pub mod op {
     /// line to the unit doc's `## Sessions` section — keeperd stamps the
     /// `- <utc> · ` prefix and appends the caller's `<reason> · <model> ·
     /// member <id> · $cost` tail. The doc is the slice doc (`unit` given),
-    /// the milestone `CLAUDE.md` (close-out), or the task/restack doc. One
-    /// commit, `queue_v2_session_logged`.
+    /// the milestone's `sessions.md` (close-out, created by its first line),
+    /// or the task/restack doc. One commit, `queue_v2_session_logged`.
     pub const QUEUE_V2_SESSION_LOG: &str = "queue_v2_session_log";
     /// queue v2 daemon op, keeperd↔growlightd only: write the close-out's
     /// deferred tests (§6.5 `deferred_tests`, protocol §7b) into the entry
@@ -322,12 +325,38 @@ pub mod op {
     /// queue v2 daemon op, keeperd↔growlightd only: the §7 sub-milestone
     /// (`queue-v2-scheduling` slice 010, `growlight_add_sub_milestone`'s
     /// commit). Creates `milestones/<milestone>/subs/<slug>/` — its
-    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, and its
-    /// `slices.toml` (every slice `queued`) — marks the `active` slice `split`,
+    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, its
+    /// `slices.toml` (every slice `queued`) and `slices.md` view — marks the `active` slice `split`,
     /// and places the sub in the parent's `slices.toml`: right after the split
     /// slice (the front of the remaining items, the default) or at the end
     /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
     pub const QUEUE_V2_ADD_SUB: &str = "queue_v2_add_sub";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): enqueue ONE urgent `restack` entry for a repo whose stack moved
+    /// under an open branch (§8, `queue-v2-git` slice 003). Idempotent per
+    /// project — a live restack row already present is returned untouched (the
+    /// reply's `id`/`path` are `None`). The full restack doc is generated from
+    /// `stack` (growlightd resolved it read-only with git). One commit,
+    /// `queue_v2_updated`.
+    pub const QUEUE_V2_ENQUEUE_RESTACK: &str = "queue_v2_enqueue_restack";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): re-record the restacked branches' bases after a restack completed
+    /// (§8, `queue-v2-git` slice 004). growlightd recomputed each branch's base
+    /// read-only with `git merge-base` and passes `entries: [{entry, base}]`;
+    /// keeperd replaces each named live entry's `base`. One commit,
+    /// `queue_v2_bases_rerecorded`.
+    pub const QUEUE_V2_RE_RECORD_BASES: &str = "queue_v2_re_record_bases";
+    /// queue v2 one-time op (spec §11, `queue-v2-migrate` slice 005), called
+    /// by `softfig growlight queue migrate --apply` only: rebuild the legacy
+    /// snapshot from keeperd's own working tree (the runtime batons ride in
+    /// the args), recompute the migration plan under the owner's answers, and
+    /// refuse (`migrate::ApplyRefusal`) before any write when the fleet is
+    /// armed, the switch is already `v2`, any v2 file exists, the backlog doc
+    /// is not the `expect` version, or the plan has a refusal or an open call.
+    /// Otherwise `queue.toml` + `queue-archive.toml` + every `slices.toml` and
+    /// their derived views land in one commit, `queue_v2_migrated`. Never
+    /// touches the legacy tables, never flips the switch.
+    pub const QUEUE_V2_MIGRATE_APPLY: &str = "queue_v2_migrate_apply";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2217,7 +2246,8 @@ pub struct QueueAddProjectArgs {
     pub name: String,
     /// A local path (`~` allowed) or `host:path`. Non-empty.
     pub repo: String,
-    /// The branch merges land on; defaults to `"main"`.
+    /// The branch merges land on; defaults to `"main"`. Refused `bad_name` when
+    /// it is no branch name, by `git check-ref-format --branch`'s rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
@@ -2253,12 +2283,13 @@ pub struct QueueSliceSpec {
 
 /// `queue_add_entry({kind, slug?, title?, mission?, finish_criteria?,
 /// project, lane = "normal", after = [], position = "back", ref?,
-/// slices = [], dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
+/// slices = [], fleet?, not_before?, dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
 /// the docs as the legacy `add_backlog_item` does and places the lane row in
 /// `queue.toml` — one commit:
 ///
 /// - `milestone`: `milestones/<slug>/CLAUDE.md`, `slices/`, `slices.toml`
-///   (plus the generated `001-plan` slice when `slices` is empty, §4);
+///   and its `slices.md` view (plus the generated `001-plan` slice when
+///   `slices` is empty, §4);
 ///   `slug`/`title`/`mission`/`finish_criteria` required.
 /// - `task`: `tasks/NNN-<slug>.md` (NNN from the tasks `.seq`), id = the NNN,
 ///   `branch = fix/<NNN>` (§3.1: the id exists only after numbering, finding
@@ -2304,6 +2335,18 @@ pub struct QueueAddEntryArgs {
     /// generates the `001-plan` slice (§4).
     #[serde(default)]
     pub slices: Vec<QueueSliceSpec>,
+    /// The row's `fleet` field (§3.1): `false` makes the entry human-only, so
+    /// the fleet never claims it. Absent writes the default, `true`. Refused
+    /// for `restack` (finding 5) and for a fleet member (§6.7: a member's
+    /// found work is the fleet's by definition, and a hold is the human's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<bool>,
+    /// The row's `not_before` start time (§3.1), in the
+    /// [`crate::fleet::parse_not_before`] grammar, kept as written. A value
+    /// that does not parse is refused `bad_start_time`. Refused for `restack`
+    /// and for a fleet member, like `fleet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,
@@ -2353,8 +2396,8 @@ pub struct QueueMoveSpec {
 }
 
 /// `queue_update_entry({id, lane?, move = {to, ref?}?, after?, status?,
-/// dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit applied in
-/// the order lane → move → after → status, committed once with the queue view
+/// fleet?, not_before?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
+/// applied in the order lane → move → after → fleet → not_before → status, committed once with the queue view
 /// re-rendered. A no-op edit mints no commit (the legacy reorder verb's
 /// idempotence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2378,6 +2421,16 @@ pub struct QueueUpdateEntryArgs {
     /// `daemon_owned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<QueueStatusArg>,
+    /// Sets the row's `fleet` field (§3.1): `false` holds the entry for the
+    /// human, `true` releases it. Takes effect at the next pick; a live-held
+    /// `active` entry keeps running (§2 **Holds**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<bool>,
+    /// Sets the row's `not_before` start time (§3.1); `""` clears it. A value
+    /// that does not parse is refused `bad_start_time`. Holds a `queued`
+    /// entry only: one that has started ignores it (§2 **Holds**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,
@@ -2391,6 +2444,12 @@ pub struct QueueUpdateEntryReply {
     pub view: String,
     /// Commit hash; on a dry run or a no-op edit the untouched tip.
     pub hash: String,
+    /// What the edit kept but does not do, one sentence each — today, a
+    /// `not_before` set on a `paused` or `active` entry, which gates only a
+    /// `queued` entry's claim (F2). Empty, and absent on the wire, otherwise;
+    /// an older daemon sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// `slice_insert({milestone, slug, title?, body, position = "back", ref?,
@@ -2541,12 +2600,19 @@ pub struct DeferredTestSpec {
     pub expected: String,
 }
 
-/// `queue_v2_claim({entry, unit?}) -> {entry, unit, hash}` — the daemon claim
-/// (spec §6.3 step 3's claim at assignment, `queue-v2-scheduling` slice 005).
-/// Entry `queued | paused → active`; `unit` (a slice id) `queued → active`.
-/// `unit` is omitted for a task/restack or a milestone close-out. A re-claim
-/// of an already-active unit is an idempotent no-op; a different already-active
-/// slice of the same entry is refused `started`.
+/// `queue_v2_claim({entry, unit?, parent?, base?}) -> {entry, unit, hash}` —
+/// the daemon claim (spec §6.3 step 3's claim at assignment,
+/// `queue-v2-scheduling` slice 005). Entry `queued | paused → active`; `unit`
+/// (a slice id) `queued → active`. `unit` is omitted for a task/restack or a
+/// milestone close-out. A re-claim of an already-active unit is an idempotent
+/// no-op; a different already-active slice of the same entry is refused
+/// `started`.
+///
+/// `parent`/`base` are the §8 first-claim recording (`queue-v2-git` slice 002):
+/// growlightd computes them from the stack and passes them only on a first
+/// claim (a never-claimed entry). keeperd records them — and stamps `claimed`
+/// itself — only when the entry's `claimed` is still empty, so a resume or a
+/// re-claim never overwrites an already-recorded base.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2ClaimArgs {
     /// The live entry id (a milestone identity, a task's NNN, or a restack's
@@ -2556,6 +2622,14 @@ pub struct QueueV2ClaimArgs {
     /// task, restack or close-out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// §8 `parent` — the entry whose branch this was cut from (`""` = `main`).
+    /// First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// §8 `base` — the commit cut from (local) or the parent branch name
+    /// (remote). First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2622,9 +2696,9 @@ pub struct QueueV2FollowUpsReply {
 /// `queue_v2_session_log({entry, unit?, line}) -> {entry, unit, path, hash}` —
 /// the §3.5 session log. keeperd stamps the `- <utc> · ` prefix and appends
 /// `line` (the `<reason> · <model ref> · member <id> · $cost` tail) to the
-/// unit doc's `## Sessions` section: the slice doc for `unit`, the milestone
-/// `CLAUDE.md` for a close-out, the task/restack doc otherwise. The section
-/// is created when absent.
+/// unit doc's `## Sessions` section: the slice doc for `unit`, the
+/// milestone's `sessions.md` for a close-out (created by its first line), the
+/// task/restack doc otherwise. The section is created when absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2SessionLogArgs {
     pub entry: String,
@@ -2703,6 +2777,97 @@ pub struct QueueV2AddSubReply {
     /// Its `CLAUDE.md` (garden-relative).
     pub path: String,
     pub hash: String,
+}
+
+/// `queue_v2_enqueue_restack({project, stack}) -> {id?, path?, hash}` — the §8
+/// auto-restack enqueue (`queue-v2-git` slice 003), keeperd↔growlightd only.
+/// growlightd detected a stale stack (read-only git) and passes the ordered
+/// stack; keeperd enqueues ONE urgent restack row for `project` and generates
+/// the full restack doc from `stack`, or merges `stack` into the live row's doc.
+/// Idempotent per project: if that doc already carries the stack, or a session
+/// holds it, `id`/`path` are `None` and nothing is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackArgs {
+    /// The project whose repo needs a restack.
+    pub project: String,
+    /// The ordered stack (claim order) growlightd resolved with git — each
+    /// branch, its recorded `parent`/`base`, and the resolved `--onto` target.
+    pub stack: Vec<RestackBranch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackReply {
+    /// The restack entry's id (`NNN`), new or merged into; `None` on the
+    /// idempotent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The restack doc (garden-relative); `None` on the idempotent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The commit hash, or the untouched tip on the idempotent no-op.
+    pub hash: String,
+}
+
+/// One restacked branch's re-recorded base (§8, `queue-v2-git` slice 004):
+/// growlightd recomputed it read-only with `git merge-base` after the restack
+/// completed, and keeperd writes it back onto the named live entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueV2BaseRecord {
+    /// The live entry whose `base` is re-recorded.
+    pub entry: String,
+    /// The new base (a commit hash for a local repo).
+    pub base: String,
+}
+
+/// `queue_v2_re_record_bases({entries}) -> {hash}` — the §8 re-record
+/// (`queue-v2-git` slice 004), keeperd↔growlightd only. growlightd recomputed
+/// each restacked branch's base after the restack completed and passes the
+/// `(entry, base)` pairs; keeperd replaces each named live entry's `base` and
+/// clears `re_record_due` on each `settled` archive row, in one commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesArgs {
+    /// The re-recorded `(entry, base)` pairs.
+    pub entries: Vec<QueueV2BaseRecord>,
+    /// The archived restack rows this pass answers. Empty pairs with a settled
+    /// row is a pass that found nothing to move.
+    #[serde(default)]
+    pub settled: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesReply {
+    /// The commit hash, or the untouched tip on an all-no-op write.
+    pub hash: String,
+}
+
+/// `queue_v2_migrate_apply({answers, expect, batons}) -> {hash, entries,
+/// archived, slices, batons}` — the §11 converter's apply (`queue-v2-migrate`
+/// slice 005).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2MigrateApplyArgs {
+    /// The owner's settlements, the parsed `--answers` file.
+    pub answers: migrate::Answers,
+    /// The snapshot version the dry run printed (`--expect`), a CAS over
+    /// every backlog file and baton the plan reads ([`migrate::LegacyFiles::digest`]).
+    pub expect: String,
+    /// The runtime batons (runtime-relative path → content), read by the
+    /// caller as the dry run reads them; keeperd cannot see runtime state.
+    #[serde(default)]
+    pub batons: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2MigrateApplyReply {
+    /// The `queue_v2_migrated` commit hash.
+    pub hash: String,
+    /// Entries written to `queue.toml`.
+    pub entries: usize,
+    /// Rows written to `queue-archive.toml`.
+    pub archived: usize,
+    /// `slices.toml` files written.
+    pub slices: usize,
+    /// The baton copies the caller makes now that the commit landed (§3.6).
+    pub batons: Vec<migrate::BatonMove>,
 }
 
 /// `growlight_init({}) -> {created, skipped, nav_wired, committed, hash}`.

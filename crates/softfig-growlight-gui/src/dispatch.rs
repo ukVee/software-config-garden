@@ -141,9 +141,9 @@ impl std::error::Error for StatusError {}
 pub fn load_status(transport: &mut impl Transport) -> Result<Message, StatusError> {
     let resp = dispatch(transport, &status_request()).map_err(StatusError::Transport)?;
     match resp.into_result() {
-        Ok(data) => Ok(Message::StatusLoaded(
+        Ok(data) => Ok(Message::StatusLoaded(Box::new(
             serde_json::from_value::<FleetStatusReply>(data).map_err(StatusError::Decode)?,
-        )),
+        ))),
         Err((kind, error)) => Err(StatusError::Daemon { kind, error }),
     }
 }
@@ -283,10 +283,12 @@ mod tests {
             build_caps: Default::default(),
             paused: false,
             fleet_enabled: false,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: vec![AgentSummary::new("loop-1", "running", true)],
             live_scopes: Vec::new(),
             held: Vec::new(),
+            schedule: None,
         };
 
         /// A transport that answers the one `status` round-trip with a canned

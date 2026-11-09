@@ -430,7 +430,8 @@ fn tool_defs() -> Vec<Value> {
             "name": "queue_add_project",
             "description": "growlight queue v2: append a [[project]] row to queue.toml (name, repo, \
                             merge branch). On a fresh garden this creates the first v2 file, so the \
-                            softfig:queue-v2 view renders from then on. A HUMAN verb: a fleet member \
+                            softfig:queue-v2 view renders into growlight/backlog/queue.md from then \
+                            on. A HUMAN verb: a fleet member \
                             is refused member_not_allowed (§6.7). Refusal codes surface as-is from \
                             keeperd.",
             "inputSchema": {
@@ -439,7 +440,7 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "[a-z0-9-]+; the project name entries reference (refused bad_name; exists when already present)" },
                     "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
-                    "main": { "type": "string", "description": "the branch merges land on; defaults to main" },
+                    "main": { "type": "string", "description": "the branch merges land on, a valid git branch name; defaults to main" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -447,14 +448,15 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "queue_add_entry",
             "description": "growlight queue v2: create a backlog entry and its docs in one commit. \
-                            milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml \
-                            plus the generated 001-plan slice when no slices are given); task kind \
+                            milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml, \
+                            the slices.md view, plus the generated 001-plan slice when no slices are \
+                            given); task kind \
                             writes tasks/NNN-<slug>.md (branch fix/<NNN>); restack kind writes a \
                             generated doc into the urgent lane (project only — every other arg is \
                             refused BadArgs). A fleet member may call it for found work only \
                             (§6.7): a milestone or task in the normal lane, appended at the back, \
-                            `after` allowed, and no `> Model:` line in any text (field_not_allowed); \
-                            urgent work goes to @human. Anything else is member_not_allowed. Refusal \
+                            `after` allowed, no `fleet` or `not_before`, and no `> Model:` line in any text \
+                            (field_not_allowed); urgent work goes to @human. Anything else is member_not_allowed. Refusal \
                             codes surface as-is from keeperd.",
             "inputSchema": {
                 "type": "object",
@@ -471,6 +473,8 @@ fn tool_defs() -> Vec<Value> {
                     "position": { "type": "string", "description": "front | back | before | after (with ref for the last two), inside the entry's lane; defaults to back" },
                     "ref": { "type": "string", "description": "the reference entry id for before/after placement" },
                     "slices": { "type": "array", "items": { "type": "object" }, "description": "slices to seed slices.toml with, each {slug, title?, body}; empty generates the 001-plan slice. Refused for the task kind" },
+                    "fleet": { "type": "boolean", "description": "false makes the entry human-only: the fleet never claims it. Defaults to true. Refused for the restack kind, and for a fleet member (member_not_allowed)" },
+                    "not_before": { "type": "string", "description": "the earliest time the fleet may start the entry, `YYYY-MM-DD HH:MM ±HH:MM` (offset required; `T` and `Z` allowed), kept as written. A value that does not parse is refused bad_start_time. Refused for the restack kind, and for a fleet member (member_not_allowed)" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -478,7 +482,7 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "queue_update_entry",
             "description": "growlight queue v2: one atomic edit of a live entry, applied in the order \
-                            lane → move → after → status — patch-style, pass only the fields you \
+                            lane → move → after → fleet → not_before → status — patch-style, pass only the fields you \
                             change. status takes the human statuses queued | blocked | deferred | \
                             done (done archives the row; refused running on an active entry); \
                             active/paused/split are daemon-owned and refused. A HUMAN verb: a fleet \
@@ -493,6 +497,8 @@ fn tool_defs() -> Vec<Value> {
                     "move": { "type": "object", "description": "{to: front|back|before|after, ref?: id} — a within-lane move; refused started once the entry is claimed" },
                     "after": { "type": "array", "items": { "type": "string" }, "description": "replaces the whole link list ([] clears it); every id must resolve and the links stay acyclic" },
                     "status": { "type": "string", "description": "queued | blocked | deferred | done. queued also unblocks and un-defers" },
+                    "fleet": { "type": "boolean", "description": "false holds the entry for the human (the fleet never claims it), true releases it. A live-held active entry keeps running" },
+                    "not_before": { "type": "string", "description": "sets the start time, `YYYY-MM-DD HH:MM ±HH:MM`; \"\" clears it. Holds a queued entry only. A value that does not parse is refused bad_start_time" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -502,7 +508,9 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
                             names it, running for an active entry; if a stacked branch was cut from \
-                            it, one restack is enqueued per child project. A HUMAN verb: a fleet \
+                            it, one restack is enqueued per child repo, or merged into that \
+                            repo's live one, and the drop is refused started while a session holds \
+                            that restack. A HUMAN verb: a fleet \
                             member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
                             from keeperd.",
             "inputSchema": {
@@ -1141,11 +1149,9 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
         )
     };
     match name {
-        "queue_add_project" | "queue_update_entry" | "queue_drop" => Some(refused(
-            name,
-            "a fleet member may add found work with queue_add_entry, and move slices in its own \
-             entry; shaping the queue is the human's",
-        )),
+        _ if softfig_ipc::member::HUMAN_QUEUE_VERBS.contains(&name) => {
+            Some(refused(name, softfig_ipc::member::HUMAN_QUEUE_VERB_WHY))
+        }
         "queue_add_entry" => {
             let a: QueueAddEntryArgs = serde_json::from_value(args.clone()).ok()?;
             let urgent = "urgent work goes to the human instead: post_message to @human";
@@ -1158,6 +1164,18 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
                 Some(refused(
                     "queue_add_entry lane=urgent",
                     &format!("a member's found work joins the normal lane, and {urgent}"),
+                ))
+            } else if a.fleet.is_some() {
+                Some(refused(
+                    "queue_add_entry fleet",
+                    "a member's found work is the fleet's, and holding an entry for the human is \
+                     the human's call",
+                ))
+            } else if a.not_before.is_some() {
+                Some(refused(
+                    "queue_add_entry not_before",
+                    "a member's found work is the fleet's, and scheduling an entry is the \
+                     human's call",
                 ))
             } else if a.position.as_deref().is_some_and(|p| p != "back") || a.ref_id.is_some() {
                 Some(refused(
@@ -1575,11 +1593,24 @@ fn summarize(name: &str, data: &Value) -> String {
             head.push_str(&format!(" -> {path}"));
         }
         head.push_str(&format!("; commit {}", if hash.is_empty() { "?" } else { hash }));
+        // What the edit kept but does not do (F2), after the list as the CLI
+        // prints it.
+        let notes: String = data
+            .get("notes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str())
+            .map(|n| format!("\nnote: {n}"))
+            .collect();
         let view = g("view");
         if view.is_empty() {
-            return head;
+            return format!("{head}{notes}");
         }
-        return format!("{head}\n{view}");
+        if notes.is_empty() {
+            return format!("{head}\n{view}");
+        }
+        return format!("{head}\n{}{notes}", view.trim_end_matches('\n'));
     }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
@@ -1832,6 +1863,12 @@ mod tests {
             ("queue_add_entry", entry(json!({ "position": "front" }))),
             ("queue_add_entry", entry(json!({ "position": "after", "ref": "x" }))),
             ("queue_add_entry", json!({ "kind": "restack", "project": "softfig" })),
+            ("queue_add_entry", entry(json!({ "fleet": false }))),
+            ("queue_add_entry", entry(json!({ "fleet": true }))),
+            ("queue_update_entry", json!({ "id": "m", "fleet": true })),
+            ("queue_add_entry", entry(json!({ "not_before": "2026-11-01 02:00 -04:00" }))),
+            ("queue_add_entry", entry(json!({ "not_before": "" }))),
+            ("queue_update_entry", json!({ "id": "m", "not_before": "" })),
             ("slice_update", json!({ "milestone": "m", "id": "002", "status": "done" })),
         ];
         for (verb, args) in &refused {
@@ -2236,6 +2273,13 @@ mod tests {
         );
         assert!(s.contains("queue_update_entry m9; commit abc"), "{s}");
         assert!(s.contains("## urgent") && s.contains("- m9"), "{s}");
+        assert!(!s.contains("note:"), "{s}");
+        // F2: the reply's notes follow the list, one line each.
+        let s = summarize(
+            "queue_update_entry",
+            &json!({ "id": "m9", "view": "- m9\n", "hash": "abc", "notes": ["m9 is paused"] }),
+        );
+        assert!(s.ends_with("- m9\nnote: m9 is paused"), "{s}");
         // queue_add_project has no id — the project name stands in.
         let s = summarize(
             "queue_add_project",

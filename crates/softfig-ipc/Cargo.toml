@@ -16,6 +16,7 @@ toml.workspace = true
 anyhow.workspace = true
 semver.workspace = true
 memchr.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 # The session-context tests render against a real (temporary) garden + memory dir.

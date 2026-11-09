@@ -1106,12 +1106,13 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
 
     assert!(reply.committed);
-    // All twelve pillar files + the in-garden fleet config are created on a fresh
+    // All fourteen pillar files + the in-garden fleet config are created on a fresh
     // garden.
     for rel in [
         "growlight/CLAUDE.md",
         "growlight/protocol.md",
         "growlight/protocol-fleet.md",
+        "growlight/protocol-fleet-v2.md",
         "growlight/memory-read.md",
         "growlight/memory-write.md",
         "growlight/session-policy.md",
@@ -1120,6 +1121,7 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
         "growlight/baton-log/CLAUDE.md",
         "growlight/baton-log/.seq",
         "growlight/reports/CLAUDE.md",
+        "growlight/reports/index.md",
         "growlight/reports/.seq",
         "config/growlight.toml",
     ] {
@@ -1137,6 +1139,15 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let fleet = fx.read("growlight/protocol-fleet.md");
     assert!(fleet.contains("SOFT-FIG GROWLIGHT — operating protocol"));
     assert!(!fleet.contains("pull the next"), "fleet protocol must not self-pull");
+    // The v2 variant ships too (queue-v2-git slice 005): the fleet protocol plus
+    // the §10 changes — the roll verbs named, the legacy endings gone.
+    let v2 = fx.read("growlight/protocol-fleet-v2.md");
+    assert!(v2.contains("SOFT-FIG GROWLIGHT — operating protocol"));
+    assert!(v2.contains("`growlight_complete_slice`"), "v2 must name the roll verb");
+    assert!(v2.contains("`growlight_complete_entry`"), "v2 must name the close verb");
+    assert!(v2.contains("`growlight_block`"), "v2 must name the block verb");
+    assert!(!v2.contains("log_baton"), "v2 must drop the legacy log_baton step");
+    assert!(v2.contains("Do NOT call `set_item_status`"));
     // The opencode memory rules ship as two halves (opencode-v2-repin slice 005).
     assert!(fx.read("growlight/memory-read.md").starts_with("CLAUDE MEMORY — reading"));
     assert!(fx.read("growlight/memory-write.md").starts_with("CLAUDE MEMORY — writing"));
@@ -1164,8 +1175,8 @@ fn growlight_init_is_idempotent_without_an_empty_commit() {
     assert!(!reply.committed, "re-run must not commit");
     assert!(reply.created.is_empty());
     assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
-    // The twelve pillar files + config/growlight.toml are reported kept, not recreated.
-    assert_eq!(reply.skipped.len(), 13);
+    // The fourteen pillar files + config/growlight.toml are reported kept, not recreated.
+    assert_eq!(reply.skipped.len(), 15);
 
     let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
     assert_eq!(tip_after, tip_before, "no new commit on a no-op init");
@@ -1716,7 +1727,7 @@ fn file_report_numbers_tags_and_indexes() {
     ));
     assert!(doc.contains("## Report\n\nEditing the last section dropped the region.\n"));
 
-    let index = fx.read("growlight/reports/CLAUDE.md");
+    let index = fx.read("growlight/reports/index.md");
     assert!(index.contains("## Tags"), "routing doc scaffolded: {index}");
     assert!(index.contains("_1 report(s) — open 1_"), "{index}");
     assert!(
@@ -1732,6 +1743,27 @@ fn file_report_numbers_tags_and_indexes() {
     assert_eq!(payload["number"], 1);
     assert_eq!(payload["type"], "bug");
     assert_eq!(payload["severity"], "high");
+}
+
+#[test]
+fn a_garden_from_before_the_move_loses_the_index_from_its_routing_doc() {
+    let fx = Fixture::start();
+    std::fs::create_dir_all(fx.garden.join("growlight/reports")).unwrap();
+    std::fs::write(
+        fx.garden.join("growlight/reports/CLAUDE.md"),
+        "# r\n\nprose\n\n<!-- softfig:reports -->\n\nOLD\n\n<!-- /softfig:reports -->\n",
+    )
+    .unwrap();
+    file(
+        &fx,
+        serde_json::json!({ "title": "T", "body": "B", "tags": ["type:idea"], "from": "human" }),
+    );
+    let routing = fx.read("growlight/reports/CLAUDE.md");
+    assert!(!routing.contains("softfig:reports"), "the region moved out: {routing}");
+    assert!(routing.contains("prose"), "the rest of the doc stays: {routing}");
+    let index = fx.read("growlight/reports/index.md");
+    assert!(index.contains("## Tags"), "the index doc is scaffolded: {index}");
+    assert!(index.contains("_1 report(s) — open 1_"), "{index}");
 }
 
 #[test]
@@ -1806,7 +1838,7 @@ fn update_report_moves_status_and_keeps_a_log() {
     assert!(doc.contains("## Log\n\n- "), "{doc}");
     assert!(doc.contains("· claude · +item:061; +severity:medium; status open → triaged: queued as task 061"), "{doc}");
     assert!(doc.contains("· anon · status triaged → resolved: fixed in abc123"), "{doc}");
-    let index = fx.read("growlight/reports/CLAUDE.md");
+    let index = fx.read("growlight/reports/index.md");
     assert!(index.contains("| flake | medium | resolved | item:061 |"), "{index}");
     let (intent, payload) = fx.tip_intent();
     assert_eq!(intent, "report_updated");
@@ -1861,7 +1893,7 @@ fn reports_index_follows_generic_edits_and_refuses_unlink() {
         op::PATCH_FILE,
         serde_json::json!({ "path": reply.path, "old": "status:open", "new": "status:triaged" }),
     ));
-    assert!(fx.read("growlight/reports/CLAUDE.md").contains("| finding |  | triaged |"));
+    assert!(fx.read("growlight/reports/index.md").contains("| finding |  | triaged |"));
     assert_eq!(
         err_kind(fx.call(op::UNLINK, serde_json::json!({ "path": reply.path }))),
         ErrorKind::ReferencedElsewhere

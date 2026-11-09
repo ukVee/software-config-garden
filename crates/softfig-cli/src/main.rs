@@ -11,6 +11,7 @@ mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_shared_subtree;
+mod cmd_telemetry;
 mod cmd_uninstall;
 mod cmd_upgrade;
 mod cmd_vault;
@@ -102,6 +103,11 @@ enum Cmd {
     /// (`~/.local/share/softfig/claude-profiles/`); `home` is the default.
     #[command(name = "claude-login", subcommand)]
     ClaudeLogin(cmd_claude_login::ClaudeLoginCmd),
+
+    /// Token telemetry (spec-token-telemetry). `ingest-transcript` is the
+    /// semi-auto capture point, run from claude's `SessionEnd` hook.
+    #[command(subcommand)]
+    Telemetry(cmd_telemetry::TelemetryCmd),
 }
 
 #[derive(Args, Debug)]
@@ -135,5 +141,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Upgrade(args) => cmd_upgrade::run(args),
         Cmd::Uninstall(args) => cmd_uninstall::run(args),
         Cmd::ClaudeLogin(cmd) => cmd_claude_login::run(cmd),
+        Cmd::Telemetry(cmd) => cmd_telemetry::run(cmd),
     }
 }

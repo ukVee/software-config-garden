@@ -14,7 +14,8 @@ fleet_enabled = true
 
 # Which queue model growlightd schedules from (spec-growlight-queue §11).
 # Default `legacy` (today's backlog tables + queues); `v2` reads the v2 files.
-# Unknown values are refused at arm time. The migration session flips it.
+# Unknown values are refused at arm time. The migration session flips it,
+# after `softfig growlight queue migrate` (docs/growlight-queue-migrate.md).
 # queue = "legacy"
 
 # The v2 handshake's grace: seconds a member may linger after growlightd asks
@@ -205,7 +206,8 @@ opencode 2.x loads `AGENTS.md` only. It never falls back to `CLAUDE.md`, ignores
 `agents.<id>.system` carries everything a Claude Code session would have been handed, in
 this order, every piece by `{file:}` reference (house rule 1: never copied):
 
-1. the fleet protocol, `growlight/protocol-fleet.md`;
+1. the fleet protocol, `growlight/protocol-fleet.md` (`growlight/protocol-fleet-v2.md` under
+   `queue = "v2"`);
 2. the step-0 line naming this member's own `agents/<id>/baton.md`;
 3. the garden root `CLAUDE.md` (the map and the house rules);
 4. `growlight/memory-read.md`, the read half of the memory rules;
@@ -276,6 +278,47 @@ halts on them, and it omits the 5h/7d percentages from the baton. Without that o
 session started while the Claude window was spent would halt immediately, and that is
 exactly when the human reaches for opencode.
 
+## When members run: the `[schedule]` table
+
+`[schedule]` in `config/growlight.toml` is an admission filter on top of everything above
+(growlight-schedule spec §3). `fleet_enabled` stays the master arm. With
+`[schedule] enabled = true`, an armed fleet admits a member only while one of its windows
+is open, in local time:
+
+```toml
+[schedule]
+enabled = true
+windows = ["23:00-07:00"]          # every day, every member
+reserve_weekly_pct = { slot1 = 20, "*" = 0 }
+
+[[schedule.window]]
+days     = ["mon-fri"]
+start    = "10:00"
+end      = "20:00"
+backends = ["opencode"]            # and/or members = ["b"]
+```
+
+- **Windows union.** A member is admitted when any window whose filters match it is open.
+  `backends` and `members` must both match. A window that crosses midnight belongs to the
+  day it starts.
+- **A close never kills.** A member mid-iteration finishes, and its re-roll waits for the
+  next open window. Past `close_grace_minutes` (default 45) it is flagged `overrun`.
+- **Timed items.** With `tasks = true` (the default), an item whose `> Not before:` has
+  arrived may run outside every window.
+- **The weekly reserve** is per claude-login slot. A slot is held once its vouchable 7d
+  reading reaches `100 − reserve`, until the window resets. opencode members are never
+  reserve-held, because they draw on no weekly window.
+- **Restart after an edit.** growlightd reads `[schedule]` once, at start, so an edit
+  takes effect after `systemctl --user restart softfig-growlightd`. There is no reload.
+  Each open or close edge is one line in the journal (`schedule: window <label> opened`),
+  not on the coordination bus.
+- **Fail-closed.** An unknown key, a bad time or day, or a `members` id with no `[[fleet]]`
+  agent disables the fleet at load. An unreadable local zone closes the schedule for
+  everyone.
+
+The shipped template (`templates/default-garden/config/growlight.toml`) documents every
+key.
+
 ## Reading a mixed fleet: `growlight status`
 
 `growlight status` reports two lists, and the difference matters:
@@ -285,6 +328,10 @@ exactly when the human reaches for opencode.
 - **`agents`** — one live row per member of an **armed** fleet. Empty while disarmed:
   nothing is assembled then, so there is no runtime state to report and inventing a
   roster echo here would claim liveness the daemon cannot observe.
+
+Its `queue` line is the §11 switch as growlightd read it at boot, `legacy` or `v2`, armed or
+not. `protocol` is the wire version and stays `v1` under either, so read `queue` to see that a
+flip took. A growlightd older than the field prints no `queue` line.
 
 ```
 roster:
@@ -324,6 +371,50 @@ held:
   default/hover-view-sticky        human-only (> Fleet: no)
 ```
 
+Below the lists come the **`[schedule]`** block (growlight-schedule spec §3.8) and the
+live **build caps**. The schedule block is the drive loop's last verdict: whether a
+window is open, the next open or close edge in local time, each member the schedule
+holds and why, the items waiting on their `> Not before:`, and every claude-login
+slot's weekly reserve and budget projection. It reads `schedule (none)` while no
+`[schedule] enabled = true` is loaded; a disarmed fleet isn't the cause, because with no
+growlightd running `status` has nothing to answer it.
+
+```
+schedule      closed (zone America/New_York)
+  next edge     2026-10-31 23:00 -04:00
+  held          a                outside window
+  held          b                overrun
+  waiting       default/084 at 2026-11-01 02:00 -04:00
+  reserve       slot1            keep 20% · 7d used unknown · clear
+  projection    slot1            5h           resets first, resets in 2h
+  projection    slot1            7d           cap in 1d–3d, resets in 4d
+  projection    slot1            reserve 80%  cap in 18h at the earliest, or resets first, resets in 4d
+build caps    (live default — the next spawn's throttle)
+  cargo_build_jobs  2
+  …
+  test_threads      2
+```
+
+- **`overrun`** replaces a member's window reason once it has kept running more than
+  `close_grace_minutes` past its window's close. It raises one `ScheduleOverrun` alert
+  (GUI and log, not the phone). It is information only: the member still finishes its
+  iteration, and nothing is killed. A member spawned while its window was already closed
+  (a due timed item) is never flagged.
+- **A reserve reads `unknown`** when no reading can vouch for the slot's 7d percentage.
+  A headless capture records no percentage, so this is the usual state until an
+  interactive statusline writes one. An unknown reserve does not hold.
+- **`projection`** rows (spec §3.11) say when each claude-login slot's 5h and 7d windows
+  are projected to reach 100%, and, for a slot that keeps a reserve, when its 7d window
+  reaches the reserve threshold. Each row is a range, never a point. The fastest and
+  slowest burn over a few recent look-back spans give its two ends. `at the earliest,
+  or resets first` means only the fastest burn reaches the cap before the window
+  resets, and `resets first` means none does. The samples are the same per-slot
+  readings the reserve reads. They are kept in memory only, so a restarted growlightd
+  reads `unknown` until two fresh measured readings land in the current window. A
+  window reset or an expired reading (`resets_at` passed) also makes the row `unknown`.
+  The projection is information only and holds nothing. opencode (metered) members get
+  no row.
+
 ### Spend accounting is session-scoped, and it is not a cap
 
 - **In memory only.** The counters live in the backend's cells and are lost on a
@@ -345,6 +436,13 @@ kill-handle registries. So `growlight force-stop --hard-kill`, `request_restart`
 `set_resources` throttle and the boot reconciler all address it the same way. The only
 backend-specific parts are argv, the pre-approval it generates, and the wire format it
 parses.
+
+The build caps come from `[build_caps]` in `config/growlight.toml`. `test_threads`
+(default `2`) sets `RUST_TEST_THREADS` on every scope beside `CARGO_BUILD_JOBS`, so a
+member's `cargo test` runs at most that many tests at once per test binary. It
+supersedes the `softfig-growlightd.service.d/50-test-threads.conf` drop-in, which the
+growlight-schedule deploy runbook removes. A `0` disables the fleet at load, because
+libtest refuses it.
 
 Three differences worth knowing when reading logs:
 
@@ -378,6 +476,10 @@ decides on NEXT ACTION alone, as it did before. A default-queue item only gets t
 signal once its doc carries `> Worktree:`, since the default queue has no registry row.
 The repo is read once per session exit, with `git --no-optional-locks`, never once per
 tick.
+
+Under `queue = "v2"` the guard reads the repo the member's claim resolved, the same one
+the dirty-tree guard below reads (queue-v2-parity row 7). A remote or ambiguous repo gives
+no repo signal, the same as an unprobeable legacy repo.
 
 The repo excuses at most three repeats of one NEXT ACTION, and only a repo state not
 already seen during that NEXT ACTION's run. A tree that churns forever, or flips between
@@ -423,9 +525,58 @@ The guard is read-only: it never reverts, stages or commits, and ignored paths s
 on every boot and `/clear`, from the `softfig growlight boot-check` call in the generated
 `inject.sh`. Protocol step 1b tells the member what to do with it.
 
-Not yet covered: under `queue = "v2"` the guard is not wired (the v2 start rewrites the
-member baton from the entry baton, so the entry baton's time is the handoff there). That
-is part of `queue-v2-git-hardening`, before the v2 flip.
+Under `queue = "v2"` the guard runs on the same two spawns (queue-v2-parity row 6). The
+repo is the entry's project `repo` from `queue.toml`, resolved once when the member claims
+the entry and only when the project is local: `~`, `~/…` and `~<you>/…` expand against
+your home, and a remote or ambiguous repo gets no guard. The v2 start rewrites the member
+baton from the entry baton, so a fresh start compares against the entry baton's last
+write, which is its last handoff. An entry with no baton yet is seeded, so any dirt is
+surfaced. A re-roll compares against the member's carried baton, as under legacy. The
+line names the entry rather than `<queue>/<part>`:
+
+```
+growlightd: boot dirty tree: queue-v2-parity (a): /home/u/repo has 11 uncommitted path(s), newest ~533s newer than the baton handoff
+```
+
+## Queue v2: the stack's git probes are bounded
+
+Only under `queue = "v2"`. The §8 stack model reads git (`git_stack.rs`) to record a first
+claim's `parent`/`base`, to spot a stale stack and to decide when a restack's bases can be
+re-recorded. `git_probe.rs` keeps that from stalling the drive loop: one worker-thread probe
+per repo under one overall deadline, memoised for the tick so a claim, the handshake and a
+second entry's first claim share the answers, and a repo whose probe misses its deadline is
+held with a doubling backoff across ticks. A probe that cannot answer is "unknown", never
+"stack is fine": a first claim fails closed (no spawn, retried after the backoff) and
+detection skips the repo until it answers.
+
+`queue show` and `growlight status` read the stack the same way, on a probe cache of their
+own, so a human reading the list never holds a repo for the scheduler. A repo that can't
+answer shows "stack unknown" with the reason, and its started branches show the same, never
+an empty stack or a merged branch.
+
+Under v2 a hold lives only in the entry's `fleet` / `not_before` fields. Both surfaces and the
+TUI print them beside the status as `(human-only)` and `(not before …)`. An item doc's
+`> Fleet:` or `> Not before:` line holds nothing, so `queue show` prints one `warning:` line
+per entry whose doc line disagrees with the entry, along with the `queue fleet` / `queue
+not-before` command that would make the entry match. For the same reason, keeperd's member
+guard stops protecting the `> Fleet:` line once `config/growlight.toml` says `queue = "v2"`.
+Under legacy, or with a switch it can't read, the guard stays on. A member may not write
+`config/growlight.toml`.
+
+`not_before` gates only a `queued` entry's claim: a `paused` or orphaned `active` entry is
+past its claim, so a start time set on one holds nothing. `queue not-before` keeps it all
+the same (it applies if the entry is queued again) and says so with a `note:` line after
+the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
+
+One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
+`slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
+held only the one item whose doc it couldn't read. The journal gets one line per incident,
+naming the file, the line and column, and the parser's reason, and the first tick after
+the fix resumes:
+
+```
+growlightd: v2 queue source failed (scheduling nothing from v2 until it is fixed): growlight/backlog/queue.toml: invalid TOML at line 9, column 9: invalid type: string "no", expected a boolean
+```
 
 ## Known gaps
 

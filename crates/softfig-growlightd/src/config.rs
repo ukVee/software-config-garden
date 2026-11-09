@@ -133,6 +133,13 @@ pub struct BuildCaps {
     /// `None` (the default) leaves it unset; it is read from the config at
     /// spawn and not yet settable live.
     pub cpu_quota: Option<String>,
+    /// `RUST_TEST_THREADS` set on the scope beside `CARGO_BUILD_JOBS` — how many
+    /// test threads one libtest binary runs at once. Low (default 2) keeps a
+    /// `cargo test` from fanning every test out at once on a 2-core, 7.7 GB
+    /// tablet; it replaces the `50-test-threads.conf` service drop-in. An env
+    /// var, so it lands on the next spawn. `None` leaves it unset; a `0` is
+    /// refused when the config loads (libtest rejects it).
+    pub test_threads: Option<u32>,
 }
 
 impl Default for BuildCaps {
@@ -142,6 +149,7 @@ impl Default for BuildCaps {
             memory_high: Some("3G".to_string()),
             cpu_weight: Some(50),
             cpu_quota: None,
+            test_threads: Some(2),
         }
     }
 }
@@ -243,6 +251,8 @@ impl BuildCaps {
             cargo_build_jobs: self.cargo_build_jobs,
             memory_high: self.memory_high.clone(),
             cpu_weight: self.cpu_weight,
+            cpu_quota: self.cpu_quota.clone(),
+            test_threads: self.test_threads,
         }
     }
 
@@ -437,6 +447,7 @@ mod tests {
                 memory_high: Some("6G".to_string()), // set
                 cpu_weight: Some(50), // untouched
                 cpu_quota: None,
+                test_threads: Some(2),
             },
         );
 
@@ -461,6 +472,7 @@ mod tests {
                 memory_high: Some("5G".to_string()),
                 cpu_weight: Some(80),
                 cpu_quota: None,
+                test_threads: Some(2),
             },
         );
     }

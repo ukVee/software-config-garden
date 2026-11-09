@@ -22,7 +22,7 @@
 //! - anything else (`area:`, `item:`, `verb:`, `repo:`, a bare `regression`) —
 //!   the caller's vocabulary, queryable with `list_reports`.
 //!
-//! The routing doc `growlight/reports/CLAUDE.md` carries a daemon-derived
+//! The doc `growlight/reports/index.md` carries a daemon-derived
 //! `<!-- softfig:reports -->` region — a status summary plus one row per
 //! report — re-derived on every report write and on any generic edit that
 //! lands in the folder, so like the notes indexes it never needs a hand edit.
@@ -87,7 +87,7 @@ const MAX_TAGS: usize = 24;
 /// Longest accepted title, in characters.
 const TITLE_MAX: usize = 160;
 
-/// Managed-region tag of the index in the routing doc.
+/// Managed-region tag of the index in [`reports_index`].
 pub const REPORTS_TAG: &str = "reports";
 
 pub fn reports_dir() -> String {
@@ -96,6 +96,10 @@ pub fn reports_dir() -> String {
 
 pub fn reports_claude() -> String {
     format!("{}/CLAUDE.md", reports_dir())
+}
+
+pub fn reports_index() -> String {
+    format!("{}/index.md", reports_dir())
 }
 
 // ---- pure tag core ---------------------------------------------------------
@@ -311,13 +315,10 @@ fn with_log_entry(content: &str, entry: &str) -> String {
         .unwrap_or_else(|_| format!("{}\n\n## {LOG_HEADING}\n\n{entry}\n", content.trim_end()))
 }
 
-/// The routing doc a first report creates. Navigator: no reviewed stamp; the
-/// index region is appended by the first re-derivation.
+/// The routing doc a first report creates. Navigator: no reviewed stamp, and
+/// no index: that lives in [`reports_index`] so this stays small enough to
+/// auto-load.
 pub fn reports_claude_stub() -> String {
-    let types: Vec<String> = TYPES
-        .iter()
-        .map(|(ty, meaning)| format!("- `type:{ty}` — {meaning}"))
-        .collect();
     format!(
         "# {dir}/\n\n\
          Reports agents (and the human) file about things they notice but should not \
@@ -325,6 +326,31 @@ pub fn reports_claude_stub() -> String {
          gap, docs that drifted, an open question, a blocker, an idea. One numbered doc \
          per report; every machine-readable fact about it is a **semantic tag** on its \
          `> Tags:` line, so reports can be queried by any combination of tags.\n\n\
+         ## Children\n\n\
+         - `index.md` — the derived index and the tag reference. Prefer `list_reports` \
+         to reading it.\n\n\
+         ## How to behave here\n\n\
+         - File with `file_report`, move with `update_report` (closing needs a note: the \
+         fixing commit, the task it moved to, the duplicate), query with `list_reports` \
+         (`ns:*` matches any value in a namespace). Never edit a report's `> Tags:` line \
+         or the index by hand.\n\
+         - A report is not a fix. Turning one into work means a backlog item, then \
+         `update_report` to `triaged` with the item named.\n\
+         - Don't delete reports — archive them.\n",
+        dir = reports_dir(),
+    )
+}
+
+/// The index doc the first re-derivation creates: the tag reference, then the
+/// managed region.
+pub fn reports_index_stub() -> String {
+    let types: Vec<String> = TYPES
+        .iter()
+        .map(|(ty, meaning)| format!("- `type:{ty}` — {meaning}"))
+        .collect();
+    format!(
+        "# {dir}/ index\n\n\
+         The table is derived by keeperd from the reports on disk; never edit it by hand.\n\n\
          ## Tags\n\n\
          Tags are `namespace:value` or a bare word, lowercase. Four namespaces carry \
          meaning the daemon enforces; every other namespace is yours (`area:`, `item:`, \
@@ -335,15 +361,7 @@ pub fn reports_claude_stub() -> String {
          backlog item, a decision), then `resolved`, `wontfix`, or `duplicate`.\n\
          - `by:` — daemon-stamped from the filer's `from`.\n\n\
          A blocker, a security report, or anything `severity:critical` also alerts \
-         `@human` on the coordination bus.\n\n\
-         ## How to behave here\n\n\
-         - File with `file_report`, move with `update_report` (closing needs a note: the \
-         fixing commit, the task it moved to, the duplicate), query with `list_reports` \
-         (`ns:*` matches any value in a namespace). Never edit a report's `> Tags:` line \
-         or the index below by hand.\n\
-         - A report is not a fix. Turning one into work means a backlog item, then \
-         `update_report` to `triaged` with the item named.\n\
-         - Don't delete reports — archive them.\n",
+         `@human` on the coordination bus.\n",
         dir = reports_dir(),
         types = types.join("\n"),
         sev = SEVERITIES.map(|s| format!("`{s}`")).join(", "),
@@ -438,13 +456,24 @@ fn render_index(rows: &[Row]) -> String {
     s
 }
 
-/// Re-derive the index region in the routing doc from the reports on disk,
-/// writing the doc so the caller's in-flight commit folds it in. Best-effort
-/// like every index: a missing or vault-protected routing doc is skipped.
-/// Returns the routing doc's path when it rewrote it.
+/// Re-derive the index region in [`reports_index`] from the reports on disk,
+/// writing the doc so the caller's in-flight commit folds it in, and creating it
+/// on first use. Best-effort like every index: a vault-protected doc is skipped.
+/// A garden from before the index moved loses the old region from its routing
+/// doc here. Returns the index doc's path when it rewrote it.
 pub fn refresh_index(wt: &WorkTree, inner: &DaemonInner) -> Option<String> {
-    let host = reports_claude();
-    let content = crate::actions::sections::read_if_unprotected(wt, inner, &host)?;
+    let routing = reports_claude();
+    if let Some(doc) = crate::actions::sections::read_if_unprotected(wt, inner, &routing)
+        && managed::has_region(&doc, REPORTS_TAG)
+    {
+        wt.write_derived(&routing, managed::remove(&doc, REPORTS_TAG).as_bytes()).ok()?;
+    }
+    let host = reports_index();
+    let content = match crate::actions::sections::read_if_unprotected(wt, inner, &host) {
+        Some(content) => content,
+        None if !wt.exists(&host) => reports_index_stub(),
+        None => return None,
+    };
     let rows = collect(wt, inner);
     let new = managed::upsert(&content, REPORTS_TAG, &render_index(&rows));
     if new == content {
@@ -455,13 +484,15 @@ pub fn refresh_index(wt: &WorkTree, inner: &DaemonInner) -> Option<String> {
 }
 
 /// The generic-edit hook (`index::refresh_index_for`): a write landing on the
-/// routing doc or on a numbered report re-derives the index, so a hand edit
+/// routing doc, the index doc or a numbered report re-derives the index, so a hand edit
 /// of a report's tags can't leave the table lying.
 pub fn refresh_index_for(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Option<String> {
     let path = Path::new(rel);
     let in_dir = path.parent().and_then(|p| p.to_str()) == Some(reports_dir().as_str());
     let name = path.file_name().and_then(|s| s.to_str())?;
-    if in_dir && (name == "CLAUDE.md" || conventions::parse_note_number(name).is_some()) {
+    if in_dir
+        && (name == "CLAUDE.md" || name == "index.md" || conventions::parse_note_number(name).is_some())
+    {
         refresh_index(wt, inner)
     } else {
         None
@@ -829,11 +860,14 @@ mod tests {
     }
 
     #[test]
-    fn the_stub_lists_every_type() {
-        let stub = reports_claude_stub();
+    fn the_index_stub_lists_every_type_and_the_routing_doc_stays_small() {
+        let index = reports_index_stub();
         for (ty, _) in TYPES {
-            assert!(stub.contains(&format!("`type:{ty}`")), "{ty}");
+            assert!(index.contains(&format!("`type:{ty}`")), "{ty}");
         }
-        assert!(!stub.contains("Last reviewed:"), "navigator docs carry no stamp");
+        let routing = reports_claude_stub();
+        assert!(!routing.contains("Last reviewed:"), "navigator docs carry no stamp");
+        assert!(!managed::has_region(&routing, REPORTS_TAG), "the index lives in index.md");
+        assert!(routing.contains("`index.md`"), "the routing doc points at it");
     }
 }

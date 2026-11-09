@@ -49,7 +49,7 @@
 //! [`DriveLoop::tick`] takes `now` (injected Unix seconds), like every pure core;
 //! only [`spawn_drive_loop`]'s live thread reads the wall clock.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -60,10 +60,13 @@ use softfig_ipc::item_repo::{boot_signal, Handoff, RepoState};
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
-use crate::baton_store::FsEntryBatonStore;
+use crate::baton_store::{with_base_line, FsEntryBatonStore};
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
+use crate::first_claim::{self, FirstClaim};
+use crate::git_probe::ProbeCache;
+use crate::git_stack::{self, Repo};
 use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
@@ -71,8 +74,14 @@ use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{
     classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
-use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
+use crate::schedule::{
+    apply_reserve, evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone,
+    ZoneSource,
+};
+use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
+use crate::v2_repo;
 use crate::state::State;
+use crate::telemetry_capture::TelemetryTags;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
     Supervisor, STALL_LIMIT,
@@ -80,7 +89,7 @@ use crate::supervisor::{
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 use crate::v2_source::V2Load;
 use softfig_ipc::model_choice::{member_default, ModelChoice};
-use softfig_ipc::queue_v2::EntryStatus;
+use softfig_ipc::queue_v2::{EntryKind, EntryStatus, RestackBranch};
 
 /// How often the live drive loop ticks: schedule, observe health, honor control,
 /// re-roll. Agents run for minutes per session, so a ~1s cadence is ample — this
@@ -113,6 +122,17 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
     /// has no markers.
     fn claim_hold(&self, _queue: &str, _part: &str) -> Option<ClaimHold> {
         None
+    }
+
+    /// Does `part`'s item doc declare a `> Not before:` that has arrived?
+    /// (growlight-schedule slice 003, §3.5.) While the schedule is closed with
+    /// `tasks = true`, such an item opens its own window: a member the schedule
+    /// would otherwise hold may claim it. Read fresh like
+    /// [`claim_hold`](Self::claim_hold); an unreadable doc, no line, a future or
+    /// unparseable time all answer `false`. Defaults to `false` — a source with
+    /// no item docs has no timed items.
+    fn timed_due(&self, _queue: &str, _part: &str) -> bool {
+        false
     }
 
     /// The current content of `part`'s item doc (claude-login-pool-wiring slice
@@ -694,6 +714,16 @@ pub trait RepoProbe: Send + Sync + fmt::Debug {
     /// spin guard then decides on NEXT ACTION alone. The path is the one probed,
     /// so the boot dirty-tree guard (task 064) names exactly the repo it read.
     fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)>;
+
+    /// The v2 resolution (queue-v2-parity slice 005): the local repo a v2
+    /// entry of `project` lands in ([`crate::v2_repo::local_repo`], against
+    /// this probe's `$HOME` / `$USER`), or `None` for a remote or ambiguous
+    /// repo. Read once at claim and carried on the [`V2Assignment`].
+    fn v2_repo(&self, project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf>;
+
+    /// [`RepoState`] of an already-resolved `repo` — the v2 twin of
+    /// [`RepoProbe::repo_state`]'s read half. `None` when the read failed.
+    fn probe_repo(&self, repo: &std::path::Path) -> Option<RepoState>;
 }
 
 /// The default [`RepoProbe`]: no repo signal, so the spin guard is the
@@ -703,6 +733,14 @@ pub struct NoRepoProbe;
 
 impl RepoProbe for NoRepoProbe {
     fn repo_state(&self, _queue: &str, _part: &str) -> Option<(std::path::PathBuf, RepoState)> {
+        None
+    }
+
+    fn v2_repo(&self, _project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn probe_repo(&self, _repo: &std::path::Path) -> Option<RepoState> {
         None
     }
 }
@@ -807,6 +845,14 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
     /// `None` so the deferred/test sources keep the guard inert; the live
     /// [`crate::baton_store::FsBatonStore`] reads the real file.
     fn baton_mtime(&self, _agent: &str) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// The `slice:` `agent`'s baton names, when that baton is on `item` — the
+    /// slice a spawn's token-telemetry rows are tagged with (token-telemetry-p1
+    /// slice 004). `None` when the baton is on another item, names no slice, or
+    /// is unreadable. The default is `None`, like [`baton_mtime`](Self::baton_mtime).
+    fn baton_slice(&self, _agent: &str, _item: &str) -> Option<String> {
         None
     }
 }
@@ -927,18 +973,22 @@ impl BatonSeeder for DeferredBatonSeeder {
 /// from [`Supervisor::tick_with`]'s pre-spawn hook. Read-only: it journals the
 /// signal and puts it in the member's baton; it never reverts, stages or
 /// commits. Returns whether it surfaced a signal.
+///
+/// `work` names the unit for the line (`<queue>/<part>`, or a v2 entry), and
+/// `read` is the repo it lands in with its state — legacy reads it through
+/// [`RepoProbe::repo_state`], v2 through [`v2_repo_read`]. `None` = no repo
+/// signal, so nothing to surface.
 fn boot_guard(
-    repo_probe: &dyn RepoProbe,
     seeder: &dyn BatonSeeder,
     agent: &str,
-    queue: &str,
-    part: &str,
+    work: &str,
+    read: Option<(std::path::PathBuf, RepoState)>,
     handoff: Handoff,
 ) -> bool {
-    let Some((repo, state)) = repo_probe.repo_state(queue, part) else {
+    let Some((repo, state)) = read else {
         return false;
     };
-    let Some(signal) = boot_signal(&format!("{queue}/{part} ({agent})"), &repo, &state, handoff) else {
+    let Some(signal) = boot_signal(&format!("{work} ({agent})"), &repo, &state, handoff) else {
         return false;
     };
     eprintln!("growlightd: {signal}");
@@ -946,6 +996,19 @@ fn boot_guard(
         eprintln!("growlightd: boot dirty tree: failed to warn {agent}: {e}");
     }
     true
+}
+
+/// A v2 member's repo and its state, for the boot guard and the spin guard
+/// (queue-v2-parity rows 6/7): the repo the claim resolved
+/// ([`V2Assignment::repo`]), probed now. `None` for a remote or ambiguous
+/// repo, or a failed read — no repo signal, as legacy gives none.
+fn v2_repo_read(
+    repo_probe: &dyn RepoProbe,
+    assignment: &V2Assignment,
+) -> Option<(std::path::PathBuf, RepoState)> {
+    let repo = assignment.repo.clone()?;
+    let state = repo_probe.probe_repo(&repo)?;
+    Some((repo, state))
 }
 
 // ---- queue v2 scheduling seams (queue-v2-scheduling slice 006) ----
@@ -968,15 +1031,23 @@ pub trait V2QueueSource: Send + Sync + fmt::Debug {
 }
 
 /// The seam the loop claims a picked v2 unit through (spec §6.3 step 3's claim
-/// at assignment, slice 005's op): keeperd's `queue_v2_claim({entry, unit?})`.
-/// `Ok(())` means the unit is now this member's (the op's idempotent
-/// re-claim counts); `Err` aborts the spawn fail-closed, exactly like the
-/// legacy [`PartClaimer`]. The live impl is
+/// at assignment, slice 005's op): keeperd's
+/// `queue_v2_claim({entry, unit?, parent?, base?})`. `Ok(())` means the unit is
+/// now this member's (the op's idempotent re-claim counts); `Err` aborts the
+/// spawn fail-closed, exactly like the legacy [`PartClaimer`]. The live impl is
 /// [`crate::claim::KeeperdV2Claimer`] over the keeperd socket.
 pub trait V2Claimer: Send + Sync + fmt::Debug {
     /// Claim `entry` (the milestone identity — `"parent/sub"` for subs) and its
-    /// `unit` slice id (`None` for a task, restack, or close-out).
-    fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String>;
+    /// `unit` slice id (`None` for a task, restack, or close-out). `first` is
+    /// the §8 first-claim recording (queue-v2-git slice 002), present only on a
+    /// never-claimed entry — a resume or re-claim passes `None` and the op
+    /// leaves any recorded base untouched.
+    fn claim_v2(
+        &self,
+        entry: &str,
+        unit: Option<&str>,
+        first: Option<&FirstClaim>,
+    ) -> Result<(), String>;
 }
 
 /// The seam the loop item-parks a v2 ENTRY through when its member exits on a
@@ -993,6 +1064,35 @@ pub trait V2ItemParker: Send + Sync + fmt::Debug {
     /// and counters until a member resumes it (queue-v2-scheduling slice 009).
     /// A pending human change on the entry lands instead (finding 8).
     fn pause_entry_v2(&self, entry: &str) -> Result<(), String>;
+}
+
+/// The seam the loop enqueues an auto-detected §8 restack through (queue-v2-git
+/// slice 003): keeperd's `queue_v2_enqueue_restack({project, stack})` — growlightd
+/// detected a stale stack (read-only git) and keeperd enqueues ONE urgent restack
+/// row for the project's repo (idempotent per repo) + generates the full doc. Fail-soft
+/// in the drive loop: a failed enqueue is logged once per edge ([`FailSoftEdges`]),
+/// never wedges a claim or handoff.
+/// The live impl is [`crate::claim::KeeperdV2RestackEnqueuer`] over the keeperd
+/// socket.
+pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
+    /// Enqueue a restack for `project` with the ordered `stack` growlightd
+    /// resolved. Returns the new entry id (`None` on the idempotent no-op), or
+    /// `Err(reason)`.
+    fn enqueue_restack(&self, project: &str, stack: &[RestackBranch]) -> Result<Option<String>, String>;
+}
+
+/// The seam the loop re-records restacked branches' bases through (§8,
+/// queue-v2-git slice 004): keeperd's
+/// `queue_v2_re_record_bases({entries: [{entry, base}]})` — growlightd
+/// recomputed each branch's base read-only with `git merge-base` after a
+/// restack completed, and keeperd writes them back. Fail-soft in the drive
+/// loop: a failed write is logged once per edge ([`FailSoftEdges`]) and leaves
+/// the rows due, so the next tick retries it. The live impl is
+/// [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
+pub trait V2BaseReRecorder: Send + Sync + fmt::Debug {
+    /// Re-record `entries`' bases — `(entry, new base)` pairs — and mark the
+    /// archived restack rows `settled` as answered, in one write.
+    fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String>;
 }
 
 /// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
@@ -1108,6 +1208,10 @@ pub struct V2Assignment {
     /// declared (§6.4). A claude member's choice is always `claude` (its model
     /// is the harness's own, not settable from this path).
     pub resolved_model: ModelChoice,
+    /// The local repo the entry's work lands in, resolved once at claim
+    /// ([`RepoProbe::v2_repo`] over the entry's project). `None` for a remote
+    /// or ambiguous repo: the boot and spin guards then get no repo signal.
+    pub repo: Option<std::path::PathBuf>,
 }
 
 /// A v2 session the loop ended after its member-verb handoff (§6.3 step 4).
@@ -1136,6 +1240,49 @@ pub struct HeldStart {
     pub agent: String,
     /// The non-admit outcome (`Queued` / `Refused` / `SpawnFailed`).
     pub outcome: StartOutcome,
+}
+
+/// A v2 claim that failed closed this tick (V3). Carries the reason so a
+/// persistent failure is diagnosable from the journal and the alert instead of
+/// a bare "part claim failed" hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2ClaimFailure {
+    /// The member whose start failed.
+    pub agent: String,
+    /// The top-level entry it tried to claim.
+    pub entry: String,
+    /// Why the claim could not be made (the first-claim git error, or keeperd's).
+    pub reason: String,
+    /// Consecutive failures for this entry, this one included.
+    pub streak: u32,
+    /// Seconds before the entry is picked again.
+    pub retry_secs: i64,
+}
+
+/// The alert for a restack the loop will not run because `branch` tracks an
+/// upstream (V1): it names the repo's project and the branch so the human can
+/// rebase it by hand or untrack it.
+fn restack_blocked_alert(project: &str, branch: &str) -> String {
+    format!("restack {project}: {branch} tracks an upstream")
+}
+
+/// The alert for a restack whose worktree was left mid-rebase (V4): the bases
+/// are not re-recorded, and the human is told which worktree to look at.
+fn restack_rebasing_alert(project: &str, worktree: &str) -> String {
+    format!("restack {project}: worktree {worktree} is mid-rebase; bases not re-recorded")
+}
+
+/// Consecutive claim failures after which the human is alerted (V3).
+const V2_CLAIM_ALERT_STREAK: u32 = 3;
+/// First retry delay after a v2 claim failure; doubles per consecutive failure.
+const V2_CLAIM_BACKOFF_BASE_SECS: i64 = 5;
+/// The longest a failing v2 claim waits between retries.
+const V2_CLAIM_BACKOFF_MAX_SECS: i64 = 300;
+
+/// The retry delay after the `streak`-th consecutive v2 claim failure.
+pub(crate) fn v2_claim_backoff_secs(streak: u32) -> i64 {
+    let doublings = streak.saturating_sub(1).min(16);
+    (V2_CLAIM_BACKOFF_BASE_SECS << doublings).min(V2_CLAIM_BACKOFF_MAX_SECS)
 }
 
 /// A member whose FRESH start was skipped in step 3 BEFORE admission — no workable
@@ -1191,6 +1338,10 @@ pub struct HeldPart {
 pub struct TickReport {
     /// Agents started this tick, with their scheduler assignment.
     pub started: Vec<Assignment>,
+    /// The subset of `started` whose first session's token-telemetry rows carry
+    /// no `slice_id`: the seed baton named no slice (a fresh seed never does),
+    /// so growlightd attributes nothing rather than guess one.
+    pub unattributed: Vec<Assignment>,
     /// Agents started this tick under queue v2, with their `(entry, unit)`
     /// assignment and the resolved model the spawn carried (slice 006). Empty on
     /// every legacy tick.
@@ -1209,8 +1360,17 @@ pub struct TickReport {
     /// growlightd alerts once, so an item lands here on the tick its block is
     /// first seen, not every tick it persists.
     pub v2_walk_blocked: Vec<String>,
+    /// Restacks withheld because a stack branch tracks an upstream (V1): the
+    /// loop never rewrites a pushed branch, so the human is alerted instead.
+    pub v2_restack_blocked: Vec<String>,
+    /// v2 fail-soft seams that started failing or recovered this tick (V20),
+    /// already worded for the journal.
+    pub v2_fail_soft: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
+    /// v2 first-claim/claim failures this tick (V3): the reason, so the journal
+    /// and the alert can name why an entry cannot be claimed, plus the streak.
+    pub v2_claim_failures: Vec<V2ClaimFailure>,
     /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
     /// part was already spoken for (task 042's diagnosability half). Narrated as a
     /// hold so a held fleet member names itself in the journal instead of stalling
@@ -1308,6 +1468,22 @@ pub struct TickReport {
     /// edge-logged by the [`TickLogger`] on the tripping tick. `false` on every tick of
     /// an unbounded (`max_iterations` absent) run — the default.
     pub bounded_run_stopped: bool,
+    /// Members the `[schedule]` holds this tick, with the reason
+    /// (growlight-schedule slice 003, §3.4): no claim, no spawn, no re-roll. A
+    /// member admitted only to due timed items (`tasks = true`, §3.5) is listed
+    /// with its window reason too. Empty while no schedule is enabled.
+    ///
+    /// A test observation: nothing outside the tests reads it. The live
+    /// surfaces take the verdict itself (`FleetStatusReply.schedule`).
+    pub schedule_held: Vec<(String, HoldReason)>,
+    /// The schedule's open/close edge crossed this tick, as its one journal
+    /// line (`schedule: window <label> opened|closed`). `None` on every other
+    /// tick, and always while no schedule is enabled.
+    pub schedule_edge: Option<String>,
+    /// Members that went past `close_grace_minutes` after their window closed
+    /// this tick (growlight-schedule slice 006, §3.4) — each raises one
+    /// [`NotifyEvent::ScheduleOverrun`]. Nothing is killed.
+    pub schedule_overrun: Vec<String>,
 }
 
 /// The queue-v2 scheduling seams (slice 006) — the v2 siblings of the legacy
@@ -1329,6 +1505,13 @@ pub struct V2Seams {
     /// The v2 item-park (`queue_v2_set_status(entry, blocked)`) over the keeperd
     /// socket.
     pub parker: Box<dyn V2ItemParker>,
+    /// The v2 auto-restack enqueue (`queue_v2_enqueue_restack`) over the keeperd
+    /// socket — §8 restack detection (queue-v2-git slice 003) at daemon start,
+    /// claim and handshake.
+    pub restacker: Box<dyn V2RestackEnqueuer>,
+    /// The v2 base re-record (`queue_v2_re_record_bases`) over the keeperd
+    /// socket — §8 re-record (queue-v2-git slice 004) after a restack completes.
+    pub re_recorder: Box<dyn V2BaseReRecorder>,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -1443,6 +1626,23 @@ pub struct DriveLoop {
     /// legacy loop (nothing to consult); a loop whose daemon reads
     /// `queue = "v2"` but was built without seams schedules nothing (fail-closed).
     v2: Option<V2Seams>,
+    /// Whether the §8 restack scan has run once at boot (queue-v2-git slice 003).
+    /// Set on the first v2 tick after the snapshot loads; a daemon restart
+    /// re-runs it (the spec's "at daemon start").
+    restack_boot_done: bool,
+    /// The §8 git probes (queue-v2-git V13): bounded worker-thread probes whose
+    /// answers are shared per repo for the tick and backed off across ticks.
+    git_probes: ProbeCache,
+    /// Top-level entry ids that handed off this tick (queue-v2-git slice 003):
+    /// the handshake runs in step 1, before the snapshot loads, so its §8
+    /// restack scan is deferred here and drained once the snapshot is read.
+    v2_handoff_scans: std::collections::BTreeSet<String>,
+    /// Projects whose due re-record already alerted the human (V17). The row
+    /// stays due and retries every tick, so the alert goes out once per project
+    /// until that project has nothing due.
+    v2_re_record_alerted: std::collections::BTreeSet<String>,
+    /// Which v2 fail-soft seams are failing, so each logs once per edge (V20).
+    v2_fail_soft: FailSoftEdges,
     /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
     /// of `assignments`, recorded on the member's v2 fresh start and carried
     /// across re-rolls (a re-roll re-spawns on the same spec, model included).
@@ -1462,6 +1662,11 @@ pub struct DriveLoop {
     /// Paused entries → the member that paused them, the §2 step-2 resume
     /// preference overlaid as the entry's `holder`.
     v2_paused_by: std::collections::BTreeMap<String, String>,
+    /// Entries whose claim failed closed, with the consecutive-failure streak and
+    /// the time before which the entry is not picked again (V3). Cleared when the
+    /// entry claims or leaves the list. Without it one entry whose claim keeps failing is re-picked
+    /// and re-failed every ~1 s tick, head-of-line blocking its member.
+    v2_claim_backoff: std::collections::BTreeMap<String, (u32, i64)>,
     /// Entries whose §4 walk stops at a `blocked` item, already alerted (§2
     /// "growlightd alerts once"): entry → the blocked item's address. In memory
     /// like the v2 source's alert memory. An entry leaves when its walk moves
@@ -1473,8 +1678,8 @@ pub struct DriveLoop {
     v2_to_pause: std::collections::BTreeMap<String, String>,
     /// Accepted model changes (§6.4): the next session of `(entry, unit)` runs
     /// on this model, overlaid as the unit's allowed list until that unit is
-    /// spawned again — so the backend match routes it to a member that can
-    /// run it, and the spawn resolves to it.
+    /// spawned again or its entry leaves the list — so the backend match routes
+    /// it to a member that can run it, and the spawn resolves to it.
     v2_model_overrides: Vec<(String, Unit, ModelChoice)>,
     /// Claim holds the claim-time marker read found (task 068), each with the tick
     /// it was read: re-applied to every snapshot so a held part is rolled past
@@ -1581,7 +1786,50 @@ pub struct DriveLoop {
     /// after EXACTLY the configured count and never resumes without a daemon restart
     /// (which re-arms a fresh bounded batch). Never set when `max_iterations` is `None`.
     iteration_bound_reached: bool,
+    /// Where the `[schedule]` reads local time (growlight-schedule slice 003).
+    /// Consulted only while a schedule is enabled; the live [`SystemZone`]
+    /// reloads when `$TZ` or `/etc/localtime` changes.
+    zone: Box<dyn ZoneSource>,
+    /// Whether the schedule was open last tick, and the windows open then —
+    /// the edge memory behind the one `schedule: …` journal line per open/close.
+    /// `None` while no schedule is enabled.
+    schedule_last: Option<(bool, Vec<String>)>,
+    /// The instant the schedule was last seen to close (open last tick, closed
+    /// this one). The clock is read no earlier than this, so a backward step
+    /// across a close cannot re-open the window ([`clamp_to_last_close`]).
+    /// `None` while no schedule is enabled.
+    schedule_closed_at: Option<i64>,
+    /// The claude-login slots at or past their weekly reserve this tick
+    /// (growlight-schedule slice 004), rewritten from every verdict. Shared
+    /// with the claude backend's pool-slot picker through
+    /// [`with_reserve_view`](Self::with_reserve_view), which skips these while
+    /// the pool has a clear slot.
+    reserve_held: Arc<Mutex<BTreeSet<String>>>,
+    /// Running members whose window closed on them, and when (slice 006,
+    /// §3.4): the clock behind the `close_grace_minutes` overrun flag. A
+    /// member enters only on the tick its window closes while it runs, so one
+    /// spawned while closed (a due timed item) is never flagged; it leaves when
+    /// it exits or its window reopens.
+    window_closed_at: BTreeMap<String, i64>,
+    /// The members a window held last tick — the close transition's memory.
+    window_held_last: BTreeSet<String>,
+    /// The members past their close grace as of last tick, so each overrun
+    /// notifies once.
+    overrun: BTreeSet<String>,
+    /// Every pooled slot's usage samples, in memory, and this tick's budget
+    /// projection from them (slice 008, §3.11).
+    projections: crate::projection::Projections,
+    projection: Vec<softfig_ipc::growlightd::PoolProjection>,
+    /// Per part, whether its item doc declares a `> Not before:` that has
+    /// arrived, and when that was read — the `tasks = true` exception (§3.5).
+    /// Re-read after [`TIMED_DUE_TTL_SECS`], like a claim hold.
+    timed_due: BTreeMap<(String, String), (bool, i64)>,
 }
+
+/// How long a [`QueueSource::timed_due`] read is trusted — the claim-hold
+/// re-read interval, so a closed schedule with `tasks = true` costs one doc read
+/// per candidate part per minute, not per tick.
+const TIMED_DUE_TTL_SECS: i64 = 60;
 
 impl DriveLoop {
     /// Assemble a drive loop over its seams + fleet. The `health` and `samples`
@@ -1636,11 +1884,17 @@ impl DriveLoop {
             assignments: std::collections::BTreeMap::new(),
             model_refused_items: std::collections::BTreeMap::new(),
             v2: None,
+            restack_boot_done: false,
+            git_probes: ProbeCache::new(),
+            v2_handoff_scans: std::collections::BTreeSet::new(),
+            v2_re_record_alerted: std::collections::BTreeSet::new(),
+            v2_fail_soft: FailSoftEdges::default(),
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
             v2_rolled: std::collections::BTreeMap::new(),
             v2_paused_by: std::collections::BTreeMap::new(),
+            v2_claim_backoff: std::collections::BTreeMap::new(),
             v2_to_pause: std::collections::BTreeMap::new(),
             v2_model_overrides: Vec::new(),
             holds: std::collections::BTreeMap::new(),
@@ -1660,7 +1914,27 @@ impl DriveLoop {
             max_iterations: None,
             iterations_completed: 0,
             iteration_bound_reached: false,
+            zone: Box::new(SystemZone::new()),
+            schedule_last: None,
+            schedule_closed_at: None,
+            reserve_held: Arc::default(),
+            window_closed_at: BTreeMap::new(),
+            window_held_last: BTreeSet::new(),
+            overrun: BTreeSet::new(),
+            projections: Default::default(),
+            projection: Vec::new(),
+            timed_due: BTreeMap::new(),
         }
+    }
+
+    /// Install the local-time source the `[schedule]` is evaluated against
+    /// (growlight-schedule slice 003). A builder like
+    /// [`with_max_iterations`](Self::with_max_iterations): the live loop keeps
+    /// the default [`SystemZone`]; a test injects a fixed zone or a failure.
+    #[must_use]
+    pub fn with_zone(mut self, zone: Box<dyn ZoneSource>) -> Self {
+        self.zone = zone;
+        self
     }
 
     /// Set the bounded-run limit (task 040): after `max` completed member work-chunks
@@ -1706,6 +1980,16 @@ impl DriveLoop {
         holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     ) -> Self {
         self.rate_limit_holds = holds;
+        self
+    }
+
+    /// Share the reserve-held slot set (growlight-schedule slice 004) with the
+    /// claude backend's pool-slot picker, in place of the owned default. The
+    /// fleet assembly hands the same `Arc` to
+    /// [`crate::claude_backend::ClaudeBackend::with_reserve_view`].
+    #[must_use]
+    pub fn with_reserve_view(mut self, reserve_held: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.reserve_held = reserve_held;
         self
     }
 
@@ -1783,6 +2067,7 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        self.git_probes.begin_tick(now);
         // Per-slot rate-limit hold re-scan (slice 002 M-B part 1). First tick
         // seeds from disk BEFORE any admission read; a non-first tick re-scans
         // every N ticks so a sibling writer reaches admission without a daemon
@@ -2097,12 +2382,18 @@ impl DriveLoop {
                             .filter(|e| e.is_model_refused())
                             .map(|e| e.text.clone())
                     };
-                    let repo_probe = &self.repo_probe;
+                    // A v2 member reads the repo its claim resolved (queue-v2-parity
+                    // row 7); the two maps never both hold one agent.
+                    let repo_probe = self.repo_probe.as_ref();
                     let assignment = self.assignments.get(agent);
+                    let v2_assignment = self.v2_assignments.get(agent);
                     let repo_state = || {
-                        repo_read = assignment
-                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part))
-                            .map(|(_, state)| state);
+                        repo_read = match (assignment, v2_assignment) {
+                            (Some((queue, part)), _) => repo_probe.repo_state(queue, part),
+                            (None, Some(assignment)) => v2_repo_read(repo_probe, assignment),
+                            (None, None) => None,
+                        }
+                        .map(|(_, state)| state);
                         repo_read.clone()
                     };
                     self.supervisor.poll_with_progress(
@@ -2478,7 +2769,28 @@ impl DriveLoop {
         // on the NEXT tick (not the one that parked it); step 2 below is
         // where a cleared park actually re-rolls. The slice-003 alert is
         // not re-emitted here — the reconcile keeps the single alert single.
-        self.reconcile_model_refused(now, &fleet);
+        //
+        // This tick's one v2 read (F7), shared with the v2 scheduling pass
+        // below. Read when that pass runs or a v2 park needs its chain;
+        // nothing between here and that pass writes the queue.
+        let any_v2_park = self.supervisor.agents_in_model_refused_park().iter().any(|agent| {
+            matches!(
+                self.model_refused_items.get(agent),
+                Some(ModelRefusedPart::V2 { .. }),
+            )
+        });
+        let v2_load = if v2_mode || any_v2_park {
+            self.v2.as_mut().map(|seams| seams.source.load())
+        } else {
+            None
+        };
+        let mut v2_snapshot = match v2_load {
+            Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
+            // Schedule nothing from v2 this tick (the source alerted already,
+            // once), and a v2 park resolves its member default.
+            Some(V2Load::Absent) | Some(V2Load::Failed { .. }) | None => None,
+        };
+        self.reconcile_model_refused(now, &fleet, v2_snapshot.as_ref());
 
         // A live hold gates spawns this tick (steps 2 + 3), the pre-spawn HOLD twin
         // of `offline`: no re-roll, no fresh start, no backoff, no crash count — the
@@ -2518,17 +2830,31 @@ impl DriveLoop {
         let bound_reached = self.iteration_bound_reached;
         report.bounded_run_stopped = bound_reached;
 
+        // The `[schedule]` (growlight-schedule slice 003, spec §3.3–3.5): one
+        // verdict per tick, applied beside the per-member rate-limit filter in
+        // both modes' steps 2 + 3. A held member gets no claim, no spawn and no
+        // re-roll; a running member is never touched, so a window's close lets
+        // the current iteration finish. Evaluated from `now` alone, so a wake
+        // from suspend into an open window admits on that tick (a late open, no
+        // catch-up). No schedule, or `enabled = false`, is `ungated`: nobody is
+        // held and every path below is byte-identical to the unscheduled loop.
+        let schedule = self.daemon.schedule().filter(|cfg| cfg.enabled);
+        let tasks = schedule.as_ref().is_some_and(|cfg| cfg.tasks);
+        let verdict = self.schedule_verdict(schedule.as_ref(), &fleet, now);
+        *self.reserve_held.lock().unwrap() = verdict.reserve_held_slots();
+        report.schedule_edge = self.schedule_edge(schedule.is_some(), &verdict);
+        report.schedule_held = verdict.held.iter().map(|(a, r)| (a.clone(), *r)).collect();
+        report.schedule_overrun = self.track_overrun(schedule.as_ref(), &verdict, &fleet, now);
+        let admission = |agent: &str| verdict.admission(agent, tasks);
+
         if v2_mode {
-            let mut snapshot = match self.v2.as_mut().map(|seams| seams.source.load()) {
-                Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
-                Some(V2Load::Absent) | Some(V2Load::Failed { .. }) | None => {
-                    // Schedule nothing this tick (the source alerted already, once).
-                    // Health/control (step 1) still ran — exits and boundary stops
-                    // are observed; only the v2 spawns are held.
-                    None
-                }
-            };
+            // No snapshot schedules nothing this tick. Health/control (step 1)
+            // still ran — exits and boundary stops are observed; only the v2
+            // spawns are held.
+            let mut snapshot = v2_snapshot.take();
             if let Some(snapshot) = snapshot.as_mut() {
+                // The `not_before` hold reads the loop's own clock (§2 Holds).
+                snapshot.now_unix = now;
                 // §2's blocked walk: alert once per stopped entry, whatever the
                 // gates below decide about spawning.
                 self.note_v2_blocked_walks(snapshot, &mut report);
@@ -2543,7 +2869,63 @@ impl DriveLoop {
                         .iter()
                         .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
                 });
+                // An entry that left the list (archived or dropped) is never
+                // picked or spawned again: drop its backoff and model rows (F7).
+                let live: BTreeSet<&str> =
+                    snapshot.entries.iter().map(|e| e.id.as_str()).collect();
+                self.v2_claim_backoff.retain(|entry, _| live.contains(entry.as_str()));
+                self.v2_model_overrides
+                    .retain(|(entry, _, _)| live.contains(entry.as_str()));
                 apply_v2_overlay(snapshot, &self.v2_overlay());
+                // Publish the v2 holds to `growlight status` (parity row 2): the
+                // same `held` list the legacy pass fills, read off the one hold
+                // rule `pick_v2` applies. It replaces the whole list, so a hold
+                // the human lifted (or a legacy list from before a mode flip)
+                // drops at the next good read.
+                self.daemon.record_held_parts(
+                    scheduler_v2::held_entries(snapshot)
+                        .into_iter()
+                        .filter_map(|(entry, reason)| {
+                            Some(softfig_ipc::growlightd::HeldPartSummary {
+                                queue: entry.project.clone(),
+                                part: entry.id.clone(),
+                                reason: reason.hold_text(entry)?,
+                            })
+                        })
+                        .collect(),
+                );
+
+                // §8 re-record: every archived restack still due, ahead of the
+                // scans below, so a follow-up restack they enqueue this tick
+                // renders the new bases rather than the pre-rebase ones.
+                let re_records_due = snapshot.re_records_due.clone();
+                self.v2_re_record_alerted.retain(|p| re_records_due.contains_key(p));
+                self.v2_fail_soft.retain_re_records(|p| re_records_due.contains_key(p));
+                for (project, restacks) in &re_records_due {
+                    self.re_record_restack(snapshot, project, restacks, &mut report.v2_restack_blocked);
+                }
+
+                // §8 restack detection (queue-v2-git slice 003): once at daemon
+                // start, and once per handoff this tick (deferred from step 1,
+                // which runs before the snapshot loads).
+                if !self.restack_boot_done {
+                    self.scan_restacks(snapshot, None, &mut report.v2_restack_blocked);
+                    self.restack_boot_done = true;
+                }
+                let handoff_scans = std::mem::take(&mut self.v2_handoff_scans);
+                for entry_id in &handoff_scans {
+                    // An entry that completed has left `entries` for the archive.
+                    if let Some(p) = snapshot
+                        .entries
+                        .iter()
+                        .find(|e| e.id == *entry_id)
+                        .map(|e| &e.project)
+                        .or_else(|| snapshot.done_projects.get(entry_id))
+                        .cloned()
+                    {
+                        self.scan_restacks(snapshot, Some(&p), &mut report.v2_restack_blocked);
+                    }
+                }
 
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
@@ -2559,6 +2941,11 @@ impl DriveLoop {
                                 id: member.spec.agent.clone(),
                                 backend: member.backend.ipc_backend(),
                                 pin: member.pin.clone(),
+                                schedule: v2_schedule_gate(
+                                    admission(&member.spec.agent),
+                                    &snapshot.entries,
+                                    now,
+                                ),
                             },
                         )
                     })
@@ -2586,17 +2973,40 @@ impl DriveLoop {
                         {
                             return false;
                         }
+                        // The schedule (slice 003): a held member re-rolls onto
+                        // nothing, not even its own entry — its last iteration
+                        // finished at the close. `pick_v2` applies the same
+                        // gate below, through the member's `ScheduleGate`.
+                        let gate = v2_members.get(agent).map(|m| &m.schedule);
                         let resumes_own = assignments.get(agent).is_some_and(|a| {
-                            snapshot.entries.iter().any(|e| {
-                                e.id == a.entry && e.status == EntryStatus::Active
-                            })
+                            gate.is_some_and(|g| g.admits(&a.entry))
+                                && snapshot.entries.iter().any(|e| {
+                                    e.id == a.entry && e.status == EntryStatus::Active
+                                })
                         });
                         resumes_own
                             || v2_members
                                 .get(agent)
                                 .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
                     };
-                    report.rerolls = self.supervisor.tick(&budget_for, rate, now, &workable);
+                    // The boot dirty-tree guard before each re-roll's spawn
+                    // (parity row 6) — the legacy `pre_spawn` twin: a
+                    // re-rolled member boots onto its carried baton, whose last
+                    // write is the handoff.
+                    let (repo_probe, baton, seeder) =
+                        (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
+                    let pre_spawn = |spec: &mut AgentSpec| {
+                        let agent = spec.agent.clone();
+                        if let Some(assignment) = assignments.get(&agent)
+                            && let Some(handoff) = baton.baton_mtime(&agent)
+                        {
+                            let read = v2_repo_read(repo_probe, assignment);
+                            boot_guard(seeder, &agent, &assignment.entry, read, Handoff::At(handoff));
+                        }
+                    };
+                    report.rerolls =
+                        self.supervisor
+                            .tick_with(&budget_for, rate, now, &workable, &pre_spawn);
                     for outcome in &report.rerolls {
                         if let RerollOutcome::Rerolled { agent } = outcome {
                             self.reconnecting.remove(agent);
@@ -2627,6 +3037,12 @@ impl DriveLoop {
                             .unwrap()
                             .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                         {
+                            continue;
+                        }
+                        // Schedule-held (slice 003): the same skip as the rate-limit
+                        // hold above. A `TimedOnly` member still reaches `pick_v2`,
+                        // which admits only its gate's due entries.
+                        if matches!(admission(agent), Admission::Held(_)) {
                             continue;
                         }
                         // A stopping/stopped agent is never (re-)started; a registered
@@ -2680,6 +3096,17 @@ impl DriveLoop {
                             });
                             continue;
                         }
+                        // A claim that failed closed recently is not retried until
+                        // its backoff elapses (V3) — no per-tick re-fail.
+                        if let Some(&(_, until)) = self.v2_claim_backoff.get(&pick.entry)
+                            && now < until
+                        {
+                            report.held_fresh.push(HeldFresh {
+                                agent: agent.clone(),
+                                reason: "claim backing off",
+                            });
+                            continue;
+                        }
                         // Resolve the concrete model (§6.4): the unit's declared
                         // list's first entry this member's backend runs, or the
                         // member default when nothing was declared. `pick_v2` only
@@ -2702,10 +3129,6 @@ impl DriveLoop {
                             } => None,
                             other => Some(other.clone()),
                         };
-                        let spec = match override_choice {
-                            Some(c) => member.spec.clone().with_model(c),
-                            None => member.spec.clone(),
-                        };
                         // The entry id the per-entry store keys on: the TOP-LEVEL
                         // entry (a `"parent/sub"` identity shares its top-level
                         // entry's baton, §3.6). The claim op takes the unit's
@@ -2719,6 +3142,22 @@ impl DriveLoop {
                             Unit::CloseOut { milestone } => (milestone.clone(), None),
                             Unit::Entry => (pick.entry.clone(), None),
                         };
+                        // v2 has no named queues: the entry's project stands in
+                        // as the telemetry `queue` tag.
+                        let tags = TelemetryTags {
+                            item_id: Some(claim_entry.clone()),
+                            slice_id: unit_arg.clone(),
+                            queue: snapshot
+                                .entries
+                                .iter()
+                                .find(|e| e.id == pick.entry)
+                                .map(|e| e.project.clone()),
+                        };
+                        let spec = match override_choice {
+                            Some(c) => member.spec.clone().with_model(c),
+                            None => member.spec.clone(),
+                        }
+                        .with_telemetry(tags);
                         // Borrow the v2 seams as locals so the claim closure below
                         // captures disjoint fields while `start_claiming` takes
                         // `&mut self.supervisor` (the legacy seed/claim pattern).
@@ -2726,6 +3165,13 @@ impl DriveLoop {
                         let entries = &v2_seams.entries;
                         let member_writer = &v2_seams.member_writer;
                         let v2_claimer = &v2_seams.claimer;
+                        let (repo_probe, seeder) = (self.repo_probe.as_ref(), self.seeder.as_ref());
+                        // Where the entry's work lands (queue-v2-parity slice
+                        // 005), resolved once here and carried on the
+                        // assignment for the re-roll and the spin guard.
+                        let repo = v2_repo::entry_project(snapshot, &pick.entry)
+                            .and_then(|project| repo_probe.v2_repo(project));
+                        let git_probes = &self.git_probes;
                         // Per-member admission budget (slice 001 M-A): fold on
                         // this member's claude-login profile only.
                         let member_budget = budget_for(agent);
@@ -2739,13 +3185,68 @@ impl DriveLoop {
                                 // (seed before claim), so a baton failure aborts
                                 // before the keeperd write and never orphans an
                                 // `active` entry.
-                                copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
-                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())
+                                //
+                                // First claim (§8, queue-v2-git slice 002): a
+                                // never-claimed entry gets its `parent`/`base`
+                                // computed from the stack here, its baton seeded
+                                // with the concrete `create <branch> from <base>`
+                                // line, and those values passed to the claim op.
+                                // A resume or re-claim (`claimed` already set, or
+                                // an `active` row, where keeperd records nothing)
+                                // computes nothing and passes `None`, so an
+                                // already-recorded base is never overwritten. A
+                                // git failure here fails the claim closed — no
+                                // spawn, retried next tick.
+                                let first = match snapshot
+                                    .entries
+                                    .iter()
+                                    .find(|e| e.id == entry_top)
+                                {
+                                    Some(ev)
+                                        if ev.claimed.is_empty()
+                                            && ev.status != EntryStatus::Active =>
+                                    {
+                                        let home =
+                                            std::env::var_os("HOME").map(std::path::PathBuf::from);
+                                        let user = std::env::var("USER").ok();
+                                        first_claim::first_claim(
+                                            snapshot,
+                                            ev,
+                                            home.as_deref(),
+                                            user.as_deref(),
+                                            git_probes,
+                                        )
+                                        .map_err(|e| e.to_string())?
+                                    }
+                                    _ => None,
+                                };
+                                let base_line =
+                                    first.as_ref().map(|fc| (fc.branch.as_str(), fc.base.as_str()));
+                                let handoff = copy_entry_baton(
+                                    entries,
+                                    &**member_writer,
+                                    entry_top,
+                                    agent,
+                                    base_line,
+                                )?;
+                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref(), first.as_ref())?;
+                                // The boot dirty-tree guard (parity row 6), once the
+                                // claim has landed and before the spawn — the legacy
+                                // fresh start's placement. The entry baton says what
+                                // the last handoff was. Read-only; best-effort.
+                                if let Some(handoff) = handoff
+                                    && let Some(repo) = &repo
+                                {
+                                    let read = repo_probe.probe_repo(repo).map(|state| (repo.clone(), state));
+                                    boot_guard(seeder, agent, &pick.entry, read, handoff);
+                                }
+                                Ok(())
                             },
                         );
                         match outcome {
                             StartOutcome::Started => {
                                 spoken_for.insert(pick.entry.clone());
+                                self.v2_claim_backoff.remove(&pick.entry);
                                 // The handshake's bookkeeping for this entry is
                                 // spent: it is held by a running member again,
                                 // and a model change reached its session.
@@ -2758,9 +3259,16 @@ impl DriveLoop {
                                     entry: pick.entry.clone(),
                                     unit: pick.unit.clone(),
                                     resolved_model: resolved,
+                                    repo,
                                 };
                                 self.v2_assignments.insert(agent.clone(), assignment.clone());
                                 report.v2_started.push(assignment);
+
+                                // §8 restack detection at claim (queue-v2-git
+                                // slice 003): check the claimed entry's repo.
+                                if let Some(ev) = snapshot.entries.iter().find(|e| e.id == entry_top) {
+                                    self.scan_restacks(snapshot, Some(&ev.project), &mut report.v2_restack_blocked);
+                                }
                             }
                             // The claim landed even though the spawn failed — keep
                             // the entry excluded this tick so no peer grabs what
@@ -2803,9 +3311,32 @@ impl DriveLoop {
                                     outcome: StartOutcome::Hold { slots, until },
                                 });
                             }
-                            // Queued / Refused (no claim attempted) or ClaimFailed
-                            // (claim refused, fail-closed): nothing claimed, nothing
-                            // excluded.
+                            // The claim failed closed (V3): nothing claimed, nothing
+                            // excluded, but the entry backs off and the reason
+                            // surfaces instead of the member re-failing it each tick.
+                            StartOutcome::ClaimFailed { reason } => {
+                                let streak = self
+                                    .v2_claim_backoff
+                                    .get(&pick.entry)
+                                    .map_or(0, |&(n, _)| n)
+                                    .saturating_add(1);
+                                let retry_secs = v2_claim_backoff_secs(streak);
+                                self.v2_claim_backoff
+                                    .insert(pick.entry.clone(), (streak, now + retry_secs));
+                                report.v2_claim_failures.push(V2ClaimFailure {
+                                    agent: agent.clone(),
+                                    entry: pick.entry.clone(),
+                                    reason: reason.clone(),
+                                    streak,
+                                    retry_secs,
+                                });
+                                report.held_starts.push(HeldStart {
+                                    agent: agent.clone(),
+                                    outcome: StartOutcome::ClaimFailed { reason },
+                                });
+                            }
+                            // Queued / Refused (no claim attempted): nothing
+                            // claimed, nothing excluded.
                             outcome => report.held_starts.push(HeldStart {
                                 agent: agent.clone(),
                                 outcome,
@@ -2868,6 +3399,22 @@ impl DriveLoop {
                 .iter()
                 .map(|m| (m.spec.agent.as_str(), m.pin.as_deref()))
                 .collect();
+            // The `tasks = true` exception for a re-roll (slice 003, §3.5): a
+            // member the closed schedule admits only to due timed items may
+            // resume its own part only if that part is one. Read before the
+            // closure borrows the loop.
+            let timed_own: Vec<(String, (String, String))> = fleet
+                .iter()
+                .map(|m| &m.spec.agent)
+                .filter(|agent| admission(agent) == Admission::TimedOnly)
+                .filter_map(|agent| self.assignments.get(agent).map(|a| (agent.clone(), a.clone())))
+                .collect();
+            let mut timed_resume = BTreeSet::new();
+            for (agent, (queue, part)) in timed_own {
+                if self.timed_due_at(&queue, &part, now) {
+                    timed_resume.insert(agent);
+                }
+            }
             let snap = &snapshot;
             let assignments = &self.assignments;
             let draining = draining_queues(&draining_at_start, &self.assignments);
@@ -2875,6 +3422,13 @@ impl DriveLoop {
             let holds = Arc::clone(&self.rate_limit_holds);
             let profiles_resolver = self.profiles_resolver.as_ref();
             let workable = |agent: &str| -> bool {
+                // The schedule (slice 003): a held member is not workable —
+                // `HeldNoWork`, like the rate-limit hold below — so an exit
+                // after the close is never re-rolled.
+                let gate = admission(agent);
+                if matches!(gate, Admission::Held(_)) {
+                    return false;
+                }
                 // Per-member rate-limit filter (slice 008): a member whose
                 // every admission profile is held is not workable, emitted as
                 // `HeldNoWork` by `tick_with` — no re-roll, no backoff, no
@@ -2903,6 +3457,11 @@ impl DriveLoop {
                         matches!(classify_queue(q), QueueState::Active(head) if head == *part)
                     })
                 });
+                // Outside its window with `tasks = true`: only its own part, and
+                // only if that part is a due timed item.
+                if gate == Admission::TimedOnly {
+                    return resumes_own && timed_resume.contains(agent);
+                }
                 resumes_own
                     || pins.get(agent).is_some_and(|pin| {
                         let reserved = reserved_queues(&fleet, retiring, stopped, &draining, agent);
@@ -2915,12 +3474,18 @@ impl DriveLoop {
             // readable time has nothing to compare against, so it stays silent.
             let (repo_probe, baton, seeder) =
                 (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
-            let pre_spawn = |agent: &str| {
-                if let Some((queue, part)) = assignments.get(agent)
-                    && let Some(handoff) = baton.baton_mtime(agent)
-                {
-                    boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
+            // The re-roll also re-reads the slice the carried baton names, so
+            // the new session's telemetry rows follow the member's handoff.
+            let pre_spawn = |spec: &mut AgentSpec| {
+                let agent = spec.agent.clone();
+                let Some((queue, part)) = assignments.get(&agent) else {
+                    return;
+                };
+                if let Some(handoff) = baton.baton_mtime(&agent) {
+                    let read = repo_probe.repo_state(queue, part);
+                    boot_guard(seeder, &agent, &format!("{queue}/{part}"), read, Handoff::At(handoff));
                 }
+                spec.telemetry.slice_id = baton.baton_slice(&agent, part);
             };
             report.rerolls =
                 self.supervisor
@@ -3016,6 +3581,17 @@ impl DriveLoop {
                 {
                     continue;
                 }
+                // Schedule-held (slice 003): skipped exactly like the rate-limit
+                // hold above. A member admitted only to due timed items
+                // (`tasks = true`, §3.5) picks over a private view of the
+                // snapshot, on which every claimable part that isn't one is marked
+                // `OutsideWindow` — never on the shared snapshot, so a member the
+                // schedule admits still sees it.
+                let gate = admission(agent);
+                if matches!(gate, Admission::Held(_)) {
+                    continue;
+                }
+                let mut timed_view = (gate == Admission::TimedOnly).then(|| snapshot.clone());
                 // Fallback leaves a queue to the member pinned to it while that
                 // member is live on it or just exiting it (task 068).
                 let draining = draining_queues(&draining_at_start, &self.assignments);
@@ -3036,14 +3612,15 @@ impl DriveLoop {
                 // `active` head: at most one extra pass.
                 let mut pin = member.pin.as_deref();
                 let picked = loop {
-                    let Some((queue, part)) = pick_for(&snapshot, pin, &reserved) else {
+                    let view = timed_view.as_ref().unwrap_or(&snapshot);
+                    let Some((queue, part)) = pick_for(view, pin, &reserved) else {
                         break None;
                     };
                     let key = (queue.clone(), part.clone());
                     if spoken_for.contains(&key) {
                         break Some((queue, part));
                     }
-                    let fresh = snapshot.queue(&queue).is_some_and(|q| {
+                    let fresh = view.queue(&queue).is_some_and(|q| {
                         q.parts.iter().any(|p| p.id == part && p.status == PartStatus::Queued)
                     });
                     if !fresh {
@@ -3055,6 +3632,12 @@ impl DriveLoop {
                     }
                     let Some(hold) = self.queues.claim_hold(&queue, &part) else {
                         self.announced_holds.remove(&key);
+                        if let Some(view) = timed_view.as_mut()
+                            && !self.timed_due_at(&queue, &part, now)
+                        {
+                            view.mark_held(&queue, &part, ClaimHold::OutsideWindow);
+                            continue;
+                        }
                         break Some((queue, part));
                     };
                     if self.announced_holds.insert(key.clone(), hold.clone()).is_none() {
@@ -3066,6 +3649,9 @@ impl DriveLoop {
                         });
                     }
                     snapshot.mark_held(&queue, &part, hold.clone());
+                    if let Some(view) = timed_view.as_mut() {
+                        view.mark_held(&queue, &part, hold.clone());
+                    }
                     self.holds.insert(key, (hold, now));
                 };
                 let Some((queue, part)) = picked else {
@@ -3076,7 +3662,11 @@ impl DriveLoop {
                     // hold, edge-deduped like the re-roll `HeldNoWork`.
                     report.held_fresh.push(HeldFresh {
                         agent: agent.clone(),
-                        reason: "no workable part",
+                        reason: if timed_view.is_some() {
+                            "outside the schedule window (no due timed item)"
+                        } else {
+                            "no workable part"
+                        },
                     });
                     continue;
                 };
@@ -3107,8 +3697,17 @@ impl DriveLoop {
                 // Per-member admission budget (slice 001 M-A): fold on this
                 // member's claude-login profile only.
                 let member_budget = budget_for(agent);
+                // The slice comes from the member's baton only while that baton
+                // is on this part: a kept baton carries it, a fresh seed has none.
+                let slice_id = self.baton.baton_slice(agent, &part);
+                let slice_known = slice_id.is_some();
+                let tags = TelemetryTags {
+                    item_id: Some(part.clone()),
+                    slice_id,
+                    queue: Some(queue.clone()),
+                };
                 let outcome = self.supervisor.start_claiming(
-                    member.spec.clone(),
+                    member.spec.clone().with_telemetry(tags),
                     member_budget,
                     rate,
                     now,
@@ -3120,7 +3719,8 @@ impl DriveLoop {
                         // seed says what the last handoff was — the member's kept
                         // baton, or none under a fresh one. Read-only; best-effort.
                         if let Some(handoff) = seeded.handoff() {
-                            boot_guard(repo_probe, seeder, agent, &queue, &part, handoff);
+                            let read = repo_probe.repo_state(&queue, &part);
+                            boot_guard(seeder, agent, &format!("{queue}/{part}"), read, handoff);
                         }
                         Ok(())
                     },
@@ -3135,11 +3735,15 @@ impl DriveLoop {
                         // is overwritten only on its next fresh start.
                         self.assignments
                             .insert(agent.clone(), (queue.clone(), part.clone()));
-                        report.started.push(Assignment {
+                        let assignment = Assignment {
                             agent: agent.clone(),
                             queue,
                             part,
-                        });
+                        };
+                        if !slice_known {
+                            report.unattributed.push(assignment.clone());
+                        }
+                        report.started.push(assignment);
                     }
                     // The claim landed (it precedes the spawn) even though the
                     // spawn failed — keep the part excluded this tick so no peer
@@ -3246,16 +3850,177 @@ impl DriveLoop {
         // …and the runtime overlay, for `queue pick` (slice 012).
         self.daemon.publish_v2_overlay(self.v2_overlay());
 
+        // The `[schedule]` for `growlight status` (slice 006): this tick's
+        // verdict, the members past their close grace, and the items still
+        // waiting on their `> Not before:`.
+        self.daemon.record_schedule_summary(schedule.as_ref().map(|_| {
+            let held_items = self
+                .announced_holds
+                .iter()
+                .filter_map(|((queue, part), hold)| match hold {
+                    ClaimHold::NotYet(at) => Some(format!("{queue}/{part} at {at}")),
+                    _ => None,
+                })
+                .collect();
+            crate::schedule::summary(&verdict, &self.overrun, held_items, self.projection.clone())
+        }));
+
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
         //    inspect — dispatch is the live side-effect on top of it.
         self.dispatch(&report, now);
 
+        report.v2_fail_soft = std::mem::take(&mut self.v2_fail_soft.lines);
         report
     }
 
     /// Re-assert `agent`'s legacy claim, if it holds one ([`PartClaimer::reassert`]).
     /// Best-effort: a failure is journaled and the next beat retries.
+    /// The `[schedule]` verdict at `now` for the configured fleet
+    /// (growlight-schedule slice 003). `None` — no schedule, or one with
+    /// `enabled = false` — is [`ScheduleVerdict::ungated`] and reads no zone. A
+    /// zone that can't be read holds every member (§3.2, fail-closed).
+    fn schedule_verdict(
+        &mut self,
+        cfg: Option<&crate::schedule::ScheduleConfig>,
+        fleet: &[FleetMember],
+        now: i64,
+    ) -> ScheduleVerdict {
+        let Some(cfg) = cfg else {
+            self.schedule_closed_at = None;
+            return ScheduleVerdict::ungated();
+        };
+        let members: Vec<MemberRef<'_>> = fleet
+            .iter()
+            .map(|m| MemberRef { agent: &m.spec.agent, backend: m.backend.ipc_backend() })
+            .collect();
+        let at = crate::schedule::clamp_to_last_close(self.schedule_closed_at, now);
+        let was_open = self.schedule_last.as_ref().is_some_and(|(open, _)| *open);
+        let mut verdict = match self.zone.zone() {
+            Ok(zone) => {
+                let verdict = evaluate(cfg, zone, at, &members);
+                if was_open && !verdict.open {
+                    self.schedule_closed_at = Some(at);
+                }
+                verdict
+            }
+            Err(why) => ScheduleVerdict::zone_unreadable(&members, &why),
+        };
+        // The weekly reserve (slice 004, §3.6), over the same admission pools
+        // the rate-limit hold reads. No per-slot usage directory means no
+        // reading, so every reserve is unknown and nothing is held.
+        let pools: Vec<(&str, Vec<String>)> = fleet
+            .iter()
+            .map(|m| (m.spec.agent.as_str(), self.profiles_resolver.admission_profiles(&m.spec.agent)))
+            .collect();
+        let dir = self.usage_by_profile_dir.as_deref();
+        // A slot two members share is read once: skip it once it is in the map.
+        let mut readings: BTreeMap<&str, Vec<softfig_ipc::usage::UsageSnapshot>> = BTreeMap::new();
+        for slot in pools.iter().flat_map(|(_, pool)| pool) {
+            readings.entry(slot.as_str()).or_insert_with(|| {
+                dir.map(|dir| crate::profile_budget::slot_readings(dir, slot)).unwrap_or_default()
+            });
+        }
+        apply_reserve(&mut verdict, cfg, &pools, |slot| {
+            crate::profile_budget::vouchable_7d(&readings[slot], now)
+        });
+        // The same readings feed the budget projection (slice 008, §3.11).
+        self.projection = self.projections.tick(
+            verdict.reserves.iter().map(|(slot, r)| (slot.as_str(), r.reserve_pct)),
+            |slot| readings.get(slot).cloned().unwrap_or_default(),
+            now,
+        );
+        verdict
+    }
+
+    /// The journal line for the schedule's open/close edge, if `verdict`
+    /// crossed one since last tick (slice 003). The first verdict of an
+    /// enabled schedule is an edge too, so the journal says where it starts;
+    /// disabling the schedule clears the memory silently.
+    fn schedule_edge(&mut self, enabled: bool, verdict: &ScheduleVerdict) -> Option<String> {
+        if !enabled {
+            self.schedule_last = None;
+            return None;
+        }
+        let last = self.schedule_last.replace((verdict.open, verdict.open_windows.clone()));
+        let was_open = last.as_ref().map(|(open, _)| *open);
+        if was_open == Some(verdict.open) {
+            return None;
+        }
+        Some(if verdict.open {
+            format!("schedule: window {} opened", verdict.open_windows.join(", "))
+        } else if verdict.held.values().any(|r| *r == HoldReason::ZoneUnreadable) {
+            "schedule: closed (local time unreadable)".to_string()
+        } else {
+            match last {
+                Some((_, windows)) if !windows.is_empty() => {
+                    format!("schedule: window {} closed", windows.join(", "))
+                }
+                _ => "schedule: closed (no window open)".to_string(),
+            }
+        })
+    }
+
+    /// Advance the `close_grace_minutes` clock (slice 006, §3.4) and return the
+    /// members that went past it this tick. A member's clock starts on the tick
+    /// a window closes on it while it runs — a reserve hold or an unreadable
+    /// zone is not a window's close — and it is past the grace once it has run
+    /// more than `close_grace_minutes` since. Information only: nothing here
+    /// touches a member. No enabled schedule clears every clock.
+    fn track_overrun(
+        &mut self,
+        cfg: Option<&crate::schedule::ScheduleConfig>,
+        verdict: &ScheduleVerdict,
+        fleet: &[FleetMember],
+        now: i64,
+    ) -> Vec<String> {
+        let Some(cfg) = cfg else {
+            self.window_closed_at.clear();
+            self.window_held_last.clear();
+            self.overrun.clear();
+            return Vec::new();
+        };
+        let window_held: BTreeSet<String> = verdict
+            .held
+            .iter()
+            .filter(|(_, reason)| crate::schedule::is_window_hold(**reason))
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        for member in fleet {
+            let agent = &member.spec.agent;
+            if !(window_held.contains(agent) && self.supervisor.is_running(agent)) {
+                self.window_closed_at.remove(agent);
+            } else if !self.window_held_last.contains(agent) {
+                self.window_closed_at.entry(agent.clone()).or_insert(now);
+            }
+        }
+        self.window_held_last = window_held;
+        let grace = i64::from(cfg.close_grace_minutes) * 60;
+        let overrun: BTreeSet<String> = self
+            .window_closed_at
+            .iter()
+            .filter(|(_, closed)| now - **closed > grace)
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        let newly = overrun.difference(&self.overrun).cloned().collect();
+        self.overrun = overrun;
+        newly
+    }
+
+    /// Whether `part` of `queue` is an item whose `> Not before:` has arrived
+    /// ([`QueueSource::timed_due`]), trusted for [`TIMED_DUE_TTL_SECS`].
+    fn timed_due_at(&mut self, queue: &str, part: &str, now: i64) -> bool {
+        let key = (queue.to_string(), part.to_string());
+        if let Some(&(due, read_at)) = self.timed_due.get(&key)
+            && now - read_at < TIMED_DUE_TTL_SECS
+        {
+            return due;
+        }
+        let due = self.queues.timed_due(queue, part);
+        self.timed_due.insert(key, (due, now));
+        due
+    }
+
     fn reassert_claim(&self, agent: &str) {
         if let Some((queue, part)) = self.assignments.get(agent)
             && let Err(e) = self.claimer.reassert(queue, part, agent)
@@ -3277,6 +4042,15 @@ impl DriveLoop {
         for crash in &report.crashes {
             self.dispatcher.notify(crash, now);
         }
+        if !report.schedule_overrun.is_empty()
+            && let Some(cfg) = self.daemon.schedule()
+        {
+            for agent in &report.schedule_overrun {
+                let grace_minutes = cfg.close_grace_minutes;
+                let event = NotifyEvent::ScheduleOverrun { agent: agent.clone(), grace_minutes };
+                self.dispatcher.notify(&event, now);
+            }
+        }
         // A start or re-roll whose backend spawn FAILED is an operator alert, not a
         // silent held-start: a fail-closed pre-approval generation failure (slice
         // 004) — or any launch failure — means an agent could not be (re-)spawned
@@ -3289,6 +4063,17 @@ impl DriveLoop {
                 // the bare `agent_crashed` shape (crash-diagnostics slice 001).
                 self.dispatcher
                     .notify(&NotifyEvent::agent_crashed(held.agent.clone()), now);
+            }
+        }
+        // A v2 claim that keeps failing is the same class: the member cannot start
+        // and needs a human. The reason rides the alert; the dispatcher's
+        // per-agent cooldown dedups a still-failing claim.
+        for f in &report.v2_claim_failures {
+            if f.streak >= V2_CLAIM_ALERT_STREAK {
+                let event = NotifyEvent::agent_crashed(f.agent.clone()).with_stdout_error(Some(
+                    format!("claim of {} failed: {}", f.entry, f.reason),
+                ));
+                self.dispatcher.notify(&event, now);
             }
         }
         for reroll in &report.rerolls {
@@ -3330,6 +4115,11 @@ impl DriveLoop {
         for a in &report.v2_parked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
+        }
+        // V1: a restack withheld over an upstream-tracking branch needs the human.
+        for what in &report.v2_restack_blocked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: what.clone() }, now);
         }
         // §2: a walk stopped at a human-`blocked` item (review R3).
         for at in &report.v2_walk_blocked {
@@ -3398,7 +4188,7 @@ impl DriveLoop {
     ///    source:
     ///    - `Legacy { queue, part }` — [`QueueSource::read_item_doc`] against
     ///      the latched part, same shape as the semi-auto launcher.
-    ///    - `V2 { entry }` — fresh [`V2QueueSource::load`] + the entry's
+    ///    - `V2 { entry }` — the tick's one [`V2QueueSource::load`] + the entry's
     ///      [`crate::scheduler_v2::next_unit`] walk, mirroring the admission
     ///      path's [`resolve_v2_model`] over a live snapshot.
     ///
@@ -3431,33 +4221,20 @@ impl DriveLoop {
     /// Keeps the slice-003 single alert exactly single: no event is pushed
     /// onto `report.crashes` here, so a park whose refused model is still
     /// refused does NOT re-page.
-    fn reconcile_model_refused(&mut self, now: i64, fleet: &[FleetMember]) {
+    fn reconcile_model_refused(
+        &mut self,
+        now: i64,
+        fleet: &[FleetMember],
+        v2_snapshot: Option<&scheduler_v2::V2Snapshot>,
+    ) {
         let parked = self.supervisor.agents_in_model_refused_park();
         if parked.is_empty() {
             return;
         }
-        // Load the v2 snapshot once per tick, shared across every V2-latched
-        // member. Skipped when nothing V2 is parked (the common path on a
-        // legacy loop). A separate `source.load()` from the v2-mode branch's
-        // own load the same tick is a per-tick file read on the v2 TOML; the
-        // in-source alert-once memory stays quiet on a repeated-same error, so
-        // the second load doesn't double-alert. Absent / Failed falls through
-        // as `None` here, and each V2-latched park then resolves its member
-        // default (same shape as an unreadable legacy item doc).
-        let any_v2 = parked.iter().any(|agent| {
-            matches!(
-                self.model_refused_items.get(agent),
-                Some(ModelRefusedPart::V2 { .. }),
-            )
-        });
-        let v2_snapshot = if any_v2 {
-            self.v2.as_mut().and_then(|seams| match seams.source.load() {
-                V2Load::Snapshot(snapshot) => Some(snapshot),
-                V2Load::Absent | V2Load::Failed { .. } => None,
-            })
-        } else {
-            None
-        };
+        // `v2_snapshot` is the tick's one v2 read (F7), taken whenever a v2
+        // park exists, before any overlay. `None` (absent / failed / no
+        // seams) makes each V2-latched park resolve its member default (same
+        // shape as an unreadable legacy item doc).
         for agent in parked {
             // The latched identity. On a miss, keep the park alive (slice
             // 005): the silent defensive un-park is what masked review 049
@@ -3509,7 +4286,7 @@ impl DriveLoop {
                     // 007, code-review 050 F1). Slice 005 `continue`d here,
                     // which stranded the park at `not_before = i64::MAX` even
                     // after a roster edit moved the default off the refusal.
-                    match v2_snapshot.as_ref() {
+                    match v2_snapshot {
                         None => {
                             eprintln!(
                                 "growlightd: reconcile model-refused: v2 snapshot unavailable \
@@ -3607,6 +4384,199 @@ impl DriveLoop {
         report.retired.push(agent.to_string());
     }
 
+    /// §8 restack detection (queue-v2-git slice 003): scan the snapshot's LOCAL
+    /// repos (read-only git) for a stack whose `main` moved under an open
+    /// branch, and enqueue one restack per affected repo through the restacker
+    /// seam. `project: None` scans every local project (daemon start);
+    /// `Some(p)` scans just `p`'s repo (a claim or handshake in it). Fail-soft:
+    /// a detection or enqueue error is skipped — the next scan re-detects it,
+    /// and a restack row already enqueued is an idempotent no-op in keeperd.
+    ///
+    /// Never auto-enqueues a restack over a branch that tracks an upstream (§8,
+    /// V1): the loop does not rewrite a pushed branch. That repo's restack is
+    /// withheld and `blocked` gets an alert for the human instead; a git error
+    /// while checking withholds it too (fail closed, re-checked next scan).
+    fn scan_restacks(
+        &mut self,
+        snapshot: &scheduler_v2::V2Snapshot,
+        project: Option<&str>,
+        blocked: &mut Vec<String>,
+    ) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let user = std::env::var("USER").ok();
+        let want_repo = project.map(|want| {
+            snapshot.projects.iter().find(|p| p.name == want).map(|p| p.repo.as_str())
+        });
+        // One bounded probe per repo (V13), all started before any is waited on,
+        // so a boot scan over every project costs one deadline, not one each. The
+        // stack is per repo (§8), so the first project naming a repo speaks for
+        // it, and keeperd merges into a live row that another project holds.
+        let mut scanned = std::collections::HashSet::new();
+        let mut probes = Vec::new();
+        for proj in &snapshot.projects {
+            if want_repo.is_some_and(|want| want != Some(proj.repo.as_str()))
+                || !scanned.insert(proj.repo.as_str())
+            {
+                continue;
+            }
+            let repo = Repo::of(proj, home.as_deref(), user.as_deref());
+            let repo_path = match &repo {
+                Repo::Local(path) => path.clone(),
+                Repo::Remote => continue, // a remote repo never auto-enqueues (§8)
+            };
+            let entries: Vec<git_stack::RestackEntry> = snapshot
+                .entries_in_repo(&proj.repo)
+                .map(|e| git_stack::RestackEntry {
+                    id: e.id.clone(),
+                    branch: e.branch.clone(),
+                    lane: e.lane,
+                    claimed: e.claimed.clone(),
+                    parent: e.parent.clone(),
+                    base: e.base.clone(),
+                })
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let main = proj.main.clone();
+            let archived = snapshot.done_branches.clone();
+            let probe = self.git_probes.spawn(&repo_path, move |git| {
+                let Some(stack) =
+                    git_stack::detect_restack(&repo, &main, &entries, &archived, git)?
+                else {
+                    return Ok(None);
+                };
+                let upstream = git_stack::restack_upstream_branch(&stack, git)?;
+                Ok(Some((stack, upstream)))
+            });
+            probes.push((proj.name.clone(), probe));
+        }
+        for (name, probe) in probes {
+            // Fail-soft / fail closed: on an error nothing is enqueued, and the
+            // next scan re-detects (a timed-out repo is held, not re-probed
+            // every tick).
+            let scan = probe.wait().map_err(|e| e.to_string());
+            match self.v2_fail_soft.note(FailSoft::RestackScan(name.clone()), scan) {
+                Some(Some((stack, None))) => {
+                    let enqueued = seams.restacker.enqueue_restack(&name, &stack);
+                    self.v2_fail_soft.note(FailSoft::RestackEnqueue(name), enqueued);
+                }
+                Some(Some((_, Some(branch)))) => {
+                    blocked.push(restack_blocked_alert(&name, &branch));
+                }
+                Some(None) | None => {}
+            }
+        }
+    }
+
+    /// §8 re-record (queue-v2-git slice 004): `restacks` are this project's
+    /// archived rows still due. Recompute each restacked local branch's `base`
+    /// read-only (`git merge-base <branch> <its parent's tip or main>`), write
+    /// them back through the re-recorder seam with the rows marked settled, and
+    /// patch `snapshot` so this tick's scans carry the new bases.
+    ///
+    /// The rows stay due, and the next tick retries, on anything that can still
+    /// come right: a git error, a failed write, a worktree mid-rebase, or a live
+    /// restack row on the repo. That last one is the drop's case: its child
+    /// keeps a `base` it needs until the rewrite lands, and it contains `main`
+    /// beforehand, so a pass now would move that base. The later row's own
+    /// completion settles both.
+    ///
+    /// A branch that tracks an upstream settles the rows instead: the loop
+    /// never rewrites it, so waiting changes nothing, its base stays as recorded
+    /// and the human is told through `blocked`. This is the backstop:
+    /// [`Self::scan_restacks`] withholds a restack over such a branch up front,
+    /// and the restack's doc and the v2 protocol tell the agent to end with
+    /// `growlight_block kind = human`, so reaching it means a branch gained an
+    /// upstream mid-restack.
+    fn re_record_restack(
+        &mut self,
+        snapshot: &mut scheduler_v2::V2Snapshot,
+        project: &str,
+        restacks: &[String],
+        blocked: &mut Vec<String>,
+    ) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let seam = FailSoft::ReRecord(project.to_string());
+        let Some(proj) = snapshot.projects.iter().find(|p| p.name == project) else {
+            self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
+            return;
+        };
+        if snapshot.entries_in_repo(&proj.repo).any(|e| e.kind == EntryKind::Restack) {
+            return;
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let user = std::env::var("USER").ok();
+        let repo = Repo::of(proj, home.as_deref(), user.as_deref());
+        let repo_path = match &repo {
+            Repo::Local(path) => path.clone(),
+            // A remote repo has no commit to resolve: the human re-records (§8).
+            Repo::Remote => {
+                self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
+                return;
+            }
+        };
+        let entries: Vec<git_stack::RestackEntry> = snapshot
+            .entries_in_repo(&proj.repo)
+            .map(|e| git_stack::RestackEntry {
+                id: e.id.clone(),
+                branch: e.branch.clone(),
+                lane: e.lane,
+                claimed: e.claimed.clone(),
+                parent: e.parent.clone(),
+                base: e.base.clone(),
+            })
+            .collect();
+        // Fresh reads: this runs after a restack the loop was told about, and
+        // writes bases back, so it must not answer from this tick's earlier scans.
+        let main = proj.main.clone();
+        let archived = snapshot.done_branches.clone();
+        let probe = self.git_probes.spawn_fresh(&repo_path, move |git| {
+            git_stack::re_record_bases(&repo, &main, &entries, &archived, git)
+        });
+        let probed = probe.wait().map_err(|e| e.to_string());
+        // Fail-soft: on an error the rows stay due, so the next tick retries.
+        let bases = match self.v2_fail_soft.note(FailSoft::ReRecordProbe(project.to_string()), probed) {
+            Some(git_stack::ReRecord::Bases(bases)) => bases,
+            // A branch tracks an upstream: the loop never rewrites it, so the
+            // bases stay as recorded and the human is told.
+            Some(git_stack::ReRecord::Upstream { branch }) => {
+                self.v2_fail_soft.note(seam, seams.re_recorder.re_record_bases(&[], restacks));
+                if self.v2_re_record_alerted.insert(project.to_string()) {
+                    blocked.push(restack_blocked_alert(project, &branch));
+                }
+                return;
+            }
+            // A stack worktree is mid-rebase (a killed restack session): the
+            // branch has not moved yet, so record nothing and tell the human.
+            Some(git_stack::ReRecord::Rebasing { worktree }) => {
+                if self.v2_re_record_alerted.insert(project.to_string()) {
+                    blocked.push(restack_rebasing_alert(project, &worktree));
+                }
+                return;
+            }
+            None => return,
+        };
+        let pairs: Vec<(String, String)> = bases
+            .iter()
+            .map(|b| (b.entry.clone(), b.base.clone()))
+            .collect();
+        let written = seams.re_recorder.re_record_bases(&pairs, restacks);
+        if self.v2_fail_soft.note(seam, written).is_none() {
+            return;
+        }
+        for (id, base) in pairs {
+            if let Some(e) = snapshot.entries.iter_mut().find(|e| e.id == id) {
+                e.base = base;
+            }
+        }
+    }
+
     /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
     /// end the session when its process exits or once `roll_grace_secs` have
     /// passed since the loop first saw the handoff, whichever comes first. The
@@ -3644,6 +4614,9 @@ impl DriveLoop {
         self.reconnecting.remove(agent);
         self.v2_assignments.remove(agent);
         let entry = handoff.entry_top().to_string();
+        // §8 restack detection at handshake (queue-v2-git slice 003): deferred
+        // until the snapshot loads (step 3), then drained by the tick.
+        self.v2_handoff_scans.insert(entry.clone());
         if let Some(model) = &handoff.next_model {
             // The same unit's next session runs on the requested model (§6.4).
             let unit = handoff.assignment.unit.clone();
@@ -3679,13 +4652,14 @@ impl DriveLoop {
         let Some(seams) = self.v2.as_ref() else {
             return;
         };
-        match seams.parker.pause_entry_v2(entry) {
-            Ok(()) => {
+        let paused = seams.parker.pause_entry_v2(entry);
+        match self.v2_fail_soft.note(FailSoft::Pause(entry.to_string()), paused) {
+            Some(()) => {
                 self.v2_to_pause.remove(entry);
                 self.v2_paused_by.insert(entry.to_string(), agent.to_string());
                 report.v2_paused.push((agent.to_string(), entry.to_string()));
             }
-            Err(_) => {
+            None => {
                 self.v2_to_pause.insert(entry.to_string(), agent.to_string());
             }
         }
@@ -3704,6 +4678,7 @@ impl DriveLoop {
             .collect();
         for (entry, agent) in landed {
             self.v2_to_pause.remove(&entry);
+            self.v2_fail_soft.clear(&FailSoft::Pause(entry.clone()));
             self.v2_paused_by.insert(entry, agent);
         }
     }
@@ -3892,25 +4867,44 @@ fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
 /// before the claim (the legacy seed-before-claim order), so a member never
 /// boots stateless and a claim never lands behind a failed baton.
 ///
-/// The §8 base line (branch/base) is seeded as the literal `<branch>`/`<base>`
-/// tokens: computing the concrete stack-top values is `queue-v2-git`'s row
-/// (§13), so this milestone records the tokens, exactly as the store documents.
+/// The §8 base line (queue-v2-git slice 002): a first claim passes the CONCRETE
+/// `(branch, base)` (computed by [`crate::first_claim`]) so the seeded baton
+/// reads `create <branch> from <base>`. A resume or a branchless entry (a
+/// restack) passes `None` and a seed carries no line. A first claim that finds a
+/// baton is a retry: the earlier attempt's seed gets this attempt's values,
+/// because they are what this claim records (V18).
 fn copy_entry_baton(
     entries: &FsEntryBatonStore,
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
-) -> Result<(), String> {
-    let baton = match entries.read(entry_top) {
-        Some(baton) => baton,
+    base_line: Option<(&str, &str)>,
+) -> Result<Option<Handoff>, String> {
+    let (baton, handoff) = match entries.read(entry_top) {
+        Some(stored) => {
+            // The handoff is the stored baton's write, read before the base line
+            // rewrites it: that write is the session's, this one is ours.
+            let handoff = entries.mtime(entry_top).map(Handoff::At);
+            let baton = match base_line {
+                Some((branch, base)) => {
+                    let baton = with_base_line(&stored, branch, base);
+                    entries.write(entry_top, &baton)?;
+                    baton
+                }
+                None => stored,
+            };
+            (baton, handoff)
+        }
         None => {
-            entries.seed(entry_top, None, None)?;
-            entries
+            entries.seed(entry_top, base_line)?;
+            let baton = entries
                 .read(entry_top)
-                .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?
+                .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?;
+            (baton, Some(Handoff::Fresh))
         }
     };
-    member_writer.write(agent, &baton)
+    member_writer.write(agent, &baton)?;
+    Ok(handoff)
 }
 
 /// The journal label for a v2 unit (slice 006) — the `unit` half of a
@@ -4000,6 +4994,37 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
     }
 }
 
+/// The v2 eligibility clause for one member's schedule [`Admission`]
+/// (growlight-schedule §3.10). A `TimedOnly` member takes only the due timed
+/// entries: those whose `not_before` parses and has arrived by `now` (§3.5). A
+/// human-only entry (`fleet = false`) is never due — the exception opens a
+/// window for a timed item and lifts no other hold, as the legacy
+/// [`doc_timed_due`](crate::queue_source::doc_timed_due) reads it.
+fn v2_schedule_gate(
+    admission: Admission,
+    entries: &[scheduler_v2::EntryView],
+    now: i64,
+) -> ScheduleGate {
+    match admission {
+        Admission::Open => ScheduleGate::Open,
+        Admission::Held(_) => ScheduleGate::Held,
+        Admission::TimedOnly => ScheduleGate::TimedOnly {
+            due: entries
+                .iter()
+                .filter(|entry| {
+                    entry.fleet
+                        && entry
+                            .not_before
+                            .as_deref()
+                            .and_then(|at| softfig_ipc::fleet::parse_not_before(at).ok())
+                            .is_some_and(|at| at <= now)
+                })
+                .map(|entry| entry.id.clone())
+                .collect(),
+        },
+    }
+}
+
 /// Drop the `systemd-run` scope banner from a crash's stderr tail (task 070): a
 /// headless member's stderr typically holds ONLY `Running as unit:
 /// growlight-agent-<id>-<n>.scope; invocation ID: …` — the launch wrapper's line,
@@ -4012,6 +5037,83 @@ fn filter_systemd_banner(tail: &[String]) -> Vec<String> {
         .filter(|line| !line.starts_with("Running as unit:"))
         .cloned()
         .collect()
+}
+
+/// A v2 seam the loop keeps going past when it fails, and what it was doing:
+/// the project (or, for a pause, the entry) it failed for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FailSoft {
+    RestackScan(String),
+    RestackEnqueue(String),
+    ReRecordProbe(String),
+    ReRecord(String),
+    Pause(String),
+}
+
+impl fmt::Display for FailSoft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RestackScan(project) => write!(f, "restack scan of {project}"),
+            Self::RestackEnqueue(project) => write!(f, "restack enqueue for {project}"),
+            Self::ReRecordProbe(project) => write!(f, "base re-record probe for {project}"),
+            Self::ReRecord(project) => write!(f, "base re-record for {project}"),
+            Self::Pause(entry) => write!(f, "pause of v2 {entry}"),
+        }
+    }
+}
+
+/// The journal voice of the v2 fail-soft seams (V20). They retry on their own
+/// schedule, the re-record and the pause every tick, so a seam logs when it
+/// starts failing and when it recovers, never per attempt. The latch lives here
+/// and not in [`TickLogger`] because a restack scan runs only at boot and at a
+/// handoff: a tick without one says nothing about whether it still fails.
+#[derive(Debug, Default)]
+struct FailSoftEdges {
+    failing: BTreeSet<FailSoft>,
+    /// Edges not yet handed to a [`TickReport`].
+    lines: Vec<String>,
+}
+
+impl FailSoftEdges {
+    /// Record how `seam` went, and hand back its value when it worked.
+    fn note<T>(&mut self, seam: FailSoft, result: Result<T, String>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.clear(&seam);
+                Some(value)
+            }
+            Err(reason) => {
+                let line = format!("{seam} failed ({reason}); will retry");
+                if self.failing.insert(seam) {
+                    self.lines.push(line);
+                }
+                None
+            }
+        }
+    }
+
+    fn clear(&mut self, seam: &FailSoft) {
+        if self.failing.remove(seam) {
+            self.lines.push(format!("{seam} recovered"));
+        }
+    }
+
+    /// Clear the re-record of every project `due` no longer holds. A write can
+    /// land with its reply lost, and the row then leaves `due` with no success
+    /// to clear it, which would mute that project's next failure.
+    fn retain_re_records(&mut self, due: impl Fn(&str) -> bool) {
+        let settled: Vec<FailSoft> = self
+            .failing
+            .iter()
+            .filter(|seam| {
+                matches!(seam, FailSoft::ReRecordProbe(p) | FailSoft::ReRecord(p) if !due(p))
+            })
+            .cloned()
+            .collect();
+        for seam in &settled {
+            self.clear(seam);
+        }
+    }
 }
 
 /// The drive loop's journal voice (task 033's diagnosability half): render one
@@ -4074,6 +5176,12 @@ impl TickLogger {
         for a in &r.started {
             out.push(format!("fleet: started {} on {}/{}", a.agent, a.queue, a.part));
         }
+        for a in &r.unattributed {
+            out.push(format!(
+                "telemetry: {}'s first session on {}/{} is unattributed to a slice (its baton names none); its rows carry slice_id null until a re-roll reads the slice it hands off",
+                a.agent, a.queue, a.part
+            ));
+        }
         for a in &r.v2_started {
             // The v2 journal voice (slice 006): name the entry, unit and resolved
             // model so a v2 assignment is diagnosable like a legacy one.
@@ -4083,6 +5191,23 @@ impl TickLogger {
                 a.entry,
                 v2_unit_label(&a.unit),
                 model_ref_label(&a.resolved_model),
+            ));
+        }
+        for what in &r.v2_restack_blocked {
+            out.push(format!(
+                "fleet: {what}; the loop never rewrites a pushed branch, so no restack was enqueued"
+            ));
+        }
+        // Already edge-deduped, by `FailSoftEdges`.
+        for what in &r.v2_fail_soft {
+            out.push(format!("fleet: {what}"));
+        }
+        // Not edge-deduped: the claim backoff already spaces these out, and each
+        // carries a new streak and reason (V3).
+        for f in &r.v2_claim_failures {
+            out.push(format!(
+                "fleet: claim of v2 {} by {} failed ({}); failure {}, retrying in {}s",
+                f.entry, f.agent, f.reason, f.streak, f.retry_secs
             ));
         }
         let mut held_now: BTreeSet<(String, &'static str)> = BTreeSet::new();
@@ -4283,6 +5408,11 @@ impl TickLogger {
                     .to_string(),
             );
         }
+        // The schedule's edge (growlight-schedule slice 003): the loop already
+        // edge-detects it, so this is one line per open/close, not per tick.
+        if let Some(line) = &r.schedule_edge {
+            out.push(line.clone());
+        }
         out
     }
 }
@@ -4320,7 +5450,7 @@ pub fn spawn_drive_loop(
 /// Wall-clock Unix seconds for the live thread's `now`. The pure policy stays
 /// time-injected; only this live driver reads the clock (mirrors
 /// [`crate::claude_backend`]'s local clock).
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -4799,6 +5929,11 @@ mod tests {
         }
         fn read_item_doc(&self, part: &str) -> Option<String> {
             self.item_docs.lock().unwrap().get(part).cloned()
+        }
+        fn timed_due(&self, _queue: &str, part: &str) -> bool {
+            self.item_docs.lock().unwrap().get(part).is_some_and(|doc| {
+                crate::queue_source::doc_timed_due(doc, crate::agent_harness::unix_now())
+            })
         }
     }
 
@@ -6311,12 +7446,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     }
 
     /// A scripted [`RepoProbe`] (task 069): every read answers the current state
-    /// and is recorded with the `(queue, part)` it asked for.
+    /// and is recorded with the `(queue, part)` it asked for. A v2 read
+    /// resolves through the real [`v2_repo::local_repo`] (home `/home/t`, user
+    /// `t`) and is recorded with the path it probed (slot 3).
     #[derive(Debug, Default)]
     struct ScriptedRepo(
         Mutex<Option<RepoState>>,
         Mutex<Vec<(String, String)>>,
         Mutex<Option<std::path::PathBuf>>,
+        Mutex<Vec<std::path::PathBuf>>,
     );
     impl ScriptedRepo {
         fn set(&self, head: &str, dirty: usize, fingerprint: u64) {
@@ -6343,12 +7481,22 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn reads(&self) -> Vec<(String, String)> {
             self.1.lock().unwrap().clone()
         }
+        fn v2_reads(&self) -> Vec<std::path::PathBuf> {
+            self.3.lock().unwrap().clone()
+        }
     }
     impl RepoProbe for Arc<ScriptedRepo> {
         fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)> {
             self.1.lock().unwrap().push((queue.into(), part.into()));
             let path = self.2.lock().unwrap().clone().unwrap_or_else(|| "/scripted-repo".into());
             self.0.lock().unwrap().clone().map(|state| (path, state))
+        }
+        fn v2_repo(&self, project: &scheduler_v2::ProjectView) -> Option<std::path::PathBuf> {
+            v2_repo::local_repo(project, Some(std::path::Path::new("/home/t")), Some("t"))
+        }
+        fn probe_repo(&self, repo: &std::path::Path) -> Option<RepoState> {
+            self.3.lock().unwrap().push(repo.to_path_buf());
+            self.0.lock().unwrap().clone()
         }
     }
 
@@ -6934,6 +8082,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             logger.lines(&started),
             vec!["fleet: started a on default/020".to_string()],
         );
+
+        // A first spawn whose baton names no slice says so, beside its start.
+        let first = Assignment {
+            agent: "a".into(),
+            queue: "default".into(),
+            part: "020".into(),
+        };
+        let unattributed = TickReport {
+            started: vec![first.clone()],
+            unattributed: vec![first],
+            ..TickReport::default()
+        };
+        let lines = logger.lines(&unattributed);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].starts_with("telemetry: a's first session on default/020 is unattributed"));
 
         // The stall shape: held (no workable part) tick after tick → one line.
         let held = TickReport {
@@ -8694,22 +9857,25 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         cell: Arc<Mutex<Option<V2Snapshot>>>,
         absent: Arc<AtomicBool>,
         failed: Arc<AtomicBool>,
+        /// How many times the loop read the source.
+        loads: Arc<AtomicUsize>,
     }
 
     impl FakeV2Source {
         fn with(snapshot: V2Snapshot) -> Self {
             Self {
                 cell: Arc::new(Mutex::new(Some(snapshot))),
-                absent: Arc::new(AtomicBool::new(false)),
-                failed: Arc::new(AtomicBool::new(false)),
+                ..Self::default()
             }
         }
         fn absent() -> Self {
             Self {
-                cell: Arc::new(Mutex::new(None)),
                 absent: Arc::new(AtomicBool::new(true)),
-                failed: Arc::new(AtomicBool::new(false)),
+                ..Self::default()
             }
+        }
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
         }
         /// Replace the scripted snapshot (the next `load`s read it) — the test's
         /// stand-in for the committed state a claim produces.
@@ -8722,6 +9888,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
     impl V2QueueSource for FakeV2Source {
         fn load(&mut self) -> V2Load {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             if self.failed.load(Ordering::SeqCst) {
                 V2Load::Failed {
                     error: crate::v2_source::V2SourceError::Unreadable {
@@ -8742,15 +9909,24 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     #[derive(Debug, Default)]
     struct FakeV2Claimer {
         claims: Mutex<Vec<(String, Option<String>)>>,
+        /// The `base` each claim asked keeperd to record, `None` when it asked
+        /// for none.
+        bases: Mutex<Vec<Option<String>>>,
         fail: AtomicBool,
     }
 
     impl V2Claimer for FakeV2Claimer {
-        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+        fn claim_v2(
+            &self,
+            entry: &str,
+            unit: Option<&str>,
+            first: Option<&FirstClaim>,
+        ) -> Result<(), String> {
             self.claims
                 .lock()
                 .unwrap()
                 .push((entry.to_string(), unit.map(str::to_string)));
+            self.bases.lock().unwrap().push(first.map(|f| f.base.clone()));
             if self.fail.load(Ordering::SeqCst) {
                 Err("claim refused".into())
             } else {
@@ -8762,8 +9938,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// The `Arc` shape the loop's `Box<dyn V2Claimer>` holds (same pattern as
     /// `FakeFleet`).
     impl V2Claimer for Arc<FakeV2Claimer> {
-        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
-            (**self).claim_v2(entry, unit)
+        fn claim_v2(
+            &self,
+            entry: &str,
+            unit: Option<&str>,
+            first: Option<&FirstClaim>,
+        ) -> Result<(), String> {
+            (**self).claim_v2(entry, unit, first)
         }
     }
 
@@ -8799,6 +9980,69 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
     }
 
+    /// A recording [`V2RestackEnqueuer`] — the §8 restack enqueue (slice 003),
+    /// recording each `(project, stack)` for assertions.
+    #[derive(Debug, Default)]
+    struct FakeV2RestackEnqueuer {
+        enqueued: Mutex<Vec<(String, usize)>>,
+        stacks: Mutex<Vec<Vec<RestackBranch>>>,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl V2RestackEnqueuer for FakeV2RestackEnqueuer {
+        fn enqueue_restack(
+            &self,
+            project: &str,
+            stack: &[RestackBranch],
+        ) -> Result<Option<String>, String> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("refused".into());
+            }
+            self.enqueued
+                .lock()
+                .unwrap()
+                .push((project.to_string(), stack.len()));
+            self.stacks.lock().unwrap().push(stack.to_vec());
+            Ok(Some("001".into()))
+        }
+    }
+
+    impl V2RestackEnqueuer for Arc<FakeV2RestackEnqueuer> {
+        fn enqueue_restack(
+            &self,
+            project: &str,
+            stack: &[RestackBranch],
+        ) -> Result<Option<String>, String> {
+            (**self).enqueue_restack(project, stack)
+        }
+    }
+
+    /// A recording [`V2BaseReRecorder`] — the §8 re-record (slice 004),
+    /// recording each `(entry, base)` pair for assertions.
+    #[derive(Debug, Default)]
+    struct FakeV2BaseReRecorder {
+        recorded: Mutex<Vec<(String, String)>>,
+        settled: Mutex<Vec<String>>,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl V2BaseReRecorder for FakeV2BaseReRecorder {
+        fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("refused".into());
+            }
+            self.recorded.lock().unwrap().extend_from_slice(entries);
+            self.settled.lock().unwrap().extend_from_slice(settled);
+            Ok(())
+        }
+    }
+
+    impl V2BaseReRecorder for Arc<FakeV2BaseReRecorder> {
+        fn re_record_bases(&self, entries: &[(String, String)], settled: &[String]) -> Result<(), String> {
+            (**self).re_record_bases(entries, settled)
+        }
+    }
+
     /// A v2 snapshot with one milestone entry and one queued slice, whose
     /// declared `> Model:` list is `decl` (parsed) — the smallest list
     /// `pick_v2` walks to a slice unit.
@@ -8816,6 +10060,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/garden".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
+                main: "main".into(),
             }],
             entries: vec![EntryView {
                 id: entry_id.into(),
@@ -8824,9 +10070,14 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 lane: Lane::Normal,
                 status,
                 after: vec![],
+                branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: String::new(),
                 follow_ups: 0,
                 pending: None,
+                fleet: true,
+                not_before: None,
                 holder: None,
                 models: None,
             }],
@@ -8846,6 +10097,10 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             .into_iter()
             .collect(),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -8877,6 +10132,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             member_writer: Box::new(Arc::clone(&backend)),
             claimer: Box::new(claimer),
             parker: Box::new(parker),
+            restacker: Box::new(FakeV2RestackEnqueuer::default()),
+            re_recorder: Box::new(FakeV2BaseReRecorder::default()),
         });
         (drive, d, backend, probe)
     }
@@ -8886,6 +10143,172 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         FleetMember::unpinned(spec(id)).with_backend(crate::fleet::MemberBackend::Opencode(
             crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
         ))
+    }
+
+    /// A fresh per-test entry-baton dir under the system temp dir.
+    fn v2_entries_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("v2-entries-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// QUEUE-V2-PARITY ROW 6 — the boot dirty-tree guard on both v2 spawn
+    /// paths. The fresh start compares against the entry baton's handoff (its
+    /// last write), so dirt older than it is silent and dirt newer than it
+    /// warns before the spawn; the re-roll compares against the member's
+    /// carried baton from the pre-spawn hook. The repo is the one the claim
+    /// resolved from the entry's project.
+    #[test]
+    fn a_v2_spawn_warns_on_dirt_newer_than_the_baton() {
+        let t = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let carried_entry = |tag: &str| {
+            let dir = v2_entries_dir(tag);
+            let store = FsEntryBatonStore::new(&dir, "garden");
+            store.write("m1", "---\nitem: m1\n---\n# NEXT ACTION\ncarry on\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("m1").join("baton.md"))
+                .unwrap()
+                .set_modified(t(1_000))
+                .unwrap();
+            dir
+        };
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        // Fresh start, dirt newer than the entry's handoff: warned, then spawned.
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot(EntryStatus::Queued)),
+            carried_entry("row6-newer"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, t(1_060));
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started[0].repo, Some(PathBuf::from("/garden")), "resolved at claim");
+        assert_eq!(repo.v2_reads(), vec![PathBuf::from("/garden")], "the project's repo is probed");
+        let warns = backend.warns();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].1.contains("m1 (a1)")
+                && warns[0].1.contains("/garden has 3 uncommitted path(s)")
+                && warns[0].1.contains("newer than the baton"),
+            "the guard names the entry, the repo, the count and the recency: {warns:?}",
+        );
+        assert_eq!(backend.events(), vec!["warn:a1", "spawn:a1"], "before the spawn");
+
+        // Fresh start, dirt OLDER than the entry's handoff: the baton knows it.
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            carried_entry("row6-older"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, t(900));
+        loop_.tick(0);
+        assert!(backend.warns().is_empty(), "dirt older than the handoff is not a cut-off session");
+        assert_eq!(backend.events(), vec!["spawn:a1"]);
+
+        // The session is cut off by the network, leaving work newer than the
+        // member's carried baton: the re-roll warns before it spawns.
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_baton_mtime("a1", t(1_000));
+        repo.set_dirty("h1", 4, 9, t(1_060));
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr("a1", &["error: getaddrinfo ENOTFOUND api.anthropic.com"]);
+        let rerolled = (1..40).any(|now| {
+            loop_.tick(now).rerolls.contains(&RerollOutcome::Rerolled { agent: "a1".into() })
+        });
+        assert!(rerolled, "the member re-rolls");
+        assert_eq!(backend.events(), vec!["spawn:a1", "warn:a1", "spawn:a1"], "warned, then spawned");
+        assert!(backend.warns()[0].1.contains("/garden has 4 uncommitted path(s)"));
+    }
+
+    /// QUEUE-V2-PARITY ROW 6 — a remote entry gives no repo signal, as legacy
+    /// gives none for a repo it cannot probe: a claude member (the remote rule
+    /// lets it take the entry) spawns with no guard, and nothing is probed —
+    /// even under a fresh entry baton, where any local dirt would surface.
+    #[test]
+    fn a_v2_remote_entry_gets_no_boot_guard() {
+        let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+        snapshot.projects[0].repo = "otg-travel:/srv/r".into();
+        snapshot.projects[0].locality = softfig_ipc::queue_v2::RepoLocality::Remote;
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![FleetMember::unpinned(spec("c1"))],
+            FakeV2Source::with(snapshot),
+            v2_entries_dir("row6-remote"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, std::time::UNIX_EPOCH);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "the claude member takes the remote entry");
+        assert_eq!(r.v2_started[0].repo, None, "a remote repo resolves to no path");
+        assert!(repo.v2_reads().is_empty(), "nothing is probed");
+        assert!(backend.warns().is_empty());
+        assert_eq!(backend.events(), vec!["spawn:c1"]);
+    }
+
+    /// QUEUE-V2-PARITY ROW 7 — the task 069 replay for a v2 member: the spin
+    /// guard reads the repo the claim resolved, so a session that ends with the
+    /// same NEXT ACTION but a moved repo is progress, not a spin. A session
+    /// after it that moves nothing parks the entry.
+    #[test]
+    fn a_v2_member_whose_repo_moves_is_not_parked_as_stuck() {
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let parker = Arc::new(FakeV2Parker::default());
+        let (loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir("row7"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+
+        loop_.tick(0); // a1 claims m1
+        source.set(snapshot(EntryStatus::Active));
+        let start_reads = repo.v2_reads().len();
+
+        // Session 1 hands off X on a clean tree.
+        repo.set("h1", 0, 0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "wire the booking form");
+        let r1 = loop_.tick(1);
+        assert!(r1.v2_parked.is_empty());
+        assert_eq!(
+            repo.v2_reads()[start_reads..],
+            [PathBuf::from("/garden")],
+            "one read, of the repo the claim resolved",
+        );
+
+        // Session 2 works and ends with no handoff: same NEXT ACTION, 5 files dirty.
+        repo.set("h1", 5, 42);
+        let r2 = loop_.tick(2);
+        assert!(r2.v2_parked.is_empty(), "the repo moved — progress, not a spin");
+        assert!(parker.parked.lock().unwrap().is_empty(), "m1 is not parked");
+        assert_eq!(backend.spawn_count(), 3, "a1 re-rolled onto m1");
+        assert_eq!(repo.v2_reads().len() - start_reads, 2, "one repo read per session exit");
+
+        // Session 3 moves nothing: now it is a spin.
+        let r3 = loop_.tick(3);
+        assert_eq!(r3.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
+        assert_eq!(*parker.parked.lock().unwrap(), ["m1"]);
     }
 
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
@@ -8927,6 +10350,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     slice: "001".into(),
                 },
                 resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_REASONING),
+                repo: None,
             }],
             "the assignment names the entry, the walked unit, and the resolved model",
         );
@@ -8946,8 +10370,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the unit's declared reasoning model overrides the flash roster default",
         );
         // The §3.6 copy: the never-claimed entry was seeded from the template
-        // (with the literal §8 base-line tokens — the concrete values are
-        // queue-v2-git's row) and the SAME contents written to the member path.
+        // (with no §8 base line — the first claim resolved no branch/base here)
+        // and the SAME contents written to the member path.
         let seeded = std::fs::read_to_string(entries_dir.join("m1").join("baton.md"))
             .expect("the entry baton was seeded");
         assert!(
@@ -8955,8 +10379,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the seed is the entry's baton: {seeded}"
         );
         assert!(
-            seeded.contains("<branch>") && seeded.contains("<base>"),
-            "the §8 base-line tokens ride the seed until queue-v2-git computes them: {seeded}"
+            !seeded.contains("FIRST STEP"),
+            "no §8 base line rides the seed when the first claim resolves none: {seeded}"
         );
         let writes = backend.member_writes();
         assert_eq!(writes.len(), 1, "one member write: {writes:?}");
@@ -9135,6 +10559,610 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// V3 — a persistent claim error surfaces with its reason and backs off: the
+    /// failing entry is not re-picked (and re-failed) every tick, the journal line
+    /// names why, and past the alert streak the human is paged. A claim that then
+    /// succeeds clears the backoff.
+    /// A real repo for the §8 scan: `main`, a branch `feat/one` cut from it,
+    /// then `main` amended so `feat/one`'s recorded base is abandoned (a stale
+    /// stack). Returns the repo and the original main commit (the recorded base).
+    fn stale_stack_repo(track: bool) -> (tempfile::TempDir, String) {
+        fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+        let base = git(repo, &["rev-parse", "main"]);
+        git(repo, &["checkout", "-q", "-b", "feat/one"]);
+        std::fs::write(repo.join("one.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "one"]);
+        git(repo, &["checkout", "-q", "main"]);
+        if track {
+            git(repo, &["update-ref", "refs/remotes/origin/feat/one", "feat/one"]);
+            git(repo, &["remote", "add", "origin", "https://example.invalid/origin"]);
+            git(repo, &["branch", "--set-upstream-to", "origin/feat/one", "feat/one"]);
+        }
+        std::fs::write(repo.join("a.txt"), "amended\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "--amend", "-m", "main rewritten"]);
+        (dir, base)
+    }
+
+    /// A snapshot with one local project at `repo` and one claimed normal entry
+    /// on `feat/one`, whose recorded base is `base`.
+    fn restack_snapshot(repo: &std::path::Path, base: &str) -> V2Snapshot {
+        V2Snapshot {
+            projects: vec![ProjectView {
+                name: "softfig".into(),
+                repo: repo.display().to_string(),
+                locality: softfig_ipc::queue_v2::RepoLocality::of(&repo.display().to_string(), None),
+                main: "main".into(),
+            }],
+            entries: vec![EntryView {
+                id: "one".into(),
+                kind: EntryKind::Task,
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Active,
+                after: vec![],
+                branch: "feat/one".into(),
+                claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: base.into(),
+                follow_ups: 0,
+                pending: None,
+                fleet: true,
+                not_before: None,
+                holder: None,
+                models: None,
+            }],
+            trees: BTreeMap::new(),
+            done_ids: BTreeSet::new(),
+            done_branches: Default::default(),
+            now_unix: 0,
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
+        }
+    }
+
+    /// Swap `loop_`'s re-recorder for a spy the test can read.
+    fn spy_re_recorder(loop_: &mut DriveLoop) -> Arc<FakeV2BaseReRecorder> {
+        let rec = Arc::new(FakeV2BaseReRecorder::default());
+        loop_.v2.as_mut().unwrap().re_recorder = Box::new(Arc::clone(&rec));
+        rec
+    }
+
+    fn v2_loop_with_restacker(enq: &Arc<FakeV2RestackEnqueuer>) -> DriveLoop {
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            std::env::temp_dir().join(format!("v2-entries-restack-{}", std::process::id())),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(enq));
+        loop_
+    }
+
+    /// [`restack_snapshot`] with a second project on the same repo, whose entry
+    /// `two` is on `branch`, recorded on top of `feat/one`.
+    fn two_project_snapshot(repo: &std::path::Path, base: &str, branch: &str) -> V2Snapshot {
+        let mut snapshot = restack_snapshot(repo, base);
+        snapshot.projects.push(ProjectView {
+            name: "mirror".into(),
+            repo: repo.display().to_string(),
+            locality: softfig_ipc::queue_v2::RepoLocality::Local,
+            main: "main".into(),
+        });
+        let mut two = snapshot.entries[0].clone();
+        two.id = "two".into();
+        two.project = "mirror".into();
+        two.branch = branch.into();
+        two.parent = "one".into();
+        two.claimed = "2026-10-15T00:00Z".into();
+        snapshot.entries.push(two);
+        snapshot
+    }
+
+    fn git_in(repo: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// §8: two projects on one repo are one stack, whichever one the scan
+    /// starts from, so they get one restack that covers both.
+    #[test]
+    fn v2_two_projects_on_one_repo_share_one_restack() {
+        let (dir, base) = stale_stack_repo(false);
+        git_in(dir.path(), &["branch", "feat/two", "feat/one"]);
+        let snapshot = two_project_snapshot(dir.path(), &base, "feat/two");
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+
+        enq.enqueued.lock().unwrap().clear();
+        loop_.scan_restacks(&snapshot, Some("mirror"), &mut blocked);
+        assert_eq!(
+            *enq.enqueued.lock().unwrap(),
+            vec![("softfig".to_string(), 2)],
+            "a scan from the second project is the same stack",
+        );
+    }
+
+    /// A row in the sibling project holds a due re-record back, as one in the
+    /// project itself does: it is the repo's one row, and its doc still needs the
+    /// bases.
+    #[test]
+    fn v2_a_due_re_record_waits_for_a_restack_row_of_a_project_on_the_same_repo() {
+        let (dir, base) = stale_stack_repo(false);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        snapshot.projects.push(ProjectView {
+            name: "mirror".into(),
+            repo: dir.path().display().to_string(),
+            locality: softfig_ipc::queue_v2::RepoLocality::Local,
+            main: "main".into(),
+        });
+        let mut restack = snapshot.entries[0].clone();
+        restack.id = "073".into();
+        restack.kind = EntryKind::Restack;
+        restack.project = "mirror".into();
+        restack.lane = Lane::Urgent;
+        restack.status = EntryStatus::Blocked;
+        restack.branch = String::new();
+        restack.claimed = String::new();
+        snapshot.entries.insert(0, restack);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &["072".to_string()], &mut Vec::new());
+
+        assert!(rec.settled.lock().unwrap().is_empty(), "the live row holds it back");
+    }
+
+    /// The re-record of a restack covers the repo's stack: a branch of the
+    /// sibling project moved with it, so its base moves too.
+    #[test]
+    fn v2_a_re_record_moves_the_base_of_a_project_on_the_same_repo() {
+        let (dir, base) = stale_stack_repo(false);
+        let repo = dir.path();
+        git_in(repo, &["checkout", "-q", "-b", "feat/two"]);
+        std::fs::write(repo.join("two.txt"), "two\n").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "two"]);
+        git_in(repo, &["checkout", "-q", "main"]);
+        let mut snapshot = two_project_snapshot(repo, &base, "feat/two");
+        snapshot.entries[1].parent = String::new();
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &["072".to_string()], &mut Vec::new());
+
+        let recorded = rec.recorded.lock().unwrap();
+        assert!(recorded.iter().any(|(id, _)| id == "two"), "{recorded:?}");
+    }
+
+    /// V1: a stale stack whose branch tracks an upstream is NOT auto-enqueued —
+    /// the loop never rewrites a pushed branch — and the human is alerted.
+    #[test]
+    fn v2_mode_withholds_a_restack_over_an_upstream_branch_and_alerts() {
+        let (dir, base) = stale_stack_repo(true);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
+
+        assert!(
+            enq.enqueued.lock().unwrap().is_empty(),
+            "no restack is enqueued over a pushed branch",
+        );
+        assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+        let r = TickReport { v2_restack_blocked: blocked, ..TickReport::default() };
+        let lines = TickLogger::default().lines(&r);
+        assert!(
+            lines.iter().any(|l| l.contains("feat/one") && l.contains("upstream")),
+            "the journal names the branch: {lines:?}",
+        );
+    }
+
+    /// V20: a failed enqueue says so when it starts and when it ends, however
+    /// many scans it fails in between.
+    #[test]
+    fn v2_mode_a_failing_restack_enqueue_logs_once_per_edge() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        enq.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        let mut blocked = Vec::new();
+
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["restack enqueue for softfig failed (refused); will retry"],
+        );
+
+        enq.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(loop_.v2_fail_soft.lines, ["restack enqueue for softfig recovered"]);
+    }
+
+    /// V20: a repo git can't read fails its scan, and the tick's report carries
+    /// that to the journal, once.
+    #[test]
+    fn v2_mode_a_failing_restack_scan_reaches_the_journal_once() {
+        let nowhere = tempfile::tempdir().unwrap();
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(restack_snapshot(nowhere.path(), "base")),
+            std::env::temp_dir().join(format!("v2-entries-failsoft-{}", std::process::id())),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let report = loop_.tick(500);
+        assert_eq!(report.v2_fail_soft.len(), 1, "{:?}", report.v2_fail_soft);
+        assert!(report.v2_fail_soft[0].starts_with("restack scan of softfig failed ("));
+        let lines = TickLogger::default().lines(&report);
+        assert!(lines.contains(&format!("fleet: {}", report.v2_fail_soft[0])), "{lines:?}");
+
+        loop_.restack_boot_done = false; // the next scan, as a handoff would ask for
+        assert!(loop_.tick(501).v2_fail_soft.is_empty());
+    }
+
+    /// V20: the re-record retries every tick, so it can't log every tick.
+    #[test]
+    fn v2_mode_a_failing_re_record_logs_once_per_edge() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        rec.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        let due = vec!["r1".to_string()];
+
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["base re-record for softfig failed (refused); will retry"],
+        );
+
+        // The write landed but its reply was lost: nothing is due, and nothing
+        // reported success. The project's next failure must still be heard.
+        loop_.v2_fail_soft.retain_re_records(|_| false);
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["base re-record for softfig recovered"],
+        );
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(loop_.v2_fail_soft.lines.len(), 1, "{:?}", loop_.v2_fail_soft.lines);
+    }
+
+    /// V20: a pause that failed is retried every tick, silently until it lands.
+    #[test]
+    fn v2_mode_a_failing_pause_logs_once_per_edge() {
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let parker = Arc::new(FakeV2Parker::default());
+        loop_.v2.as_mut().unwrap().parker = Box::new(Arc::clone(&parker));
+        parker.fail_pause.store(true, Ordering::SeqCst);
+
+        loop_.pause_v2_entry("m1", "a1", &mut TickReport::default());
+        loop_.retry_v2_pauses();
+        assert_eq!(
+            std::mem::take(&mut loop_.v2_fail_soft.lines),
+            ["pause of v2 m1 failed (keeperd unreachable); will retry"],
+        );
+
+        parker.fail_pause.store(false, Ordering::SeqCst);
+        loop_.retry_v2_pauses();
+        assert_eq!(loop_.v2_fail_soft.lines, ["pause of v2 m1 recovered"]);
+    }
+
+    /// V13: restack scans of one repo within a tick share git's answers — the
+    /// scan at claim and the scan at a handshake do not each re-run the probe.
+    #[test]
+    fn v2_mode_scans_of_one_repo_in_a_tick_spawn_git_once() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        loop_.git_probes.begin_tick(500);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        let first = loop_.git_probes.spawned(dir.path());
+        assert!(first > 0, "the first scan ran git");
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        assert_eq!(
+            loop_.git_probes.spawned(dir.path()),
+            first,
+            "later scans in the tick are answered from the first",
+        );
+
+        loop_.git_probes.begin_tick(501);
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        assert_eq!(loop_.git_probes.spawned(dir.path()), first, "a new tick asks git again");
+    }
+
+    /// V13: a git that never answers costs the tick one overall deadline, not a
+    /// kill per call, and the next scan in the tick does not wait again.
+    #[test]
+    fn v2_mode_scan_of_a_hung_repo_is_bounded_and_enqueues_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let tools = tempfile::tempdir().unwrap();
+        let (slow_git, _) = crate::git_probe::tests::fake_git(tools.path(), "30");
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        loop_.git_probes = ProbeCache::with(Duration::from_millis(300), slow_git);
+        let snapshot = restack_snapshot(dir.path(), &base);
+        loop_.git_probes.begin_tick(500);
+
+        let started = std::time::Instant::now();
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&snapshot, None, &mut blocked);
+        loop_.scan_restacks(&snapshot, Some("softfig"), &mut blocked);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(enq.enqueued.lock().unwrap().is_empty());
+        assert!(blocked.is_empty());
+    }
+
+    /// The control: the same stale stack with no upstream is enqueued as before.
+    #[test]
+    fn v2_mode_still_enqueues_a_restack_over_local_branches() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+
+        let mut blocked = Vec::new();
+        loop_.scan_restacks(&restack_snapshot(dir.path(), &base), None, &mut blocked);
+
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 1)]);
+        assert!(blocked.is_empty(), "{blocked:?}");
+    }
+
+    /// The backstop: a branch that gained an upstream mid-restack is reported at
+    /// re-record time too, instead of the loop returning silently.
+    #[test]
+    fn v2_mode_re_record_over_an_upstream_branch_alerts_instead_of_returning_silently() {
+        let (dir, base) = stale_stack_repo(true);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+
+        let mut blocked = Vec::new();
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut restack_snapshot(dir.path(), &base), "softfig", &due, &mut blocked);
+
+        assert_eq!(blocked, vec!["restack softfig: feat/one tracks an upstream".to_string()]);
+        // Waiting changes nothing for a pushed branch, so the row stops being due.
+        assert!(rec.recorded.lock().unwrap().is_empty());
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    /// A remote repo runs no git, so its row settles at once with nothing moved.
+    #[test]
+    fn v2_mode_re_record_settles_a_remote_repo_with_nothing_moved() {
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        let mut snapshot = restack_snapshot(std::path::Path::new("/tmp"), "abc");
+        snapshot.projects[0].repo = "ssh://host/repo.git".into();
+
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+
+        assert!(rec.recorded.lock().unwrap().is_empty());
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    /// A refused write leaves the list as it was, so the row stays due and the
+    /// snapshot keeps the base the list still holds.
+    #[test]
+    fn v2_mode_a_refused_re_record_patches_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        rec.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = restack_snapshot(dir.path(), &base);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let main = git(&["rev-parse", "main"]);
+        git(&["rebase", "-q", "--onto", "main", &base, "feat/one"]);
+        git(&["checkout", "-q", "main"]);
+
+        let due = ["r".to_string()];
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(snapshot.entries[0].base, base, "the list still holds the old base");
+
+        rec.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut Vec::new());
+        assert_eq!(snapshot.entries[0].base, main, "the retry lands and patches");
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    /// V4: a restack session killed mid-rebase leaves a stack worktree in
+    /// `rebase-merge`; the re-record records nothing and tells the human which
+    /// worktree it is.
+    #[test]
+    fn v2_mode_re_record_mid_rebase_alerts_and_records_nothing() {
+        let (dir, base) = stale_stack_repo(false);
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        std::fs::write(repo.join("one.txt"), "main\n").unwrap();
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "main moved"]).status.success());
+        assert!(!git(&["rebase", "main", "feat/one"]).status.success(), "stops on the conflict");
+
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        let mut loop_ = v2_loop_with_restacker(&enq);
+        let rec = spy_re_recorder(&mut loop_);
+        let mut blocked = Vec::new();
+        let due = ["r".to_string()];
+        let mut snapshot = restack_snapshot(repo, &base);
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
+
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert!(
+            blocked[0].starts_with("restack softfig: worktree ")
+                && blocked[0].ends_with(" is mid-rebase; bases not re-recorded"),
+            "{blocked:?}",
+        );
+
+        // The row stays due, so the retry every tick must not alert again.
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
+        assert_eq!(blocked.len(), 1, "one alert, not one per tick: {blocked:?}");
+        assert!(rec.settled.lock().unwrap().is_empty(), "still due");
+
+        // The rebase ends, and the retry finishes the job.
+        assert!(git(&["rebase", "--abort"]).status.success());
+        loop_.re_record_restack(&mut snapshot, "softfig", &due, &mut blocked);
+        assert_eq!(*rec.settled.lock().unwrap(), due);
+    }
+
+    #[test]
+    fn v2_mode_a_persistent_claim_failure_backs_off_and_surfaces_its_reason() {
+        let claimer = Arc::new(FakeV2Claimer::default());
+        claimer.fail.store(true, Ordering::SeqCst);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            std::env::temp_dir().join(format!("v2-entries-backoff-{}", std::process::id())),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let f = &r.v2_claim_failures[0];
+        assert_eq!((f.entry.as_str(), f.streak), ("m1", 1));
+        assert_eq!(f.reason, "claim refused", "the reason rides the report");
+        assert_eq!(f.retry_secs, v2_claim_backoff_secs(1));
+        let mut logger = TickLogger::default();
+        let lines = logger.lines(&r);
+        assert!(
+            lines.iter().any(|l| l.contains("m1") && l.contains("claim refused")),
+            "the journal line names the reason: {lines:?}",
+        );
+
+        // The next tick, inside the backoff: no claim is attempted.
+        let r = loop_.tick(1);
+        assert_eq!(claimer.claims.lock().unwrap().len(), 1, "no re-claim while backing off");
+        assert!(r.v2_claim_failures.is_empty());
+        assert_eq!(r.held_fresh.len(), 1);
+        assert_eq!(r.held_fresh[0].reason, "claim backing off");
+
+        // Past the backoff the claim is retried, and the delay grows.
+        let r = loop_.tick(v2_claim_backoff_secs(1) + 1);
+        assert_eq!(claimer.claims.lock().unwrap().len(), 2, "retried after the backoff");
+        assert_eq!(r.v2_claim_failures[0].streak, 2);
+        assert!(r.v2_claim_failures[0].retry_secs > v2_claim_backoff_secs(1));
+        assert_eq!(backend.spawn_count(), 0);
+
+        // A claim that lands clears the backoff.
+        claimer.fail.store(false, Ordering::SeqCst);
+        let r = loop_.tick(1_000);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert!(loop_.v2_claim_backoff.is_empty(), "success clears the backoff");
+    }
+
+    /// F7: an entry that leaves the list takes its backoff and model-override
+    /// rows with it; a live entry's rows stay.
+    #[test]
+    fn v2_mode_an_archived_entry_leaves_no_side_table_rows() {
+        let claimer = Arc::new(FakeV2Claimer::default());
+        claimer.fail.store(true, Ordering::SeqCst);
+        let source = FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            std::env::temp_dir().join(format!("v2-entries-prune-{}", std::process::id())),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        assert!(loop_.v2_claim_backoff.contains_key("m1"), "preamble: m1 backs off");
+        let unit = Unit::Slice {
+            milestone: "m1".into(),
+            slice: "001".into(),
+        };
+        let model = ModelChoice::claude();
+        for entry in ["m1", "m2"] {
+            loop_
+                .v2_model_overrides
+                .push((entry.into(), unit.clone(), model.clone()));
+        }
+
+        // m1 is archived: the list now carries only m2.
+        source.set(v2_milestone("m2", EntryStatus::Queued, "001", None));
+        loop_.tick(1);
+        assert!(
+            !loop_.v2_claim_backoff.contains_key("m1"),
+            "{:?}",
+            loop_.v2_claim_backoff
+        );
+        assert_eq!(
+            loop_
+                .v2_model_overrides
+                .iter()
+                .map(|(entry, _, _)| entry.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m2"],
+        );
+    }
+
     /// SLICE 006 — an `Absent` v2 source (no `queue.toml`) schedules nothing,
     /// and a v2-mode daemon whose loop was never given seams schedules nothing
     /// either — both fail-closed, never a legacy fallback.
@@ -9217,6 +11245,99 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "a2 is held, naming itself: {:?}",
             second.held_fresh,
         );
+    }
+
+    /// Queue-v2-parity slice 002, row 2: a `fleet = false` entry shows under
+    /// `growlight status`'s `held:` in v2 mode, from the same hold rule the pick
+    /// applies. The v2 list replaces whatever was there (a legacy list from
+    /// before a mode flip), and lifting the hold drops the row at the next read.
+    #[test]
+    fn v2_mode_status_lists_a_human_only_entry_until_the_hold_is_lifted() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-held-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let human_only = |status| {
+            let mut snapshot = v2_milestone("m1", status, "001", None);
+            snapshot.entries[0].fleet = false;
+            snapshot
+        };
+        let source = FakeV2Source::with(human_only(EntryStatus::Queued));
+        let (mut loop_, d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+        d.record_held_parts(vec![softfig_ipc::growlightd::HeldPartSummary {
+            queue: "default".into(),
+            part: "stale".into(),
+            reason: "human-only (> Fleet: no)".into(),
+        }]);
+
+        assert!(loop_.tick(0).v2_started.is_empty(), "a1 never claims m1");
+        assert_eq!(
+            held(&d),
+            vec![softfig_ipc::growlightd::HeldPartSummary {
+                queue: "softfig".into(),
+                part: "m1".into(),
+                reason: "human-only (fleet = false)".into(),
+            }],
+            "m1 is listed, and the legacy row is gone",
+        );
+
+        // A `blocked` entry is not a hold: it is ineligible on its status.
+        source.set(human_only(EntryStatus::Blocked));
+        loop_.tick(1);
+        assert_eq!(held(&d), vec![], "a blocked entry is not listed as held");
+
+        // The owner lifts the hold: the row drops and a1 takes the entry.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        assert_eq!(loop_.tick(2).v2_started.len(), 1, "a1 claims the freed m1");
+        assert_eq!(held(&d), vec![], "nothing is held any more");
+    }
+
+    /// Queue-v2-parity slice 003, row 3: a `queued` entry before its
+    /// `not_before` is listed under `held:` with the time as written, read off
+    /// the tick's own clock. The tick at the time lists nothing and claims it.
+    #[test]
+    fn v2_mode_status_lists_a_not_yet_entry_until_its_start_time() {
+        const START: &str = "2026-10-31 02:00 -04:00";
+        let at = softfig_ipc::fleet::parse_not_before(START).expect("valid start time");
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-not-yet-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+        snapshot.entries[0].not_before = Some(START.into());
+        let source = FakeV2Source::with(snapshot);
+        let (mut loop_, d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source,
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+
+        assert!(loop_.tick(at - 1).v2_started.is_empty(), "a1 waits for m1's time");
+        assert_eq!(
+            held(&d),
+            vec![softfig_ipc::growlightd::HeldPartSummary {
+                queue: "softfig".into(),
+                part: "m1".into(),
+                reason: format!("not yet (not_before {START})"),
+            }],
+        );
+
+        assert_eq!(loop_.tick(at).v2_started.len(), 1, "a1 claims m1 at its time");
+        assert_eq!(held(&d), vec![], "nothing is held any more");
     }
 
     /// Review R1 — a growlightd restart: the new loop has no v2 assignments, the
@@ -9344,6 +11465,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     slice: "001".into(),
                 },
                 resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_FLASH),
+                repo: None,
             }],
             "the released member's assignment is recorded as parked",
         );
@@ -9401,6 +11523,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     claimed: "2026-10-14T00:01:00Z".into(),
                     follow_ups: 0,
                     pending_status: None,
+                    fleet: true,
+                    not_before: None,
                 }],
             )
             .to_toml()
@@ -9499,12 +11623,19 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     use crate::member_handoff::tests::SpyKeeper;
     use crate::member_handoff::{HandoffSeams, KeeperOp};
     use softfig_ipc::growlightd::{op as gop, MemberVerbReply, NextUnit, RefusalCode, MEMBER_VERB_OK};
-    use softfig_ipc::queue_v2::{slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE};
+    use softfig_ipc::queue_v2::{
+        slices_file, ArchivedEntry, Entry, FinalStatus, Project, QueueArchiveToml, QueueToml,
+        SliceItem, SlicesToml, QUEUE_ARCHIVE_FILE, QUEUE_FILE,
+    };
     use softfig_ipc::verbs::DaemonStatusArg;
 
     /// A throwaway garden the v2 source reads.
     struct TestGarden {
         root: PathBuf,
+        /// A real git repo (at `root/repo`, one `main` commit) so the §8
+        /// first-claim stack computation (queue-v2-git slice 002) can resolve
+        /// `main` when a `Queued` entry is first claimed.
+        repo: PathBuf,
     }
 
     impl TestGarden {
@@ -9515,7 +11646,55 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             ));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
-            Self { root }
+            let repo = root.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let ok = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("run git")
+                    .success();
+                assert!(ok, "git {args:?}");
+            };
+            git(&["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            Self { root, repo }
+        }
+        fn main_tip(&self) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["rev-parse", "main"])
+                .output()
+                .expect("run git");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        /// Commit on `main` and return the new tip.
+        fn advance_main(&self) -> String {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["commit", "-q", "--allow-empty", "-m", "moved"])
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git commit");
+            self.main_tip()
         }
         fn write(&self, rel: &str, content: &str) {
             let path = self.root.join(rel);
@@ -9526,7 +11705,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn queue(&self, entries: Vec<Entry>) {
             let project = Project {
                 name: "softfig".into(),
-                repo: "/garden".into(),
+                repo: self.repo.display().to_string(),
                 main: "main".into(),
             };
             self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());
@@ -9586,6 +11765,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             },
             follow_ups: 0,
             pending_status: None,
+            fleet: true,
+            not_before: None,
         }
     }
 
@@ -9623,6 +11804,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             member_writer: Box::new(Arc::clone(&backend)),
             claimer: Box::new(Arc::clone(&claimer)),
             parker: Box::new(Arc::clone(&parker)),
+            restacker: Box::new(FakeV2RestackEnqueuer::default()),
+            re_recorder: Box::new(FakeV2BaseReRecorder::default()),
         });
         let keeper = Arc::new(SpyKeeper::default());
         let mut d = d;
@@ -9843,6 +12026,503 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "the urgent task runs",
         );
         assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("070".to_string(), None)));
+    }
+
+    /// V18: a first claim failed and left its seed behind, then the stack moved
+    /// before the retry. The baton the member boots from names the base the
+    /// landing claim records, and nothing else in the stored seed changes.
+    #[test]
+    fn v2_a_retried_first_claim_rewrites_the_seeds_base_line() {
+        let garden = TestGarden::new("retry-base");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let stored = garden.root.join("entries/m1/baton.md");
+
+        claimer.fail.store(true, Ordering::SeqCst);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let old = garden.main_tip();
+        let seeded = std::fs::read_to_string(&stored).expect("the failed attempt seeded");
+        assert!(seeded.contains(&format!("create feat/m1 from {old}")), "{seeded}");
+
+        let new = garden.advance_main();
+        claimer.fail.store(false, Ordering::SeqCst);
+        let r = loop_.tick(1_000);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+
+        assert_eq!(
+            claimer.bases.lock().unwrap().last(),
+            Some(&Some(new.clone())),
+            "the landing claim records the moved base",
+        );
+        let baton = std::fs::read_to_string(&stored).unwrap();
+        assert_eq!(baton, seeded.replace(&old, &new), "only the line changes");
+        let writes = backend.member_writes();
+        assert_eq!(writes.last().unwrap().1, baton, "the member boots from the rewritten baton");
+    }
+
+    /// V18: a restack has no branch, so its seed tells the session to create
+    /// none. The store and the member's copy both go without the line.
+    #[test]
+    fn v2_a_restack_seed_names_no_branch_to_create() {
+        let mut restack = row("072", EntryKind::Restack, Lane::Urgent, EntryStatus::Queued);
+        restack.branch = String::new();
+        let garden = TestGarden::new("restack-seed");
+        garden.queue(vec![restack]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(*claimer.bases.lock().unwrap(), vec![None], "a restack records no base");
+        let baton = std::fs::read_to_string(garden.root.join("entries/072/baton.md")).unwrap();
+        assert!(baton.contains("item: 072"), "{baton}");
+        for gone in ["create ", "<branch>", "<base>", "# FIRST STEP"] {
+            assert!(!baton.contains(gone), "{gone:?} in {baton}");
+        }
+        assert_eq!(backend.member_writes().last().unwrap().1, baton);
+    }
+
+    /// V18's other half: keeperd records a base only on a `queued` or `paused`
+    /// row with no `claimed`, so no other claim may touch the baton's line, even
+    /// though main moved. A resume keeps it, and so does an `active` row that
+    /// never recorded a claim, which also asks keeperd to record nothing.
+    #[test]
+    fn v2_a_claim_that_records_no_base_leaves_the_baton_alone() {
+        let unclaimed_active = {
+            let mut r = milestone_row("m1", EntryStatus::Active);
+            r.claimed = String::new();
+            r
+        };
+        for (tag, entry, slice) in [
+            ("resume", milestone_row("m1", EntryStatus::Paused), SliceStatus::Queued),
+            ("active", unclaimed_active, SliceStatus::Active),
+        ] {
+            let garden = TestGarden::new(&format!("keep-base-{tag}"));
+            garden.queue(vec![entry]);
+            garden.slices("m1", &[("001", slice, 0)]);
+            let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+                make_handshake(vec![opencode_member("a1")], &garden);
+            let stored = "---\nstatus: IN_PROGRESS\nitem: m1\n---\n# NEXT ACTION\ngo\n\n\
+                          # FIRST STEP\ncreate feat/m1 from recorded\n";
+            garden.write("entries/m1/baton.md", stored);
+            garden.advance_main();
+
+            let r = loop_.tick(0);
+            assert_eq!(r.v2_started.len(), 1, "{tag}: {r:?}");
+            assert_eq!(*claimer.bases.lock().unwrap(), vec![None], "{tag}");
+            let baton = std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap();
+            assert_eq!(baton, stored, "{tag}");
+            assert_eq!(backend.member_writes().last().unwrap().1, stored, "{tag}");
+        }
+    }
+
+    /// F2 + V8, over a real two-member loop: the restack a drop leaves is not
+    /// picked while the child's session lives, even across its re-roll. When
+    /// the child hands off the restack runs alone, and normal work resumes
+    /// after it, with no deadlock at any tick.
+    #[test]
+    fn v2_a_restack_waits_for_the_active_child_then_normal_work_resumes() {
+        let restack = |status| {
+            let mut r = row("072", EntryKind::Restack, Lane::Urgent, status);
+            r.branch = String::new();
+            r
+        };
+        let task = |status| row("071", EntryKind::Task, Lane::Normal, status);
+        let started = |r: &TickReport| {
+            r.v2_started.iter().map(|a| a.entry.clone()).collect::<Vec<_>>()
+        };
+        let garden = TestGarden::new("restack-waits");
+        garden.queue(vec![task(EntryStatus::Queued), milestone_row("m2", EntryStatus::Queued)]);
+        garden.slices("m2", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), opencode_member("a2")], &garden);
+        let r = loop_.tick(0);
+        assert_eq!(started(&r), vec!["071".to_string()], "{r:?}");
+
+        // The drop's one write: the child runs on, its restack row leads.
+        garden.queue(vec![
+            restack(EntryStatus::Queued),
+            task(EntryStatus::Active),
+            milestone_row("m2", EntryStatus::Queued),
+        ]);
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "a2 stays free, a1 holds the child: {r:?}");
+
+        // A re-roll is not a hand-off: the child keeps going, unpaused.
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("071", "IN_PROGRESS", "resume"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(2);
+        assert_eq!(started(&r), vec!["071".to_string()], "{r:?}");
+        assert!(parker.paused.lock().unwrap().is_empty(), "the restack preempts nothing");
+
+        // The child hands off, and the restack takes the repo.
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "finished",
+                "baton": handoff_baton("071", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(vec![restack(EntryStatus::Queued), milestone_row("m2", EntryStatus::Queued)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(3);
+        assert_eq!(started(&r), vec!["072".to_string()], "the restack, and only it: {r:?}");
+        let holder = r.v2_started[0].agent.clone();
+
+        // While it runs, the other member is free and m2 still waits.
+        garden.queue(vec![restack(EntryStatus::Active), milestone_row("m2", EntryStatus::Queued)]);
+        let r = loop_.tick(4);
+        assert!(r.v2_started.is_empty(), "{r:?}");
+
+        // The restack finishes, and normal work resumes.
+        let reply = verb_call(
+            &d,
+            &holder,
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "restacked",
+                "baton": handoff_baton("072", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(vec![milestone_row("m2", EntryStatus::Queued)]);
+        backend.set_health(&holder, AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(5);
+        assert_eq!(started(&r), vec!["m2".to_string()], "{r:?}");
+        let claims = claimer.claims.lock().unwrap();
+        assert_eq!(
+            claims.iter().map(|(entry, _)| entry.as_str()).collect::<Vec<_>>(),
+            vec!["071", "071", "072", "m2"],
+            "one claim each, in order",
+        );
+    }
+
+    /// `git` in the garden's repo, asserting it worked; returns its stdout.
+    fn garden_git(garden: &TestGarden, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(&garden.repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// One commit adding `file`, on whatever is checked out; returns its hash.
+    fn garden_commit(garden: &TestGarden, file: &str) -> String {
+        std::fs::write(garden.repo.join(file), "x\n").unwrap();
+        garden_git(garden, &["add", "."]);
+        garden_git(garden, &["commit", "-q", "-m", file]);
+        garden_git(garden, &["rev-parse", "HEAD"])
+    }
+
+    /// `feat/one` off `main` and `feat/two` off it, then `main` moved under
+    /// both. Returns the rows and `feat/one`'s tip before any restack.
+    fn stale_garden_stack(garden: &TestGarden) -> (Vec<Entry>, String) {
+        let base = garden_git(garden, &["rev-parse", "main"]);
+        garden_git(garden, &["checkout", "-q", "-b", "feat/one"]);
+        let one_tip = garden_commit(garden, "one.txt");
+        garden_git(garden, &["checkout", "-q", "-b", "feat/two"]);
+        garden_commit(garden, "two.txt");
+        garden_git(garden, &["checkout", "-q", "main"]);
+        garden_commit(garden, "urgent.txt");
+        let mut one = row("one", EntryKind::Task, Lane::Normal, EntryStatus::Blocked);
+        one.branch = "feat/one".into();
+        one.base = base;
+        let mut two = row("two", EntryKind::Task, Lane::Normal, EntryStatus::Blocked);
+        two.branch = "feat/two".into();
+        two.parent = "one".into();
+        two.base = one_tip.clone();
+        two.claimed = "2026-10-14T00:02:00Z".into();
+        (vec![one, two], one_tip)
+    }
+
+    /// What a restack session does to [`stale_garden_stack`]'s branches.
+    fn restack_garden_stack(garden: &TestGarden, one_tip: &str) {
+        garden_git(garden, &["rebase", "-q", "main", "feat/one"]);
+        garden_git(garden, &["rebase", "-q", "--onto", "feat/one", one_tip, "feat/two"]);
+        garden_git(garden, &["checkout", "-q", "main"]);
+    }
+
+    /// `queue-archive.toml` holding restack row `id`, finished `done`.
+    fn archive_restack(garden: &TestGarden, id: &str, re_record_due: bool) {
+        let mut row = row(id, EntryKind::Restack, Lane::Urgent, EntryStatus::Active);
+        row.branch = String::new();
+        let archived = ArchivedEntry {
+            row,
+            finished: "2026-10-15T00:00:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due,
+        };
+        let archive = QueueArchiveToml::new(vec![archived]);
+        garden.write(QUEUE_ARCHIVE_FILE, &archive.to_toml().unwrap());
+    }
+
+    /// V17's acceptance: one real move fires one restack across every tick that
+    /// follows, and a claim scan in the re-record's own tick adds no second one.
+    /// Detection judges containment, not the recorded base (`8feb7b1`), so this
+    /// holds without the snapshot patch: it pins the behaviour, and it is
+    /// `v2_a_follow_up_restack_carries_the_re_recorded_bases` that tests the patch.
+    #[test]
+    fn v2_one_real_move_fires_one_restack_and_no_follow_up_across_ticks() {
+        let garden = TestGarden::new("one-restack");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        garden.queue(rows.clone());
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+
+        // The session restacks and completes: its row is archived, still due.
+        // A queued entry is claimed in the same tick the re-record runs in.
+        restack_garden_stack(&garden, &one_tip);
+        archive_restack(&garden, "072", true);
+        let mut with_three = rows.clone();
+        with_three.push(row("three", EntryKind::Task, Lane::Normal, EntryStatus::Queued));
+        garden.queue(with_three);
+        let r = loop_.tick(1);
+        assert_eq!(r.v2_started.len(), 1, "the claim scan ran this tick: {r:?}");
+
+        let main = garden_git(&garden, &["rev-parse", "main"]);
+        let one = garden_git(&garden, &["rev-parse", "feat/one"]);
+        assert_eq!(
+            *rec.recorded.lock().unwrap(),
+            vec![("one".to_string(), main.clone()), ("two".to_string(), one.clone())],
+        );
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+
+        // keeperd's write: the new bases, and the row no longer due.
+        let mut landed = rows;
+        landed[0].base = main;
+        landed[1].base = one;
+        garden.queue(landed);
+        archive_restack(&garden, "072", false);
+        loop_.tick(2);
+        loop_.tick(3);
+        assert_eq!(enq.enqueued.lock().unwrap().len(), 1, "no spurious follow-up");
+        assert_eq!(rec.settled.lock().unwrap().len(), 1, "one re-record");
+    }
+
+    /// V17's acceptance: the trigger is on the archive row, so a loop that never
+    /// saw the claim or the completion still re-records.
+    #[test]
+    fn v2_a_restart_between_the_restack_and_its_re_record_still_re_records() {
+        let garden = TestGarden::new("restart-re-record");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        garden.queue(rows);
+        archive_restack(&garden, "072", true);
+
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+        loop_.tick(0);
+
+        assert_eq!(rec.recorded.lock().unwrap().len(), 2);
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+    }
+
+    /// V17: `outcome = deferred` leaves the row live for the human's verdict, so
+    /// nothing is re-recorded until that row is finished `done`.
+    #[test]
+    fn v2_a_deferred_restack_re_records_only_once_it_is_done() {
+        let restack = |status| {
+            let mut r = row("072", EntryKind::Restack, Lane::Urgent, status);
+            r.branch = String::new();
+            r
+        };
+        let garden = TestGarden::new("deferred-re-record");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        let list = |status| {
+            let mut list = vec![restack(status)];
+            list.extend(rows.clone());
+            list
+        };
+        garden.queue(list(EntryStatus::Queued));
+        let (mut loop_, d, backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+
+        garden.queue(list(EntryStatus::Active));
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "deferred",
+                "summary": "needs a look",
+                "deferred_tests": [{ "what": "check", "expected": "fine" }],
+                "baton": handoff_baton("072", "ITEM_DEFERRED", "wait"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        garden.queue(list(EntryStatus::Deferred));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        loop_.tick(1);
+        loop_.tick(2);
+        assert!(rec.recorded.lock().unwrap().is_empty(), "deferred is not done");
+
+        // The human's `done` archives the row, and that is what triggers it.
+        garden.queue(rows.clone());
+        archive_restack(&garden, "072", true);
+        loop_.tick(3);
+        assert_eq!(rec.recorded.lock().unwrap().len(), 2);
+    }
+
+    /// V17: a completed entry's row has left the list, and its handoff scan still
+    /// has to find the repo.
+    #[test]
+    fn v2_a_completed_entry_still_gets_its_handoff_scan() {
+        let task = |status| row("071", EntryKind::Task, Lane::Normal, status);
+        let garden = TestGarden::new("handoff-scan");
+        garden.queue(vec![task(EntryStatus::Queued)]);
+        let (mut loop_, d, backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert!(enq.enqueued.lock().unwrap().is_empty(), "nothing is stale at boot");
+
+        // The stack goes stale while 071 runs, and only its handoff can see it.
+        let (rows, _) = stale_garden_stack(&garden);
+        let mut list = vec![task(EntryStatus::Active)];
+        list.extend(rows.clone());
+        garden.queue(list);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "finished",
+                "baton": handoff_baton("071", "ITEM_COMPLETE", "done"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+
+        garden.queue(rows);
+        let archived = ArchivedEntry {
+            row: task(EntryStatus::Active),
+            finished: "2026-10-15T00:00:00Z".into(),
+            final_status: FinalStatus::Done,
+            reason: None,
+            re_record_due: false,
+        };
+        garden.write(
+            QUEUE_ARCHIVE_FILE,
+            &QueueArchiveToml::new(vec![archived]).to_toml().unwrap(),
+        );
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        loop_.tick(1);
+
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+    }
+
+    /// The boot scan has passed and no entry has handed off, so only the claim
+    /// can see a stack that went stale since (review 044 V22).
+    #[test]
+    fn v2_a_claim_scans_the_claimed_entrys_repo() {
+        let garden = TestGarden::new("claim-scan");
+        garden.queue(vec![]);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let r = loop_.tick(0);
+        assert!(r.v2_started.is_empty(), "{r:?}");
+        assert!(enq.enqueued.lock().unwrap().is_empty(), "the boot scan found nothing");
+
+        let (rows, _) = stale_garden_stack(&garden);
+        let mut list = vec![row("071", EntryKind::Task, Lane::Normal, EntryStatus::Queued)];
+        list.extend(rows);
+        garden.queue(list);
+        let r = loop_.tick(1);
+
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(*enq.enqueued.lock().unwrap(), vec![("softfig".to_string(), 2)]);
+    }
+
+    /// A live restack row holds a due re-record back: a drop's child keeps a base
+    /// it needs until the rewrite lands, and it already contains `main`.
+    #[test]
+    fn v2_a_due_re_record_waits_for_a_live_restack_row() {
+        let garden = TestGarden::new("re-record-waits");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        let mut restack = row("073", EntryKind::Restack, Lane::Urgent, EntryStatus::Blocked);
+        restack.branch = String::new();
+        let mut list = vec![restack];
+        list.extend(rows.clone());
+        garden.queue(list);
+        archive_restack(&garden, "072", true);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+        assert!(rec.settled.lock().unwrap().is_empty(), "the live row holds it back");
+        assert!(rec.recorded.lock().unwrap().is_empty());
+
+        garden.queue(rows);
+        loop_.tick(1);
+        assert_eq!(*rec.settled.lock().unwrap(), vec!["072".to_string()]);
+    }
+
+    /// `main` moved again while the restack ran: the follow-up is real, and the
+    /// doc it renders must carry the re-recorded bases, not the pre-rebase ones
+    /// (the old `feat/one` tip is no longer in `feat/two`, so a step from it
+    /// would replay `feat/one`'s commits).
+    #[test]
+    fn v2_a_follow_up_restack_carries_the_re_recorded_bases() {
+        let garden = TestGarden::new("follow-up-bases");
+        let (rows, one_tip) = stale_garden_stack(&garden);
+        restack_garden_stack(&garden, &one_tip);
+        garden_commit(&garden, "urgent-two.txt");
+        garden.queue(rows);
+        archive_restack(&garden, "072", true);
+        let (mut loop_, _d, _backend, _claimer, _parker, _keeper) =
+            make_handshake(vec![], &garden);
+        let enq = Arc::new(FakeV2RestackEnqueuer::default());
+        loop_.v2.as_mut().unwrap().restacker = Box::new(Arc::clone(&enq));
+        let rec = spy_re_recorder(&mut loop_);
+
+        loop_.tick(0);
+
+        // `feat/one` isn't on the new `main`, so only `feat/two` re-records.
+        let one = garden_git(&garden, &["rev-parse", "feat/one"]);
+        assert_eq!(*rec.recorded.lock().unwrap(), vec![("two".to_string(), one.clone())]);
+        let stacks = enq.stacks.lock().unwrap();
+        assert_eq!(stacks.len(), 1, "{stacks:?}");
+        let two = stacks[0].iter().find(|b| b.branch == "feat/two").unwrap();
+        assert_eq!(two.base, one, "not the pre-rebase {one_tip}");
     }
 
     /// SLICE 009 — a pause whose keeperd write fails is retried every tick,
@@ -11549,6 +14229,38 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// F7: a tick with a v2 park reads the v2 source once, shared by the
+    /// park's reconcile and the v2 scheduling pass.
+    #[test]
+    fn v2_mode_a_tick_with_a_v2_park_reads_the_source_once() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-f7-one-read-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let source = FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on m1",
+        );
+
+        let before = source.loads();
+        loop_.tick(2);
+        assert_eq!(source.loads() - before, 1, "one read per tick");
+    }
+
     /// SLICE 006 (code-review 050 F2), re-pinned by SLICE 007 (050 F1 shape
     /// a) — if the latched v2 entry is absent from the live snapshot
     /// (archived / completed between park and tick), the reconcile falls
@@ -12018,5 +14730,377 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             r3.crashes.is_empty(),
             "no second ModelRefused alert while the fresh session is healthy",
         );
+    }
+
+    // ---- growlight-schedule slice 003: the window gate ----
+
+    /// A fixed local zone for the schedule tests, or a fixed failure.
+    #[derive(Debug)]
+    struct FixedZone(Result<softfig_ipc::tz::Zone, String>);
+    impl ZoneSource for FixedZone {
+        fn zone(&mut self) -> Result<&softfig_ipc::tz::Zone, String> {
+            self.0.as_ref().map_err(Clone::clone)
+        }
+    }
+
+    /// 10:00 and 12:00 UTC on day 0 — the edges of the test window.
+    const OPEN: i64 = 10 * 3600;
+    const CLOSE: i64 = 12 * 3600;
+    const DAY: i64 = 86_400;
+
+    /// Give `d` a fleet config whose `[schedule]` is `body` (on a one-member
+    /// roster `a1`, which only the member filters validate against).
+    fn set_schedule(d: &Daemon, body: &str) {
+        let toml = format!("[[fleet]]\nagent = \"a1\"\n[schedule]\n{body}");
+        d.set_fleet_config(crate::fleet::FleetConfig::from_growlight_toml(&toml).unwrap());
+    }
+
+    /// A one-member loop on `qa = rows`, scheduled `10:00-12:00` daily in UTC.
+    #[allow(clippy::type_complexity)]
+    fn make_scheduled(
+        rows: &[(&str, &str)],
+        body: &str,
+    ) -> (DriveLoop, Arc<FakeFleet>, Arc<FakeClaimer>, Arc<FixedQueues>) {
+        let (loop_, d, backend, claimer, queues, _probe) =
+            make_claiming(vec![member("a1", "qa")], vec![q("qa", rows)], Policy::default());
+        set_schedule(&d, body);
+        let loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+        (loop_, backend, claimer, queues)
+    }
+
+    const WINDOW: &str = "enabled = true\nwindows = [\"10:00-12:00\"]\n";
+
+    #[test]
+    fn a_closed_schedule_holds_a_fresh_start_and_a_late_open_admits_on_wake() {
+        let (mut loop_, backend, claimer, _q) = make_scheduled(&[("p1", "queued")], WINDOW);
+
+        let r0 = loop_.tick(0);
+        assert!(backend.spawns().is_empty(), "closed: no fresh start");
+        assert!(claimer.claims().is_empty(), "closed: no claim");
+        assert_eq!(r0.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert_eq!(r0.schedule_edge.as_deref(), Some("schedule: closed (no window open)"));
+        // `tasks` defaults on (the interim table's meaning), so a1 looked for a
+        // due timed item and found none — narrated as the schedule, not as an
+        // empty queue.
+        assert_eq!(r0.held_fresh.len(), 1);
+        assert_eq!(r0.held_fresh[0].reason, "outside the schedule window (no due timed item)");
+
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.schedule_edge, None, "one line per edge, not per tick");
+
+        // Suspend: the device sleeps through 10:00 and wakes at 11:00. The
+        // window opens late, on that tick — no catch-up, no lost start.
+        let r = loop_.tick(OPEN + 3600);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 opened"));
+    }
+
+    #[test]
+    fn a_backward_clock_step_across_a_close_does_not_reopen_the_window() {
+        let (mut loop_, _backend, _claimer, _q) = make_scheduled(&[], WINDOW);
+        assert_eq!(loop_.tick(OPEN + 60).schedule_held, vec![]);
+        let r = loop_.tick(CLOSE + 1200);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 closed"));
+        // NTP pulls the clock back to 11:50, inside the window it just closed:
+        // the close stands, and the journal sees no second edge.
+        let r = loop_.tick(CLOSE - 600);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert_eq!(r.schedule_edge, None);
+        // The next day's window opens as usual.
+        let r = loop_.tick(DAY + OPEN);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 opened"));
+    }
+
+    #[test]
+    fn a_running_member_finishes_across_the_close_and_is_not_rerolled_until_reopen() {
+        let (mut loop_, backend, _claimer, _q) = make_scheduled(&[("p1", "queued")], WINDOW);
+        loop_.tick(OPEN);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // The close: a1 is mid-iteration and keeps running — nothing is killed.
+        let r = loop_.tick(CLOSE);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: window daily 10:00-12:00 closed"));
+        assert_eq!(backend.kill_count(), 0, "a close finishes the iteration, it kills nothing");
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 hands off and exits after the close: held, not re-rolled.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::HeldNoWork { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 1, "no re-roll while closed");
+        let r = loop_.tick(CLOSE + 120);
+        assert_eq!(backend.spawn_count(), 1, "still none a tick later");
+        assert!(r.crashes.is_empty());
+
+        // Next day's window: a1 resumes its own part.
+        let r = loop_.tick(DAY + OPEN);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 2);
+    }
+
+    #[test]
+    fn a_member_running_past_its_close_grace_is_flagged_overrun_once_and_never_killed() {
+        let (loop_, d, backend, _claimer, _queues, _probe) =
+            make_claiming(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, &format!("{WINDOW}close_grace_minutes = 30\n"));
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+        let reason = |d: &Daemon| {
+            let summary = d.inner.lock().unwrap().schedule_summary.clone().expect("recorded");
+            summary.held_members.iter().map(|h| (h.agent.clone(), h.reason.clone())).collect::<Vec<_>>()
+        };
+        let mut tick = |at: i64| {
+            backend.set_health("a1", AgentHealth::Alive { last_active: at });
+            loop_.tick(at)
+        };
+        tick(OPEN);
+        assert_eq!(backend.spawn_count(), 1);
+        assert!(reason(&d).is_empty(), "open: nobody held");
+
+        assert!(tick(CLOSE).schedule_overrun.is_empty(), "the close starts the clock");
+        assert!(tick(CLOSE + 30 * 60).schedule_overrun.is_empty(), "the grace itself is not past it");
+        assert_eq!(tick(CLOSE + 30 * 60 + 1).schedule_overrun, vec!["a1".to_string()]);
+        assert_eq!(reason(&d), vec![("a1".to_string(), crate::schedule::OVERRUN.to_string())]);
+        assert!(tick(CLOSE + 3600).schedule_overrun.is_empty(), "one flag per overrun");
+        assert_eq!(backend.kill_count(), 0, "an overrun is information, never a kill");
+
+        // a1 hands off: the clock stops and status shows the window again.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        loop_.tick(CLOSE + 3660);
+        assert_eq!(reason(&d), vec![("a1".to_string(), "outside window".to_string())]);
+    }
+
+    #[test]
+    fn a_claude_only_window_holds_an_opencode_member_with_not_in_window() {
+        let (loop_, d, backend, claimer, _queues, _probe) = make_claiming(
+            vec![
+                member("a1", "qa"),
+                member("b1", "qb").with_backend(crate::fleet::MemberBackend::Opencode(
+                    crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+                )),
+            ],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            Policy::default(),
+        );
+        set_schedule(
+            &d,
+            "enabled = true\n[[schedule.window]]\nstart = \"10:00\"\nend = \"12:00\"\nbackends = [\"claude\"]\n",
+        );
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+
+        let r = loop_.tick(OPEN);
+        assert_eq!(backend.spawns(), vec!["a1"], "only the claude member starts");
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert_eq!(r.schedule_held, vec![("b1".to_string(), HoldReason::NotInWindow)]);
+
+        // Outside the window both are held, for the other reason.
+        let r = loop_.tick(CLOSE);
+        assert_eq!(
+            r.schedule_held,
+            vec![
+                ("a1".to_string(), HoldReason::OutsideWindow),
+                ("b1".to_string(), HoldReason::OutsideWindow),
+            ],
+        );
+        assert_eq!(backend.spawns(), vec!["a1"]);
+    }
+
+    #[test]
+    fn a_pool_at_its_weekly_reserve_holds_the_member_even_in_an_open_window() {
+        let runtime = tempfile::tempdir().unwrap();
+        let by_profile = runtime.path().join("usage.by-profile");
+        std::fs::create_dir_all(&by_profile).unwrap();
+        let (loop_, backend, _claimer, _q) = make_scheduled(
+            &[("p1", "queued")],
+            &format!("{WINDOW}reserve_weekly_pct = {{ \"*\" = 10 }}\n"),
+        );
+        let mut loop_ = loop_.with_usage_by_profile_dir(Some(by_profile));
+        // a1 follows `home`; the shared reading (no `profile` ⇒ home) is at 95%.
+        let reading = |used: Option<u8>| softfig_ipc::usage::UsageSnapshot {
+            rate_limits: softfig_ipc::usage::RateLimits {
+                seven_day: softfig_ipc::usage::RateWindow {
+                    used_percentage: used,
+                    resets_at: Some(DAY),
+                    status: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let shared = runtime.path().join(crate::fleet::USAGE_FILE);
+        reading(Some(95)).write_atomic(&shared).unwrap();
+        let r = loop_.tick(OPEN);
+        assert!(backend.spawns().is_empty(), "the reserve holds inside the window");
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::Reserve)]);
+        assert_eq!(*loop_.reserve_held.lock().unwrap(), BTreeSet::from(["home".to_string()]));
+
+        // The same reading without a percentage can't vouch: not held.
+        reading(None).write_atomic(&shared).unwrap();
+        let r = loop_.tick(OPEN + 60);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert!(loop_.reserve_held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_schedule_gates_nothing_and_reads_no_zone() {
+        let (loop_, d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, "enabled = false\nwindows = [\"10:00-12:00\"]\n");
+        // An unreadable zone would hold everyone — if it were read.
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Err("no zone".into()))));
+        let r = loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert!(r.schedule_held.is_empty());
+        assert_eq!(r.schedule_edge, None);
+    }
+
+    #[test]
+    fn an_unreadable_zone_closes_an_enabled_schedule() {
+        let (loop_, d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+        set_schedule(&d, "enabled = true\nwindows = [\"00:00-00:00\"]\n");
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Err("no zone".into()))));
+        let r = loop_.tick(OPEN);
+        assert!(backend.spawns().is_empty(), "fail-closed: no start without local time");
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::ZoneUnreadable)]);
+        assert_eq!(r.schedule_edge.as_deref(), Some("schedule: closed (local time unreadable)"));
+    }
+
+    #[test]
+    fn a_due_timed_item_is_admitted_while_closed_only_with_tasks_on() {
+        let rows = [("p0", "queued"), ("p1", "queued")];
+        let timed = "> Not before: 2020-01-01 00:00 Z\n";
+        let future = "> Not before: 2999-01-01 00:00 Z\n";
+
+        // tasks = true: a1 rolls past the untimed p0 to the due timed p1.
+        let (mut loop_, backend, claimer, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = true\n"));
+        queues.set_item_doc("p1", timed);
+        let r = loop_.tick(0);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)]);
+        assert!(r.skipped_for_human.is_empty(), "the window view is private, never announced");
+
+        // A timed item that is not yet due opens nothing.
+        let (mut loop_, backend, _c, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = true\n"));
+        queues.set_item_doc("p1", future);
+        let r = loop_.tick(0);
+        assert!(backend.spawns().is_empty());
+        assert_eq!(r.held_fresh.len(), 1, "narrated as a schedule hold");
+        assert_eq!(r.held_fresh[0].reason, "outside the schedule window (no due timed item)");
+
+        // tasks = false: the due timed item waits for the window too.
+        let (mut loop_, backend, claimer, queues) =
+            make_scheduled(&rows, &format!("{WINDOW}tasks = false\n"));
+        queues.set_item_doc("p1", timed);
+        loop_.tick(0);
+        assert!(claimer.claims().is_empty());
+        assert!(backend.spawns().is_empty());
+    }
+
+    #[test]
+    fn a_timed_only_member_resumes_its_own_part_only_if_that_part_is_due_timed() {
+        let body = format!("{WINDOW}tasks = true\n");
+        // Its part is a due timed item: the exit after the close re-rolls.
+        let (mut loop_, backend, _c, queues) = make_scheduled(&[("p1", "queued")], &body);
+        queues.set_item_doc("p1", "> Not before: 2020-01-01 00:00 Z\n");
+        loop_.tick(OPEN);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+
+        // An untimed part: held like any closed member.
+        let (mut loop_, backend, _c, _q) = make_scheduled(&[("p1", "queued")], &body);
+        loop_.tick(OPEN);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "the next step");
+        let r = loop_.tick(CLOSE + 60);
+        assert_eq!(r.rerolls, vec![RerollOutcome::HeldNoWork { agent: "a1".into() }]);
+    }
+
+    #[test]
+    fn the_schedule_edge_reaches_the_journal() {
+        let mut logger = TickLogger::default();
+        let r = TickReport {
+            schedule_edge: Some("schedule: window daily 10:00-12:00 opened".into()),
+            ..TickReport::default()
+        };
+        assert!(logger.lines(&r).contains(&"schedule: window daily 10:00-12:00 opened".to_string()));
+        assert!(logger.lines(&TickReport::default()).is_empty());
+    }
+
+    #[test]
+    fn the_v2_schedule_gate_mirrors_the_admission() {
+        let entry = |id: &str, not_before: Option<&str>, fleet: bool| EntryView {
+            not_before: not_before.map(str::to_string),
+            fleet,
+            ..v2_milestone(id, EntryStatus::Queued, "001", None).entries.remove(0)
+        };
+        let entries = [
+            entry("arrived", Some("2026-11-08 09:00 Z"), true),
+            entry("at-now", Some("2026-11-08 12:00 Z"), true),
+            entry("future", Some("2026-11-09 00:00 Z"), true),
+            entry("untimed", None, true),
+            entry("typo", Some("soon"), true),
+            entry("human", Some("2026-11-08 09:00 Z"), false),
+        ];
+        let now = softfig_ipc::fleet::parse_not_before("2026-11-08 12:00 Z").unwrap();
+        assert_eq!(v2_schedule_gate(Admission::Open, &entries, now), ScheduleGate::Open);
+        assert_eq!(
+            v2_schedule_gate(Admission::Held(HoldReason::Reserve), &entries, now),
+            ScheduleGate::Held,
+        );
+        assert_eq!(
+            v2_schedule_gate(Admission::TimedOnly, &entries, now),
+            ScheduleGate::TimedOnly { due: ["arrived".to_string(), "at-now".to_string()].into() },
+            "due: a start time that parses and has arrived, on an entry the fleet may take",
+        );
+    }
+
+    /// growlight-schedule step 0, the v2 timed gate: outside its window with
+    /// `tasks = true`, a member claims the v2 entry whose `not_before` has
+    /// arrived, and not the one whose start time is still ahead, though that
+    /// one comes first in the file.
+    #[test]
+    fn a_closed_v2_member_with_tasks_on_claims_only_the_arrived_timed_entry() {
+        // Midnight UTC is outside the daily 10:00-12:00 window.
+        let now = softfig_ipc::fleet::parse_not_before("2026-11-08 00:00 Z").unwrap();
+        let mut snapshot = v2_milestone("arrived", EntryStatus::Queued, "001", None);
+        snapshot.entries[0].not_before = Some("2026-11-07 09:00 Z".into());
+        let mut future = snapshot.entries[0].clone();
+        future.id = "future".into();
+        future.not_before = Some("2026-11-09 00:00 Z".into());
+        let tree = snapshot.trees["arrived"].clone();
+        snapshot.trees.insert("future".into(), tree);
+        snapshot.entries.insert(0, future);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let (loop_, d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot),
+            v2_entries_dir("timed-gate"),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let toml = format!("queue = \"v2\"\n[schedule]\n{WINDOW}tasks = true\n");
+        d.set_fleet_config(FleetConfig::from_growlight_toml(&toml).unwrap());
+        let mut loop_ = loop_.with_zone(Box::new(FixedZone(Ok(softfig_ipc::tz::Zone::utc()))));
+
+        let r = loop_.tick(now);
+        assert_eq!(r.schedule_held, vec![("a1".to_string(), HoldReason::OutsideWindow)], "closed");
+        assert_eq!(*claimer.claims.lock().unwrap(), vec![("arrived".to_string(), Some("001".to_string()))]);
+        assert_eq!(backend.spawns(), vec!["a1"]);
     }
 }

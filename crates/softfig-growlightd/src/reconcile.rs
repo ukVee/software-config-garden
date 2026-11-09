@@ -50,12 +50,11 @@ use crate::scheduler::{PartStatus, Snapshot};
 /// The status the reap writes: a dead `active` claim goes back to the ready pool.
 const REAP_STATUS: &str = "queued";
 
-/// The transient-scope unit-name prefix ([`crate::claude_backend`]'s
-/// `scope_base_name`) and the systemd `.scope` suffix — the bounds of a
-/// `growlight-agent-<id>-<gen>.scope` unit, used to both glob the list and filter
-/// the parse.
-const SCOPE_PREFIX: &str = "growlight-agent-";
-const SCOPE_SUFFIX: &str = ".scope";
+// The bounds of a `growlight-agent-<id>-<gen>.scope` unit, used to both glob
+// the list and filter the parse. Shared with the harness that names the scope
+// and with keeperd, which reads a connection's member out of it.
+use softfig_ipc::member::{SCOPE_PREFIX, SCOPE_SUFFIX};
+
 /// The `systemctl list-units` glob that narrows the listing to our agent scopes.
 const SCOPE_GLOB: &str = "growlight-agent-*.scope";
 

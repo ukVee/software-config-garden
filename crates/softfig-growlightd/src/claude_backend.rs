@@ -63,6 +63,7 @@ use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
 use crate::preapproval::{AgentPaths, PreApproval};
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
+use crate::telemetry_capture::{CaptureContext, ClaudeCapture, TelemetrySink};
 use crate::usage::WindowResets;
 use crate::usage_file::UsageCapture;
 
@@ -776,6 +777,9 @@ struct ClaudeSpawnObserver {
     /// every re-roll like `budget`, so the drive loop reads the CURRENT
     /// generation's last in-band error.
     stream_err: Arc<AgentStreamErrState>,
+    /// This spawn's Layer-1 token telemetry fold (token-telemetry-p1 slice
+    /// 004): one row per API request, stamped with the spawn's identity.
+    capture: ClaudeCapture,
 }
 
 impl LineObserver for ClaudeSpawnObserver {
@@ -792,11 +796,16 @@ impl LineObserver for ClaudeSpawnObserver {
             self.profile_name.as_deref(),
             &self.stream_err,
         );
+        self.capture.observe(line, at);
     }
 
-    /// Nothing to settle: claude's terminal `result` line already carried the
-    /// turn's usage, metered in [`observe`](Self::observe).
-    fn finish(&self, _at: i64) {}
+    /// The meters have nothing to settle: claude's terminal `result` line
+    /// already carried the turn's usage, metered in [`observe`](Self::observe).
+    /// The telemetry fold closes any request still open, for a stream that
+    /// ended without a `result` line.
+    fn finish(&self, _at: i64) {
+        self.capture.finish();
+    }
 }
 
 /// The borrowing [`LineObserver`] the unit tests drive — the SAME
@@ -1014,6 +1023,16 @@ struct ClaudeFlavor {
     /// [`ClaudeBackend::with_holds_view`]; a bare test backend leaves it unset
     /// and the pre-filter degrades to credential-only (today's behaviour).
     holds_view: OnceLock<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
+    /// A read-handle to the drive loop's reserve-held slot set
+    /// (growlight-schedule slice 004): slots at or past their weekly reserve,
+    /// rewritten every tick. The picker skips them while the pool has a clear
+    /// slot. Installed once via [`ClaudeBackend::with_reserve_view`]; unset, no
+    /// slot is reserve-held.
+    reserve_view: OnceLock<Arc<Mutex<BTreeSet<String>>>>,
+    /// Where this backend's token-telemetry rows go (token-telemetry-p1 slice
+    /// 004). One-shot like `usage_capture`, installed by
+    /// [`ClaudeBackend::with_telemetry`]; unset, every row is dropped.
+    telemetry: OnceLock<TelemetrySink>,
 }
 
 impl ClaudeFlavor {
@@ -1230,6 +1249,33 @@ impl ClaudeFlavor {
             pool
         } else {
             survivors.as_slice()
+        };
+        // The weekly reserve (growlight-schedule slice 004, §3.6): skip a
+        // reserve-held slot while the candidates include a clear one. When
+        // every candidate is held the member waits: a sibling slot on a
+        // rate-limit hold narrows `candidates` to the reserved slot alone, so
+        // this is reached without any race, and picking it would spend the
+        // owner's reserve. The Hold names no slot, so the drive loop stamps no
+        // rate-limit entry on a slot that is only reserved; the next tick
+        // re-runs the pick and it clears when the reserve or the sibling does.
+        let reserve_held: BTreeSet<String> = self
+            .reserve_view
+            .get()
+            .map(|view| view.lock().unwrap().clone())
+            .unwrap_or_default();
+        let unreserved: Vec<String> =
+            candidates.iter().filter(|slot| !reserve_held.contains(*slot)).cloned().collect();
+        if unreserved.is_empty() && !candidates.is_empty() {
+            return Err(SpawnKind::Hold { slots: Vec::new(), until: None });
+        }
+        let candidates: &[String] = if unreserved.len() == candidates.len() {
+            candidates
+        } else {
+            eprintln!(
+                "growlightd: agent {agent:?}: skipping claude-login slot(s) at their weekly \
+                 reserve; picking from {unreserved:?}"
+            );
+            unreserved.as_slice()
         };
 
         let histories: Vec<Vec<pin::ProfilePin>> = profiles
@@ -1483,7 +1529,8 @@ impl BackendFlavor for ClaudeFlavor {
         }
     }
 
-    fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+    fn new_observer(&self, spec: &AgentSpec, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+        let agent = spec.agent.as_str();
         // Fresh reserve cell for this spawn, overwriting any prior generation's —
         // so `budget` always reads the CURRENT child's reading. The exact
         // replace-on-re-roll lifecycle of the harness's own per-agent cells.
@@ -1507,6 +1554,17 @@ impl BackendFlavor for ClaudeFlavor {
         // gets a disabled capture (byte-identical to pre-slice-003 at tee
         // time).
         let (per_profile_usage, profile_name) = self.per_profile_usage_for(agent);
+        let capture = ClaudeCapture::new(CaptureContext {
+            sink: self.telemetry.get().cloned().unwrap_or_default(),
+            member: agent.to_string(),
+            profile: profile_name.clone(),
+            tags: spec.telemetry.clone(),
+            effort: spec
+                .model
+                .as_ref()
+                .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Claude)
+                .and_then(|c| c.variant.clone()),
+        });
         Box::new(ClaudeSpawnObserver {
             agent: agent.to_string(),
             hub: self.hub.clone(),
@@ -1516,6 +1574,7 @@ impl BackendFlavor for ClaudeFlavor {
             per_profile_usage,
             profile_name,
             stream_err,
+            capture,
         })
     }
 }
@@ -1566,6 +1625,8 @@ impl ClaudeBackend {
             usage_capture: OnceLock::new(),
             per_slot_captures: Mutex::new(BTreeMap::new()),
             holds_view: OnceLock::new(),
+            reserve_view: OnceLock::new(),
+            telemetry: OnceLock::new(),
         });
         Self {
             harness: Harness::new(
@@ -1614,6 +1675,23 @@ impl ClaudeBackend {
         holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     ) -> Self {
         let _ = self.flavor.holds_view.set(holds);
+        self
+    }
+
+    /// Share the drive loop's reserve-held slot set (growlight-schedule slice
+    /// 004) with this backend's pool-slot picker, which skips a slot at its
+    /// weekly reserve while the pool has a clear one. One-shot like
+    /// [`Self::with_holds_view`]; a bare test backend leaves it unset.
+    pub fn with_reserve_view(self, reserve_held: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        let _ = self.flavor.reserve_view.set(reserve_held);
+        self
+    }
+
+    /// Install the sink every spawn's token-telemetry rows go to
+    /// (token-telemetry-p1 slice 004) — the daemon's recorder and price table.
+    /// One-shot like [`Self::with_usage_capture`]; without it rows are dropped.
+    pub fn with_telemetry(self, sink: TelemetrySink) -> Self {
+        let _ = self.flavor.telemetry.set(sink);
         self
     }
 
@@ -2500,10 +2578,12 @@ mod tests {
             .expect("a `--` separates the scope wrapper from the command");
 
         // The GENTLE build caps (slice 002) are `systemd-run` scope options, so
-        // they sit BEFORE the `--`: a low CARGO_BUILD_JOBS + a SOFT MemoryHigh + a
-        // deprioritizing CPUWeight. Never a hard kill cap (MemoryMax/TasksMax).
+        // they sit BEFORE the `--`: low CARGO_BUILD_JOBS + RUST_TEST_THREADS, a SOFT
+        // MemoryHigh and a deprioritizing CPUWeight. Never a hard kill cap
+        // (MemoryMax/TasksMax).
         let scope_opts = &s[..sep];
         assert!(scope_opts.contains(&"--setenv=CARGO_BUILD_JOBS=2".to_string()));
+        assert!(scope_opts.contains(&"--setenv=RUST_TEST_THREADS=2".to_string()));
         assert!(scope_opts.contains(&"--property=MemoryHigh=3G".to_string()));
         assert!(scope_opts.contains(&"--property=CPUWeight=50".to_string()));
         assert!(
@@ -2558,6 +2638,7 @@ mod tests {
                 "--collect",
                 "--unit=growlight-agent-a1-7",
                 "--setenv=CARGO_BUILD_JOBS=2",
+                "--setenv=RUST_TEST_THREADS=2",
                 "--property=MemoryHigh=3G",
                 "--property=CPUWeight=50",
                 "--",
@@ -3142,6 +3223,44 @@ mod tests {
         assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
     }
 
+    /// growlight-schedule slice 004 — a slot at its weekly reserve is skipped
+    /// while the pool has a clear one.
+    #[test]
+    fn a_reserve_held_slot_is_skipped_while_the_pool_has_a_clear_one() {
+        let mut fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        reserve.lock().unwrap().insert("slot1".to_string());
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// Review 056 F8 — a candidate set that is all reserve-held waits (a quiet
+    /// `Hold` naming no slot) instead of spending a reserved slot. A
+    /// rate-limited sibling reaches this deterministically: slot1 is held, so
+    /// the pick narrows to slot2, which is at its reserve.
+    #[test]
+    fn a_pool_with_only_reserved_slots_left_holds_instead_of_picking_one() {
+        let (mut fx, holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let reserve: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+        fx.backend = fx.backend.with_reserve_view(Arc::clone(&reserve));
+        holds.lock().unwrap().extend("slot1", 10_000);
+        reserve.lock().unwrap().insert("slot2".to_string());
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("only a reserved slot is left") {
+            SpawnKind::Hold { slots, until } => {
+                assert!(slots.is_empty(), "no rate-limit entry is stamped on a reserved slot");
+                assert_eq!(until, None);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        assert!(fx.history("a").is_empty(), "nothing was picked");
+        // The reserve clearing releases the member.
+        reserve.lock().unwrap().clear();
+        assert!(fx.backend.flavor.child_env("a", &paths).is_ok());
+    }
+
     /// M-C finish check 3a — every slot held = quiet Stall-shape, same as
     /// `pick_with_budget`'s all-exhausted branch (slice 002 M-B part 2's cold-
     /// restart test). The returned `until` is the earliest `resets_at` across
@@ -3271,5 +3390,55 @@ mod tests {
         fx.exit("a");
         // Third: slot2 is now MRU, LRU rotates back to slot1.
         assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+    }
+
+    #[derive(Debug, Default)]
+    struct Collect(Mutex<Vec<softfig_telemetry::RequestRow>>);
+    impl softfig_telemetry::Recorder for Collect {
+        fn record(&self, row: softfig_telemetry::RequestRow) {
+            self.0.lock().unwrap().push(row);
+        }
+    }
+
+    /// Slice 004: the production observer folds the stream into rows on the
+    /// backend's sink, stamped with the spawn's tags and its claude `--effort`.
+    #[test]
+    fn the_spawn_observer_records_rows_tagged_with_the_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = Arc::new(Collect::default());
+        let backend = ClaudeBackend::new(
+            "claude",
+            "kick",
+            EventHub::new(),
+            PreApproval::new(tmp.path(), "p", "g", "m", "c"),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .with_telemetry(TelemetrySink {
+            recorder: Arc::clone(&rows) as Arc<dyn softfig_telemetry::Recorder>,
+            prices: None,
+        });
+        let tags = crate::telemetry_capture::TelemetryTags {
+            item_id: Some("t1".into()),
+            slice_id: Some("004".into()),
+            queue: Some("default".into()),
+        };
+        let spec = AgentSpec::new("a", "loop.json", "mcp.json")
+            .with_model(softfig_ipc::model_choice::ModelChoice::claude_on(None, Some("high".into())))
+            .with_telemetry(tags.clone());
+        let observer = backend.flavor.new_observer(&spec, Arc::new(AgentRateState::default()));
+        for line in include_str!("../../softfig-telemetry/tests/fixtures/claude-assistant-usage-run.jsonl").lines() {
+            observer.observe(line, 1);
+        }
+        observer.finish(2);
+
+        let rows = rows.0.lock().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        for row in rows.iter() {
+            assert_eq!(row.member, "a");
+            assert_eq!(row.effort.as_deref(), Some("high"));
+            assert_eq!((&row.item_id, &row.slice_id, &row.queue), (&tags.item_id, &tags.slice_id, &tags.queue));
+        }
     }
 }
