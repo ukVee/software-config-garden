@@ -1694,6 +1694,13 @@ pub struct DriveLoop {
     /// Dropped when the part leaves the parked set. In memory only, so after a
     /// growlightd restart a standing spin park pages as `BlockedOnHuman`.
     spin_parks: std::collections::BTreeMap<(String, String), (u32, Option<usize>)>,
+    /// The v2 twin: entries this loop parked on a member exit, each with the
+    /// spin guard's `(sessions, dirty)` when the park was a spin (`None` = the
+    /// member declared a human block). Held for as long as the entry stays
+    /// `blocked`, so [`dispatch`](Self::dispatch) pages the standing park every
+    /// tick through the 071 ladder, as itself, and reconciles its identity. In
+    /// memory only: after a restart the entry is no longer in this map.
+    v2_parks: std::collections::BTreeMap<String, Option<(u32, Option<usize>)>>,
     /// Holds already journaled, each with its latest reason: a part's skip is
     /// narrated once, not on every re-read, and this is the list `growlight status`
     /// shows. A part leaves it when a read finds it claimable again or the queue
@@ -1901,6 +1908,7 @@ impl DriveLoop {
             v2_model_overrides: Vec::new(),
             holds: std::collections::BTreeMap::new(),
             spin_parks: std::collections::BTreeMap::new(),
+            v2_parks: std::collections::BTreeMap::new(),
             announced_holds: std::collections::BTreeMap::new(),
             announced_foreign: BTreeSet::new(),
             last_claim_reassert: None,
@@ -2596,6 +2604,12 @@ impl DriveLoop {
                                 {
                                     // Fail-soft, see the arm comment.
                                 }
+                                // A spin park pages as itself (report 170); a
+                                // member-declared block replaces a stale spin record.
+                                let spin = spin_guard.then(|| {
+                                    (STALL_LIMIT, repo_read.as_ref().map(|r| r.dirty))
+                                });
+                                self.v2_parks.insert(assignment.entry.clone(), spin);
                                 report.v2_parked.push(assignment);
                             }
                         } else if let Some((queue, part)) = self.assignments.remove(agent) {
@@ -2860,6 +2874,16 @@ impl DriveLoop {
                 // §2's blocked walk: alert once per stopped entry, whatever the
                 // gates below decide about spawning.
                 self.note_v2_blocked_walks(snapshot, &mut report);
+                // A park outlives its entry's `blocked` status only until the
+                // snapshot shows it moved on (un-blocked, done, re-queued); one
+                // made this tick is not in this snapshot yet.
+                self.v2_parks.retain(|entry, _| {
+                    report.v2_parked.iter().any(|a| &a.entry == entry)
+                        || snapshot
+                            .entries
+                            .iter()
+                            .any(|e| &e.id == entry && e.status == EntryStatus::Blocked)
+                });
                 // The runtime overlay (slices 003/006/009): who holds which entry,
                 // and the accepted model changes. Retry a pause that failed earlier
                 // first, so the entry it lands on reads as what it is; a pauser is
@@ -4146,7 +4170,12 @@ impl DriveLoop {
         // so a later re-block pages immediately instead of being swallowed by a
         // still-running reminder backoff. Items still in the set keep their
         // identity, so the ladder keeps stepping.
-        let parked_items: Vec<&str> = report.parked.iter().map(|(_, part)| part.as_str()).collect();
+        // The v2 standing set rides the same reconcile (report 170): entries this
+        // loop parked, and the items that stop an entry's walk.
+        let mut parked_items: Vec<&str> =
+            report.parked.iter().map(|(_, part)| part.as_str()).collect();
+        parked_items.extend(self.v2_parks.keys().map(String::as_str));
+        parked_items.extend(self.v2_walk_blocked.values().map(String::as_str));
         self.dispatcher.reconcile_blocked(&parked_items);
         // A part the spin guard parked pages as a spin park (task 069) — its own
         // identity and text — for as long as it stays parked.
@@ -4171,17 +4200,27 @@ impl DriveLoop {
                     .notify(&NotifyEvent::BlockedOnHuman { item: alert.clone() }, now);
             }
         }
-        for a in &report.v2_parked {
-            self.dispatcher
-                .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
+        // Every tick, like the legacy parked set: the dispatcher's ladder keeps a
+        // standing park to one page per window, and a re-block pages afresh.
+        for (entry, spin) in &self.v2_parks {
+            let event = match *spin {
+                Some((sessions, dirty)) => NotifyEvent::SpinGuardParked {
+                    item: entry.clone(),
+                    sessions,
+                    dirty,
+                },
+                None => NotifyEvent::BlockedOnHuman { item: entry.clone() },
+            };
+            self.dispatcher.notify(&event, now);
         }
         // V1: a restack withheld over an upstream-tracking branch needs the human.
         for what in &report.v2_restack_blocked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: what.clone() }, now);
         }
-        // §2: a walk stopped at a human-`blocked` item (review R3).
-        for at in &report.v2_walk_blocked {
+        // §2: a walk stopped at a human-`blocked` item (review R3), standing so
+        // the ladder reminds and an un-block then re-block pages again.
+        for at in self.v2_walk_blocked.values() {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: at.clone() }, now);
         }
@@ -10369,6 +10408,93 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r3 = loop_.tick(3);
         assert_eq!(r3.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
         assert_eq!(*parker.parked.lock().unwrap(), ["m1"]);
+    }
+
+    /// A v2 member with one entry, claimed and live, on a clean repo: the shared
+    /// setup for report 170's page tests. Returns the loop, the entry source, the
+    /// backend and the probe.
+    fn v2_park_page_rig(
+        name: &str,
+    ) -> (DriveLoop, FakeV2Source, Arc<FakeFleet>, Probe, Arc<ScriptedRepo>) {
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let (loop_, _d, backend, probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir(name),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set("h1", 0, 0);
+        loop_.tick(0); // a1 claims m1
+        source.set(snapshot(EntryStatus::Active));
+        (loop_, source, backend, probe, repo)
+    }
+
+    /// Report 170 — a v2 spin park pages as a spin park (069's text, the entry's
+    /// own identity), never as "blocked on a human decision".
+    #[test]
+    fn a_v2_spin_park_pages_as_a_spin_not_a_human_block() {
+        let (mut loop_, _source, backend, probe, _repo) = v2_park_page_rig("r170-spin");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "compile it (can't fix)");
+        assert!(loop_.tick(1).v2_parked.is_empty(), "the first repeat only arms the streak");
+        let r2 = loop_.tick(2);
+        assert_eq!(r2.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
+        let lines = alert_lines(&probe);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("`m1` stuck (spin guard): 2 sessions ended"), "{lines:?}");
+        assert!(!lines[0].contains("blocked on a human decision"), "{lines:?}");
+    }
+
+    /// Report 170 — a member-declared v2 block is a human decision; blocked,
+    /// un-blocked, blocked again pages twice (the first identity was reconciled
+    /// away when the entry left `blocked`), and while it stands nothing re-pages.
+    #[test]
+    fn a_v2_block_unblock_reblock_pages_twice() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("r170-reblock");
+        let human = "growlightd alert: `m1` is blocked on a human decision".to_string();
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(1).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        assert_eq!(alert_lines(&probe), vec![human.clone()]);
+        loop_.tick(2);
+        loop_.tick(3);
+        assert_eq!(alert_lines(&probe).len(), 1, "a standing block stays quiet");
+
+        // The human un-blocks it; a1 re-claims and blocks on it again.
+        source.set(snapshot(EntryStatus::Queued));
+        loop_.tick(4);
+        assert!(loop_.v2_parks.is_empty(), "the park left with the block");
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(5).v2_parked.len(), 1);
+        assert_eq!(alert_lines(&probe), vec![human.clone(), human]);
+    }
+
+    /// Report 170 — the 071 ladder runs on v2: a standing block pages once inside
+    /// the first 30-minute window, then reminds.
+    #[test]
+    fn a_standing_v2_block_pages_once_over_the_first_window() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("r170-window");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        loop_.tick(100);
+        source.set(v2_milestone("m1", EntryStatus::Blocked, "001", None));
+        for now in [101, 600, 1200, 1899] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "once inside the 30-minute window");
+        loop_.tick(1900);
+        assert_eq!(alert_lines(&probe).len(), 2, "the first reminder lands at 30 minutes");
     }
 
     /// Report 169 — the v2 fallback reservation, end to end: `a` is pinned to an
