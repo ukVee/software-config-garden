@@ -78,7 +78,9 @@ use crate::schedule::{
     apply_reserve, evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone,
     ZoneSource,
 };
-use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
+use crate::scheduler_v2::{
+    self, next_unit, pick_v2_reserving, Pick, ScheduleGate, Unit, WalkOutcome,
+};
 use crate::v2_repo;
 use crate::state::State;
 use crate::telemetry_capture::TelemetryTags;
@@ -2951,6 +2953,43 @@ impl DriveLoop {
                     })
                     .collect();
 
+                // The fallback reservation (§4, report 169): the projects whose
+                // own pinned member is free or exiting at the tick's start, which
+                // no member's step-4 fallback may take. Computed once, before any
+                // member's pick, so roster order never decides it.
+                let reserved = {
+                    let free: Vec<&scheduler_v2::Member> = fleet
+                        .iter()
+                        .filter(|m| {
+                            let agent = &m.spec.agent;
+                            !self.supervisor.is_registered(agent)
+                                && !self.retiring.contains(agent)
+                                && !self.stopped.contains(agent)
+                                && !matches!(admission(agent), Admission::Held(_))
+                                && !self
+                                    .rate_limit_holds
+                                    .lock()
+                                    .unwrap()
+                                    .member_fully_held(
+                                        &self.profiles_resolver.admission_profiles(agent),
+                                    )
+                        })
+                        .filter_map(|m| v2_members.get(m.spec.agent.as_str()))
+                        .collect();
+                    let exiting: Vec<(&scheduler_v2::Member, &str)> = v2_members
+                        .values()
+                        .filter_map(|m| {
+                            let entry = self
+                                .v2_assignments
+                                .get(&m.id)
+                                .map(|a| a.entry.as_str())
+                                .or_else(|| self.v2_rolled.get(&m.id).map(String::as_str))?;
+                            Some((m, entry))
+                        })
+                        .collect();
+                    scheduler_v2::reserved_projects(snapshot, &free, &exiting)
+                };
+
                 // Step 2 analog — the re-roll, with the same shared gates. The
                 // workable gate is the v2 twin of the legacy closure: a down
                 // member's own entry still standing `active` in the fresh snapshot
@@ -2987,7 +3026,9 @@ impl DriveLoop {
                         resumes_own
                             || v2_members
                                 .get(agent)
-                                .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
+                                .is_some_and(|m| {
+                                    pick_v2_reserving(snapshot, m, &reserved).picked.is_some()
+                                })
                     };
                     // The boot dirty-tree guard before each re-roll's spawn
                     // (parity row 6) — the legacy `pre_spawn` twin: a
@@ -3064,7 +3105,7 @@ impl DriveLoop {
                             // pick with a fabricated member.
                             continue;
                         };
-                        let picked = pick_v2(snapshot, v2_member).picked;
+                        let picked = pick_v2_reserving(snapshot, v2_member, &reserved).picked;
                         // §6.3 step 5 / §9: a member that handed off and is not
                         // resuming its entry — urgent work won the pick, or the
                         // entry's next unit needs a model this member's backend
@@ -10328,6 +10369,39 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r3 = loop_.tick(3);
         assert_eq!(r3.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
         assert_eq!(*parker.parked.lock().unwrap(), ["m1"]);
+    }
+
+    /// Report 169 — the v2 fallback reservation, end to end: `a` is pinned to an
+    /// empty project and falls back, `b` is pinned to `softfig` and is free. The
+    /// entry in `softfig` goes to `b` whatever the roster order, and `a` idles.
+    #[test]
+    fn v2_mode_a_fallback_member_never_takes_a_project_its_free_pinned_member_can() {
+        let pinned = |id: &str, pin: &str| {
+            FleetMember::pinned(spec(id), pin).with_backend(crate::fleet::MemberBackend::Opencode(
+                crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+            ))
+        };
+        for roster in [["a", "b"], ["b", "a"]] {
+            let fleet = roster
+                .iter()
+                .map(|id| pinned(id, if *id == "a" { "empty" } else { "softfig" }))
+                .collect();
+            let (mut loop_, _d, backend, _probe) = make_v2(
+                fleet,
+                FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+                v2_entries_dir(&format!("reserve-{}", roster.join(""))),
+                Arc::new(FakeV2Claimer::default()),
+                Arc::new(FakeV2Parker::default()),
+                Policy::default(),
+            );
+            let r = loop_.tick(0);
+            assert_eq!(
+                r.v2_started.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+                ["b"],
+                "roster {roster:?}: only the pinned member starts",
+            );
+            assert_eq!(backend.spawns(), vec!["b"], "roster {roster:?}");
+        }
     }
 
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
