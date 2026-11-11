@@ -60,7 +60,7 @@ use softfig_ipc::item_repo::{boot_signal, Handoff, RepoState};
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
-use crate::baton_store::{with_base_line, FsEntryBatonStore};
+use crate::baton_store::{with_base_line, FirstStep, FsEntryBatonStore};
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
@@ -3220,8 +3220,13 @@ impl DriveLoop {
                                     }
                                     _ => None,
                                 };
-                                let base_line =
-                                    first.as_ref().map(|fc| (fc.branch.as_str(), fc.base.as_str()));
+                                let base_line = first.as_ref().map(|fc| {
+                                    if fc.existing {
+                                        FirstStep::Resume { branch: &fc.branch }
+                                    } else {
+                                        FirstStep::Create { branch: &fc.branch, base: &fc.base }
+                                    }
+                                });
                                 let handoff = copy_entry_baton(
                                     entries,
                                     &**member_writer,
@@ -4869,7 +4874,8 @@ fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
 ///
 /// The §8 base line (queue-v2-git slice 002): a first claim passes the CONCRETE
 /// `(branch, base)` (computed by [`crate::first_claim`]) so the seeded baton
-/// reads `create <branch> from <base>`. A resume or a branchless entry (a
+/// reads `create <branch> from <base>` (`resume <branch>` when the branch
+/// already exists, report 171). A resume or a branchless entry (a
 /// restack) passes `None` and a seed carries no line. A first claim that finds a
 /// baton is a retry: the earlier attempt's seed gets this attempt's values,
 /// because they are what this claim records (V18).
@@ -4878,7 +4884,7 @@ fn copy_entry_baton(
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
-    base_line: Option<(&str, &str)>,
+    base_line: Option<FirstStep<'_>>,
 ) -> Result<Option<Handoff>, String> {
     let (baton, handoff) = match entries.read(entry_top) {
         Some(stored) => {
@@ -4886,8 +4892,8 @@ fn copy_entry_baton(
             // rewrites it: that write is the session's, this one is ours.
             let handoff = entries.mtime(entry_top).map(Handoff::At);
             let baton = match base_line {
-                Some((branch, base)) => {
-                    let baton = with_base_line(&stored, branch, base);
+                Some(step) => {
+                    let baton = with_base_line(&stored, step);
                     entries.write(entry_top, &baton)?;
                     baton
                 }
@@ -11703,9 +11709,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
         /// `queue.toml` with these rows, all in project `softfig`.
         fn queue(&self, entries: Vec<Entry>) {
+            self.queue_in(&self.repo, entries);
+        }
+        /// [`Self::queue`] with project `softfig` naming `repo`.
+        fn queue_in(&self, repo: &Path, entries: Vec<Entry>) {
             let project = Project {
                 name: "softfig".into(),
-                repo: self.repo.display().to_string(),
+                repo: repo.display().to_string(),
                 main: "main".into(),
             };
             self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());
@@ -12061,6 +12071,69 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(baton, seeded.replace(&old, &new), "only the line changes");
         let writes = backend.member_writes();
         assert_eq!(writes.last().unwrap().1, baton, "the member boots from the rewritten baton");
+    }
+
+    /// Report 171: the entry's branch already exists with work on it. The first
+    /// claim records the merge-base and seeds `resume <branch>` — never `create`,
+    /// which would invite a `checkout -B` over the branch's commits.
+    #[test]
+    fn v2_a_first_claim_of_an_existing_branch_seeds_resume_not_create() {
+        let garden = TestGarden::new("existing-branch");
+        let base = garden.main_tip();
+        for args in [&["checkout", "-q", "-b", "feat/m1"][..], &["commit", "-q", "--allow-empty", "-m", "work"][..], &["checkout", "-q", "main"][..]] {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(&garden.repo)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        garden.advance_main();
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(
+            claimer.bases.lock().unwrap().last(),
+            Some(&Some(base)),
+            "the claim records the branch's merge-base with main",
+        );
+        let baton = std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap();
+        assert!(baton.contains("# FIRST STEP\nresume feat/m1\n"), "{baton}");
+        assert!(!baton.contains("create "), "no create line: {baton}");
+        assert_eq!(backend.member_writes().last().unwrap().1, baton);
+    }
+
+    /// Report 171: a project whose repo is not a git repo fails the claim with a
+    /// reason that names the entry and the path, and backs off like any failed
+    /// claim — no spawn, and no claim written.
+    #[test]
+    fn v2_a_first_claim_in_a_non_repo_project_names_it_and_backs_off() {
+        let garden = TestGarden::new("non-repo");
+        let plain = garden.root.join("not-a-repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        garden.queue_in(&plain, vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let f = &r.v2_claim_failures[0];
+        assert!(f.reason.contains("m1"), "{}", f.reason);
+        assert!(f.reason.contains(&plain.display().to_string()), "{}", f.reason);
+        assert!(f.reason.contains("not a git repository"), "{}", f.reason);
+        assert!(claimer.bases.lock().unwrap().is_empty(), "nothing was claimed");
+        assert_eq!(backend.spawn_count(), 0);
+
+        let r = loop_.tick(1);
+        assert!(r.v2_claim_failures.is_empty(), "backing off, not retried every tick: {r:?}");
     }
 
     /// V18: a restack has no branch, so its seed tells the session to create

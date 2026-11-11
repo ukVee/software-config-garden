@@ -70,6 +70,10 @@ pub enum GitError {
         repo: PathBuf,
         cause: String,
     },
+    /// `repo` is not a git repository (git exits 128 for "not a repository"
+    /// and equally for a repo it refuses to read, e.g. dubious ownership).
+    #[error("{repo} is not a git repository git can read")]
+    NotARepo { repo: PathBuf },
     /// The call outlived [`GIT_TIMEOUT`] and was killed.
     #[error("git {cmd} in {repo}: timed out after {secs}s")]
     Timeout {
@@ -156,6 +160,24 @@ impl Git {
     /// deadline (its answers are not shared: they differ per path).
     fn at(&self, path: PathBuf) -> Self {
         Self { repo: path, program: self.program.clone(), deadline: self.deadline, memo: None }
+    }
+
+    /// `git rev-parse --git-dir`: is this handle's path a git repo (or a
+    /// worktree of one)? Exit 0 = yes, exit 128 = no, anything else is an error.
+    /// The first-claim probe asks before any other question, so a project whose
+    /// `repo` is a plain directory is named as such rather than surfacing as the
+    /// bare exit 128 of whichever query ran first (report 171).
+    pub fn is_repo(&self) -> Result<bool, GitError> {
+        let (status, _) = self.run(&["rev-parse", "--git-dir"])?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(128) => Ok(false),
+            _ => Err(GitError::Run {
+                cmd: "rev-parse --git-dir".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            }),
+        }
     }
 
     /// `git merge-base --is-ancestor <ancestor> <descendant>`: is `ancestor`
@@ -482,6 +504,10 @@ impl Stack {
 pub struct ClaimBase {
     pub parent: String,
     pub base: String,
+    /// The entry's branch already exists in the (local) repo, so `base` is the
+    /// merge-base it shares with its parent (or `main`) and the work resumes on
+    /// that branch rather than cutting it (report 171).
+    pub existing: bool,
 }
 
 /// Compute the stack candidates for `repo` from the live entries: every
@@ -547,7 +573,39 @@ pub fn claim_base(
         Repo::Local(_) => git.rev_parse(&base_ref)?,
         Repo::Remote => base_ref,
     };
-    Ok(ClaimBase { parent, base })
+    Ok(ClaimBase { parent, base, existing: false })
+}
+
+/// What a first claim records for an entry whose `branch` **already exists** in
+/// a local repo (§8, report 171): a migrated or hand-seeded entry whose work is
+/// already on the branch. The branch is never cut again (that would be a
+/// `checkout -B` over its commits), so the base is read, not chosen: the
+/// merge-base of `branch` and its parent's branch (`parent` = the entry's
+/// recorded `(id, branch)`) while that branch exists and is not yet in `main`,
+/// else the merge-base with `main`. `None` when the branch does not exist yet
+/// (the ordinary [`claim_base`] path) and for a remote repo, which runs no git.
+pub fn existing_branch_base(
+    repo: &Repo,
+    main: &str,
+    branch: &str,
+    parent: Option<(&str, &str)>,
+    git: &Git,
+) -> Result<Option<ClaimBase>, GitError> {
+    if matches!(repo, Repo::Remote) || !git.branch_exists(branch)? {
+        return Ok(None);
+    }
+    let (parent_id, onto) = match parent {
+        Some((id, parent_branch))
+            if !parent_branch.is_empty()
+                && git.branch_exists(parent_branch)?
+                && !git.is_ancestor(parent_branch, main)? =>
+        {
+            (id.to_string(), parent_branch.to_string())
+        }
+        _ => (String::new(), main.to_string()),
+    };
+    let base = git.merge_base(branch, &onto)?;
+    Ok(Some(ClaimBase { parent: parent_id, base, existing: true }))
 }
 
 /// One live entry reduced to what restack detection reads: the §8 first-claim

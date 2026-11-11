@@ -445,11 +445,12 @@ impl FsEntryBatonStore {
     /// create-dir-on-seed convention (idempotent with [`Self::write`]'s
     /// create), and a failed create errors fail-closed.
     ///
-    /// `base_line` is the §8 `(branch, base)` — the drive loop's values, computed
-    /// at first claim, where §8 says growlightd puts `create <branch> from
-    /// <base>` in the seeded baton. `None` seeds no line: an entry with no branch
-    /// (a restack) has nothing to create. This store never computes git state.
-    pub fn seed(&self, entry_id: &str, base_line: Option<(&str, &str)>) -> Result<(), String> {
+    /// `base_line` is the §8 first step — the drive loop's values, computed at
+    /// first claim, where §8 says growlightd puts `create <branch> from <base>`
+    /// (or `resume <branch>` for a branch that already exists) in the seeded
+    /// baton. `None` seeds no line: an entry with no branch (a restack) has
+    /// nothing to create. This store never computes git state.
+    pub fn seed(&self, entry_id: &str, base_line: Option<FirstStep<'_>>) -> Result<(), String> {
         let path = self.entry_path(entry_id);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
@@ -492,24 +493,37 @@ impl FsEntryBatonStore {
 /// The heading the §8 base line sits under in an entry baton.
 const FIRST_STEP_HEADING: &str = "# FIRST STEP";
 
-/// The §8 base line.
-fn render_base_line(branch: &str, base: &str) -> String {
-    format!("create {branch} from {base}")
+/// The §8 first step an entry baton carries: cut the entry's branch from the
+/// recorded base, or — when the branch already exists with work on it (report
+/// 171) — resume it as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstStep<'a> {
+    Create { branch: &'a str, base: &'a str },
+    Resume { branch: &'a str },
 }
 
-/// `baton` with its §8 base line set to `(branch, base)` (V18): the seed of a
-/// first claim that failed still names the base that attempt computed, and the
-/// retry may record another. Everything else is kept byte for byte, and a baton
+/// The §8 base line.
+fn render_base_line(step: FirstStep<'_>) -> String {
+    match step {
+        FirstStep::Create { branch, base } => format!("create {branch} from {base}"),
+        FirstStep::Resume { branch } => format!("resume {branch}"),
+    }
+}
+
+/// `baton` with its §8 base line set to `step` (V18): the seed of a first claim
+/// that failed still names the base that attempt computed, and the retry may
+/// record another (or find the branch now exists, and swap `create` for
+/// `resume`). Everything else is kept byte for byte, and a baton
 /// with no base line is returned as it is, since it states no base to disagree
 /// with.
-pub(crate) fn with_base_line(baton: &str, branch: &str, base: &str) -> String {
+pub(crate) fn with_base_line(baton: &str, step: FirstStep<'_>) -> String {
     let mut out = String::with_capacity(baton.len());
     let mut in_first_step = false;
     for line in baton.split_inclusive('\n') {
         if line.starts_with("# ") {
             in_first_step = line.trim_end() == FIRST_STEP_HEADING;
-        } else if in_first_step && line.starts_with("create ") {
-            out.push_str(&render_base_line(branch, base));
+        } else if in_first_step && (line.starts_with("create ") || line.starts_with("resume ")) {
+            out.push_str(&render_base_line(step));
             out.push('\n');
             continue;
         }
@@ -531,12 +545,12 @@ pub(crate) fn with_base_line(baton: &str, branch: &str, base: &str) -> String {
 fn seed_entry_baton(
     garden_name: &str,
     entry_id: &str,
-    base_line: Option<(&str, &str)>,
+    base_line: Option<FirstStep<'_>>,
     baton_path: &Path,
 ) -> String {
     let baton_path = baton_path.display().to_string();
-    let first_step = base_line.map_or(String::new(), |(branch, base)| {
-        format!("{FIRST_STEP_HEADING}\n{}\n\n", render_base_line(branch, base))
+    let first_step = base_line.map_or(String::new(), |step| {
+        format!("{FIRST_STEP_HEADING}\n{}\n\n", render_base_line(step))
     });
     format!(
         "---\n\
@@ -1076,7 +1090,7 @@ mod tests {
     fn seed_renders_the_concrete_base_line_when_given() {
         let tmp = tempfile::tempdir().unwrap();
         let s = entry_store(tmp.path());
-        s.seed("queue-v2-state", Some(("feat/queue-v2-state", "main")))
+        s.seed("queue-v2-state", Some(FirstStep::Create { branch: "feat/queue-v2-state", base: "main" }))
             .expect("seeds");
         let raw = s.read("queue-v2-state").unwrap();
         assert!(
@@ -1092,8 +1106,21 @@ mod tests {
         let baton = "# NEXT ACTION\ncreate the fixture\n\n# FIRST STEP\ncreate feat/x from old\n\n\
                      # STATE\ncreate nothing\nno trailing newline";
         assert_eq!(
-            with_base_line(baton, "feat/x", "new"),
+            with_base_line(baton, FirstStep::Create { branch: "feat/x", base: "new" }),
             baton.replace("from old", "from new"),
+        );
+    }
+
+    /// Report 171: a retry that finds the branch now exists swaps the line for
+    /// `resume`, and back again, leaving the rest of the baton alone.
+    #[test]
+    fn with_base_line_swaps_create_and_resume() {
+        let baton = "# FIRST STEP\ncreate feat/x from old\n\n# STATE\nresume nothing\n";
+        let resumed = with_base_line(baton, FirstStep::Resume { branch: "feat/x" });
+        assert_eq!(resumed, "# FIRST STEP\nresume feat/x\n\n# STATE\nresume nothing\n");
+        assert_eq!(
+            with_base_line(&resumed, FirstStep::Create { branch: "feat/x", base: "abc" }),
+            "# FIRST STEP\ncreate feat/x from abc\n\n# STATE\nresume nothing\n",
         );
     }
 
@@ -1101,7 +1128,7 @@ mod tests {
     #[test]
     fn with_base_line_leaves_a_baton_without_one_alone() {
         for baton in ["", "# NEXT ACTION\ngo\n", "# FIRST STEP\nread the doc\n# STATE\ncreate x\n"] {
-            assert_eq!(with_base_line(baton, "feat/x", "new"), baton);
+            assert_eq!(with_base_line(baton, FirstStep::Create { branch: "feat/x", base: "new" }), baton);
         }
     }
 
