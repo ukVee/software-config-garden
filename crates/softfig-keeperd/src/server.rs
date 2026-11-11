@@ -209,6 +209,7 @@ fn op_is_local_write(op: &str) -> bool {
             | op::SET_ITEM_STATUS
             | op::REORDER_BACKLOG_ITEM
             | op::QUEUE_ADD_PROJECT
+            | op::QUEUE_SET_PROJECT_REPO
             | op::QUEUE_ADD_ENTRY
             | op::QUEUE_UPDATE_ENTRY
             | op::SLICE_INSERT
@@ -312,6 +313,7 @@ fn dispatch(daemon: &Daemon, req: Request, connection: Option<&str>) -> Response
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
         op::REORDER_BACKLOG_ITEM => crate::actions::reorder_backlog_item(daemon, req.args),
         op::QUEUE_ADD_PROJECT => crate::actions::queue_add_project(daemon, req.args),
+        op::QUEUE_SET_PROJECT_REPO => crate::actions::queue_set_project_repo(daemon, req.args),
         op::QUEUE_ADD_ENTRY => crate::actions::queue_add_entry(daemon, req.args),
         op::QUEUE_UPDATE_ENTRY => crate::actions::queue_update_entry(daemon, req.args),
         // A member's slice verbs are held to its own current entry, which only

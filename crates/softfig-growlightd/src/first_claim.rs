@@ -50,11 +50,13 @@ use crate::scheduler_v2::{EntryView, V2Snapshot};
 pub enum FirstClaimError {
     /// The entry's project names a local repo that is not a git repo (report
     /// 171: `remote-runner` and `fixes` name the non-repo parent of their
-    /// worktrees). It cannot clear by waiting, so the text says what to fix.
+    /// worktrees). It cannot clear by waiting, so the text says what to fix,
+    /// with the human verbs that do it.
     #[error(
         "entry {entry}: project {project}'s repo {repo} is not a git repository; \
-         set the project's repo to a git checkout, or move the entry to a project \
-         whose repo is one"
+         point the project at a git checkout (`softfig growlight queue project \
+         set-repo {project} <repo>`), or move the entry to a project whose repo \
+         is one (`softfig growlight queue repair {entry} --project <project>`)"
     )]
     NotARepo { entry: String, project: String, repo: std::path::PathBuf },
     #[error(transparent)]
@@ -515,6 +517,10 @@ mod tests {
         );
         let text = err.to_string();
         for want in ["089", "softfig", &dir.path().display().to_string(), "not a git repository"] {
+            assert!(text.contains(want), "{want:?} missing from {text:?}");
+        }
+        // Report 171: the text names the two human verbs that repair the row.
+        for want in ["queue project set-repo softfig", "queue repair 089 --project"] {
             assert!(text.contains(want), "{want:?} missing from {text:?}");
         }
     }

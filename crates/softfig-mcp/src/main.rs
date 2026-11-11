@@ -34,7 +34,7 @@ use softfig_ipc::{
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
         FileReportArgs, ListReportsArgs, LogBatonArgs, LogDecisionArgs, LogIncidentArgs,
-        PatchFileArgs, PostMessageArgs, QueueAddEntryArgs, QueueAddProjectArgs, QueueDropArgs,
+        PatchFileArgs, PostMessageArgs, QueueAddEntryArgs, QueueAddProjectArgs, QueueDropArgs, QueueSetProjectRepoArgs,
         QueueUpdateEntryArgs, ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
         SetItemStatusArgs, SetReviewedArgs, SliceInsertArgs, SliceUpdateArgs, UnlinkArgs,
@@ -442,6 +442,26 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "queue_set_project_repo",
+            "description": "growlight queue v2: correct an existing [[project]] row's repo (and \
+                            optionally its merge branch) — the repair queue_add_project cannot make, \
+                            since a repeat add is refused exists. Same validation as the add \
+                            (non-empty repo, ambiguous_repo, a valid branch name); unknown_project \
+                            for a name with no row; refused running while one of the project's \
+                            entries is active. A HUMAN verb: a fleet member is refused \
+                            member_not_allowed (§6.7). Refusal codes surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name", "repo"],
+                "properties": {
+                    "name": { "type": "string", "description": "the existing project's name" },
+                    "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
+                    "main": { "type": "string", "description": "the branch merges land on, a valid git branch name; omitted keeps the project's current one" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
             "name": "queue_add_entry",
             "description": "growlight queue v2: create a backlog entry and its docs in one commit. \
                             milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml, \
@@ -478,7 +498,7 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "queue_update_entry",
             "description": "growlight queue v2: one atomic edit of a live entry, applied in the order \
-                            lane → move → after → fleet → not_before → status — patch-style, pass only the fields you \
+                            lane → move → after → fleet → not_before → branch/base/project → status — patch-style, pass only the fields you \
                             change. status takes the human statuses queued | blocked | deferred | \
                             done (done archives the row; refused running on an active entry); \
                             active/paused/split are daemon-owned and refused. A HUMAN verb: a fleet \
@@ -495,6 +515,9 @@ fn tool_defs() -> Vec<Value> {
                     "status": { "type": "string", "description": "queued | blocked | deferred | done. queued also unblocks and un-defers" },
                     "fleet": { "type": "boolean", "description": "false holds the entry for the human (the fleet never claims it), true releases it. A live-held active entry keeps running" },
                     "not_before": { "type": "string", "description": "sets the start time, `YYYY-MM-DD HH:MM ±HH:MM`; \"\" clears it. Holds a queued entry only. A value that does not parse is refused bad_start_time" },
+                    "branch": { "type": "string", "description": "repairs the row's branch (a valid git branch name; refused on a restack). Refused running while the entry is active" },
+                    "base": { "type": "string", "description": "repairs the row's base, the commit or parent branch it was cut from; \"\" clears it. Refused running while the entry is active" },
+                    "project": { "type": "string", "description": "moves the entry to another existing project (unknown_project otherwise). Refused running while the entry is active" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -1312,6 +1335,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: QueueAddProjectArgs = serde_json::from_value(args)?;
             (op::QUEUE_ADD_PROJECT, serde_json::to_value(a)?)
         }
+        "queue_set_project_repo" => {
+            let a: QueueSetProjectRepoArgs = serde_json::from_value(args)?;
+            (op::QUEUE_SET_PROJECT_REPO, serde_json::to_value(a)?)
+        }
         "queue_add_entry" => {
             let a: QueueAddEntryArgs = serde_json::from_value(args)?;
             (op::QUEUE_ADD_ENTRY, serde_json::to_value(a)?)
@@ -1569,6 +1596,7 @@ fn summarize(name: &str, data: &Value) -> String {
     if matches!(
         name,
         "queue_add_project"
+            | "queue_set_project_repo"
             | "queue_add_entry"
             | "queue_update_entry"
             | "queue_drop"
@@ -1696,7 +1724,7 @@ mod tests {
     #[test]
     fn tools_list_has_forty_three() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 43);
+        assert_eq!(defs.len(), 44);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1716,6 +1744,7 @@ mod tests {
             "add_backlog_item",
             "add_queue",
             "queue_add_project",
+            "queue_set_project_repo",
             "queue_add_entry",
             "queue_update_entry",
             "queue_drop",
@@ -1754,7 +1783,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         );
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 43);
+        assert_eq!(tools.len(), 44);
     }
 
     /// A `tools/call` for a tool that doesn't exist: dispatch refuses it before
@@ -1853,7 +1882,9 @@ mod tests {
         }
         let refused = [
             ("queue_add_project", json!({ "name": "p", "repo": "~/p" })),
+            ("queue_set_project_repo", json!({ "name": "p", "repo": "~/p" })),
             ("queue_update_entry", json!({ "id": "m", "lane": "urgent" })),
+            ("queue_update_entry", json!({ "id": "m", "branch": "feat/x", "base": "abc", "project": "p" })),
             ("queue_drop", json!({ "id": "m", "reason": "r" })),
             ("queue_add_entry", entry(json!({ "lane": "urgent" }))),
             ("queue_add_entry", entry(json!({ "position": "front" }))),
@@ -1942,7 +1973,7 @@ mod tests {
         assert!(msg.starts_with("softfig-mcp refuses every verb: SOFTFIG_MEMBER="), "{msg}");
         // Listing the tools stays harmless.
         let resp = handle_line(&caller, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 43);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 44);
     }
 
     #[test]
@@ -2015,6 +2046,11 @@ mod tests {
                 "queue_add_project",
                 json!({ "name": "p", "repo": "~/r", "main": "main" }),
                 op::QUEUE_ADD_PROJECT,
+            ),
+            (
+                "queue_set_project_repo",
+                json!({ "name": "p", "repo": "~/r", "main": "main" }),
+                op::QUEUE_SET_PROJECT_REPO,
             ),
             (
                 "queue_add_entry",
