@@ -3664,7 +3664,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "softfig-deploy",
  "softfig-growlightd",
  "softfig-growlightd-client",
  "softfig-ipc",

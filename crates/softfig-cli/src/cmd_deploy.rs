@@ -1,31 +1,33 @@
 //! `softfig deploy` — materialize the garden's `config/deploy.toml` table
 //! onto the real filesystem (the `bombadil link` replacement, M4a). A thin
-//! TTY frontend over the frontend-neutral `softfig-deploy` core; a future
-//! daemon-mediated MCP `deploy` verb wraps the same `plan`/`apply`.
+//! TTY frontend over keeperd's `deploy_plan` / `deploy_apply` verbs, the same
+//! two the TUI's Deploy tab drives.
 //!
-//! Reads sources + the table from the garden root (the FUSE plaintext view)
-//! and writes targets/cache directly — native filesystem ops, no daemon
-//! round-trip. Requires the garden unlocked: when locked, the FUSE mount
-//! (and thus `config/deploy.toml`) is gone, which surfaces as a clear
-//! "is the garden unlocked?" hint.
+//! The daemon is the one source reader. It reads `config/deploy.toml` and each
+//! dot's `config/source/` file through its mount-safe working tree, so a Layer-B
+//! sealed source deploys its plaintext. The CLI never reads `config/source/`
+//! itself: on a live device `~/soft-fig_garden` is the FUSE mount, which serves
+//! a sealed file as the reader-redacted `[sealed:<path>]` projection (report
+//! 168). Targets and the deploy cache are written by the daemon too, so the
+//! garden must be running and unlocked.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use clap::Args;
-use softfig_deploy::{
-    apply, plan, ApplyOptions, DeployConfig, DeployError, DeployPaths, FsSource, Plan,
+use softfig_ipc::{
+    runtime_socket_path,
+    verbs::{
+        op, DeployApplyArgs, DeployApplyReply, DeployPlanArgs, DeployPlanReply,
+    },
+    ErrorKind, Request,
 };
 
 #[derive(Args, Debug)]
 pub struct DeployArgs {
-    /// Garden root (the FUSE mount path). Defaults to `~/soft-fig_garden`.
+    /// Override the daemon socket path.
     #[arg(long)]
-    pub garden_root: Option<PathBuf>,
-    /// Deploy-cache root. Defaults to `$XDG_DATA_HOME/softfig/deployed`
-    /// (or `~/.local/share/softfig/deployed`).
-    #[arg(long)]
-    pub cache_root: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
     /// Show the plan and exit without touching anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -36,30 +38,13 @@ pub struct DeployArgs {
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
-    let home = home_dir()?;
-    let garden_root = args
-        .garden_root
-        .unwrap_or_else(|| home.join("soft-fig_garden"));
-    let cache_root = args
-        .cache_root
-        .unwrap_or_else(softfig_deploy::default_cache_root);
-    let paths = DeployPaths {
-        config_dir: garden_root.join("config"),
-        garden_root,
-        home,
-        cache_root,
-    };
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
 
-    let config = DeployConfig::load(&paths.config_file()).map_err(|e| match e {
-        DeployError::ConfigNotFound(p) => anyhow!(
-            "deploy config not found at {} — is the garden unlocked? \
-             run `softfig daemon unlock` first",
-            p.display()
-        ),
-        other => anyhow!(other),
-    })?;
-
-    let plan = plan(&config, &paths, &FsSource::new(&paths))?;
+    let plan: DeployPlanReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::DEPLOY_PLAN,
+        serde_json::to_value(DeployPlanArgs {})?,
+    )?)?;
     print_plan(&plan);
 
     if args.dry_run {
@@ -67,7 +52,14 @@ pub fn run(args: DeployArgs) -> Result<()> {
         return Ok(());
     }
 
-    let report = apply(&plan, &paths, &ApplyOptions { force: args.force })?;
+    // The daemon recomputes the plan under its deploy gate rather than trusting
+    // the one just printed, so a target that changed in between is planned
+    // against its current state.
+    let report: DeployApplyReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::DEPLOY_APPLY,
+        serde_json::to_value(DeployApplyArgs { force: args.force })?,
+    )?)?;
     print_report(&report);
 
     if !report.conflicts.is_empty() {
@@ -79,7 +71,29 @@ pub fn run(args: DeployArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_plan(plan: &Plan) {
+/// Call keeperd. Deploy has no direct-mode fallback: reading the sources
+/// without the daemon is exactly the mount read this verb exists to avoid.
+fn daemon_call(socket: &Path, op: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+    let mut stream = softfig_ipc::connect(socket).map_err(|e| {
+        if e.is_daemon_absent() {
+            anyhow!(
+                "daemon not running — start it with `softfig daemon start` and \
+                 unlock the garden with `softfig daemon unlock`"
+            )
+        } else {
+            anyhow!("{e}")
+        }
+    })?;
+    let resp = softfig_ipc::call(&mut stream, &Request::new(op, args))?;
+    resp.into_result().map_err(|(kind, message)| match kind {
+        ErrorKind::VaultLocked => anyhow!(
+            "garden is locked — run `softfig daemon unlock` first ({message})"
+        ),
+        _ => anyhow!("{message}").context(format!("daemon error ({kind:?})")),
+    })
+}
+
+fn print_plan(plan: &DeployPlanReply) {
     if plan.entries.is_empty() {
         println!("No dots in config/deploy.toml.");
         return;
@@ -92,16 +106,11 @@ fn print_plan(plan: &Plan) {
             .as_deref()
             .map(|r| format!(" — {r}"))
             .unwrap_or_default();
-        println!(
-            "  {verb:>8}  {}  →  {}{}",
-            e.name,
-            e.target_abs.display(),
-            extra
-        );
+        println!("  {verb:>8}  {}  →  {}{}", e.name, e.target, extra);
     }
 }
 
-fn print_report(r: &softfig_deploy::Report) {
+fn print_report(r: &DeployApplyReply) {
     println!(
         "\nApplied: {} created, {} replaced, {} copied, {} skipped, {} forced.",
         r.created.len(),
@@ -116,10 +125,4 @@ fn print_report(r: &softfig_deploy::Report) {
     for c in &r.conflicts {
         println!("  conflict (skipped): {c}");
     }
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("$HOME not set"))
 }
