@@ -119,10 +119,12 @@ fn main() -> Result<()> {
     // synchronously here, so the reset always completes before the loop's first
     // `pick()`. Two steps: SIGKILL stray `growlight-agent-*.scope` units from a prior
     // generation, then reset every orphaned-`active` item (no live holder exists
-    // post-restart) to `queued` so the scheduler can re-pick it. Gate off ⇒ skipped,
+    // post-restart) to `queued` so the scheduler can re-pick it — under
+    // `queue = "v2"` that includes every `active` entry of `queue.toml` (report
+    // 172), which the legacy snapshot never held. Gate off ⇒ skipped,
     // so growlightd stays byte-identical to today when disarmed.
     if fleet_config.enabled {
-        reconcile_on_boot(&keeperd_socket);
+        reconcile_on_boot(&keeperd_socket, &garden_root, fleet_config.queue);
     }
 
     // Token telemetry (token-telemetry-p1 slice 004): installed before

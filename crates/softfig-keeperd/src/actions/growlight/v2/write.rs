@@ -294,7 +294,10 @@ pub(crate) mod tests {
             KeeperConfig::new(garden)
                 .without_watcher()
                 .without_net()
-                .without_fuse(),
+                .without_fuse()
+                // Never a live growlightd: an unreachable one reads as "cannot
+                // say" (the `running` refusals fail closed on it).
+                .with_growlightd_socket(garden.join(".no-growlightd.sock")),
         );
         let reply = handlers::unlock(
             &daemon,

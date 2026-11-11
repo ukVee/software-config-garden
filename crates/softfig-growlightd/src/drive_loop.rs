@@ -3175,6 +3175,11 @@ impl DriveLoop {
                         // Per-member admission budget (slice 001 M-A): fold on
                         // this member's claude-login profile only.
                         let member_budget = budget_for(agent);
+                        // Held from here to the assignment record below, so a
+                        // human verb asking keeperd about this entry while the
+                        // claim lands and the member spawns sees a holder
+                        // (report 172).
+                        self.daemon.claim_started(entry_top);
                         let outcome = self.supervisor.start_claiming(
                             spec,
                             member_budget,
@@ -3248,6 +3253,10 @@ impl DriveLoop {
                                 Ok(())
                             },
                         );
+                        // Anything but a started session leaves no holder.
+                        if !matches!(outcome, StartOutcome::Started) {
+                            self.daemon.claim_ended(entry_top);
+                        }
                         match outcome {
                             StartOutcome::Started => {
                                 spoken_for.insert(pick.entry.clone());
@@ -3267,6 +3276,10 @@ impl DriveLoop {
                                     repo,
                                 };
                                 self.v2_assignments.insert(agent.clone(), assignment.clone());
+                                // Hold it in the overlay at once; the end-of-tick
+                                // publish repeats this.
+                                self.daemon.publish_v2_overlay(self.v2_overlay());
+                                self.daemon.claim_ended(entry_top);
                                 report.v2_started.push(assignment);
 
                                 // §8 restack detection at claim (queue-v2-git

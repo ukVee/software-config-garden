@@ -192,12 +192,16 @@ pub fn queue_set_project_repo(daemon: &Daemon, args: serde_json::Value) -> Handl
     };
     // The active session is probing the old repo through this row; it takes
     // the new one at its next claim, never mid-session (the `done`/drop rule).
-    if let Some(active) = queue
+    let active: Vec<&Entry> = queue
         .entries
         .iter()
-        .find(|e| e.project == args.name && e.status == EntryStatus::Active)
-    {
-        return Err(refuse(QueueRefusal::Running { id: active.id.clone() }));
+        .filter(|e| e.project == args.name && e.status == EntryStatus::Active)
+        .collect();
+    if !active.is_empty() {
+        let holders = Holders::ask(&growlightd_socket_of(&inner));
+        if let Some(refusal) = active.iter().find_map(|e| holders.running_refusal(&e.id)) {
+            return Err(refusal);
+        }
     }
     let before = queue.projects[idx].clone();
     queue.projects[idx].repo = args.repo.clone();
@@ -1312,6 +1316,10 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
+    // growlightd's answer on who holds an `active` entry, asked at most once and
+    // only when an `active` entry is in the way (report 172).
+    let mut holders: Option<Holders> = None;
+
     // Load the live list + archive, keeping the loaded models for the no-op
     // guard (an edit that changes nothing mints no commit).
     let (mut queue, queue_version, mut archive, archive_version, loaded_queue, loaded_archive) = {
@@ -1420,8 +1428,12 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // starts nothing a repo already holds.
     if args.branch.is_some() || args.base.is_some() || args.project.is_some() {
         let idx = idx_of(&queue, &args.id);
-        if queue.entries[idx].status == EntryStatus::Active {
-            return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+        if queue.entries[idx].status == EntryStatus::Active
+            && let Some(refusal) = holders
+                .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                .running_refusal(&args.id)
+        {
+            return Err(refusal);
         }
         if queue.entries[idx].kind == EntryKind::Restack
             && (args.branch.is_some() || args.base.is_some())
@@ -1460,10 +1472,17 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 // `running` — the running session is never killed. A paused /
                 // blocked / deferred entry has no running session, so the
                 // human override stands.
-                if queue.entries[idx].status == EntryStatus::Active {
-                    return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+                if queue.entries[idx].status == EntryStatus::Active
+                    && let Some(refusal) = holders
+                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .running_refusal(&args.id)
+                {
+                    return Err(refusal);
                 }
-                let row = queue.entries.remove(idx);
+                let mut row = queue.entries.remove(idx);
+                // A change recorded for a session's next handshake is moot
+                // once the row is archived (the op's `done` drops it too).
+                row.pending_status = None;
                 // The human's `done` finishes a deferred restack too, and the
                 // re-record tests each branch, so it moves only what landed.
                 let re_record_due = row.kind == EntryKind::Restack;
@@ -1476,12 +1495,13 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 });
                 archived = true;
             }
-            // Finding 8 (§6.8): a status change on an `active` entry takes
-            // effect at its session's next handshake, never mid-session. The
-            // row keeps `active` (the repo rule and the scheduler keep
-            // working) and records the change as `pending_status`; the view
-            // annotates it, and the handshake's `queue_v2_set_status` applies
-            // it at the boundary. Any other entry changes now.
+            // Finding 8 (§6.8): a status change on an entry a session holds
+            // takes effect at that session's next handshake, never
+            // mid-session. The row keeps `active` (the repo rule and the
+            // scheduler keep working) and records the change as
+            // `pending_status`; the view annotates it, and the handshake's
+            // `queue_v2_set_status` applies it at the boundary. Any other
+            // entry — and an `active` one nothing holds — changes now.
             QueueStatusArg::Queued | QueueStatusArg::Blocked | QueueStatusArg::Deferred => {
                 let new = match status {
                     QueueStatusArg::Queued => EntryStatus::Queued, // also unblocks and un-defers
@@ -1489,11 +1509,19 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                     _ => EntryStatus::Deferred,
                 };
                 let idx = idx_of(&queue, &args.id);
+                // An `active` row nothing holds has no handshake to apply a
+                // pending change: it takes effect now, the same as any other
+                // entry. Unknown liveness records it, as a held row does.
+                let holder_less = queue.entries[idx].status == EntryStatus::Active
+                    && !holders
+                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .holds(&args.id);
                 let row = &mut queue.entries[idx];
-                if row.status == EntryStatus::Active {
+                if row.status == EntryStatus::Active && !holder_less {
                     row.pending_status = Some(new);
                 } else {
                     row.status = new;
+                    row.pending_status = None;
                 }
             }
         }
@@ -1932,8 +1960,10 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         return Err(refuse(QueueRefusal::LinkedFrom { id: args.id.clone() }));
     }
     let idx = idx_of(&queue, &args.id);
-    if queue.entries[idx].status == EntryStatus::Active {
-        return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+    if queue.entries[idx].status == EntryStatus::Active
+        && let Some(refusal) = Holders::ask(&growlightd_socket_of(&inner)).running_refusal(&args.id)
+    {
+        return Err(refusal);
     }
 
     // The drop→restack path (§8, queue-v2-git slices 004 + 006): the live
@@ -1985,7 +2015,8 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         e.parent = dropped_parent.clone();
     }
 
-    let row = queue.entries.remove(idx);
+    let mut row = queue.entries.remove(idx);
+    row.pending_status = None;
     archive.entries.push(ArchivedEntry {
         row,
         finished: conventions::now_rfc3339(),
@@ -2137,6 +2168,82 @@ fn refuse(r: QueueRefusal) -> (ErrorKind, String) {
         _ => ErrorKind::BadArgs,
     };
     (kind, r.to_string())
+}
+
+/// Which entries a live session holds, as growlightd answered (report 172).
+///
+/// `active` in `queue.toml` says a session claimed the entry, not that one is
+/// running now: a member that died, a growlightd restart before the v2 boot
+/// reconcile, or a failed spawn all leave an `active` row nothing holds, and
+/// no status the human can write moves it. So the `running` refusals ask the
+/// one party that knows. Asked while the daemon lock is held: a claim needs
+/// that lock to land, and growlightd marks an entry held before it claims, so
+/// an `active` row the answer does not list really is holder-less.
+enum Holders {
+    Held(HashSet<String>),
+    /// growlightd could not say. The refusals fail closed on this; a status
+    /// change falls back to recording `pending_status`.
+    Unknown(String),
+}
+
+impl Holders {
+    /// Ask growlightd at `socket`. A read: safe to retry across a restart,
+    /// bounded so the held lock is not kept long.
+    fn ask(socket: &std::path::Path) -> Self {
+        let req = softfig_ipc::Request::new(softfig_ipc::growlightd::op::QUEUE_LIVE, serde_json::Value::Null);
+        let policy = softfig_ipc::RetryPolicy {
+            budget: std::time::Duration::from_millis(600),
+            ..softfig_ipc::RetryPolicy::default()
+        };
+        match softfig_ipc::call_reconnecting(socket, &req, policy) {
+            Ok(softfig_ipc::Response::Ok { data, .. }) => {
+                match serde_json::from_value::<softfig_ipc::growlightd::QueueLiveReply>(data) {
+                    Ok(reply) => Self::Held(reply.held.into_iter().collect()),
+                    Err(e) => Self::Unknown(format!("undecodable queue_live reply: {e}")),
+                }
+            }
+            Ok(softfig_ipc::Response::Err { kind, error, .. }) => {
+                Self::Unknown(format!("growlightd refused queue_live ({kind:?}): {error}"))
+            }
+            Err(e) => Self::Unknown(format!("growlightd unreachable at {}: {e}", socket.display())),
+        }
+    }
+
+    /// Whether a live session holds `id`; unknown reads as held, for the
+    /// refusals that must fail closed.
+    fn holds(&self, id: &str) -> bool {
+        match self {
+            Self::Held(set) => set.contains(id),
+            Self::Unknown(_) => true,
+        }
+    }
+
+    /// The `running` refusal for an `active` entry `id`, or `None` when no
+    /// live session holds it.
+    fn running_refusal(&self, id: &str) -> Option<(ErrorKind, String)> {
+        match self {
+            Self::Held(set) if !set.contains(id) => None,
+            Self::Held(_) => Some(refuse(QueueRefusal::Running { id: id.to_string() })),
+            Self::Unknown(why) => Some((
+                ErrorKind::BadArgs,
+                format!(
+                    "running: '{id}' is active and growlightd cannot say whether a session holds \
+                     it ({why}); start growlightd — its boot reconcile returns a holder-less \
+                     entry to queued — and retry"
+                ),
+            )),
+        }
+    }
+}
+
+/// growlightd's socket, read off the locked daemon state (`Daemon::growlightd_socket`
+/// would take the lock again).
+fn growlightd_socket_of(inner: &DaemonInner) -> std::path::PathBuf {
+    inner
+        .config
+        .growlightd_socket
+        .clone()
+        .unwrap_or_else(softfig_ipc::growlightd_runtime_socket_path)
 }
 
 /// The untouched tip hash — a dry run's reply `hash` (no commit is minted).
@@ -5091,6 +5198,150 @@ mod tests {
             .expect("restack doc");
         assert!(doc.contains("- `git rebase --onto main feat/a feat/b`"), "{doc}");
         assert!(doc.contains("- `git rebase --onto main feat/a feat/c`"), "{doc}");
+    }
+
+    // ---- liveness: a holder-less `active` entry is not "running" (report 172) ----
+
+    /// Point the daemon at a stub growlightd that answers every `queue_live` with
+    /// `held`; the listener lives as long as the returned guard's thread (it
+    /// answers until the test drops the tempdir).
+    fn live_growlightd(daemon: &Daemon, dir: &std::path::Path, held: &[&str]) {
+        use std::io::{BufRead, BufReader, Write};
+        let socket = dir.join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        daemon.inner.lock().unwrap().config.growlightd_socket = Some(socket);
+        let reply = softfig_ipc::Response::ok(
+            serde_json::to_value(softfig_ipc::growlightd::QueueLiveReply {
+                held: held.iter().map(|h| h.to_string()).collect(),
+            })
+            .unwrap(),
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).is_err() {
+                    return;
+                }
+                assert!(line.contains("queue_live"), "asked growlightd something else: {line}");
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                let _ = stream.write_all(&bytes);
+            }
+        });
+    }
+
+    /// The report 172 shape: an `active` entry with a recorded pending status
+    /// that nothing holds.
+    fn stranded() -> Entry {
+        let mut e = entry("109");
+        e.status = EntryStatus::Active;
+        e.claimed = "2026-11-08T14:13:32Z".to_string();
+        e.fleet = false;
+        e.pending_status = Some(EntryStatus::Deferred);
+        e
+    }
+
+    #[test]
+    fn a_human_drop_of_a_holder_less_active_entry_succeeds() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded(), entry("b")], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "stale restack" }))
+            .expect("nothing holds it");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert!(qs.queue.model.entries.iter().all(|e| e.id != "109"));
+        let archived = &qs.archive.model.entries[0];
+        assert_eq!((archived.row.id.as_str(), archived.final_status), ("109", FinalStatus::Dropped));
+        assert_eq!(archived.row.pending_status, None, "a pending change dies with the row");
+    }
+
+    #[test]
+    fn a_drop_of_an_entry_a_live_session_holds_is_still_running() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &["109"]);
+        let before = commit_count(&daemon);
+
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        assert!(err.1.starts_with("running: '109' is running a session"), "{err:?}");
+        assert_eq!(commit_count(&daemon), before);
+    }
+
+    #[test]
+    fn when_growlightd_cannot_say_the_running_refusal_fails_closed_and_says_so() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path()); // growlightd socket points at nothing
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        assert!(
+            err.1.starts_with("running:") && err.1.contains("cannot say whether a session holds it"),
+            "{err:?}"
+        );
+        let err = update_entry(&daemon, serde_json::json!({ "id": "109", "status": "done" })).unwrap_err();
+        assert!(err.1.starts_with("running:") && err.1.contains("growlightd"), "{err:?}");
+    }
+
+    #[test]
+    fn a_status_change_on_a_holder_less_active_entry_lands_now_not_as_pending() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        let r = update_entry(&daemon, serde_json::json!({ "id": "109", "status": "queued" })).expect("status");
+        assert!(!r.view.contains("pending"), "{}", r.view);
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let row = load_queue_state(&wt, &inner).unwrap().unwrap().queue.model.entries.remove(0);
+        assert_eq!((row.status, row.pending_status), (EntryStatus::Queued, None));
+    }
+
+    #[test]
+    fn a_status_change_on_a_held_entry_still_records_pending() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut e = stranded();
+        e.pending_status = None;
+        seed_queue(&daemon, vec![project()], vec![e], None);
+        live_growlightd(&daemon, sock.path(), &["109"]);
+
+        update_entry(&daemon, serde_json::json!({ "id": "109", "status": "deferred" })).expect("status");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let row = load_queue_state(&wt, &inner).unwrap().unwrap().queue.model.entries.remove(0);
+        assert_eq!((row.status, row.pending_status), (EntryStatus::Active, Some(EntryStatus::Deferred)));
+    }
+
+    #[test]
+    fn done_repair_and_set_repo_share_the_liveness_check() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        // Holder-less: the repair fields and the project's repo are editable.
+        update_entry(&daemon, serde_json::json!({ "id": "109", "branch": "feat/fixed" })).expect("repair");
+        set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/new" })).expect("set repo");
+        update_entry(&daemon, serde_json::json!({ "id": "109", "status": "done" })).expect("done");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert!(qs.queue.model.entries.is_empty());
+        assert_eq!(qs.archive.model.entries[0].final_status, FinalStatus::Done);
+        assert_eq!(qs.archive.model.entries[0].row.pending_status, None);
     }
 
     #[test]

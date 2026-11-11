@@ -188,6 +188,14 @@ pub mod op {
     /// there (queue-v2-git slice 006). No v2 list -> `list: false`.
     pub const QUEUE_SHOW: &str = "queue_show";
 
+    /// `queue_live() -> `[`QueueLiveReply`]. Read-only: the v2 entries a live
+    /// session holds right now (report 172). keeperd asks it before it reads an
+    /// `active` entry as running, so a human `drop` / `done` / repair of an entry
+    /// nothing holds is not trapped behind a status no one will ever clear.
+    /// Answered from the drive loop's published holds plus the claims in flight,
+    /// never from a git or file read.
+    pub const QUEUE_LIVE: &str = "queue_live";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,
@@ -1556,6 +1564,15 @@ pub struct QueueShowTree {
     pub milestone: String,
     #[serde(default)]
     pub slices: Vec<QueueShowSlice>,
+}
+
+/// Reply to [`op::QUEUE_LIVE`]: the v2 entry ids a live member holds now — a
+/// running session, a claim whose spawn has not landed, or a handoff still in
+/// flight. An `active` entry absent from this list has no holder. A fleet that
+/// is not armed holds nothing, so the list is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueLiveReply {
+    pub held: Vec<String>,
 }
 
 /// Reply to [`op::QUEUE_SHOW`]: the live v2 list and its annotations, for the
