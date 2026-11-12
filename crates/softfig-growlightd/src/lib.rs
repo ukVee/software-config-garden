@@ -59,6 +59,7 @@ pub mod schedule;
 pub mod scheduler;
 pub mod scheduler_v2;
 pub mod server;
+pub mod singleton;
 pub mod state;
 pub mod supervisor;
 pub mod telemetry_capture;
