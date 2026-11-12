@@ -2203,12 +2203,18 @@ enum Holders {
 }
 
 impl Holders {
+    /// How long the daemon lock may be held waiting on growlightd (report 179):
+    /// `budget` bounds the reconnects, `call_timeout` the accepted-but-silent
+    /// peer. Every caller holds the global daemon lock.
+    const ASK_BOUND: std::time::Duration = std::time::Duration::from_millis(600);
+
     /// Ask growlightd at `socket`. A read: safe to retry across a restart,
-    /// bounded so the held lock is not kept long.
+    /// bounded to [`Self::ASK_BOUND`] so the held lock is not kept long.
     fn ask(socket: &std::path::Path) -> Self {
         let req = softfig_ipc::Request::new(softfig_ipc::growlightd::op::QUEUE_LIVE, serde_json::Value::Null);
         let policy = softfig_ipc::RetryPolicy {
-            budget: std::time::Duration::from_millis(600),
+            budget: Self::ASK_BOUND,
+            call_timeout: Self::ASK_BOUND,
             ..softfig_ipc::RetryPolicy::default()
         };
         match softfig_ipc::call_reconnecting(socket, &req, policy) {
@@ -2220,6 +2226,13 @@ impl Holders {
             }
             Ok(softfig_ipc::Response::Err { kind, error, .. }) => {
                 Self::Unknown(format!("growlightd refused queue_live ({kind:?}): {error}"))
+            }
+            Err(softfig_ipc::ReconnectError::Ambiguous { source, .. }) if source.is_timeout() => {
+                Self::Unknown(format!(
+                    "growlightd did not answer within {} ms at {}",
+                    Self::ASK_BOUND.as_millis(),
+                    socket.display()
+                ))
             }
             Err(e) => Self::Unknown(format!("growlightd unreachable at {}: {e}", socket.display())),
         }
@@ -5326,6 +5339,37 @@ mod tests {
         let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
         assert!(err.1.starts_with("running: '109' is running a session"), "{err:?}");
         assert_eq!(commit_count(&daemon), before);
+    }
+
+    /// Report 179: a growlightd that accepts and never replies must neither hold
+    /// the daemon lock for the 30 s `CALL_TIMEOUT` nor leave the refusal vague.
+    #[test]
+    fn a_growlightd_that_accepts_and_never_replies_is_bounded_and_named() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        let socket = sock.path().join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        daemon.inner.lock().unwrap().config.growlightd_socket = Some(socket);
+        let (release, held_open) = std::sync::mpsc::channel::<()>();
+        let stub = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = held_open.recv(); // never replies until the test is done
+        });
+
+        let start = std::time::Instant::now();
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "held the daemon lock {elapsed:?}");
+        assert!(
+            err.1.starts_with("running:") && err.1.contains("growlightd did not answer within 600 ms"),
+            "{err:?}"
+        );
+        // The lock is free again for the next verb.
+        assert!(daemon.inner.try_lock().is_ok(), "daemon lock still held");
+        drop(release);
+        stub.join().unwrap();
     }
 
     #[test]
