@@ -122,7 +122,7 @@ pub enum Tag {
     /// (growlightd-only) channel — the stack annotation needs growlightd's
     /// read-only git surface. Fired once when the tab is active and the snapshot
     /// is marked stale (entry / refresh / a confirmed action), NOT polled. `Ok`
-    /// carries a `softfig_ipc::growlightd::QueueShowReply`; an `Err` (growlightd
+    /// carries a `softfig_protocol_growlightd::QueueShowReply`; an `Err` (growlightd
     /// down) soft-fails to `None` — the legacy tree still renders (slice 007).
     GrowlightQueueShow,
     /// growlight: one §6.9 mutating action (`queue_update_entry` / `queue_drop` /

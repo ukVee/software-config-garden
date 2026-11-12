@@ -1046,7 +1046,7 @@ pub struct RestartReply {
 
 /// The envelope every member verb travels in: the caller's identity beside the
 /// model-supplied arguments, never inside them. `member` is filled by
-/// softfig-mcp from `SOFTFIG_MEMBER` (`softfig_ipc::MemberIdentity`); `None` = the
+/// softfig-mcp from `SOFTFIG_MEMBER` (`softfig-ipc::MemberIdentity`); `None` = the
 /// caller is not a member session, which growlightd refuses `not_a_member`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

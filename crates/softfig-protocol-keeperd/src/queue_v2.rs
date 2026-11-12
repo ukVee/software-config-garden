@@ -1,5 +1,5 @@
 //! The queue v2 vocabularies that cross the keeperd wire. The rest of the state
-//! model stays in `softfig_ipc::queue_v2`, which re-exports these.
+//! model stays in `softfig-ipc::queue_v2`, which re-exports these.
 
 use std::fmt;
 

@@ -8063,8 +8063,8 @@ mod tests {
 
     // ---- queue v2 actions address the captured entry (review 044 V12) ------
 
-    fn v2_entry(id: &str) -> softfig_ipc::growlightd::QueueShowEntry {
-        softfig_ipc::growlightd::QueueShowEntry {
+    fn v2_entry(id: &str) -> softfig_protocol_growlightd::QueueShowEntry {
+        softfig_protocol_growlightd::QueueShowEntry {
             id: id.into(),
             kind: "milestone".into(),
             project: "softfig".into(),
@@ -8108,22 +8108,22 @@ mod tests {
         let mut app = v2_app_cursor_on_b();
         let reply = app.growlight_queue_v2.as_mut().unwrap();
         reply.entries = vec![v2_entry("m")];
-        let slice = |id: &str, kind: &str| softfig_ipc::growlightd::QueueShowSlice {
+        let slice = |id: &str, kind: &str| softfig_protocol_growlightd::QueueShowSlice {
             id: id.into(),
             kind: kind.into(),
             status: "queued".into(),
         };
         reply.trees = vec![
-            softfig_ipc::growlightd::QueueShowTree {
+            softfig_protocol_growlightd::QueueShowTree {
                 milestone: "m".into(),
                 slices: vec![slice("001", "slice"), slice("s", "sub")],
             },
-            softfig_ipc::growlightd::QueueShowTree {
+            softfig_protocol_growlightd::QueueShowTree {
                 milestone: "m/s".into(),
                 slices: vec![slice("001", "slice")],
             },
         ];
-        let log = |tree: Option<&str>, line: &str| softfig_ipc::growlightd::QueueShowSession {
+        let log = |tree: Option<&str>, line: &str| softfig_protocol_growlightd::QueueShowSession {
             entry: "m".into(),
             tree: tree.map(str::to_string),
             unit: Some("001".into()),
@@ -8182,7 +8182,7 @@ mod tests {
             Reply {
                 id: 1,
                 tag: Tag::GrowlightQueueShow,
-                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+                result: Err((softfig_protocol_keeperd::ErrorKind::Io, "connect: no such file".into())),
             },
             &mut ipc,
         );
@@ -8201,7 +8201,7 @@ mod tests {
             Reply {
                 id: 1,
                 tag: Tag::FleetStatus,
-                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+                result: Err((softfig_protocol_keeperd::ErrorKind::Io, "connect: no such file".into())),
             },
             &mut ipc,
         );
@@ -8274,7 +8274,7 @@ mod tests {
         // A's dry-run (id 1) and B's committed write (id 2) are both in flight.
         let mut app = v2_app_cursor_on_b();
         let drop = |id: &str| {
-            V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+            V2Action::Drop(softfig_protocol_keeperd::verbs::QueueDropArgs {
                 id: id.into(),
                 reason: "r".into(),
                 dry_run: false,
@@ -8333,7 +8333,7 @@ mod tests {
         assert!(p.dry_run);
         let V2Action::EntryUpdate(args) = &p.action else { panic!("expected an entry update") };
         assert_eq!(args.id, "a");
-        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Blocked));
+        assert_eq!(args.status, Some(softfig_protocol_keeperd::verbs::QueueStatusArg::Blocked));
     }
 
     #[test]
@@ -8348,7 +8348,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &mut ipc);
         let V2Action::EntryUpdate(args) = &only_pending(&app).action else { panic!() };
         assert_eq!(args.id, "b");
-        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Deferred));
+        assert_eq!(args.status, Some(softfig_protocol_keeperd::verbs::QueueStatusArg::Deferred));
     }
 
     // ---- queue v2 glue: keys, the action pair, the gates (review 044 V22) ---
@@ -8363,7 +8363,7 @@ mod tests {
 
     /// What a [`recording_ipc`] socket received. Dropping it removes the socket.
     struct Wire {
-        requests: std::sync::mpsc::Receiver<softfig_ipc::Request>,
+        requests: std::sync::mpsc::Receiver<softfig_protocol_keeperd::Request>,
         path: std::path::PathBuf,
     }
 
@@ -8391,7 +8391,7 @@ mod tests {
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line).unwrap();
                 let _ = tx.send(serde_json::from_str(&line).unwrap());
-                let reply = softfig_ipc::Response::ok(json!({
+                let reply = softfig_protocol_keeperd::Response::ok(json!({
                     "id": "a", "view": "would-be", "hash": "h"
                 }));
                 let mut bytes = serde_json::to_vec(&reply).unwrap();
@@ -8404,7 +8404,11 @@ mod tests {
 
     /// The next request off the wire, and its reply applied to `app` the way
     /// the run loop would.
-    fn settle(app: &mut App, ipc: &mut IpcClient, wire: &Wire) -> softfig_ipc::Request {
+    fn settle(
+        app: &mut App,
+        ipc: &mut IpcClient,
+        wire: &Wire,
+    ) -> softfig_protocol_keeperd::Request {
         let req = wire.requests.recv_timeout(std::time::Duration::from_secs(10)).expect("a request");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -8428,7 +8432,7 @@ mod tests {
         press_char(&mut app, &mut ipc, 't');
 
         let dry = settle(&mut app, &mut ipc, &wire);
-        assert_eq!(dry.op, softfig_ipc::op::QUEUE_UPDATE_ENTRY);
+        assert_eq!(dry.op, softfig_protocol_keeperd::verbs::op::QUEUE_UPDATE_ENTRY);
         assert_eq!(dry.args["id"], "b");
         assert_eq!(dry.args["dry_run"], true);
         let Overlay::QueueConfirm { action, preview, .. } = &app.overlay else {
@@ -8451,7 +8455,10 @@ mod tests {
         assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
         assert_eq!(app.status, "queue v2: updated");
         assert!(app.growlight_v2_stale);
-        assert_eq!(settle(&mut app, &mut ipc, &wire).op, softfig_ipc::op::GROWLIGHT_QUEUE);
+        assert_eq!(
+            settle(&mut app, &mut ipc, &wire).op,
+            softfig_protocol_keeperd::verbs::op::GROWLIGHT_QUEUE
+        );
     }
 
     #[test]
@@ -8479,7 +8486,7 @@ mod tests {
         for key in [KeyCode::Enter, KeyCode::Char('Y')] {
             let mut ipc = dummy_ipc();
             let mut app = v2_app_cursor_on_b();
-            let action = V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+            let action = V2Action::Drop(softfig_protocol_keeperd::verbs::QueueDropArgs {
                 id: "a".into(),
                 reason: "r".into(),
                 dry_run: false,
@@ -8531,7 +8538,7 @@ mod tests {
             panic!("expected an entry update")
         };
         assert_eq!(args.id, "b");
-        assert_eq!(args.lane, Some(softfig_ipc::queue_v2::Lane::Urgent));
+        assert_eq!(args.lane, Some(softfig_protocol_keeperd::queue_v2::Lane::Urgent));
     }
 
     #[test]
@@ -8675,7 +8682,7 @@ mod tests {
     fn a_refused_commit_reports_it_and_does_not_claim_an_update() {
         let mut ipc = dummy_ipc();
         let mut app = v2_app_cursor_on_b();
-        let action = V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+        let action = V2Action::Drop(softfig_protocol_keeperd::verbs::QueueDropArgs {
             id: "a".into(),
             reason: "r".into(),
             dry_run: false,
