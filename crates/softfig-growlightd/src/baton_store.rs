@@ -510,19 +510,35 @@ fn render_base_line(step: FirstStep<'_>) -> String {
     }
 }
 
+/// Is `line` (no newline) exactly a base line [`render_base_line`] writes:
+/// `create <branch> from <base>` or `resume <branch>`, single-space separated?
+/// Anything longer (a hand-seeded `resume the WIP tree at ~/w/089 - do not
+/// rebuild it`) is the human's prose, not the store's line (review 061 F13).
+/// A branch or base never holds a space, so the shape is unambiguous.
+fn is_seeded_base_line(line: &str) -> bool {
+    let words: Vec<&str> = line.split(' ').collect();
+    let named = |w: &&str| !w.is_empty();
+    match words.as_slice() {
+        ["create", branch, "from", base] => named(branch) && named(base),
+        ["resume", branch] => named(branch),
+        _ => false,
+    }
+}
+
 /// `baton` with its §8 base line set to `step` (V18): the seed of a first claim
 /// that failed still names the base that attempt computed, and the retry may
 /// record another (or find the branch now exists, and swap `create` for
-/// `resume`). Everything else is kept byte for byte, and a baton
-/// with no base line is returned as it is, since it states no base to disagree
-/// with.
+/// `resume`). Only a line of the exact shape the store seeds is rewritten
+/// ([`is_seeded_base_line`]). Everything else is kept byte for byte, and a
+/// baton with no such line is returned as it is, since it states no base to
+/// disagree with.
 pub(crate) fn with_base_line(baton: &str, step: FirstStep<'_>) -> String {
     let mut out = String::with_capacity(baton.len());
     let mut in_first_step = false;
     for line in baton.split_inclusive('\n') {
         if line.starts_with("# ") {
             in_first_step = line.trim_end() == FIRST_STEP_HEADING;
-        } else if in_first_step && (line.starts_with("create ") || line.starts_with("resume ")) {
+        } else if in_first_step && is_seeded_base_line(line.trim_end_matches('\n')) {
             out.push_str(&render_base_line(step));
             out.push('\n');
             continue;
@@ -1122,6 +1138,26 @@ mod tests {
             with_base_line(&resumed, FirstStep::Create { branch: "feat/x", base: "abc" }),
             "# FIRST STEP\ncreate feat/x from abc\n\n# STATE\nresume nothing\n",
         );
+    }
+
+    /// Review 061 F13: a hand-seeded FIRST STEP that merely begins `resume ` or
+    /// `create ` is the human's instruction, not the store's one-line seed.
+    #[test]
+    fn with_base_line_keeps_hand_seeded_prose() {
+        for line in [
+            "resume the WIP tree at ~/w/089 - do not rebuild it",
+            "create the branch by hand, then tell me",
+            "resume  feat/x",
+            "create feat/x from  main",
+            "resume ",
+        ] {
+            let baton = format!("# FIRST STEP\n{line}\n\n# STATE\nx\n");
+            assert_eq!(
+                with_base_line(&baton, FirstStep::Resume { branch: "feat/x" }),
+                baton,
+                "{line:?} must survive",
+            );
+        }
     }
 
     /// A baton with no base line states no base, so there is nothing to rewrite.

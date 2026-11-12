@@ -1723,7 +1723,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_forty_three() {
+    fn tools_list_has_forty_four() {
         let defs = tool_defs();
         assert_eq!(defs.len(), 44);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();

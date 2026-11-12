@@ -526,6 +526,35 @@ mod tests {
         }
     }
 
+    /// Review 061 F14: a repo git refuses over ownership is not "not a git
+    /// repository" — the claim names `safe.directory`, since repointing the
+    /// project at the same path would change nothing.
+    #[test]
+    fn a_repo_git_refuses_for_ownership_is_not_called_a_non_repo() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"fatal: detected dubious ownership in repository at '/x'\" >&2\nexit 128\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let entries = vec![entry("089", "fix/089", Lane::Normal, EntryStatus::Queued, "")];
+        let snapshot = local_snap(dir.path(), entries);
+        let claiming = snapshot.entries.first().unwrap();
+        let probes = ProbeCache::with(std::time::Duration::from_secs(10), &fake);
+
+        let err = first_claim(&snapshot, claiming, None, None, &probes).unwrap_err();
+        assert!(
+            matches!(&err, FirstClaimError::Git(git_stack::GitError::DubiousOwnership { .. })),
+            "{err:?}",
+        );
+        let text = err.to_string();
+        assert!(text.contains("safe.directory"), "{text}");
+        assert!(!text.contains("not a git repository"), "{text}");
+    }
+
     #[test]
     fn a_started_entry_with_no_branch_does_not_block_a_normal_first_claim() {
         // V3: `ghost` was claimed (then blocked/deferred) before its branch was

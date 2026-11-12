@@ -107,12 +107,22 @@ impl Fixture {
         self.root.join("home/.config/secret-target")
     }
 
+    /// The daemon's socket, where `$XDG_RUNTIME_DIR` points the default lookup.
+    fn socket(&self) -> PathBuf {
+        self.root.join("run/softfig-keeperd.sock")
+    }
+
     fn deploy(&self, args: &[&str]) -> Output {
+        self.deploy_in(&self.root.join("run"), args)
+    }
+
+    /// `softfig deploy` with `$XDG_RUNTIME_DIR` set to `runtime`.
+    fn deploy_in(&self, runtime: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_softfig"))
             .arg("deploy")
             .args(args)
             .env("HOME", self.root.join("home"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("XDG_RUNTIME_DIR", runtime)
             .env("XDG_DATA_HOME", self.root.join("data"))
             .output()
             .expect("softfig runs")
@@ -211,4 +221,47 @@ fn a_locked_daemon_asks_for_an_unlock() {
     let err = refused(&fx.deploy(&[]));
     assert!(err.contains("unlock"), "error says to unlock: {err}");
     assert!(fs::symlink_metadata(fx.target()).is_err(), "nothing deployed");
+}
+
+/// Review 061 F15: `--socket` reaches a daemon the default lookup cannot. The
+/// runtime dir the CLI would search holds no socket, so only the flag can find
+/// the fixture's daemon — and without it the same call finds none.
+#[test]
+fn socket_flag_reaches_a_daemon_outside_the_runtime_dir() {
+    let fx = Fixture::start("socket-flag", true, true);
+    let empty = fx.root.join("elsewhere");
+    fs::create_dir_all(&empty).unwrap();
+
+    let err = refused(&fx.deploy_in(&empty, &[]));
+    assert!(err.contains("daemon not running"), "no socket in the default dir: {err}");
+    assert!(fs::symlink_metadata(fx.target()).is_err(), "nothing deployed");
+
+    let socket = fx.socket();
+    let socket = socket.to_str().unwrap();
+    let out = ok(&fx.deploy_in(&empty, &["--socket", socket]));
+    assert!(out.contains("sealed-test"), "plan names the dot: {out}");
+    assert_eq!(read(&fx.target()), SECRET);
+}
+
+/// `--socket` pointing at nothing is the daemon-absent error, not a silent
+/// fall-back to the default socket (which here exists and would deploy).
+#[test]
+fn socket_flag_does_not_fall_back_to_the_default_socket() {
+    let fx = Fixture::start("socket-miss", true, true);
+    let missing = fx.root.join("elsewhere/none.sock");
+    let err = refused(&fx.deploy(&["--socket", missing.to_str().unwrap()]));
+    assert!(err.contains("daemon not running"), "{err}");
+    assert!(fs::symlink_metadata(fx.target()).is_err(), "nothing deployed");
+}
+
+/// The flags this branch removed are refused by the parser, not ignored.
+#[test]
+fn the_retired_source_flags_are_refused() {
+    let fx = Fixture::start("retired", true, true);
+    for flag in ["--garden-root", "--cache-root"] {
+        let out = fx.deploy(&[flag, "/nonexistent"]);
+        let err = refused(&out);
+        assert!(err.contains(flag) && err.contains("unexpected"), "{flag}: {err}");
+        assert!(fs::symlink_metadata(fx.target()).is_err(), "{flag}: nothing deployed");
+    }
 }
