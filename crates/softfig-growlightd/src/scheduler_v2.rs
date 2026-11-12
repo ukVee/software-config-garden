@@ -292,7 +292,7 @@ pub enum SkipReason {
     /// §3.10).
     Schedule,
     /// The fallback leaves this project to the member pinned to it, who is
-    /// free (or exiting it) this tick and can take it (§4 fallback
+    /// free (or exiting it) this tick and can take it (§2 fallback
     /// reservation, report 169).
     Reserved,
 }
@@ -380,7 +380,7 @@ impl SkipReason {
                 "the schedule holds this member, and this is not a due timed item"
             }
             SkipReason::Reserved => {
-                "its project's own pinned member is free to take it, so the fallback leaves it (§4)"
+                "its project's own pinned member is free to take it, so the fallback leaves it (§2)"
             }
         }
     }
@@ -762,7 +762,7 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
     pick_v2_reserving(snapshot, member, &BTreeSet::new())
 }
 
-/// [`pick_v2`] with the fallback reservation (§4, report 169): step 4 skips
+/// [`pick_v2`] with the fallback reservation (§2, report 169): step 4 skips
 /// every project in `reserved`, the projects whose own pinned member is free
 /// (or just rolled off an entry) this tick — see [`reserved_projects`]. A
 /// member's pinned scans (steps 1/3) ignore the set, so a member always
@@ -868,7 +868,7 @@ pub fn pick_v2_reserving(
     PickOutcome { picked, skips }
 }
 
-/// The projects a fallback must leave alone this tick (§4, report 169; the v2
+/// The projects a fallback must leave alone this tick (§2, report 169; the v2
 /// twin of 068's legacy reservation, `de47894`): a project is reserved while a
 /// member pinned to it is
 ///

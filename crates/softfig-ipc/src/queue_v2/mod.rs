@@ -43,7 +43,7 @@ pub use sub_doc::{
     reserved_field, reserved_lines, sub_doc_violation, FieldViolation, SubSliceText,
     SLICE_BODY_RESERVED, SUB_DOC_RESERVED,
 };
-pub use validate::{sub_depth, valid_branch_name, QueueRefusal};
+pub use validate::{safe_ref_name, sub_depth, valid_branch_name, QueueRefusal};
 
 use std::fmt;
 
@@ -330,17 +330,22 @@ pub(crate) fn is_fleet_default(fleet: &bool) -> bool {
 }
 
 /// The §2 holds as a surface prints them beside an entry's status:
-/// ` (human-only)` for `fleet = false`, and ` (not before <at>)` for a start
-/// time as written, whether or not it is still ahead. Empty when neither is
-/// set. The one wording, so `queue show`, the `growlight status` lanes and the
-/// TUI can't drift about the same hold.
-pub fn hold_annotation(fleet: bool, not_before: Option<&str>) -> String {
+/// ` (human-only)` for `fleet = false`, ` (not before <at>)` for a start
+/// time as written, whether or not it is still ahead, and
+/// ` (no auto-restack)` for an `auto_restack = false` branch the loop will not
+/// rewrite (§8, review 061). Empty when none is set. The one wording, so
+/// `queue show`, the `growlight status` lanes and the TUI can't drift about
+/// the same hold.
+pub fn hold_annotation(fleet: bool, not_before: Option<&str>, auto_restack: bool) -> String {
     let mut out = String::new();
     if !fleet {
         out.push_str(" (human-only)");
     }
     if let Some(at) = not_before {
         out.push_str(&format!(" (not before {at})"));
+    }
+    if !auto_restack {
+        out.push_str(" (no auto-restack)");
     }
     out
 }

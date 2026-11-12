@@ -259,7 +259,8 @@ pub mod op {
     /// queue v2 (§6.8 human verb, report 171): correct an existing project's
     /// `repo` (and optionally its `main`) — the repair `queue_add_project`
     /// can't do, since a repeat is refused `exists`. Same validation as the
-    /// add; refused `running` while an entry of the project is `active`. One
+    /// add; refused `running` only while a live session holds an `active` entry of
+    /// the project (§6.8, report 172). One
     /// commit, `queue_v2_updated`. `--dry-run` computes + renders, writes
     /// nothing.
     pub const QUEUE_SET_PROJECT_REPO: &str = "queue_set_project_repo";
@@ -291,8 +292,8 @@ pub mod op {
     pub const SLICE_UPDATE: &str = "slice_update";
     /// queue v2 (§6.8 human verb): drop an entry — the row moves to
     /// `queue-archive.toml` as `dropped` with `finished` + `reason`. Refused
-    /// `linked_from` while a live `after` names it, `running` for an `active`
-    /// entry. A live child's `parent == id` enqueues one restack per child
+    /// `linked_from` while a live `after` names it, `running` while a live session
+    /// holds it (§6.8). A live child's `parent == id` enqueues one restack per child
     /// project (§8). One commit, `queue_v2_updated`. `--dry-run` computes +
     /// renders, writes nothing.
     pub const QUEUE_DROP: &str = "queue_drop";
@@ -2424,7 +2425,7 @@ pub struct QueueUpdateEntryArgs {
     pub after: Option<Vec<String>>,
     /// `queued` (also unblocks and un-defers) | `blocked` | `deferred` |
     /// `done` (human override → archive, no open-items check; refused
-    /// `running` on an `active` entry). `active`/`paused`/`split` are refused
+    /// `running` while a live session holds the entry). `active`/`paused`/`split` are refused
     /// `daemon_owned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<QueueStatusArg>,
@@ -2446,18 +2447,20 @@ pub struct QueueUpdateEntryArgs {
     pub auto_restack: Option<bool>,
     /// Repairs the row's `branch` (report 171): the branch the entry's work
     /// lives on, which a migrated row names wrongly. A valid git branch name
-    /// (`bad_name` otherwise); a restack has none, and is refused. Taken only
-    /// while the entry is not `active` (`running` otherwise).
+    /// (`bad_name` otherwise) drawn from `[A-Za-z0-9._/-]`, and never the project's
+    /// own merge branch; a restack has none, and is refused. Refused `running`
+    /// only while a live session holds the entry (§6.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Repairs the row's `base` (§8), the commit or parent branch it was cut
     /// from; `""` clears it. A non-empty value is checked like a branch name
-    /// (it reaches git as a rev). Taken only while the entry is not `active`.
+    /// (it reaches git as a rev) and drawn from `[A-Za-z0-9._/-]`. Refused
+    /// `running` only while a live session holds the entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     /// Moves the entry to another project, which must already exist
-    /// (`unknown_project`). Taken only while the entry is not `active`; the
-    /// §3.1 invariants are re-checked, so a move that would start a second
+    /// (`unknown_project`). Refused `running` only while a live session holds the
+    /// entry; the §3.1 invariants are re-checked, so a move that would start a second
     /// entry in the new repo is refused `started`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,

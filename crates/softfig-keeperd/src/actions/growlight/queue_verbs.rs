@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
-    milestone_doc, sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus,
+    milestone_doc, safe_ref_name, sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus,
     FinalStatus, Lane, Project, QueueArchiveToml, QueueRefusal, QueueToml, RepoLocality,
     RestackBranch, SliceItem, SliceKind, SliceStatus, SlicesToml, QUEUE_ARCHIVE_FILE,
 };
@@ -1299,16 +1299,18 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     };
 
     // The repair fields' shapes, like `not_before`'s, check before the lock. A
-    // branch or base reaches git as a rev, so each is a branch name by git's
-    // rule; `base = ""` clears it, `branch` has no empty form.
+    // branch or base reaches git as a rev and is rendered into the restack
+    // doc's `git rebase --onto` steps, so each is a branch name by git's rule
+    // drawn from the conservative charset (review 061 F7); `base = ""` clears
+    // it, `branch` has no empty form.
     if let Some(branch) = &args.branch
-        && (branch.trim().is_empty() || !valid_branch_name(branch))
+        && (branch.trim().is_empty() || !valid_branch_name(branch) || !safe_ref_name(branch))
     {
         return Err(refuse(QueueRefusal::BadName { name: branch.clone() }));
     }
     if let Some(base) = &args.base
         && !base.is_empty()
-        && !valid_branch_name(base)
+        && (!valid_branch_name(base) || !safe_ref_name(base))
     {
         return Err(refuse(QueueRefusal::BadName { name: base.clone() }));
     }
@@ -1462,7 +1464,22 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 ),
             ));
         }
+        // The branch is never the merge branch of the project the entry will
+        // sit in: a claim would resume the merge branch itself, and the stack
+        // scan would count it as already merged (review 061 F7).
         if let Some(branch) = &args.branch {
+            let project = args.project.as_deref().unwrap_or(&queue.entries[idx].project);
+            if let Some(p) = queue.projects.iter().find(|p| p.name == project)
+                && p.main == *branch
+            {
+                return Err((
+                    ErrorKind::BadArgs,
+                    format!(
+                        "branch {branch:?} is project {:?}'s merge branch: an entry works on its own branch, never on main",
+                        p.name
+                    ),
+                ));
+            }
             queue.entries[idx].branch = branch.clone();
         }
         if let Some(base) = &args.base {
@@ -2957,6 +2974,50 @@ mod tests {
         let n = commit_count(&daemon);
         update_entry(&daemon, serde_json::json!({ "id": "b", "base": "958a010" })).expect("no-op");
         assert_eq!(commit_count(&daemon), n);
+    }
+
+    /// Review 061 F7: a repaired branch is never the project's own merge branch, and a
+    /// branch or base outside `[A-Za-z0-9._/-]` is refused before the write, because both
+    /// are rendered into the restack doc's `git rebase --onto` steps.
+    #[test]
+    fn update_entry_repair_refuses_the_projects_main_and_shell_metacharacters() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let trunk = Project {
+            name: "trunky".to_string(),
+            repo: "~/t".to_string(),
+            main: "trunk".to_string(),
+        };
+        seed_queue(&daemon, vec![project(), trunk], vec![entry("a")], None);
+        let before = commit_count(&daemon);
+
+        // The entry's own project's main.
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "main" })).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        assert!(err.1.contains("merge branch"), "{err:?}");
+        // The destination project's main counts, in the same edit as a move; the old
+        // project's main does not.
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "trunk", "project": "trunky" }))
+            .unwrap_err();
+        assert!(err.1.contains("merge branch"), "{err:?}");
+        update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "main", "project": "trunky" }))
+            .expect("main is an ordinary branch name in a project whose merge branch is trunk");
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "trunk" })).unwrap_err();
+        assert!(err.1.contains("merge branch"), "{err:?}");
+
+        // Git-legal metacharacters never reach the restack doc.
+        for bad in ["feat/x;curl${IFS}evil", "a$b", "a(b)", "a|b", "a{b}", "a&b", "a'b", "a\"b", "a`b`", "a>b"] {
+            for field in ["branch", "base"] {
+                let err = update_entry(&daemon, serde_json::json!({ "id": "a", field: bad })).unwrap_err();
+                assert!(err.1.starts_with("bad_name:"), "{field} {bad:?}: {err:?}");
+            }
+        }
+        // A base may be the project's main (a branch cut from main) or a hash.
+        update_entry(&daemon, serde_json::json!({ "id": "a", "base": "trunk" })).expect("base = main");
+        assert_eq!(commit_count(&daemon), before + 2, "only the two accepted edits committed");
+        let q = read_queue(&daemon);
+        assert_eq!(q.entries[0].branch, "main");
+        assert_eq!(q.entries[0].base, "trunk");
     }
 
     #[test]

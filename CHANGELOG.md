@@ -73,6 +73,15 @@ decision record or crate that owns it, rather than at every internal change.
   semi-auto `SessionEnd` hook runs; a repeat run skips a transcript that has
   not grown. Raw rows are kept 90 days, then rolled into a daily rollup kept
   forever. See `docs/token-telemetry.md`.
+- **`softfig growlight queue repair`** and **`queue project set-repo`** — human-only
+  verbs to correct a migrated entry's `branch`, `base` or `project`, and an
+  existing project's `repo` (and optionally its merge branch), so an entry migrated
+  with the wrong repo or branch can be claimed. A branch or base takes only
+  `[A-Za-z0-9._/-]`, and a branch is never its project's merge branch. Both are
+  refused `running` only while a live session holds the entry. `queue
+  auto-restack <id> yes|no` opts a resumed branch in or out of the loop's automatic
+  restack, and `queue show`, `growlight status` and the TUI mark a held-out one
+  `(no auto-restack)` (sweep-fixes 002, 008; `spec-growlight-queue` §6.8, §8).
 
 ### Changed
 
@@ -82,6 +91,16 @@ decision record or crate that owns it, rather than at every internal change.
   to its `sessions.md`. keeperd creates each file on first write. No v2 write,
   `queue migrate --apply` included, changes any `CLAUDE.md` (task 104;
   `spec-growlight-queue` §3.4–§3.5, `decision-claude-md-lazy-pointers`).
+- **Breaking: `softfig deploy` is a thin client of keeperd.** `--garden-root` and
+  `--cache-root` are gone (clap now refuses them) and `--socket <path>` is new. The
+  daemon must be running and unlocked; there is no direct-mode fallback. The daemon
+  is the one source reader, so a sealed source deploys as plaintext and is never
+  written as `[sealed:...]`, and `softfig-cli` no longer depends on `softfig-deploy`
+  (sweep-fixes 006, report 168).
+- A first claim of an entry whose branch already exists resumes it (`resume <branch>`,
+  base = the merge-base with the parent or `main`) instead of seeding a `create`
+  line, and a resumed branch is held out of the automatic restack until a human opts
+  it in (sweep-fixes 001, 008; reports 171, 178).
 
 ### Fixed
 
@@ -91,6 +110,21 @@ decision record or crate that owns it, rather than at every internal change.
   so an up-to-date host costs no walk and no commit read and a new commit reads
   only what is new (about 4.5 % of a core around the clock before; growlight
   report 092).
+- growlightd's boot reconcile under `queue = "v2"` resets every holder-less `active`
+  entry (to its `pending_status`, else `queued`), and keeperd refuses `done`, a drop
+  or a repair as `running` only while a live session holds the entry, so a stranded
+  `active` row no longer traps the entry (sweep-fixes 003, report 172). keeperd asks
+  growlightd who holds an entry (`queue_live`) and waits at most 600 ms in total,
+  so a silent growlightd cannot hold keeperd's lock (009, report 179).
+- A second growlightd on the same socket path exits instead of stealing the socket
+  and reaping the live instance's entries (sweep-fixes 010, review 061).
+- The v2 fallback never hands a project's entry to another member while that
+  project's own free pinned member is eligible, whatever the roster order, and a
+  held or already-busy pinned member does not reserve its project (sweep-fixes 004,
+  011, report 169).
+- A v2 spin park pages as `SpinGuardParked` rather than `BlockedOnHuman`, parks and
+  walk-blocks ride the 30-minute and 2-hour page ladder, and a failed `queue.toml`
+  read stops replaying the standing pages (sweep-fixes 005, 012, report 170).
 
 ## [1.0.0-alpha.1] - 2026-10-17
 

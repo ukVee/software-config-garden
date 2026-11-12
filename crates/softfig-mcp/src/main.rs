@@ -447,8 +447,8 @@ fn tool_defs() -> Vec<Value> {
                             optionally its merge branch) — the repair queue_add_project cannot make, \
                             since a repeat add is refused exists. Same validation as the add \
                             (non-empty repo, ambiguous_repo, a valid branch name); unknown_project \
-                            for a name with no row; refused running while one of the project's \
-                            entries is active. A HUMAN verb: a fleet member is refused \
+                            for a name with no row; refused running only while a live session holds one of the \
+                            project's active entries (or growlightd cannot say). A HUMAN verb: a fleet member is refused \
                             member_not_allowed (§6.7). Refusal codes surface as-is from keeperd.",
             "inputSchema": {
                 "type": "object",
@@ -500,7 +500,7 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: one atomic edit of a live entry, applied in the order \
                             lane → move → after → fleet → not_before → branch/base/project → status — patch-style, pass only the fields you \
                             change. status takes the human statuses queued | blocked | deferred | \
-                            done (done archives the row; refused running on an active entry); \
+                            done (done archives the row; refused running only while a live session holds the entry); \
                             active/paused/split are daemon-owned and refused. A HUMAN verb: a fleet \
                             member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
                             from keeperd.",
@@ -516,9 +516,9 @@ fn tool_defs() -> Vec<Value> {
                     "fleet": { "type": "boolean", "description": "false holds the entry for the human (the fleet never claims it), true releases it. A live-held active entry keeps running" },
                     "not_before": { "type": "string", "description": "sets the start time, `YYYY-MM-DD HH:MM ±HH:MM`; \"\" clears it. Holds a queued entry only. A value that does not parse is refused bad_start_time" },
                     "auto_restack": { "type": "boolean", "description": "true opts a resumed branch (one the first claim found already existing) into the loop's automatic restack, which rewrites it; false holds a branch out of it. Refused on a restack row" },
-                    "branch": { "type": "string", "description": "repairs the row's branch (a valid git branch name; refused on a restack). Refused running while the entry is active" },
-                    "base": { "type": "string", "description": "repairs the row's base, the commit or parent branch it was cut from; \"\" clears it. Refused running while the entry is active" },
-                    "project": { "type": "string", "description": "moves the entry to another existing project (unknown_project otherwise). Refused running while the entry is active" },
+                    "branch": { "type": "string", "description": "repairs the row's branch (a valid git branch name; refused on a restack). Refused running only while a live session holds the entry" },
+                    "base": { "type": "string", "description": "repairs the row's base, the commit or parent branch it was cut from; \"\" clears it. Refused running only while a live session holds the entry" },
+                    "project": { "type": "string", "description": "moves the entry to another existing project (unknown_project otherwise). Refused running only while a live session holds the entry" },
                     "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
@@ -527,7 +527,7 @@ fn tool_defs() -> Vec<Value> {
             "name": "queue_drop",
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
-                            names it, running for an active entry; if a stacked branch was cut from \
+                            names it, running while a live session holds it; if a stacked branch was cut from \
                             it, one restack is enqueued per child repo, or merged into that \
                             repo's live one, and the drop is refused started while a session holds \
                             that restack. A HUMAN verb: a fleet \

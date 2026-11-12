@@ -2981,7 +2981,7 @@ impl DriveLoop {
                     })
                     .collect();
 
-                // The fallback reservation (§4, report 169): the projects whose
+                // The fallback reservation (§2, report 169): the projects whose
                 // own pinned member is free or exiting at the tick's start, which
                 // no member's step-4 fallback may take. Computed once, before any
                 // member's pick, so roster order never decides it.

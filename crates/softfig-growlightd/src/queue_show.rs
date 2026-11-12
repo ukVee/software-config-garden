@@ -158,6 +158,7 @@ pub fn build(
                 && !entry.claimed.is_empty()
                 && unknown.contains(&entry.project),
             fleet: entry.fleet,
+            auto_restack: entry.auto_restack,
             not_before: entry.not_before.clone(),
             doc_fleet,
             doc_not_before,
@@ -209,6 +210,7 @@ pub fn build(
                 open: false,
                 open_unknown: false,
                 fleet: a.row.fleet,
+                auto_restack: a.row.auto_restack,
                 not_before: a.row.not_before,
                 doc_fleet: None,
                 doc_not_before: None,
@@ -582,6 +584,9 @@ mod tests {
         let mut held = entry("m", "feat/m", Lane::Normal, EntryStatus::Queued, "");
         held.fleet = false;
         held.not_before = Some("2026-11-08 09:00Z".into());
+        // A resumed branch the first claim held out of the automatic restack.
+        let mut resumed = entry("r", "feat/r", Lane::Normal, EntryStatus::Queued, "");
+        resumed.auto_restack = false;
         let habit = entry("h", "feat/h", Lane::Normal, EntryStatus::Queued, "");
         let mut task = entry("007", "fix/007", Lane::Urgent, EntryStatus::Queued, "");
         task.kind = EntryKind::Task;
@@ -599,13 +604,18 @@ mod tests {
         fs::create_dir_all(root.join(TASKS_DIR)).unwrap();
         fs::write(root.join(TASKS_DIR).join("007-fix.md"), "# 007\n\n> Not before: 2026-12-01 00:00Z\n").unwrap();
 
-        let reply = show(&snap(root, vec![held, habit, task, bare, gone], BTreeMap::new()), root);
+        let reply = show(&snap(root, vec![held, resumed, habit, task, bare, gone], BTreeMap::new()), root);
         let row = |id: &str| reply.entries.iter().find(|e| e.id == id).unwrap();
         let m = row("m");
         assert_eq!((m.fleet, m.not_before.as_deref()), (false, Some("2026-11-08 09:00Z")));
         assert_eq!(m.doc_fleet.as_deref(), Some("no"));
         assert_eq!(m.doc_not_before.as_deref(), Some("2026-11-08 09:00 +00:00"));
         assert_eq!(m.doc_hold_warning(), None, "the doc agrees with the entry");
+        assert!(m.auto_restack, "an entry at the default is not annotated");
+        assert_eq!(m.hold_annotation(), " (human-only) (not before 2026-11-08 09:00Z)");
+        let r = row("r");
+        assert!(!r.auto_restack, "a branch held out of the restack reaches the reply");
+        assert_eq!(r.hold_annotation(), " (no auto-restack)");
         let h = row("h");
         assert_eq!((h.fleet, h.doc_fleet.as_deref()), (true, Some("no")), "the fenced line is skipped");
         assert!(h.doc_hold_warning().is_some(), "a habit `> Fleet: no` holds nothing under v2");

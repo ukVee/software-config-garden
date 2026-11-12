@@ -17,10 +17,13 @@
 //! plan so [`apply`](crate::apply) re-materializes exactly what was planned
 //! without touching the source a second time. Two implementations:
 //!
-//! * [`FsSource`] — the byte-for-byte `std::fs` reader. Correct for the
-//!   `softfig deploy` CLI (a *separate process* from the daemon; reading the
-//!   FUSE plaintext from outside never self-reads a mount) and for non-FUSE
-//!   (M1c-compat / direct) daemons.
+//! * [`FsSource`] — the byte-for-byte `std::fs` reader. Correct only where the
+//!   source tree is real files: a non-FUSE (M1c-compat / direct) daemon. **Not**
+//!   for a frontend reading a FUSE mount from outside the daemon: that read
+//!   returns the redacted `[sealed:…]` projection, which is exactly what
+//!   report 168 deployed. `softfig deploy` therefore no longer reads sources at
+//!   all: it is a thin client of keeperd's `deploy_plan` / `deploy_apply`, and
+//!   the daemon is the one reader ([`MemSource`]). A new frontend does the same.
 //! * [`MemSource`] — an in-memory reader. The FUSE-mode daemon snapshots each
 //!   dot's **plaintext** from its mount-safe working-tree view (tip ∪ overlay,
 //!   no kernel round-trip, no redaction) into this *before* dropping `inner`,

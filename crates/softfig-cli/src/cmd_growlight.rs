@@ -2371,7 +2371,8 @@ pub enum QueueSub {
     AutoRestack(QueueAutoRestackArgs),
 
     /// Repair a migrated entry's `branch`, `base` or `project` (report 171).
-    /// Refused `running` while the entry is `active`.
+    /// Refused `running` only while a live session holds the entry (an `active`
+    /// entry nothing holds takes it).
     Repair(QueueRepairArgs),
 
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
@@ -2425,7 +2426,8 @@ pub enum QueueProjectSub {
     Add(QueueProjectAddArgs),
     /// Correct an existing project's repo (and optionally its merge branch):
     /// the repair `add` cannot make, since a repeat is refused `exists`.
-    /// Refused `running` while one of the project's entries is `active`.
+    /// Refused `running` only while a live session holds one of the project's
+    /// `active` entries.
     SetRepo(QueueProjectSetRepoArgs),
 }
 
@@ -3439,7 +3441,7 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         let status = format!(
             "{}{}",
             e.status,
-            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref())
+            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref(), e.auto_restack)
         );
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -5881,6 +5883,7 @@ mod tests {
                 open: true,
                 open_unknown: false,
                 fleet: true,
+                auto_restack: true,
                 not_before: None,
                 doc_fleet: None,
                 doc_not_before: None,
@@ -5899,6 +5902,7 @@ mod tests {
                 open: false,
                 open_unknown: false,
                 fleet: false,
+                auto_restack: true,
                 not_before: Some("2026-11-08 09:00Z".into()),
                 doc_fleet: None,
                 doc_not_before: None,
@@ -5917,6 +5921,7 @@ mod tests {
                 open: false,
                 open_unknown: true,
                 fleet: true,
+                auto_restack: true,
                 not_before: None,
                 doc_fleet: Some("no".into()),
                 doc_not_before: None,

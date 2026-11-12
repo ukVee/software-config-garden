@@ -399,6 +399,15 @@ pub fn valid_branch_name(name: &str) -> bool {
         && name.split('/').all(component)
 }
 
+/// A branch or base name that is safe to render into a command line: a
+/// [`valid_branch_name`] drawn only from `[A-Za-z0-9._/-]`. git accepts `; $ ( ) | { } &`
+/// and more, and a repaired `branch`/`base` is copied into the restack doc's
+/// `git rebase --onto` steps (review 061 F7), so the verbs take the narrower set.
+pub fn safe_ref_name(name: &str) -> bool {
+    valid_branch_name(name)
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+}
+
 fn dfs_cycle(
     idx: usize,
     entries: &[Entry],
@@ -494,6 +503,20 @@ mod tests {
             "a.lock/b", "a\nb", "a\u{7f}b",
         ] {
             assert!(!valid_branch_name(bad), "{bad:?}");
+        }
+    }
+
+    /// F7: the repair verbs take only `[A-Za-z0-9._/-]`, so a name is safe in a command line.
+    #[test]
+    fn safe_ref_name_is_the_conservative_charset() {
+        for good in ["main", "feat/x-y", "release/1.2", "v1_2", "0123abc"] {
+            assert!(safe_ref_name(good), "{good}");
+        }
+        for bad in [
+            "", "-x", "a b", "a;b", "a$b", "a(b)", "a|b", "a{b}", "a&b", "a@b", "a`b`", "a'b",
+            "a\"b", "a>b", "a<b", "a!b", "a#b", "a%b", "a=b", "a,b", "a+b", "a..b", "\u{e9}",
+        ] {
+            assert!(!safe_ref_name(bad), "{bad:?}");
         }
     }
 

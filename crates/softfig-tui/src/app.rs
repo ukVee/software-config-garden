@@ -8078,6 +8078,7 @@ mod tests {
             open: false,
             open_unknown: false,
             fleet: true,
+            auto_restack: true,
             not_before: None,
             doc_fleet: None,
             doc_not_before: None,
