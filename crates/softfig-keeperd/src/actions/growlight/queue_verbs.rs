@@ -497,6 +497,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: args.fleet.unwrap_or(true),
         not_before,
     };
@@ -664,6 +665,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: args.fleet.unwrap_or(true),
         not_before,
     };
@@ -828,6 +830,7 @@ fn restack_core(
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: true,
         not_before: None,
     };
@@ -1412,6 +1415,19 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     if let Some(fleet) = args.fleet {
         let idx = idx_of(&queue, &args.id);
         queue.entries[idx].fleet = fleet;
+    }
+
+    // 4b. auto_restack: whether the loop may restack this branch (§8). A
+    // restack row has no branch, so there is nothing to opt in or out.
+    if let Some(auto_restack) = args.auto_restack {
+        let idx = idx_of(&queue, &args.id);
+        if queue.entries[idx].kind == EntryKind::Restack {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("entry {:?} is a restack: it has no branch to hold out of a restack", args.id),
+            ));
+        }
+        queue.entries[idx].auto_restack = auto_restack;
     }
 
     // 5. not_before: the start-time hold (§3.1), also before status.
@@ -2652,6 +2668,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }
@@ -3234,6 +3251,41 @@ mod tests {
         update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": true })).unwrap();
         assert!(fleet_of(&daemon), "released to the fleet");
         assert_eq!(commit_count(&daemon), before + 2);
+    }
+
+    /// `auto_restack` on `queue_update_entry` is the human's opt-in (review 061
+    /// F1): it sets and clears the row's flag, the same value again is a no-op
+    /// that mints no commit, and a restack row (no branch) refuses it.
+    #[test]
+    fn update_entry_sets_auto_restack_and_refuses_it_on_a_restack() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut r = entry("r");
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        let mut held = entry("held");
+        held.auto_restack = false;
+        seed_queue(&daemon, vec![project()], vec![r, held], None);
+        let flag_of = |daemon: &Daemon| {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(daemon, &inner);
+            let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+            qs.queue.model.entries.iter().find(|e| e.id == "held").unwrap().auto_restack
+        };
+        assert!(!flag_of(&daemon));
+        let before = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": false })).unwrap();
+        assert_eq!(commit_count(&daemon), before, "the value it already has is a no-op");
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": true })).unwrap();
+        assert!(flag_of(&daemon), "opted in");
+        assert_eq!(commit_count(&daemon), before + 1);
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": false })).unwrap();
+        assert!(!flag_of(&daemon), "held out again");
+
+        let err = queue_update_entry(&daemon, serde_json::json!({ "id": "r", "auto_restack": true }))
+            .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        assert!(err.1.contains("restack"), "{err:?}");
     }
 
     /// §6.7: a member's found work may not carry `not_before` either — any

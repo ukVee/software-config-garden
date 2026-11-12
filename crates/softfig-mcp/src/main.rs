@@ -515,6 +515,7 @@ fn tool_defs() -> Vec<Value> {
                     "status": { "type": "string", "description": "queued | blocked | deferred | done. queued also unblocks and un-defers" },
                     "fleet": { "type": "boolean", "description": "false holds the entry for the human (the fleet never claims it), true releases it. A live-held active entry keeps running" },
                     "not_before": { "type": "string", "description": "sets the start time, `YYYY-MM-DD HH:MM ±HH:MM`; \"\" clears it. Holds a queued entry only. A value that does not parse is refused bad_start_time" },
+                    "auto_restack": { "type": "boolean", "description": "true opts a resumed branch (one the first claim found already existing) into the loop's automatic restack, which rewrites it; false holds a branch out of it. Refused on a restack row" },
                     "branch": { "type": "string", "description": "repairs the row's branch (a valid git branch name; refused on a restack). Refused running while the entry is active" },
                     "base": { "type": "string", "description": "repairs the row's base, the commit or parent branch it was cut from; \"\" clears it. Refused running while the entry is active" },
                     "project": { "type": "string", "description": "moves the entry to another existing project (unknown_project otherwise). Refused running while the entry is active" },

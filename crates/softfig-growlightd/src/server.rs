@@ -1299,6 +1299,7 @@ mod tests {
                 claimed: "2026-10-11T15:04:00Z".into(),
                 follow_ups: 0,
                 pending_status: None,
+                auto_restack: true,
                 fleet: false,
                 not_before: Some("2026-11-08 09:00Z".into()),
             }],

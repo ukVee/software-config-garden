@@ -847,6 +847,7 @@ some-other.scope            loaded active running   unrelated
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: false,
             not_before: None,
         };

@@ -248,8 +248,8 @@ pub enum EntryStatus {
 
 /// A `[[entry]]` row (§3.1) — exactly the spec's field set, every field
 /// required and written on every write, except the three optional ones
-/// (`pending_status`, `fleet`, `not_before`) that are omitted at their
-/// default.
+/// (`pending_status`, `fleet`, `not_before`, `auto_restack`) that are omitted
+/// at their default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -308,6 +308,16 @@ pub struct Entry {
     /// only by the human verbs (§6.8) and the migration. Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// `false` holds this entry's branch out of the loop's automatic restack
+    /// (§8; review 061 F1, report 178). The first claim writes it `false` when
+    /// the branch already existed (a resumed branch, report 171): that branch
+    /// is behind `main` by construction and sessions outside the queue may be
+    /// using it, so the restack scan neither judges nor rewrites it. A fleet-cut
+    /// branch keeps the default. Only a human re-enables it (`queue_update_entry`
+    /// `auto_restack`); a member never writes it. Omitted when `true`, so a
+    /// pre-existing file round-trips byte-identical.
+    #[serde(default = "fleet_default", skip_serializing_if = "is_fleet_default")]
+    pub auto_restack: bool,
 }
 
 /// [`Entry::fleet`]'s default: an entry the fleet may claim.
@@ -671,6 +681,7 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }
@@ -853,6 +864,23 @@ follow_ups = 0
         let text = q.to_toml().expect("serialize held");
         assert!(text.contains("fleet = false"), "{text}");
         assert!(text.contains("not_before = \"2026-11-01 09:00\""), "{text}");
+        assert_eq!(QueueToml::parse(&text).expect("re-parse held").entries, vec![held]);
+    }
+
+    /// `auto_restack` (§8, review 061 F1) defaults to `true` when absent and is
+    /// omitted at its default, so an older `queue.toml` round-trips
+    /// byte-identical; a held-out row carries `false` through.
+    #[test]
+    fn auto_restack_defaults_when_absent_and_round_trips_when_false() {
+        let q = QueueToml::parse(SPEC_QUEUE).expect("the §3.1 example must parse");
+        assert!(q.entries[0].auto_restack);
+        let text = q.to_toml().expect("serialize");
+        assert!(!text.contains("auto_restack"), "default is omitted:\n{text}");
+
+        let mut held = entry("held");
+        held.auto_restack = false;
+        let text = QueueToml::new(vec![], vec![held.clone()]).to_toml().expect("serialize held");
+        assert!(text.contains("auto_restack = false"), "{text}");
         assert_eq!(QueueToml::parse(&text).expect("re-parse held").entries, vec![held]);
     }
 
@@ -1099,6 +1127,7 @@ follow_ups = 0
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         };

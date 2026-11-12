@@ -2365,6 +2365,11 @@ pub enum QueueSub {
     /// is held until then. `""` clears it.
     NotBefore(QueueNotBeforeArgs),
 
+    /// Opt a resumed branch into the loop's automatic restack (`yes`), or hold
+    /// a fleet-cut branch out of it (`no`) — the row's `auto_restack` field. A
+    /// first claim that finds the branch already existing writes `no`.
+    AutoRestack(QueueAutoRestackArgs),
+
     /// Repair a migrated entry's `branch`, `base` or `project` (report 171).
     /// Refused `running` while the entry is `active`.
     Repair(QueueRepairArgs),
@@ -2610,6 +2615,18 @@ pub struct QueueFleetArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct QueueAutoRestackArgs {
+    /// The live entry id.
+    pub id: String,
+    /// yes lets the loop restack the entry's branch (it rewrites it, so only
+    /// for a branch no session outside the queue is using); no holds it out.
+    pub auto_restack: FleetArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct QueueNotBeforeArgs {
     /// The live entry id.
     pub id: String,
@@ -2751,6 +2768,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Status(a) => queue_status(&socket, a),
         QueueSub::Fleet(a) => queue_fleet(&socket, a),
         QueueSub::NotBefore(a) => queue_not_before(&socket, a),
+        QueueSub::AutoRestack(a) => queue_auto_restack(&socket, a),
         QueueSub::Repair(a) => queue_repair(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
         QueueSub::Migrate(a) => queue_migrate(&socket, a),
@@ -3634,6 +3652,7 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
         branch: None,
         base: None,
         project: None,
@@ -3658,6 +3677,7 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
         branch: None,
         base: None,
         project: None,
@@ -3679,6 +3699,7 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
         branch: None,
         base: None,
         project: None,
@@ -3705,6 +3726,7 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
         }),
         fleet: None,
         not_before: None,
+        auto_restack: None,
         branch: None,
         base: None,
         project: None,
@@ -3726,6 +3748,29 @@ fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
         status: None,
         fleet: Some(args.fleet == FleetArg::Yes),
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_auto_restack(socket: &Path, args: QueueAutoRestackArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: Some(args.auto_restack == FleetArg::Yes),
         branch: None,
         base: None,
         project: None,
@@ -3747,6 +3792,7 @@ fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: Some(args.time),
+        auto_restack: None,
         branch: None,
         base: None,
         project: None,
@@ -3768,6 +3814,7 @@ fn queue_repair(socket: &Path, args: QueueRepairArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
         branch: args.branch,
         base: args.base,
         project: args.project,
@@ -5746,6 +5793,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         };

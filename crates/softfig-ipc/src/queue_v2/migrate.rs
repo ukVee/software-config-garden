@@ -913,6 +913,7 @@ fn plan_item(p: &mut Planner, ctx: &ItemCtx, item: &LegacyItem) -> Planned {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: item.meta.fleet.as_deref().is_none_or(|v| v.eq_ignore_ascii_case("yes")),
         not_before: None,
     };

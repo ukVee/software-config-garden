@@ -483,6 +483,7 @@ mod tests {
             pending: None,
             fleet: true,
             not_before: None,
+            auto_restack: true,
             holder: None,
             models: None,
         }
@@ -990,6 +991,7 @@ mod tests {
                 claimed: "2026-10-01T00:00:00Z".into(),
                 follow_ups: 0,
                 pending_status: None,
+                auto_restack: true,
                 fleet: true,
                 not_before: None,
             },

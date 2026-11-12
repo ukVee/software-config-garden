@@ -4534,6 +4534,7 @@ impl DriveLoop {
                     claimed: e.claimed.clone(),
                     parent: e.parent.clone(),
                     base: e.base.clone(),
+                    auto_restack: e.auto_restack,
                 })
                 .collect();
             if entries.is_empty() {
@@ -4628,6 +4629,7 @@ impl DriveLoop {
                 claimed: e.claimed.clone(),
                 parent: e.parent.clone(),
                 base: e.base.clone(),
+                auto_restack: e.auto_restack,
             })
             .collect();
         // Fresh reads: this runs after a restack the loop was told about, and
@@ -10177,6 +10179,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 pending: None,
                 fleet: true,
                 not_before: None,
+                auto_restack: true,
                 holder: None,
                 models: None,
             }],
@@ -10845,6 +10848,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 pending: None,
                 fleet: true,
                 not_before: None,
+                auto_restack: true,
                 holder: None,
                 models: None,
             }],
@@ -11742,6 +11746,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     claimed: "2026-10-14T00:01:00Z".into(),
                     follow_ups: 0,
                     pending_status: None,
+                    auto_restack: true,
                     fleet: true,
                     not_before: None,
                 }],
@@ -11988,6 +11993,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             },
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }

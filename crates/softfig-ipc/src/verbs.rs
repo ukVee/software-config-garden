@@ -2438,6 +2438,12 @@ pub struct QueueUpdateEntryArgs {
     /// entry only: one that has started ignores it (§2 **Holds**).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// Sets the row's `auto_restack` field (§8): `true` opts a resumed branch
+    /// (one the first claim found already existing) into the loop's automatic
+    /// restack, `false` holds a fleet-cut branch out of it. Human-only, like
+    /// `fleet`; refused for a restack row, which has no branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_restack: Option<bool>,
     /// Repairs the row's `branch` (report 171): the branch the entry's work
     /// lives on, which a migrated row names wrongly. A valid git branch name
     /// (`bad_name` otherwise); a restack has none, and is refused. Taken only
@@ -2654,6 +2660,16 @@ pub struct QueueV2ClaimArgs {
     /// (remote). First claim only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The entry's branch already existed when this first claim resumed it
+    /// (report 171). keeperd records `auto_restack = false` on the row, so the
+    /// loop never restacks a branch it did not cut (review 061 F1). First
+    /// claim only; omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub existing: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

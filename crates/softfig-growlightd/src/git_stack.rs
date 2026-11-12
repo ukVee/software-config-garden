@@ -622,6 +622,34 @@ pub struct RestackEntry {
     /// The recorded `base` — the commit cut from (local) / the parent branch
     /// name (remote). `""` = never claimed.
     pub base: String,
+    /// `false` holds the branch out of the automatic restack: a branch a first
+    /// claim resumed rather than cut (review 061 F1). It is neither judged
+    /// stale nor rewritten, though it still anchors its children's `--onto`.
+    pub auto_restack: bool,
+}
+
+/// The stack candidates the loop may rewrite: [`stack_candidates`] minus every
+/// branch held out of the automatic restack ([`RestackEntry::auto_restack`]).
+fn restackable_candidates(
+    repo: &Repo,
+    main: &str,
+    entries: &[RestackEntry],
+    git: &Git,
+) -> Result<Stack, GitError> {
+    let stack_input: Vec<StackEntry> = entries
+        .iter()
+        .map(|e| StackEntry {
+            id: e.id.clone(),
+            branch: e.branch.clone(),
+            lane: e.lane,
+            claimed: e.claimed.clone(),
+        })
+        .collect();
+    let mut stack = stack_candidates(repo, main, &stack_input, git)?;
+    stack
+        .candidates
+        .retain(|c| entries.iter().find(|e| e.id == c.id).is_none_or(|e| e.auto_restack));
+    Ok(stack)
 }
 
 /// The `--onto` target for a branch recorded with `parent` (§8): the live
@@ -678,16 +706,7 @@ pub fn detect_restack(
     if matches!(repo, Repo::Remote) {
         return Ok(None);
     }
-    let stack_input: Vec<StackEntry> = entries
-        .iter()
-        .map(|e| StackEntry {
-            id: e.id.clone(),
-            branch: e.branch.clone(),
-            lane: e.lane,
-            claimed: e.claimed.clone(),
-        })
-        .collect();
-    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    let stack = restackable_candidates(repo, main, entries, git)?;
     if stack.candidates.is_empty() {
         return Ok(None);
     }
@@ -797,16 +816,7 @@ pub fn re_record_bases(
     if matches!(repo, Repo::Remote) {
         return Ok(ReRecord::Bases(Vec::new()));
     }
-    let stack_input: Vec<StackEntry> = entries
-        .iter()
-        .map(|e| StackEntry {
-            id: e.id.clone(),
-            branch: e.branch.clone(),
-            lane: e.lane,
-            claimed: e.claimed.clone(),
-        })
-        .collect();
-    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    let stack = restackable_candidates(repo, main, entries, git)?;
     if stack.candidates.is_empty() {
         return Ok(ReRecord::Bases(Vec::new()));
     }
@@ -1177,6 +1187,81 @@ mod tests {
             claimed: claimed.into(),
             parent: parent.into(),
             base: base.into(),
+            auto_restack: true,
+        }
+    }
+
+    /// A branch a first claim resumed rather than cut (review 061 F1).
+    fn resumed_entry(id: &str, branch: &str, base: &str, claimed: &str) -> RestackEntry {
+        RestackEntry { auto_restack: false, ..restack_entry(id, branch, "", base, claimed) }
+    }
+
+    /// Review 061 F1 (report 178): a branch the claim resumed is behind `main`
+    /// by construction, and the loop must not enqueue a `git rebase --onto`
+    /// over it. Fails on `1ad3a01`, where it is a stale candidate.
+    #[test]
+    fn detect_restack_never_judges_a_resumed_branch() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/resumed", "main");
+        ff_main(repo);
+        let git = Git::new(repo.to_path_buf());
+        let repo_kind = Repo::Local(repo.to_path_buf());
+
+        let resumed = vec![resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z")];
+        let need = detect_restack(&repo_kind, "main", &resumed, &Default::default(), &git).unwrap();
+        assert!(need.is_none(), "a resumed stale branch enqueues no restack: {need:?}");
+
+        // The same branch, fleet-cut, is stale and does restack.
+        let cut = vec![restack_entry("r", "feat/resumed", "", &main_commit, "2026-10-01T00:00:00Z")];
+        let need = detect_restack(&repo_kind, "main", &cut, &Default::default(), &git).unwrap();
+        assert_eq!(need.expect("a fleet-cut stale branch restacks").len(), 1);
+    }
+
+    /// A resumed branch beside a fleet-cut one: only the fleet-cut branch is
+    /// rewritten, and a child cut from the resumed branch is still judged
+    /// against that branch's tip, never rebased onto `main`.
+    #[test]
+    fn detect_restack_leaves_a_resumed_branch_out_but_keeps_it_as_a_parent() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let resumed_tip = open_branch_from(repo, "feat/resumed", "main");
+        open_branch_from(repo, "feat/child", "feat/resumed");
+        open_branch_from(repo, "feat/cut", "main");
+        ff_main(repo);
+        let git = Git::new(repo.to_path_buf());
+
+        let entries = vec![
+            resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("c", "feat/child", "r", &resumed_tip, "2026-10-02T00:00:00Z"),
+            restack_entry("k", "feat/cut", "", &main_commit, "2026-10-03T00:00:00Z"),
+        ];
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git)
+            .unwrap()
+            .expect("the fleet-cut branch is stale");
+        let names: Vec<(&str, &str)> = need.iter().map(|b| (b.branch.as_str(), b.onto.as_str())).collect();
+        assert_eq!(names, vec![("feat/child", "feat/resumed"), ("feat/cut", "main")], "{need:?}");
+    }
+
+    /// The re-record never touches a held-out branch either (it would block on
+    /// that branch's upstream, or record a base nothing rewrote).
+    #[test]
+    fn re_record_bases_skips_a_resumed_branch() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/resumed", "main");
+        ff_main(repo);
+        sh_git(repo, &["rebase", "-q", "main", "feat/resumed"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+        let git = Git::new(repo.to_path_buf());
+        let repo_kind = Repo::Local(repo.to_path_buf());
+        let held = vec![resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z")];
+        let held_out = re_record_bases(&repo_kind, "main", &held, &Default::default(), &git).unwrap();
+        assert_eq!(held_out, ReRecord::Bases(Vec::new()), "a held-out branch records nothing");
+        let cut = vec![restack_entry("r", "feat/resumed", "", &main_commit, "2026-10-01T00:00:00Z")];
+        match re_record_bases(&repo_kind, "main", &cut, &Default::default(), &git).unwrap() {
+            ReRecord::Bases(b) => assert_eq!(b.len(), 1, "{b:?}"),
+            other => panic!("{other:?}"),
         }
     }
 

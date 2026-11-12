@@ -144,6 +144,10 @@ pub struct EntryView {
     /// a `queued` entry is not claimed before it. Kept raw, so a malformed
     /// value reaches the pick and holds (fail closed) rather than vanishing.
     pub not_before: Option<String>,
+    /// `false` holds the entry's branch out of the automatic restack (§8, review
+    /// 061 F1): a first claim that resumed an existing branch wrote it. The pick
+    /// ignores it; restack detection and the re-record read it. Default `true`.
+    pub auto_restack: bool,
     /// Who holds the entry. An `active` entry → the running member, or `None`
     /// when no running member holds it (an orphan any member resumes); a
     /// `paused` entry → the member that paused it (the step-2 resume
@@ -937,6 +941,7 @@ mod tests {
             pending: None,
             fleet: true,
             not_before: None,
+            auto_restack: true,
             holder: None,
             models: None,
         }

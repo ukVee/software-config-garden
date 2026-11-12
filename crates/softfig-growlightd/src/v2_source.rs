@@ -325,6 +325,7 @@ fn assemble_with(
             pending: entry.pending_status,
             fleet: entry.fleet,
             not_before: entry.not_before.clone(),
+            auto_restack: entry.auto_restack,
             // Runtime state, not TOML — the drive loop overlays it (slice
             // 006; slice 002's contract).
             holder: None,
@@ -623,6 +624,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }

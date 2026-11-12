@@ -260,6 +260,7 @@ mod tests {
             pending: None,
             fleet: true,
             not_before: None,
+            auto_restack: true,
             holder: None,
             models: None,
         }

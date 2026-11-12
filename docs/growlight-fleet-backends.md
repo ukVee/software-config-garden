@@ -568,6 +568,15 @@ past its claim, so a start time set on one holds nothing. `queue not-before` kee
 the same (it applies if the entry is queued again) and says so with a `note:` line after
 the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
 
+A branch a first claim resumed (the baton's `resume <branch>` case) is written
+`auto_restack = false` on its row. The loop never judges it stale, never enqueues a restack
+over it and never re-records its base, because it is usually work the human already stacked
+other entries on. It still anchors its children's `--onto`. A fleet-cut branch keeps the
+default `true`. Only the human turns it back on, with `queue_update_entry auto_restack` or
+`softfig growlight queue auto-restack <id> yes|no [--dry-run]`. A restack row takes none.
+`queue show`, `growlight status` and the TUI do not mark a held-out entry yet; it shows in
+`queue.toml` as `auto_restack = false`.
+
 One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
 `slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
 held only the one item whose doc it couldn't read. The journal gets one line per incident,
