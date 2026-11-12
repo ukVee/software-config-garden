@@ -59,6 +59,7 @@ pub mod schedule;
 pub mod scheduler;
 pub mod scheduler_v2;
 pub mod server;
+pub mod singleton;
 pub mod state;
 pub mod supervisor;
 pub mod telemetry_capture;
@@ -72,7 +73,7 @@ pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
 pub use backend_router::{BackendHandle, BackendRouter};
-pub use baton_store::{FsBatonStore, FsEntryBatonStore};
+pub use baton_store::{FirstStep, FsBatonStore, FsEntryBatonStore};
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
 pub use agent_harness::{AgentHealthState, BackendFlavor, Harness, LineObserver};

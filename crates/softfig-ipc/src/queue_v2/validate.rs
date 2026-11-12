@@ -399,6 +399,15 @@ pub fn valid_branch_name(name: &str) -> bool {
         && name.split('/').all(component)
 }
 
+/// A branch or base name that is safe to render into a command line: a
+/// [`valid_branch_name`] drawn only from `[A-Za-z0-9._/-]`. git accepts `; $ ( ) | { } &`
+/// and more, and a repaired `branch`/`base` is copied into the restack doc's
+/// `git rebase --onto` steps (review 061 F7), so the verbs take the narrower set.
+pub fn safe_ref_name(name: &str) -> bool {
+    valid_branch_name(name)
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+}
+
 fn dfs_cycle(
     idx: usize,
     entries: &[Entry],
@@ -497,6 +506,20 @@ mod tests {
         }
     }
 
+    /// F7: the repair verbs take only `[A-Za-z0-9._/-]`, so a name is safe in a command line.
+    #[test]
+    fn safe_ref_name_is_the_conservative_charset() {
+        for good in ["main", "feat/x-y", "release/1.2", "v1_2", "0123abc"] {
+            assert!(safe_ref_name(good), "{good}");
+        }
+        for bad in [
+            "", "-x", "a b", "a;b", "a$b", "a(b)", "a|b", "a{b}", "a&b", "a@b", "a`b`", "a'b",
+            "a\"b", "a>b", "a<b", "a!b", "a#b", "a%b", "a=b", "a,b", "a+b", "a..b", "\u{e9}",
+        ] {
+            assert!(!safe_ref_name(bad), "{bad:?}");
+        }
+    }
+
     /// V20: `queue_add_project` refuses this up front, and a hand edit lands here.
     #[test]
     fn a_main_git_would_read_as_an_option_fails_validation() {
@@ -526,6 +549,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }

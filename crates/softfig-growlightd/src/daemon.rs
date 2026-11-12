@@ -3,7 +3,7 @@
 //! keeperd `Daemon`/`DaemonHandle` split: the accept loop hands `Arc`-shared
 //! clones to each connection handler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -220,6 +220,12 @@ pub struct V2Mirror {
     /// the accepted model changes) — what `queue pick` applies to its own read
     /// of the v2 list (slice 012).
     pub overlay: crate::drive_loop::V2Overlay,
+    /// Entries the loop is claiming right now: marked before the keeperd claim
+    /// and cleared once the assignment is recorded or the start failed. The
+    /// overlay above is published at the end of a tick, so without this an
+    /// entry keeperd already shows `active` would read holder-less across the
+    /// spawn (report 172).
+    pub claiming: BTreeSet<String>,
 }
 
 impl Daemon {
@@ -288,6 +294,38 @@ impl Daemon {
     /// first tick and on a legacy loop.
     pub fn v2_overlay(&self) -> crate::drive_loop::V2Overlay {
         self.v2_mirror.lock().unwrap().overlay.clone()
+    }
+
+    /// Mark `entry` as being claimed: from before the keeperd claim until the
+    /// assignment is recorded or the start fails ([`claim_ended`](Self::claim_ended)).
+    pub fn claim_started(&self, entry: &str) {
+        self.v2_mirror.lock().unwrap().claiming.insert(entry.to_string());
+    }
+
+    /// The claim of `entry` is over: it is held through the overlay now, or
+    /// nothing holds it.
+    pub fn claim_ended(&self, entry: &str) {
+        self.v2_mirror.lock().unwrap().claiming.remove(entry);
+    }
+
+    /// The v2 entry ids a live member holds right now (report 172): every hold
+    /// in the loop's overlay except a paused entry's remembered pauser (that
+    /// session is over), plus the claims in flight. Sorted, deduplicated. Empty
+    /// on a legacy or disarmed fleet, which publishes no holds.
+    pub fn v2_live(&self) -> Vec<String> {
+        use softfig_ipc::queue_v2::EntryStatus;
+        let mirror = self.v2_mirror.lock().unwrap();
+        let mut held: BTreeSet<String> = mirror
+            .overlay
+            .holds
+            .iter()
+            .filter(|h| h.status != Some(EntryStatus::Paused))
+            // A sub-milestone's slice holds `<parent>/<sub>`; the queue row is
+            // the parent's.
+            .map(|h| h.entry.split('/').next().unwrap_or(&h.entry).to_string())
+            .collect();
+        held.extend(mirror.claiming.iter().cloned());
+        held.into_iter().collect()
     }
 
     /// `agent`'s live v2 assignment, if it holds one — the member verbs'
@@ -863,6 +901,38 @@ mod tests {
 
     fn test_daemon() -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
+    }
+
+    #[test]
+    fn v2_live_lists_holds_and_claims_in_flight_but_not_a_pausers_memory() {
+        use crate::drive_loop::{V2Hold, V2Overlay};
+        use softfig_ipc::queue_v2::EntryStatus;
+        let daemon = test_daemon();
+        assert!(daemon.v2_live().is_empty(), "no loop, no holds");
+
+        let hold = |entry: &str, status| V2Hold {
+            entry: entry.to_string(),
+            agent: "c".to_string(),
+            status,
+        };
+        daemon.publish_v2_overlay(V2Overlay {
+            holds: vec![
+                hold("running", None),
+                hold("sub-parent/sub", None),
+                hold("rolled", Some(EntryStatus::Active)),
+                // A paused entry remembers who paused it; that session is over.
+                hold("paused", Some(EntryStatus::Paused)),
+            ],
+            model_overrides: vec![],
+        });
+        assert_eq!(daemon.v2_live(), ["rolled", "running", "sub-parent"]);
+
+        // A claim in flight is held before the overlay knows of it, and is gone
+        // once the claim ends.
+        daemon.claim_started("claiming");
+        assert_eq!(daemon.v2_live(), ["claiming", "rolled", "running", "sub-parent"]);
+        daemon.claim_ended("claiming");
+        assert_eq!(daemon.v2_live(), ["rolled", "running", "sub-parent"]);
     }
 
     /// A fake agent child that, when killed, checks whether the kill-registry lock

@@ -256,6 +256,14 @@ pub mod op {
     /// here on (§3.4). One commit, `queue_v2_updated`. `--dry-run` computes +
     /// renders, writes nothing.
     pub const QUEUE_ADD_PROJECT: &str = "queue_add_project";
+    /// queue v2 (§6.8 human verb, report 171): correct an existing project's
+    /// `repo` (and optionally its `main`) — the repair `queue_add_project`
+    /// can't do, since a repeat is refused `exists`. Same validation as the
+    /// add; refused `running` only while a live session holds an `active` entry of
+    /// the project (§6.8, report 172). One
+    /// commit, `queue_v2_updated`. `--dry-run` computes + renders, writes
+    /// nothing.
+    pub const QUEUE_SET_PROJECT_REPO: &str = "queue_set_project_repo";
     /// queue v2 (§6.8 human verb): create a backlog entry — a milestone with
     /// its docs, `slices.toml` and the generated `001-plan` slice (§4) when no
     /// slices are given, a numbered task (`fix/<NNN>` branch), or an urgent
@@ -284,8 +292,8 @@ pub mod op {
     pub const SLICE_UPDATE: &str = "slice_update";
     /// queue v2 (§6.8 human verb): drop an entry — the row moves to
     /// `queue-archive.toml` as `dropped` with `finished` + `reason`. Refused
-    /// `linked_from` while a live `after` names it, `running` for an `active`
-    /// entry. A live child's `parent == id` enqueues one restack per child
+    /// `linked_from` while a live `after` names it, `running` while a live session
+    /// holds it (§6.8). A live child's `parent == id` enqueues one restack per child
     /// project (§8). One commit, `queue_v2_updated`. `--dry-run` computes +
     /// renders, writes nothing.
     pub const QUEUE_DROP: &str = "queue_drop";
@@ -2239,6 +2247,33 @@ pub struct QueueAddProjectReply {
     pub hash: String,
 }
 
+/// `queue_set_project_repo({name, repo, main?, dry_run}) -> {name, view, hash}`
+/// — queue v2 §6.8 (report 171). Rewrites an existing `[[project]]` row's
+/// `repo`, and its `main` when given (an omitted `main` keeps the row's own).
+/// The checks are `queue_add_project`'s: `repo` non-empty and not
+/// `ambiguous_repo`, `main` a branch name. Refused `unknown_project` for a name
+/// with no row, and `running` while one of the project's entries is `active`
+/// (its session is probing the old repo). A repeat of the stored values mints
+/// no commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueSetProjectRepoArgs {
+    /// The existing project's name.
+    pub name: String,
+    /// A local path (`~` allowed) or `host:path`. Non-empty.
+    pub repo: String,
+    /// The branch merges land on; omitted keeps the project's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The reply has [`QueueAddProjectReply`]'s shape: the project name, the
+/// projects table after the write (the would-be one on a dry run) and the
+/// commit hash (the untouched tip on a dry run or a no-op).
+pub type QueueSetProjectRepoReply = QueueAddProjectReply;
+
 /// One slice passed to [`QueueAddEntryArgs::slices`] — the §7 sub-milestone
 /// slice shape `{slug, title, body}` (the §6.8 signature leaves the shape
 /// unstated; finding 2 in the milestone doc). Written as the next numbered
@@ -2369,8 +2404,8 @@ pub struct QueueMoveSpec {
 }
 
 /// `queue_update_entry({id, lane?, move = {to, ref?}?, after?, status?,
-/// fleet?, not_before?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
-/// applied in the order lane → move → after → fleet → not_before → status, committed once with the queue view
+/// fleet?, not_before?, branch?, base?, project?, dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit
+/// applied in the order lane → move → after → fleet → not_before → branch/base/project → status, committed once with the queue view
 /// re-rendered. A no-op edit mints no commit (the legacy reorder verb's
 /// idempotence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2390,7 +2425,7 @@ pub struct QueueUpdateEntryArgs {
     pub after: Option<Vec<String>>,
     /// `queued` (also unblocks and un-defers) | `blocked` | `deferred` |
     /// `done` (human override → archive, no open-items check; refused
-    /// `running` on an `active` entry). `active`/`paused`/`split` are refused
+    /// `running` while a live session holds the entry). `active`/`paused`/`split` are refused
     /// `daemon_owned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<QueueStatusArg>,
@@ -2404,6 +2439,31 @@ pub struct QueueUpdateEntryArgs {
     /// entry only: one that has started ignores it (§2 **Holds**).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// Sets the row's `auto_restack` field (§8): `true` opts a resumed branch
+    /// (one the first claim found already existing) into the loop's automatic
+    /// restack, `false` holds a fleet-cut branch out of it. Human-only, like
+    /// `fleet`; refused for a restack row, which has no branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_restack: Option<bool>,
+    /// Repairs the row's `branch` (report 171): the branch the entry's work
+    /// lives on, which a migrated row names wrongly. A valid git branch name
+    /// (`bad_name` otherwise) drawn from `[A-Za-z0-9._/-]`, and never the project's
+    /// own merge branch; a restack has none, and is refused. Refused `running`
+    /// only while a live session holds the entry (§6.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Repairs the row's `base` (§8), the commit or parent branch it was cut
+    /// from; `""` clears it. A non-empty value is checked like a branch name
+    /// (it reaches git as a rev) and drawn from `[A-Za-z0-9._/-]`. Refused
+    /// `running` only while a live session holds the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Moves the entry to another project, which must already exist
+    /// (`unknown_project`). Refused `running` only while a live session holds the
+    /// entry; the §3.1 invariants are re-checked, so a move that would start a second
+    /// entry in the new repo is refused `started`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Compute + validate + render the would-be state, write nothing (§6.9).
     #[serde(default)]
     pub dry_run: bool,
@@ -2603,6 +2663,16 @@ pub struct QueueV2ClaimArgs {
     /// (remote). First claim only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The entry's branch already existed when this first claim resumed it
+    /// (report 171). keeperd records `auto_restack = false` on the row, so the
+    /// loop never restacks a branch it did not cut (review 061 F1). First
+    /// claim only; omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub existing: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

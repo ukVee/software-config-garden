@@ -350,6 +350,12 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
                 if let Some(base) = args.base.as_deref() {
                     queue.entries[eidx].base = base.to_string();
                 }
+                // A branch that pre-existed its claim is resumed work, not the
+                // loop's to rewrite: hold it out of the automatic restack until a
+                // human opts it in (review 061 F1, report 178).
+                if args.existing {
+                    queue.entries[eidx].auto_restack = false;
+                }
             }
             true
         }
@@ -1591,6 +1597,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }
@@ -1812,6 +1819,46 @@ mod tests {
             "claimed unchanged by a resume: {}",
             e.claimed
         );
+    }
+
+    /// Review 061 F1 (report 178): a first claim that resumed an existing
+    /// branch records `auto_restack = false` on the row; a fleet-cut claim, a
+    /// resume and a re-claim leave the flag alone. The flag is read back from
+    /// the committed `queue.toml`, so it survives a keeperd write/read round
+    /// trip. Fails on `1ad3a01`, where `existing` is never persisted.
+    #[test]
+    fn a_first_claim_that_resumed_a_branch_holds_it_out_of_the_auto_restack() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        // The fleet cut the branch (a second garden: one entry per repo starts):
+        // the default stands.
+        let other_garden = tempfile::tempdir().unwrap();
+        let other = unlocked(other_garden.path());
+        seed_queued_milestone(&other, "n");
+        claim_first(&other, "n", Some("001"), "", "cafe").expect("fleet-cut claim");
+        let (queue, _) = loaded_queue(&other);
+        assert!(queue.entries[0].auto_restack);
+
+        let v = queue_v2_claim(
+            &daemon,
+            serde_json::json!({ "entry": "m", "unit": "001", "parent": "", "base": "deadbeef", "existing": true }),
+        );
+        v.expect("resuming claim");
+        let (queue, _) = loaded_queue(&daemon);
+        let m = queue.entries.iter().find(|e| e.id == "m").unwrap();
+        assert!(!m.auto_restack, "a resumed branch is held out of the auto restack");
+        assert_eq!(m.base, "deadbeef");
+        let text = queue.to_toml().unwrap();
+        assert!(text.contains("auto_restack = false"), "{text}");
+        assert_eq!(QueueToml::parse(&text).unwrap(), queue, "round-trips");
+
+        // A resume of the same entry (no `existing`) does not re-enable it.
+        set_status(&daemon, "m", None, "paused").expect("pause");
+        claim(&daemon, "m", None).expect("resume");
+        let (queue, _) = loaded_queue(&daemon);
+        assert!(!queue.entries.iter().find(|e| e.id == "m").unwrap().auto_restack);
     }
 
     #[test]

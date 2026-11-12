@@ -568,6 +568,15 @@ past its claim, so a start time set on one holds nothing. `queue not-before` kee
 the same (it applies if the entry is queued again) and says so with a `note:` line after
 the list. The reply's `notes` field carries the sentence, and the MCP summary prints it too.
 
+A branch a first claim resumed (the baton's `resume <branch>` case) is written
+`auto_restack = false` on its row. The loop never judges it stale, never enqueues a restack
+over it and never re-records its base, because it is usually work the human already stacked
+other entries on. It still anchors its children's `--onto`. A fleet-cut branch keeps the
+default `true`. Only the human turns it back on, with `queue_update_entry auto_restack` or
+`softfig growlight queue auto-restack <id> yes|no [--dry-run]`. A restack row takes none.
+`queue show`, `growlight status` and the TUI do not mark a held-out entry yet; it shows in
+`queue.toml` as `auto_restack = false`.
+
 One bad byte in a v2 file stops all scheduling. A `queue.toml`, `queue-archive.toml` or
 `slices.toml` that won't read or parse fails the snapshot closed (spec §3), where legacy
 held only the one item whose doc it couldn't read. The journal gets one line per incident,
@@ -577,6 +586,12 @@ the fix resumes:
 ```
 growlightd: v2 queue source failed (scheduling nothing from v2 until it is fixed): growlight/backlog/queue.toml: invalid TOML at line 9, column 9: invalid type: string "no", expected a boolean
 ```
+
+## One growlightd per socket
+
+growlightd takes an exclusive, non-blocking `flock` on `<socket>.lock` (beside `$XDG_RUNTIME_DIR/softfig-growlightd.sock`) first thing in `main`, before it asks keeperd for the garden root, unlinks or binds the socket, or runs the boot reconcile. The holder writes its pid into the file; the kernel drops the lock on any exit, a crash included, so there is no stale-pidfile logic.
+
+A second instance (anything but `systemctl --user start`) exits non-zero with `another softfig-growlightd already serves <socket> (pid N)`. It never unlinks the live socket and never runs the boot reap, which would otherwise requeue the live instance's `active` entries and hand one worktree to two members. A lock file that can't be opened or locked is also a refusal to start. `--socket` picks a different socket, and with it a different lock, so tests and side-by-side setups don't collide.
 
 ## Known gaps
 

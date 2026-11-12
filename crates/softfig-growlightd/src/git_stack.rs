@@ -70,6 +70,18 @@ pub enum GitError {
         repo: PathBuf,
         cause: String,
     },
+    /// `repo` is not a git repository (git exits 128 for "not a repository").
+    #[error("{repo} is not a git repository git can read")]
+    NotARepo { repo: PathBuf },
+    /// `repo` is a repository git refuses to read: it exits 128 for that too,
+    /// and its stderr says "dubious ownership" (review 061 F14). Pointing the
+    /// project at another path changes nothing; `safe.directory` does.
+    #[error(
+        "{repo} is a git repository, but git refuses to read it (dubious ownership: it is \
+         owned by another user); as the user growlightd runs as, run \
+         `git config --global --add safe.directory {repo}`"
+    )]
+    DubiousOwnership { repo: PathBuf },
     /// The call outlived [`GIT_TIMEOUT`] and was killed.
     #[error("git {cmd} in {repo}: timed out after {secs}s")]
     Timeout {
@@ -103,9 +115,16 @@ pub struct GitMemo {
     state: Mutex<MemoState>,
 }
 
+/// What one git call left behind: its exit status, stdout and stderr.
+type Ran = (ExitStatus, Vec<u8>, Vec<u8>);
+
+/// The most of git's stderr kept: a diagnosis is one line, and a child that
+/// writes more than this is killed by the call's deadline anyway.
+const STDERR_CAP: u64 = 8 * 1024;
+
 #[derive(Debug, Default)]
 struct MemoState {
-    results: HashMap<Vec<String>, (ExitStatus, Vec<u8>)>,
+    results: HashMap<Vec<String>, Ran>,
     /// `(command, seconds)` of the call that timed out, if one did.
     hung: Option<(String, u64)>,
     spawned: usize,
@@ -156,6 +175,29 @@ impl Git {
     /// deadline (its answers are not shared: they differ per path).
     fn at(&self, path: PathBuf) -> Self {
         Self { repo: path, program: self.program.clone(), deadline: self.deadline, memo: None }
+    }
+
+    /// `git rev-parse --git-dir`: is this handle's path a git repo (or a
+    /// worktree of one)? Exit 0 = yes, exit 128 = no (unless git's stderr says
+    /// "dubious ownership": it is a repo git will not read, so
+    /// [`GitError::DubiousOwnership`]), anything else is an error.
+    /// The first-claim probe asks before any other question, so a project whose
+    /// `repo` is a plain directory is named as such rather than surfacing as the
+    /// bare exit 128 of whichever query ran first (report 171).
+    pub fn is_repo(&self) -> Result<bool, GitError> {
+        let (status, _, stderr) = self.run_with_stderr(&["rev-parse", "--git-dir"])?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(128) if stderr_says_dubious_ownership(&stderr) => {
+                Err(GitError::DubiousOwnership { repo: self.repo.clone() })
+            }
+            Some(128) => Ok(false),
+            _ => Err(GitError::Run {
+                cmd: "rev-parse --git-dir".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            }),
+        }
     }
 
     /// `git merge-base --is-ancestor <ancestor> <descendant>`: is `ancestor`
@@ -304,10 +346,25 @@ impl Git {
 
     /// Run one git command, from the per-tick memo when it already ran.
     fn run(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
+        self.run_inner(args, false).map(|(status, out, _)| (status, out))
+    }
+
+    /// [`run`](Self::run) plus git's stderr, for the one call whose exit code
+    /// is ambiguous without it ([`is_repo`](Self::is_repo)). Every other call
+    /// leaves stderr unread: the reader is a thread a parked probe worker would
+    /// otherwise keep alive too (`tests/probe_worker_parked.rs`).
+    fn run_with_stderr(&self, args: &[&str]) -> Result<Ran, GitError> {
+        self.run_inner(args, true)
+    }
+
+    fn run_inner(&self, args: &[&str], capture_stderr: bool) -> Result<Ran, GitError> {
         let Some(memo) = &self.memo else {
-            return self.spawn_and_wait(args);
+            return self.spawn_and_wait(args, capture_stderr);
         };
-        let key: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let mut key: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        if capture_stderr {
+            key.push("<stderr>".into()); // an answer without stderr is not this one
+        }
         {
             let state = memo.lock();
             if let Some(hit) = state.results.get(&key) {
@@ -321,7 +378,7 @@ impl Git {
                 });
             }
         }
-        let out = self.spawn_and_wait(args);
+        let out = self.spawn_and_wait(args, capture_stderr);
         let mut state = memo.lock();
         state.spawned += 1;
         match &out {
@@ -336,7 +393,7 @@ impl Git {
         out
     }
 
-    fn spawn_and_wait(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
+    fn spawn_and_wait(&self, args: &[&str], capture_stderr: bool) -> Result<Ran, GitError> {
         let start = Instant::now();
         let mut deadline = start + GIT_TIMEOUT;
         if let Some(overall) = self.deadline {
@@ -352,13 +409,15 @@ impl Git {
             return Err(timed_out()); // the chain's budget is spent: don't spawn
         }
         let mut child = scrub_git_env(&mut Command::new(&self.program))
+            // `is_repo` reads git's English diagnosis off stderr.
+            .env("LC_ALL", "C")
             .arg("--no-optional-locks")
             .arg("-C")
             .arg(&self.repo)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if capture_stderr { Stdio::piped() } else { Stdio::null() })
             .spawn()
             .map_err(|e| GitError::Run {
                 cmd: args[0].into(),
@@ -370,6 +429,15 @@ impl Git {
             let mut out = Vec::new();
             let _ = stdout.read_to_end(&mut out);
             out
+        });
+        let err_reader = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut out = Vec::new();
+                let _ = stderr.by_ref().take(STDERR_CAP).read_to_end(&mut out);
+                // Drain the rest so a chatty child never blocks on a full pipe.
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                out
+            })
         });
         let status = loop {
             match child.try_wait() {
@@ -384,10 +452,12 @@ impl Git {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = reader.join();
+                    let _ = err_reader.map(|r| r.join());
                     return Err(timed_out());
                 }
                 Err(e) => {
                     let _ = reader.join();
+                    let _ = err_reader.map(|r| r.join());
                     return Err(GitError::Run {
                         cmd: "wait".into(),
                         repo: self.repo.clone(),
@@ -403,8 +473,16 @@ impl Git {
                 repo: self.repo.clone(),
                 cause: "stdout reader panicked".into(),
             })?;
-        Ok((status, out))
+        let stderr = err_reader.and_then(|r| r.join().ok()).unwrap_or_default();
+        Ok((status, out, stderr))
     }
+}
+
+/// Does git's stderr say it refused the repo over ownership? Git prints
+/// `fatal: detected dubious ownership in repository at '<path>'` and exits 128,
+/// the same code as "not a git repository".
+fn stderr_says_dubious_ownership(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains("dubious ownership")
 }
 
 /// A worktree caught mid-rebase (V4): where it is and, when the rebase says so,
@@ -482,6 +560,10 @@ impl Stack {
 pub struct ClaimBase {
     pub parent: String,
     pub base: String,
+    /// The entry's branch already exists in the (local) repo, so `base` is the
+    /// merge-base it shares with its parent (or `main`) and the work resumes on
+    /// that branch rather than cutting it (report 171).
+    pub existing: bool,
 }
 
 /// Compute the stack candidates for `repo` from the live entries: every
@@ -547,7 +629,39 @@ pub fn claim_base(
         Repo::Local(_) => git.rev_parse(&base_ref)?,
         Repo::Remote => base_ref,
     };
-    Ok(ClaimBase { parent, base })
+    Ok(ClaimBase { parent, base, existing: false })
+}
+
+/// What a first claim records for an entry whose `branch` **already exists** in
+/// a local repo (§8, report 171): a migrated or hand-seeded entry whose work is
+/// already on the branch. The branch is never cut again (that would be a
+/// `checkout -B` over its commits), so the base is read, not chosen: the
+/// merge-base of `branch` and its parent's branch (`parent` = the entry's
+/// recorded `(id, branch)`) while that branch exists and is not yet in `main`,
+/// else the merge-base with `main`. `None` when the branch does not exist yet
+/// (the ordinary [`claim_base`] path) and for a remote repo, which runs no git.
+pub fn existing_branch_base(
+    repo: &Repo,
+    main: &str,
+    branch: &str,
+    parent: Option<(&str, &str)>,
+    git: &Git,
+) -> Result<Option<ClaimBase>, GitError> {
+    if matches!(repo, Repo::Remote) || !git.branch_exists(branch)? {
+        return Ok(None);
+    }
+    let (parent_id, onto) = match parent {
+        Some((id, parent_branch))
+            if !parent_branch.is_empty()
+                && git.branch_exists(parent_branch)?
+                && !git.is_ancestor(parent_branch, main)? =>
+        {
+            (id.to_string(), parent_branch.to_string())
+        }
+        _ => (String::new(), main.to_string()),
+    };
+    let base = git.merge_base(branch, &onto)?;
+    Ok(Some(ClaimBase { parent: parent_id, base, existing: true }))
 }
 
 /// One live entry reduced to what restack detection reads: the §8 first-claim
@@ -564,6 +678,34 @@ pub struct RestackEntry {
     /// The recorded `base` — the commit cut from (local) / the parent branch
     /// name (remote). `""` = never claimed.
     pub base: String,
+    /// `false` holds the branch out of the automatic restack: a branch a first
+    /// claim resumed rather than cut (review 061 F1). It is neither judged
+    /// stale nor rewritten, though it still anchors its children's `--onto`.
+    pub auto_restack: bool,
+}
+
+/// The stack candidates the loop may rewrite: [`stack_candidates`] minus every
+/// branch held out of the automatic restack ([`RestackEntry::auto_restack`]).
+fn restackable_candidates(
+    repo: &Repo,
+    main: &str,
+    entries: &[RestackEntry],
+    git: &Git,
+) -> Result<Stack, GitError> {
+    let stack_input: Vec<StackEntry> = entries
+        .iter()
+        .map(|e| StackEntry {
+            id: e.id.clone(),
+            branch: e.branch.clone(),
+            lane: e.lane,
+            claimed: e.claimed.clone(),
+        })
+        .collect();
+    let mut stack = stack_candidates(repo, main, &stack_input, git)?;
+    stack
+        .candidates
+        .retain(|c| entries.iter().find(|e| e.id == c.id).is_none_or(|e| e.auto_restack));
+    Ok(stack)
 }
 
 /// The `--onto` target for a branch recorded with `parent` (§8): the live
@@ -620,16 +762,7 @@ pub fn detect_restack(
     if matches!(repo, Repo::Remote) {
         return Ok(None);
     }
-    let stack_input: Vec<StackEntry> = entries
-        .iter()
-        .map(|e| StackEntry {
-            id: e.id.clone(),
-            branch: e.branch.clone(),
-            lane: e.lane,
-            claimed: e.claimed.clone(),
-        })
-        .collect();
-    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    let stack = restackable_candidates(repo, main, entries, git)?;
     if stack.candidates.is_empty() {
         return Ok(None);
     }
@@ -739,16 +872,7 @@ pub fn re_record_bases(
     if matches!(repo, Repo::Remote) {
         return Ok(ReRecord::Bases(Vec::new()));
     }
-    let stack_input: Vec<StackEntry> = entries
-        .iter()
-        .map(|e| StackEntry {
-            id: e.id.clone(),
-            branch: e.branch.clone(),
-            lane: e.lane,
-            claimed: e.claimed.clone(),
-        })
-        .collect();
-    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    let stack = restackable_candidates(repo, main, entries, git)?;
     if stack.candidates.is_empty() {
         return Ok(ReRecord::Bases(Vec::new()));
     }
@@ -844,6 +968,52 @@ mod tests {
             .expect("run git rev-parse");
         assert!(out.status.success(), "git rev-parse {rev}");
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A fake `git` that prints `stderr_text` to stderr and exits `code`.
+    fn fake_git(dir: &Path, code: i32, stderr_text: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(format!("fake-git-{code}-{}", stderr_text.len()));
+        fs::write(&script, format!("#!/bin/sh\necho \"{stderr_text}\" >&2\nexit {code}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Review 061 F14: git exits 128 for a repo it refuses over ownership as
+    /// well as for a non-repo. Only its stderr tells them apart, and the two
+    /// must not both read as "not a git repository".
+    #[test]
+    fn is_repo_names_dubious_ownership_apart_from_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+
+        let dubious = fake_git(
+            dir.path(),
+            128,
+            "fatal: detected dubious ownership in repository at '/x'",
+        );
+        let err = Git::new(&repo).with_program(&dubious).is_repo().unwrap_err();
+        assert!(matches!(&err, GitError::DubiousOwnership { repo: r } if *r == repo), "{err:?}");
+        assert!(err.to_string().contains("safe.directory"), "{err}");
+
+        // Through the per-tick memo the answer is the same.
+        let memo = Arc::new(GitMemo::default());
+        let git = Git::new(&repo).with_program(&dubious).with_memo(memo);
+        for _ in 0..2 {
+            assert!(matches!(git.is_repo(), Err(GitError::DubiousOwnership { .. })));
+        }
+
+        let not_a_repo = fake_git(
+            dir.path(),
+            128,
+            "fatal: not a git repository (or any of the parent directories): .git",
+        );
+        assert!(!Git::new(&repo).with_program(&not_a_repo).is_repo().unwrap());
+
+        // Any other code is still an error, not an answer.
+        let other = fake_git(dir.path(), 2, "dubious ownership");
+        assert!(matches!(Git::new(&repo).with_program(&other).is_repo(), Err(GitError::Run { .. })));
     }
 
     /// A repo on `main` with one commit. Returns the temp dir and `main`'s tip.
@@ -1119,6 +1289,81 @@ mod tests {
             claimed: claimed.into(),
             parent: parent.into(),
             base: base.into(),
+            auto_restack: true,
+        }
+    }
+
+    /// A branch a first claim resumed rather than cut (review 061 F1).
+    fn resumed_entry(id: &str, branch: &str, base: &str, claimed: &str) -> RestackEntry {
+        RestackEntry { auto_restack: false, ..restack_entry(id, branch, "", base, claimed) }
+    }
+
+    /// Review 061 F1 (report 178): a branch the claim resumed is behind `main`
+    /// by construction, and the loop must not enqueue a `git rebase --onto`
+    /// over it. Fails on `1ad3a01`, where it is a stale candidate.
+    #[test]
+    fn detect_restack_never_judges_a_resumed_branch() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/resumed", "main");
+        ff_main(repo);
+        let git = Git::new(repo.to_path_buf());
+        let repo_kind = Repo::Local(repo.to_path_buf());
+
+        let resumed = vec![resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z")];
+        let need = detect_restack(&repo_kind, "main", &resumed, &Default::default(), &git).unwrap();
+        assert!(need.is_none(), "a resumed stale branch enqueues no restack: {need:?}");
+
+        // The same branch, fleet-cut, is stale and does restack.
+        let cut = vec![restack_entry("r", "feat/resumed", "", &main_commit, "2026-10-01T00:00:00Z")];
+        let need = detect_restack(&repo_kind, "main", &cut, &Default::default(), &git).unwrap();
+        assert_eq!(need.expect("a fleet-cut stale branch restacks").len(), 1);
+    }
+
+    /// A resumed branch beside a fleet-cut one: only the fleet-cut branch is
+    /// rewritten, and a child cut from the resumed branch is still judged
+    /// against that branch's tip, never rebased onto `main`.
+    #[test]
+    fn detect_restack_leaves_a_resumed_branch_out_but_keeps_it_as_a_parent() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let resumed_tip = open_branch_from(repo, "feat/resumed", "main");
+        open_branch_from(repo, "feat/child", "feat/resumed");
+        open_branch_from(repo, "feat/cut", "main");
+        ff_main(repo);
+        let git = Git::new(repo.to_path_buf());
+
+        let entries = vec![
+            resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("c", "feat/child", "r", &resumed_tip, "2026-10-02T00:00:00Z"),
+            restack_entry("k", "feat/cut", "", &main_commit, "2026-10-03T00:00:00Z"),
+        ];
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &Default::default(), &git)
+            .unwrap()
+            .expect("the fleet-cut branch is stale");
+        let names: Vec<(&str, &str)> = need.iter().map(|b| (b.branch.as_str(), b.onto.as_str())).collect();
+        assert_eq!(names, vec![("feat/child", "feat/resumed"), ("feat/cut", "main")], "{need:?}");
+    }
+
+    /// The re-record never touches a held-out branch either (it would block on
+    /// that branch's upstream, or record a base nothing rewrote).
+    #[test]
+    fn re_record_bases_skips_a_resumed_branch() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/resumed", "main");
+        ff_main(repo);
+        sh_git(repo, &["rebase", "-q", "main", "feat/resumed"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+        let git = Git::new(repo.to_path_buf());
+        let repo_kind = Repo::Local(repo.to_path_buf());
+        let held = vec![resumed_entry("r", "feat/resumed", &main_commit, "2026-10-01T00:00:00Z")];
+        let held_out = re_record_bases(&repo_kind, "main", &held, &Default::default(), &git).unwrap();
+        assert_eq!(held_out, ReRecord::Bases(Vec::new()), "a held-out branch records nothing");
+        let cut = vec![restack_entry("r", "feat/resumed", "", &main_commit, "2026-10-01T00:00:00Z")];
+        match re_record_bases(&repo_kind, "main", &cut, &Default::default(), &git).unwrap() {
+            ReRecord::Bases(b) => assert_eq!(b.len(), 1, "{b:?}"),
+            other => panic!("{other:?}"),
         }
     }
 

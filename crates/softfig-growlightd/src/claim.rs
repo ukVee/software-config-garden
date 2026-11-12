@@ -224,6 +224,7 @@ impl V2Claimer for KeeperdV2Claimer {
             unit: unit.map(str::to_string),
             parent: first.map(|f| f.parent.clone()),
             base: first.map(|f| f.base.clone()),
+            existing: first.is_some_and(|f| f.existing),
         })
         .map_err(|e| format!("encode queue_v2_claim args: {e}"))?;
         let req = Request::new(op::QUEUE_V2_CLAIM, args);

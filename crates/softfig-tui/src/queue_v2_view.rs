@@ -434,6 +434,10 @@ pub fn entry_move(reply: &QueueShowReply, view: &QueueV2View, up: bool) -> Optio
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: false,
     }))
 }
@@ -453,6 +457,10 @@ pub fn lane_toggle(reply: &QueueShowReply, view: &QueueV2View) -> Option<V2Actio
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: false,
     }))
 }
@@ -550,6 +558,10 @@ pub fn status_action(target: &StatusTarget, status: HumanStatus) -> V2Action {
             }),
             fleet: None,
             not_before: None,
+            auto_restack: None,
+            branch: None,
+            base: None,
+            project: None,
             dry_run: false,
         }),
         StatusTarget::Slice { milestone, id } => V2Action::SliceUpdate(SliceUpdateArgs {
@@ -592,6 +604,10 @@ pub fn entry_after(reply: &QueueShowReply, id: &str, after: Vec<String>) -> Opti
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: false,
     }))
 }
@@ -687,6 +703,7 @@ mod tests {
             open,
             open_unknown: false,
             fleet: true,
+            auto_restack: true,
             not_before: None,
             doc_fleet: None,
             doc_not_before: None,

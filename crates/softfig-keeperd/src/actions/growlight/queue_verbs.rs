@@ -24,14 +24,14 @@
 use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
-    milestone_doc, sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus,
+    milestone_doc, safe_ref_name, sub_depth, valid_branch_name, ArchivedEntry, Entry, EntryKind, EntryStatus,
     FinalStatus, Lane, Project, QueueArchiveToml, QueueRefusal, QueueToml, RepoLocality,
     RestackBranch, SliceItem, SliceKind, SliceStatus, SlicesToml, QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
     QueueAddEntryArgs, QueueAddEntryReply, QueueAddProjectArgs, QueueAddProjectReply,
-    QueueDropArgs, QueueDropReply, QueueStatusArg, QueueUpdateEntryArgs, QueueUpdateEntryReply,
-    QueueV2EnqueueRestackArgs, QueueV2EnqueueRestackReply, SliceInsertArgs, SliceInsertReply,
+    QueueDropArgs, QueueDropReply, QueueSetProjectRepoArgs, QueueSetProjectRepoReply,
+    QueueStatusArg, QueueUpdateEntryArgs, QueueUpdateEntryReply, QueueV2EnqueueRestackArgs, QueueV2EnqueueRestackReply, SliceInsertArgs, SliceInsertReply,
     SliceUpdateArgs, SliceUpdateReply,
 };
 use softfig_ipc::ErrorKind;
@@ -48,6 +48,27 @@ use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
 use crate::server::err_to_response;
 
+/// The checks a project's `repo` and `main` pass on the way in, shared by
+/// `queue_add_project` and `queue_set_project_repo` so a repair can never
+/// store what an add would refuse.
+fn check_project_repo_main(repo: &str, main: &str) -> Result<(), (ErrorKind, String)> {
+    if repo.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "repo must be non-empty".to_string()));
+    }
+    // Report 062: a repo neither provably local nor `host:path` is refused,
+    // never guessed — the pick's remote rule and the git stack both read it.
+    if RepoLocality::for_current_user(repo) == RepoLocality::Ambiguous {
+        return Err(refuse(QueueRefusal::AmbiguousRepo { repo: repo.to_string() }));
+    }
+    if main.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "main must be non-empty".to_string()));
+    }
+    if !valid_branch_name(main) {
+        return Err(refuse(QueueRefusal::BadName { name: main.to_string() }));
+    }
+    Ok(())
+}
+
 // ---- queue_add_project -------------------------------------------------
 
 pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -57,21 +78,8 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     if conventions::validate_slug(&args.name).is_err() {
         return Err(refuse(QueueRefusal::BadName { name: args.name.clone() }));
     }
-    if args.repo.trim().is_empty() {
-        return Err((ErrorKind::BadArgs, "repo must be non-empty".to_string()));
-    }
-    // Report 062: a repo neither provably local nor `host:path` is refused,
-    // never guessed — the pick's remote rule and the git stack both read it.
-    if RepoLocality::for_current_user(&args.repo) == RepoLocality::Ambiguous {
-        return Err(refuse(QueueRefusal::AmbiguousRepo { repo: args.repo.clone() }));
-    }
     let main = args.main.as_deref().unwrap_or("main");
-    if main.trim().is_empty() {
-        return Err((ErrorKind::BadArgs, "main must be non-empty".to_string()));
-    }
-    if !valid_branch_name(main) {
-        return Err(refuse(QueueRefusal::BadName { name: main.to_string() }));
-    }
+    check_project_repo_main(&args.repo, main)?;
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -141,6 +149,105 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     )?;
 
     Ok(serde_json::to_value(QueueAddProjectReply {
+        name: args.name,
+        view: list,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+// ---- queue_set_project_repo ---------------------------------------------
+
+/// Report 171: the repair `queue_add_project` cannot make — a migrated row's
+/// project names a repo that is not a git repo, and a repeat add is `exists`.
+pub fn queue_set_project_repo(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueSetProjectRepoArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_set_project_repo args: {e}")))?;
+    if args.name.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "name must be non-empty".to_string()));
+    }
+    // An omitted `main` keeps the project's own, which only the live list
+    // knows, so its check waits for the lock; the repo's does not.
+    if let Some(main) = args.main.as_deref() {
+        check_project_repo_main(&args.repo, main)?;
+    } else {
+        check_project_repo_main(&args.repo, "main")?;
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, archive) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_queue_state(&wt, &inner) {
+            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model),
+            Ok(None) => {
+                return Err(refuse(QueueRefusal::UnknownProject { project: args.name.clone() }))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+    let Some(idx) = queue.projects.iter().position(|p| p.name == args.name) else {
+        return Err(refuse(QueueRefusal::UnknownProject { project: args.name.clone() }));
+    };
+    // The active session is probing the old repo through this row; it takes
+    // the new one at its next claim, never mid-session (the `done`/drop rule).
+    let active: Vec<&Entry> = queue
+        .entries
+        .iter()
+        .filter(|e| e.project == args.name && e.status == EntryStatus::Active)
+        .collect();
+    if !active.is_empty() {
+        let holders = Holders::ask(&growlightd_socket_of(&inner));
+        if let Some(refusal) = active.iter().find_map(|e| holders.running_refusal(&e.id)) {
+            return Err(refusal);
+        }
+    }
+    let before = queue.projects[idx].clone();
+    queue.projects[idx].repo = args.repo.clone();
+    if let Some(main) = &args.main {
+        queue.projects[idx].main = main.clone();
+    }
+    // A kept `main` was valid when stored, but a hand edit could have left a
+    // bad one; the backstop catches it either way.
+    queue.validate(&archive).map_err(refuse)?;
+    let list = projects_view(&queue.projects);
+
+    if queue.projects[idx] == before || args.dry_run {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueSetProjectRepoReply {
+            name: args.name,
+            view: list,
+            hash,
+        })
+        .unwrap());
+    }
+
+    let main = queue.projects[idx].main.clone();
+    let bytes = queue
+        .to_toml()
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+        .into_bytes();
+    let view = queue_view(&queue);
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_updated",
+        serde_json::json!({
+            "verb": "queue_set_project_repo",
+            "name": args.name,
+            "repo": args.repo,
+            "main": main,
+        }),
+        &[FileWrite { rel: QUEUE_FILE.to_string(), expected: queue_version, bytes }],
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(view),
+        }],
+        &ExtraWrites::NONE,
+    )?;
+    Ok(serde_json::to_value(QueueSetProjectRepoReply {
         name: args.name,
         view: list,
         hash: hash.to_string(),
@@ -390,6 +497,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: args.fleet.unwrap_or(true),
         not_before,
     };
@@ -557,6 +665,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: args.fleet.unwrap_or(true),
         not_before,
     };
@@ -721,6 +830,7 @@ fn restack_core(
         claimed: String::new(),
         follow_ups: 0,
         pending_status: None,
+        auto_restack: true,
         fleet: true,
         not_before: None,
     };
@@ -1188,8 +1298,32 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         None => None,
     };
 
+    // The repair fields' shapes, like `not_before`'s, check before the lock. A
+    // branch or base reaches git as a rev and is rendered into the restack
+    // doc's `git rebase --onto` steps, so each is a branch name by git's rule
+    // drawn from the conservative charset (review 061 F7); `base = ""` clears
+    // it, `branch` has no empty form.
+    if let Some(branch) = &args.branch
+        && (branch.trim().is_empty() || !valid_branch_name(branch) || !safe_ref_name(branch))
+    {
+        return Err(refuse(QueueRefusal::BadName { name: branch.clone() }));
+    }
+    if let Some(base) = &args.base
+        && !base.is_empty()
+        && (!valid_branch_name(base) || !safe_ref_name(base))
+    {
+        return Err(refuse(QueueRefusal::BadName { name: base.clone() }));
+    }
+    if args.project.as_deref().is_some_and(|p| p.trim().is_empty()) {
+        return Err((ErrorKind::BadArgs, "project must be non-empty".to_string()));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+
+    // growlightd's answer on who holds an `active` entry, asked at most once and
+    // only when an `active` entry is in the way (report 172).
+    let mut holders: Option<Holders> = None;
 
     // Load the live list + archive, keeping the loaded models for the no-op
     // guard (an edit that changes nothing mints no commit).
@@ -1285,10 +1419,75 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         queue.entries[idx].fleet = fleet;
     }
 
+    // 4b. auto_restack: whether the loop may restack this branch (§8). A
+    // restack row has no branch, so there is nothing to opt in or out.
+    if let Some(auto_restack) = args.auto_restack {
+        let idx = idx_of(&queue, &args.id);
+        if queue.entries[idx].kind == EntryKind::Restack {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("entry {:?} is a restack: it has no branch to hold out of a restack", args.id),
+            ));
+        }
+        queue.entries[idx].auto_restack = auto_restack;
+    }
+
     // 5. not_before: the start-time hold (§3.1), also before status.
     if let Some(not_before) = &not_before {
         let idx = idx_of(&queue, &args.id);
         queue.entries[idx].not_before = not_before.clone();
+    }
+
+    // 5b. branch / base / project: the repair of a migrated row (report 171).
+    // The row's session, if any, is working on the branch it names, so an
+    // `active` entry is refused `running` — the same boundary `done` keeps. A
+    // restack names no branch and no base of its own (§8): refused. The
+    // backstop validate below checks a new `project` exists and that the move
+    // starts nothing a repo already holds.
+    if args.branch.is_some() || args.base.is_some() || args.project.is_some() {
+        let idx = idx_of(&queue, &args.id);
+        if queue.entries[idx].status == EntryStatus::Active
+            && let Some(refusal) = holders
+                .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                .running_refusal(&args.id)
+        {
+            return Err(refusal);
+        }
+        if queue.entries[idx].kind == EntryKind::Restack
+            && (args.branch.is_some() || args.base.is_some())
+        {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "entry {:?} is a restack: a restack has no branch or base of its own",
+                    args.id
+                ),
+            ));
+        }
+        // The branch is never the merge branch of the project the entry will
+        // sit in: a claim would resume the merge branch itself, and the stack
+        // scan would count it as already merged (review 061 F7).
+        if let Some(branch) = &args.branch {
+            let project = args.project.as_deref().unwrap_or(&queue.entries[idx].project);
+            if let Some(p) = queue.projects.iter().find(|p| p.name == project)
+                && p.main == *branch
+            {
+                return Err((
+                    ErrorKind::BadArgs,
+                    format!(
+                        "branch {branch:?} is project {:?}'s merge branch: an entry works on its own branch, never on main",
+                        p.name
+                    ),
+                ));
+            }
+            queue.entries[idx].branch = branch.clone();
+        }
+        if let Some(base) = &args.base {
+            queue.entries[idx].base = base.clone();
+        }
+        if let Some(project) = &args.project {
+            queue.entries[idx].project = project.clone();
+        }
     }
 
     // 6. status. `done` is the human's override — no open-items check — and
@@ -1306,10 +1505,17 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 // `running` — the running session is never killed. A paused /
                 // blocked / deferred entry has no running session, so the
                 // human override stands.
-                if queue.entries[idx].status == EntryStatus::Active {
-                    return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+                if queue.entries[idx].status == EntryStatus::Active
+                    && let Some(refusal) = holders
+                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .running_refusal(&args.id)
+                {
+                    return Err(refusal);
                 }
-                let row = queue.entries.remove(idx);
+                let mut row = queue.entries.remove(idx);
+                // A change recorded for a session's next handshake is moot
+                // once the row is archived (the op's `done` drops it too).
+                row.pending_status = None;
                 // The human's `done` finishes a deferred restack too, and the
                 // re-record tests each branch, so it moves only what landed.
                 let re_record_due = row.kind == EntryKind::Restack;
@@ -1322,12 +1528,13 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 });
                 archived = true;
             }
-            // Finding 8 (§6.8): a status change on an `active` entry takes
-            // effect at its session's next handshake, never mid-session. The
-            // row keeps `active` (the repo rule and the scheduler keep
-            // working) and records the change as `pending_status`; the view
-            // annotates it, and the handshake's `queue_v2_set_status` applies
-            // it at the boundary. Any other entry changes now.
+            // Finding 8 (§6.8): a status change on an entry a session holds
+            // takes effect at that session's next handshake, never
+            // mid-session. The row keeps `active` (the repo rule and the
+            // scheduler keep working) and records the change as
+            // `pending_status`; the view annotates it, and the handshake's
+            // `queue_v2_set_status` applies it at the boundary. Any other
+            // entry — and an `active` one nothing holds — changes now.
             QueueStatusArg::Queued | QueueStatusArg::Blocked | QueueStatusArg::Deferred => {
                 let new = match status {
                     QueueStatusArg::Queued => EntryStatus::Queued, // also unblocks and un-defers
@@ -1335,11 +1542,19 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                     _ => EntryStatus::Deferred,
                 };
                 let idx = idx_of(&queue, &args.id);
+                // An `active` row nothing holds has no handshake to apply a
+                // pending change: it takes effect now, the same as any other
+                // entry. Unknown liveness records it, as a held row does.
+                let holder_less = queue.entries[idx].status == EntryStatus::Active
+                    && !holders
+                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .holds(&args.id);
                 let row = &mut queue.entries[idx];
-                if row.status == EntryStatus::Active {
+                if row.status == EntryStatus::Active && !holder_less {
                     row.pending_status = Some(new);
                 } else {
                     row.status = new;
+                    row.pending_status = None;
                 }
             }
         }
@@ -1778,8 +1993,10 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         return Err(refuse(QueueRefusal::LinkedFrom { id: args.id.clone() }));
     }
     let idx = idx_of(&queue, &args.id);
-    if queue.entries[idx].status == EntryStatus::Active {
-        return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+    if queue.entries[idx].status == EntryStatus::Active
+        && let Some(refusal) = Holders::ask(&growlightd_socket_of(&inner)).running_refusal(&args.id)
+    {
+        return Err(refusal);
     }
 
     // The drop→restack path (§8, queue-v2-git slices 004 + 006): the live
@@ -1831,7 +2048,8 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         e.parent = dropped_parent.clone();
     }
 
-    let row = queue.entries.remove(idx);
+    let mut row = queue.entries.remove(idx);
+    row.pending_status = None;
     archive.entries.push(ArchivedEntry {
         row,
         finished: conventions::now_rfc3339(),
@@ -1983,6 +2201,95 @@ fn refuse(r: QueueRefusal) -> (ErrorKind, String) {
         _ => ErrorKind::BadArgs,
     };
     (kind, r.to_string())
+}
+
+/// Which entries a live session holds, as growlightd answered (report 172).
+///
+/// `active` in `queue.toml` says a session claimed the entry, not that one is
+/// running now: a member that died, a growlightd restart before the v2 boot
+/// reconcile, or a failed spawn all leave an `active` row nothing holds, and
+/// no status the human can write moves it. So the `running` refusals ask the
+/// one party that knows. Asked while the daemon lock is held: a claim needs
+/// that lock to land, and growlightd marks an entry held before it claims, so
+/// an `active` row the answer does not list really is holder-less.
+enum Holders {
+    Held(HashSet<String>),
+    /// growlightd could not say. The refusals fail closed on this; a status
+    /// change falls back to recording `pending_status`.
+    Unknown(String),
+}
+
+impl Holders {
+    /// How long the daemon lock may be held waiting on growlightd (report 179):
+    /// `budget` bounds the reconnects, `call_timeout` the accepted-but-silent
+    /// peer. Every caller holds the global daemon lock.
+    const ASK_BOUND: std::time::Duration = std::time::Duration::from_millis(600);
+
+    /// Ask growlightd at `socket`. A read: safe to retry across a restart,
+    /// bounded to [`Self::ASK_BOUND`] so the held lock is not kept long.
+    fn ask(socket: &std::path::Path) -> Self {
+        let req = softfig_ipc::Request::new(softfig_ipc::growlightd::op::QUEUE_LIVE, serde_json::Value::Null);
+        let policy = softfig_ipc::RetryPolicy {
+            budget: Self::ASK_BOUND,
+            call_timeout: Self::ASK_BOUND,
+            ..softfig_ipc::RetryPolicy::default()
+        };
+        match softfig_ipc::call_reconnecting(socket, &req, policy) {
+            Ok(softfig_ipc::Response::Ok { data, .. }) => {
+                match serde_json::from_value::<softfig_ipc::growlightd::QueueLiveReply>(data) {
+                    Ok(reply) => Self::Held(reply.held.into_iter().collect()),
+                    Err(e) => Self::Unknown(format!("undecodable queue_live reply: {e}")),
+                }
+            }
+            Ok(softfig_ipc::Response::Err { kind, error, .. }) => {
+                Self::Unknown(format!("growlightd refused queue_live ({kind:?}): {error}"))
+            }
+            Err(softfig_ipc::ReconnectError::Ambiguous { source, .. }) if source.is_timeout() => {
+                Self::Unknown(format!(
+                    "growlightd did not answer within {} ms at {}",
+                    Self::ASK_BOUND.as_millis(),
+                    socket.display()
+                ))
+            }
+            Err(e) => Self::Unknown(format!("growlightd unreachable at {}: {e}", socket.display())),
+        }
+    }
+
+    /// Whether a live session holds `id`; unknown reads as held, for the
+    /// refusals that must fail closed.
+    fn holds(&self, id: &str) -> bool {
+        match self {
+            Self::Held(set) => set.contains(id),
+            Self::Unknown(_) => true,
+        }
+    }
+
+    /// The `running` refusal for an `active` entry `id`, or `None` when no
+    /// live session holds it.
+    fn running_refusal(&self, id: &str) -> Option<(ErrorKind, String)> {
+        match self {
+            Self::Held(set) if !set.contains(id) => None,
+            Self::Held(_) => Some(refuse(QueueRefusal::Running { id: id.to_string() })),
+            Self::Unknown(why) => Some((
+                ErrorKind::BadArgs,
+                format!(
+                    "running: '{id}' is active and growlightd cannot say whether a session holds \
+                     it ({why}); start growlightd — its boot reconcile returns a holder-less \
+                     entry to queued — and retry"
+                ),
+            )),
+        }
+    }
+}
+
+/// growlightd's socket, read off the locked daemon state (`Daemon::growlightd_socket`
+/// would take the lock again).
+fn growlightd_socket_of(inner: &DaemonInner) -> std::path::PathBuf {
+    inner
+        .config
+        .growlightd_socket
+        .clone()
+        .unwrap_or_else(softfig_ipc::growlightd_runtime_socket_path)
 }
 
 /// The untouched tip hash — a dry run's reply `hash` (no commit is minted).
@@ -2391,6 +2698,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }
@@ -2520,6 +2828,281 @@ mod tests {
         assert_eq!(commit_count(&daemon), before, "no commit on a dry run");
         assert!(!garden.path().join(QUEUE_FILE).exists(), "no queue.toml written");
         assert!(reply.view.contains("softfig"), "the would-be list: {:?}", reply.view);
+    }
+
+    // ---- report 171: the repair verbs --------------------------------------
+
+    fn read_queue(daemon: &Daemon) -> QueueToml {
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(daemon, &inner);
+        load_queue_state(&wt, &inner).unwrap().unwrap().queue.model
+    }
+
+    fn other_project() -> Project {
+        Project {
+            name: "fixes".to_string(),
+            repo: "~/q".to_string(),
+            main: "main".to_string(),
+        }
+    }
+
+    fn set_repo(
+        daemon: &Daemon,
+        args: serde_json::Value,
+    ) -> Result<QueueSetProjectRepoReply, (ErrorKind, String)> {
+        queue_set_project_repo(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn set_project_repo_edits_repo_and_main_in_one_commit_and_keeps_an_omitted_main() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut dev = project();
+        dev.main = "dev".to_string();
+        seed_queue(&daemon, vec![dev], vec![entry("a")], None);
+        let before = commit_count(&daemon);
+
+        let reply = set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/repo" }))
+            .expect("set repo");
+        assert_eq!(commit_count(&daemon), before + 1, "one commit per verb");
+        assert!(reply.view.contains("~/repo"), "{:?}", reply.view);
+        let q = read_queue(&daemon);
+        assert_eq!(q.projects[0].repo, "~/repo");
+        assert_eq!(q.projects[0].main, "dev", "an omitted main is kept, not reset to main");
+        assert_eq!(q.entries.len(), 1, "no entry touched");
+
+        set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/repo", "main": "trunk" }))
+            .expect("set main");
+        assert_eq!(read_queue(&daemon).projects[0].main, "trunk");
+
+        // A repeat of the stored values mints no commit.
+        let n = commit_count(&daemon);
+        set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/repo", "main": "trunk" }))
+            .expect("no-op");
+        assert_eq!(commit_count(&daemon), n);
+    }
+
+    #[test]
+    fn set_project_repo_refuses_what_add_project_refuses_and_an_unknown_or_running_project() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut running = entry("r");
+        running.project = "fixes".to_string();
+        running.status = EntryStatus::Active;
+        running.claimed = "2026-10-12T00:00:00Z".to_string();
+        seed_queue(&daemon, vec![project(), other_project()], vec![entry("a"), running], None);
+        let before = commit_count(&daemon);
+
+        let err = set_repo(&daemon, serde_json::json!({ "name": "ghost", "repo": "~/p" })).unwrap_err();
+        assert!(err.1.starts_with("unknown_project:"), "{err:?}");
+        let err = set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "  " })).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        for repo in ["rel/path", ":path", "~bob/p"] {
+            let err = set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": repo })).unwrap_err();
+            assert!(err.1.starts_with("ambiguous_repo:"), "{repo}: {err:?}");
+        }
+        for main in ["--show-toplevel", "a..b", " "] {
+            let err = set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/p", "main": main }))
+                .unwrap_err();
+            assert!(
+                err.1.starts_with("bad_name:") || err.0 == ErrorKind::BadArgs,
+                "{main}: {err:?}"
+            );
+        }
+        // `fixes` has an active entry: its session is probing the old repo.
+        let err = set_repo(&daemon, serde_json::json!({ "name": "fixes", "repo": "~/new" })).unwrap_err();
+        assert!(err.1.starts_with("running:") && err.1.contains("'r'"), "{err:?}");
+        // The idle project is still editable while another one runs.
+        set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/new" })).expect("idle project");
+        assert_eq!(commit_count(&daemon), before + 1, "only the last call committed");
+    }
+
+    #[test]
+    fn set_project_repo_dry_run_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![entry("a")], None);
+        let before = commit_count(&daemon);
+
+        let reply = set_repo(
+            &daemon,
+            serde_json::json!({ "name": "softfig", "repo": "~/new", "dry_run": true }),
+        )
+        .expect("dry run computes");
+        assert!(reply.view.contains("~/new"), "the would-be table: {:?}", reply.view);
+        assert_eq!(commit_count(&daemon), before);
+        assert_eq!(read_queue(&daemon).projects[0].repo, "~/p");
+    }
+
+    #[test]
+    fn update_entry_repairs_branch_base_and_project_and_rerenders_the_view() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut claimed = entry("a");
+        claimed.base = "deadbeef".to_string();
+        claimed.claimed = "2026-10-12T00:00:00Z".to_string();
+        claimed.status = EntryStatus::Paused;
+        seed_queue(&daemon, vec![project(), other_project()], vec![claimed, entry("b")], None);
+        let before = commit_count(&daemon);
+
+        let reply = update_entry(
+            &daemon,
+            serde_json::json!({
+                "id": "a", "branch": "feat/remote-runner", "base": "", "project": "fixes",
+            }),
+        )
+        .expect("repair");
+        assert_eq!(commit_count(&daemon), before + 1, "one commit for the three fields");
+        let q = read_queue(&daemon);
+        let a = q.entries.iter().find(|e| e.id == "a").unwrap();
+        assert_eq!(a.branch, "feat/remote-runner");
+        assert_eq!(a.base, "", "an empty base clears it");
+        assert_eq!(a.project, "fixes");
+        assert_eq!(a.claimed, "2026-10-12T00:00:00Z", "the claim is untouched");
+        assert_eq!(a.status, EntryStatus::Paused, "status is untouched");
+        assert!(reply.view.contains("feat/remote-runner") && reply.view.contains("fixes"), "{:?}", reply.view);
+        // The derived view on disk re-rendered in the same commit.
+        let md = std::fs::read_to_string(garden.path().join(softfig_ipc::queue_v2::QUEUE_VIEW_FILE))
+            .expect("queue.md");
+        assert!(md.contains("feat/remote-runner"), "{md}");
+
+        // A non-empty base is a rev: a branch name or a hash.
+        update_entry(&daemon, serde_json::json!({ "id": "b", "base": "958a010" })).expect("hash base");
+        assert_eq!(read_queue(&daemon).entries.iter().find(|e| e.id == "b").unwrap().base, "958a010");
+
+        // The same values again change nothing.
+        let n = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "b", "base": "958a010" })).expect("no-op");
+        assert_eq!(commit_count(&daemon), n);
+    }
+
+    /// Review 061 F7: a repaired branch is never the project's own merge branch, and a
+    /// branch or base outside `[A-Za-z0-9._/-]` is refused before the write, because both
+    /// are rendered into the restack doc's `git rebase --onto` steps.
+    #[test]
+    fn update_entry_repair_refuses_the_projects_main_and_shell_metacharacters() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let trunk = Project {
+            name: "trunky".to_string(),
+            repo: "~/t".to_string(),
+            main: "trunk".to_string(),
+        };
+        seed_queue(&daemon, vec![project(), trunk], vec![entry("a")], None);
+        let before = commit_count(&daemon);
+
+        // The entry's own project's main.
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "main" })).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        assert!(err.1.contains("merge branch"), "{err:?}");
+        // The destination project's main counts, in the same edit as a move; the old
+        // project's main does not.
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "trunk", "project": "trunky" }))
+            .unwrap_err();
+        assert!(err.1.contains("merge branch"), "{err:?}");
+        update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "main", "project": "trunky" }))
+            .expect("main is an ordinary branch name in a project whose merge branch is trunk");
+        let err = update_entry(&daemon, serde_json::json!({ "id": "a", "branch": "trunk" })).unwrap_err();
+        assert!(err.1.contains("merge branch"), "{err:?}");
+
+        // Git-legal metacharacters never reach the restack doc.
+        for bad in ["feat/x;curl${IFS}evil", "a$b", "a(b)", "a|b", "a{b}", "a&b", "a'b", "a\"b", "a`b`", "a>b"] {
+            for field in ["branch", "base"] {
+                let err = update_entry(&daemon, serde_json::json!({ "id": "a", field: bad })).unwrap_err();
+                assert!(err.1.starts_with("bad_name:"), "{field} {bad:?}: {err:?}");
+            }
+        }
+        // A base may be the project's main (a branch cut from main) or a hash.
+        update_entry(&daemon, serde_json::json!({ "id": "a", "base": "trunk" })).expect("base = main");
+        assert_eq!(commit_count(&daemon), before + 2, "only the two accepted edits committed");
+        let q = read_queue(&daemon);
+        assert_eq!(q.entries[0].branch, "main");
+        assert_eq!(q.entries[0].base, "trunk");
+    }
+
+    #[test]
+    fn update_entry_repair_is_refused_on_an_active_entry_and_for_bad_values() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut running = entry("run");
+        running.status = EntryStatus::Active;
+        running.claimed = "2026-10-12T00:00:00Z".to_string();
+        let mut restack = entry("restack-softfig");
+        restack.kind = EntryKind::Restack;
+        restack.lane = Lane::Urgent;
+        restack.branch = String::new();
+        seed_queue(
+            &daemon,
+            vec![project(), other_project()],
+            vec![restack, running, entry("ok")],
+            None,
+        );
+        let before = commit_count(&daemon);
+
+        for field in [
+            serde_json::json!({ "branch": "feat/x" }),
+            serde_json::json!({ "base": "" }),
+            serde_json::json!({ "project": "fixes" }),
+        ] {
+            let mut args = serde_json::json!({ "id": "run" });
+            args.as_object_mut().unwrap().extend(field.as_object().unwrap().clone());
+            let err = update_entry(&daemon, args).unwrap_err();
+            assert!(err.1.starts_with("running:"), "{field}: {err:?}");
+        }
+        for branch in ["", " ", "--show-toplevel", "a..b", "HEAD", "x.lock"] {
+            let err = update_entry(&daemon, serde_json::json!({ "id": "ok", "branch": branch })).unwrap_err();
+            assert!(err.1.starts_with("bad_name:"), "{branch:?}: {err:?}");
+        }
+        let err = update_entry(&daemon, serde_json::json!({ "id": "ok", "base": "-x" })).unwrap_err();
+        assert!(err.1.starts_with("bad_name:"), "{err:?}");
+        let err = update_entry(&daemon, serde_json::json!({ "id": "ok", "project": "ghost" })).unwrap_err();
+        assert!(err.1.starts_with("unknown_project:"), "{err:?}");
+        let err = update_entry(&daemon, serde_json::json!({ "id": "ok", "project": " " })).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        // A restack has no branch or base of its own; its project may still move.
+        for field in ["branch", "base"] {
+            let err = update_entry(&daemon, serde_json::json!({ "id": "restack-softfig", field: "x" }))
+                .unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs, "{field}: {err:?}");
+            assert!(err.1.contains("restack"), "{err:?}");
+        }
+        assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
+    }
+
+    #[test]
+    fn update_entry_project_move_cannot_start_a_second_entry_in_the_new_repo() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut held = entry("held");
+        held.project = "fixes".to_string();
+        held.status = EntryStatus::Paused;
+        held.claimed = "2026-10-12T00:00:00Z".to_string();
+        let mut mover = entry("mover");
+        mover.status = EntryStatus::Paused;
+        mover.claimed = "2026-10-12T00:00:00Z".to_string();
+        seed_queue(&daemon, vec![project(), other_project()], vec![held, mover], None);
+        let before = commit_count(&daemon);
+
+        let err = update_entry(&daemon, serde_json::json!({ "id": "mover", "project": "fixes" })).unwrap_err();
+        assert!(err.1.starts_with("started:"), "{err:?}");
+        assert_eq!(commit_count(&daemon), before);
+    }
+
+    #[test]
+    fn update_entry_repair_dry_run_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![entry("a")], None);
+        let before = commit_count(&daemon);
+
+        let reply = update_entry(
+            &daemon,
+            serde_json::json!({ "id": "a", "branch": "feat/other", "dry_run": true }),
+        )
+        .expect("dry run");
+        assert!(reply.view.contains("feat/other"), "{:?}", reply.view);
+        assert_eq!(commit_count(&daemon), before);
+        assert_eq!(read_queue(&daemon).entries[0].branch, "feat/a");
     }
 
     #[test]
@@ -2742,6 +3325,41 @@ mod tests {
         update_entry(&daemon, serde_json::json!({ "id": "a", "fleet": true })).unwrap();
         assert!(fleet_of(&daemon), "released to the fleet");
         assert_eq!(commit_count(&daemon), before + 2);
+    }
+
+    /// `auto_restack` on `queue_update_entry` is the human's opt-in (review 061
+    /// F1): it sets and clears the row's flag, the same value again is a no-op
+    /// that mints no commit, and a restack row (no branch) refuses it.
+    #[test]
+    fn update_entry_sets_auto_restack_and_refuses_it_on_a_restack() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut r = entry("r");
+        r.kind = EntryKind::Restack;
+        r.lane = Lane::Urgent;
+        let mut held = entry("held");
+        held.auto_restack = false;
+        seed_queue(&daemon, vec![project()], vec![r, held], None);
+        let flag_of = |daemon: &Daemon| {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(daemon, &inner);
+            let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+            qs.queue.model.entries.iter().find(|e| e.id == "held").unwrap().auto_restack
+        };
+        assert!(!flag_of(&daemon));
+        let before = commit_count(&daemon);
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": false })).unwrap();
+        assert_eq!(commit_count(&daemon), before, "the value it already has is a no-op");
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": true })).unwrap();
+        assert!(flag_of(&daemon), "opted in");
+        assert_eq!(commit_count(&daemon), before + 1);
+        update_entry(&daemon, serde_json::json!({ "id": "held", "auto_restack": false })).unwrap();
+        assert!(!flag_of(&daemon), "held out again");
+
+        let err = queue_update_entry(&daemon, serde_json::json!({ "id": "r", "auto_restack": true }))
+            .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        assert!(err.1.contains("restack"), "{err:?}");
     }
 
     /// §6.7: a member's found work may not carry `not_before` either — any
@@ -4706,6 +5324,181 @@ mod tests {
             .expect("restack doc");
         assert!(doc.contains("- `git rebase --onto main feat/a feat/b`"), "{doc}");
         assert!(doc.contains("- `git rebase --onto main feat/a feat/c`"), "{doc}");
+    }
+
+    // ---- liveness: a holder-less `active` entry is not "running" (report 172) ----
+
+    /// Point the daemon at a stub growlightd that answers every `queue_live` with
+    /// `held`; the listener lives as long as the returned guard's thread (it
+    /// answers until the test drops the tempdir).
+    fn live_growlightd(daemon: &Daemon, dir: &std::path::Path, held: &[&str]) {
+        use std::io::{BufRead, BufReader, Write};
+        let socket = dir.join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        daemon.inner.lock().unwrap().config.growlightd_socket = Some(socket);
+        let reply = softfig_ipc::Response::ok(
+            serde_json::to_value(softfig_ipc::growlightd::QueueLiveReply {
+                held: held.iter().map(|h| h.to_string()).collect(),
+            })
+            .unwrap(),
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).is_err() {
+                    return;
+                }
+                assert!(line.contains("queue_live"), "asked growlightd something else: {line}");
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                let _ = stream.write_all(&bytes);
+            }
+        });
+    }
+
+    /// The report 172 shape: an `active` entry with a recorded pending status
+    /// that nothing holds.
+    fn stranded() -> Entry {
+        let mut e = entry("109");
+        e.status = EntryStatus::Active;
+        e.claimed = "2026-11-08T14:13:32Z".to_string();
+        e.fleet = false;
+        e.pending_status = Some(EntryStatus::Deferred);
+        e
+    }
+
+    #[test]
+    fn a_human_drop_of_a_holder_less_active_entry_succeeds() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded(), entry("b")], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "stale restack" }))
+            .expect("nothing holds it");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert!(qs.queue.model.entries.iter().all(|e| e.id != "109"));
+        let archived = &qs.archive.model.entries[0];
+        assert_eq!((archived.row.id.as_str(), archived.final_status), ("109", FinalStatus::Dropped));
+        assert_eq!(archived.row.pending_status, None, "a pending change dies with the row");
+    }
+
+    #[test]
+    fn a_drop_of_an_entry_a_live_session_holds_is_still_running() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &["109"]);
+        let before = commit_count(&daemon);
+
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        assert!(err.1.starts_with("running: '109' is running a session"), "{err:?}");
+        assert_eq!(commit_count(&daemon), before);
+    }
+
+    /// Report 179: a growlightd that accepts and never replies must neither hold
+    /// the daemon lock for the 30 s `CALL_TIMEOUT` nor leave the refusal vague.
+    #[test]
+    fn a_growlightd_that_accepts_and_never_replies_is_bounded_and_named() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        let socket = sock.path().join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        daemon.inner.lock().unwrap().config.growlightd_socket = Some(socket);
+        let (release, held_open) = std::sync::mpsc::channel::<()>();
+        let stub = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = held_open.recv(); // never replies until the test is done
+        });
+
+        let start = std::time::Instant::now();
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "held the daemon lock {elapsed:?}");
+        assert!(
+            err.1.starts_with("running:") && err.1.contains("growlightd did not answer within 600 ms"),
+            "{err:?}"
+        );
+        // The lock is free again for the next verb.
+        assert!(daemon.inner.try_lock().is_ok(), "daemon lock still held");
+        drop(release);
+        stub.join().unwrap();
+    }
+
+    #[test]
+    fn when_growlightd_cannot_say_the_running_refusal_fails_closed_and_says_so() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path()); // growlightd socket points at nothing
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "109", "reason": "x" })).unwrap_err();
+        assert!(
+            err.1.starts_with("running:") && err.1.contains("cannot say whether a session holds it"),
+            "{err:?}"
+        );
+        let err = update_entry(&daemon, serde_json::json!({ "id": "109", "status": "done" })).unwrap_err();
+        assert!(err.1.starts_with("running:") && err.1.contains("growlightd"), "{err:?}");
+    }
+
+    #[test]
+    fn a_status_change_on_a_holder_less_active_entry_lands_now_not_as_pending() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        let r = update_entry(&daemon, serde_json::json!({ "id": "109", "status": "queued" })).expect("status");
+        assert!(!r.view.contains("pending"), "{}", r.view);
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let row = load_queue_state(&wt, &inner).unwrap().unwrap().queue.model.entries.remove(0);
+        assert_eq!((row.status, row.pending_status), (EntryStatus::Queued, None));
+    }
+
+    #[test]
+    fn a_status_change_on_a_held_entry_still_records_pending() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut e = stranded();
+        e.pending_status = None;
+        seed_queue(&daemon, vec![project()], vec![e], None);
+        live_growlightd(&daemon, sock.path(), &["109"]);
+
+        update_entry(&daemon, serde_json::json!({ "id": "109", "status": "deferred" })).expect("status");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let row = load_queue_state(&wt, &inner).unwrap().unwrap().queue.model.entries.remove(0);
+        assert_eq!((row.status, row.pending_status), (EntryStatus::Active, Some(EntryStatus::Deferred)));
+    }
+
+    #[test]
+    fn done_repair_and_set_repo_share_the_liveness_check() {
+        let garden = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue(&daemon, vec![project()], vec![stranded()], None);
+        live_growlightd(&daemon, sock.path(), &[]);
+
+        // Holder-less: the repair fields and the project's repo are editable.
+        update_entry(&daemon, serde_json::json!({ "id": "109", "branch": "feat/fixed" })).expect("repair");
+        set_repo(&daemon, serde_json::json!({ "name": "softfig", "repo": "~/new" })).expect("set repo");
+        update_entry(&daemon, serde_json::json!({ "id": "109", "status": "done" })).expect("done");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert!(qs.queue.model.entries.is_empty());
+        assert_eq!(qs.archive.model.entries[0].final_status, FinalStatus::Done);
+        assert_eq!(qs.archive.model.entries[0].row.pending_status, None);
     }
 
     #[test]

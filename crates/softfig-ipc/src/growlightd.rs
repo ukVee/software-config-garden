@@ -188,6 +188,14 @@ pub mod op {
     /// there (queue-v2-git slice 006). No v2 list -> `list: false`.
     pub const QUEUE_SHOW: &str = "queue_show";
 
+    /// `queue_live() -> `[`QueueLiveReply`]. Read-only: the v2 entries a live
+    /// session holds right now (report 172). keeperd asks it before it reads an
+    /// `active` entry as running, so a human `drop` / `done` / repair of an entry
+    /// nothing holds is not trapped behind a status no one will ever clear.
+    /// Answered from the drive loop's published holds plus the claims in flight,
+    /// never from a git or file read.
+    pub const QUEUE_LIVE: &str = "queue_live";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,
@@ -1396,6 +1404,15 @@ pub struct QueueShowEntry {
         skip_serializing_if = "crate::queue_v2::is_fleet_default"
     )]
     pub fleet: bool,
+    /// The row's `auto_restack` field (§8): `false` holds the entry's branch out
+    /// of the loop's automatic restack (a first claim that resumed an existing
+    /// branch writes it). Absent when `true`, and on a reply from a daemon that
+    /// predates the field — which reads as no annotation, not as held out.
+    #[serde(
+        default = "crate::queue_v2::fleet_default",
+        skip_serializing_if = "crate::queue_v2::is_fleet_default"
+    )]
+    pub auto_restack: bool,
     /// The row's `not_before` start time (§3.1), as written. Absent when none,
     /// and on a reply from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1418,7 +1435,7 @@ impl QueueShowEntry {
     /// The §2 holds as the surfaces print them beside the status
     /// ([`crate::queue_v2::hold_annotation`]).
     pub fn hold_annotation(&self) -> String {
-        crate::queue_v2::hold_annotation(self.fleet, self.not_before.as_deref())
+        crate::queue_v2::hold_annotation(self.fleet, self.not_before.as_deref(), self.auto_restack)
     }
 
     /// One line when the entry's doc carries a `> Fleet:` or `> Not before:`
@@ -1556,6 +1573,15 @@ pub struct QueueShowTree {
     pub milestone: String,
     #[serde(default)]
     pub slices: Vec<QueueShowSlice>,
+}
+
+/// Reply to [`op::QUEUE_LIVE`]: the v2 entry ids a live member holds now — a
+/// running session, a claim whose spawn has not landed, or a handoff still in
+/// flight. An `active` entry absent from this list has no holder. A fleet that
+/// is not armed holds nothing, so the list is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueLiveReply {
+    pub held: Vec<String>,
 }
 
 /// Reply to [`op::QUEUE_SHOW`]: the live v2 list and its annotations, for the
@@ -1705,6 +1731,7 @@ mod tests {
 
         let held = QueueShowEntry {
             fleet: false,
+            auto_restack: false,
             not_before: Some("2026-11-08 09:00 +01:00".into()),
             doc_fleet: Some("no".into()),
             doc_not_before: Some("2026-11-08 08:00Z".into()),
@@ -1712,8 +1739,12 @@ mod tests {
         };
         let wire = serde_json::to_value(&held).unwrap();
         assert_eq!(wire["fleet"], false);
+        assert_eq!(wire["auto_restack"], false);
         assert_eq!(serde_json::from_value::<QueueShowEntry>(wire).unwrap(), held);
-        assert_eq!(held.hold_annotation(), " (human-only) (not before 2026-11-08 09:00 +01:00)");
+        assert_eq!(
+            held.hold_annotation(),
+            " (human-only) (not before 2026-11-08 09:00 +01:00) (no auto-restack)"
+        );
         assert_eq!(held.doc_hold_warning(), None, "the line and the entry agree, as instants");
     }
 
@@ -1737,6 +1768,7 @@ mod tests {
                 open: false,
                 open_unknown: false,
                 fleet,
+                auto_restack: true,
                 not_before: nb.map(str::to_string),
                 doc_fleet: doc_fleet.map(str::to_string),
                 doc_not_before: doc_nb.map(str::to_string),

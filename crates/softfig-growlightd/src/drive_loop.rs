@@ -60,7 +60,7 @@ use softfig_ipc::item_repo::{boot_signal, Handoff, RepoState};
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
-use crate::baton_store::{with_base_line, FsEntryBatonStore};
+use crate::baton_store::{with_base_line, FirstStep, FsEntryBatonStore};
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
@@ -78,7 +78,9 @@ use crate::schedule::{
     apply_reserve, evaluate, Admission, HoldReason, MemberRef, ScheduleVerdict, SystemZone,
     ZoneSource,
 };
-use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, ScheduleGate, Unit, WalkOutcome};
+use crate::scheduler_v2::{
+    self, next_unit, pick_v2_reserving, Pick, ScheduleGate, Unit, WalkOutcome,
+};
 use crate::v2_repo;
 use crate::state::State;
 use crate::telemetry_capture::TelemetryTags;
@@ -1360,6 +1362,10 @@ pub struct TickReport {
     /// growlightd alerts once, so an item lands here on the tick its block is
     /// first seen, not every tick it persists.
     pub v2_walk_blocked: Vec<String>,
+    /// A v2 tick whose snapshot read gave nothing (absent, torn, unreadable).
+    /// The standing park and walk-block sets were not reconciled, so `dispatch`
+    /// keeps their identities but pages none of them (review 061 F5).
+    pub v2_read_failed: bool,
     /// Restacks withheld because a stack branch tracks an upstream (V1): the
     /// loop never rewrites a pushed branch, so the human is alerted instead.
     pub v2_restack_blocked: Vec<String>,
@@ -1692,6 +1698,13 @@ pub struct DriveLoop {
     /// Dropped when the part leaves the parked set. In memory only, so after a
     /// growlightd restart a standing spin park pages as `BlockedOnHuman`.
     spin_parks: std::collections::BTreeMap<(String, String), (u32, Option<usize>)>,
+    /// The v2 twin: entries this loop parked on a member exit, each with the
+    /// spin guard's `(sessions, dirty)` when the park was a spin (`None` = the
+    /// member declared a human block). Held for as long as the entry stays
+    /// `blocked`, so [`dispatch`](Self::dispatch) pages the standing park every
+    /// tick through the 071 ladder, as itself, and reconciles its identity. In
+    /// memory only: after a restart the entry is no longer in this map.
+    v2_parks: std::collections::BTreeMap<String, Option<(u32, Option<usize>)>>,
     /// Holds already journaled, each with its latest reason: a part's skip is
     /// narrated once, not on every re-read, and this is the list `growlight status`
     /// shows. A part leaves it when a read finds it claimable again or the queue
@@ -1899,6 +1912,7 @@ impl DriveLoop {
             v2_model_overrides: Vec::new(),
             holds: std::collections::BTreeMap::new(),
             spin_parks: std::collections::BTreeMap::new(),
+            v2_parks: std::collections::BTreeMap::new(),
             announced_holds: std::collections::BTreeMap::new(),
             announced_foreign: BTreeSet::new(),
             last_claim_reassert: None,
@@ -2594,6 +2608,12 @@ impl DriveLoop {
                                 {
                                     // Fail-soft, see the arm comment.
                                 }
+                                // A spin park pages as itself (report 170); a
+                                // member-declared block replaces a stale spin record.
+                                let spin = spin_guard.then(|| {
+                                    (STALL_LIMIT, repo_read.as_ref().map(|r| r.dirty))
+                                });
+                                self.v2_parks.insert(assignment.entry.clone(), spin);
                                 report.v2_parked.push(assignment);
                             }
                         } else if let Some((queue, part)) = self.assignments.remove(agent) {
@@ -2858,6 +2878,16 @@ impl DriveLoop {
                 // §2's blocked walk: alert once per stopped entry, whatever the
                 // gates below decide about spawning.
                 self.note_v2_blocked_walks(snapshot, &mut report);
+                // A park outlives its entry's `blocked` status only until the
+                // snapshot shows it moved on (un-blocked, done, re-queued); one
+                // made this tick is not in this snapshot yet.
+                self.v2_parks.retain(|entry, _| {
+                    report.v2_parked.iter().any(|a| &a.entry == entry)
+                        || snapshot
+                            .entries
+                            .iter()
+                            .any(|e| &e.id == entry && e.status == EntryStatus::Blocked)
+                });
                 // The runtime overlay (slices 003/006/009): who holds which entry,
                 // and the accepted model changes. Retry a pause that failed earlier
                 // first, so the entry it lands on reads as what it is; a pauser is
@@ -2951,6 +2981,43 @@ impl DriveLoop {
                     })
                     .collect();
 
+                // The fallback reservation (§2, report 169): the projects whose
+                // own pinned member is free or exiting at the tick's start, which
+                // no member's step-4 fallback may take. Computed once, before any
+                // member's pick, so roster order never decides it.
+                //
+                // Only a member that could take its project's next entry this
+                // tick reserves it (review 061 F4): not one held by a rate-limit
+                // or the schedule, retiring or stopped, and not one merely live
+                // on an entry (a live member is busy on it; the entry a handshake
+                // rolled it off is `v2_rolled`, which is what "exiting" means).
+                let reserved = {
+                    let can_start = |agent: &str| {
+                        !self.retiring.contains(agent)
+                            && !self.stopped.contains(agent)
+                            && !matches!(admission(agent), Admission::Held(_))
+                            && !self
+                                .rate_limit_holds
+                                .lock()
+                                .unwrap()
+                                .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
+                    };
+                    let free: Vec<&scheduler_v2::Member> = fleet
+                        .iter()
+                        .filter(|m| {
+                            let agent = &m.spec.agent;
+                            !self.supervisor.is_registered(agent) && can_start(agent)
+                        })
+                        .filter_map(|m| v2_members.get(m.spec.agent.as_str()))
+                        .collect();
+                    let exiting: Vec<(&scheduler_v2::Member, &str)> = v2_members
+                        .values()
+                        .filter(|m| can_start(&m.id))
+                        .filter_map(|m| Some((m, self.v2_rolled.get(&m.id)?.as_str())))
+                        .collect();
+                    scheduler_v2::reserved_projects(snapshot, &free, &exiting)
+                };
+
                 // Step 2 analog — the re-roll, with the same shared gates. The
                 // workable gate is the v2 twin of the legacy closure: a down
                 // member's own entry still standing `active` in the fresh snapshot
@@ -2987,7 +3054,9 @@ impl DriveLoop {
                         resumes_own
                             || v2_members
                                 .get(agent)
-                                .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
+                                .is_some_and(|m| {
+                                    pick_v2_reserving(snapshot, m, &reserved).picked.is_some()
+                                })
                     };
                     // The boot dirty-tree guard before each re-roll's spawn
                     // (parity row 6) — the legacy `pre_spawn` twin: a
@@ -3064,7 +3133,7 @@ impl DriveLoop {
                             // pick with a fabricated member.
                             continue;
                         };
-                        let picked = pick_v2(snapshot, v2_member).picked;
+                        let picked = pick_v2_reserving(snapshot, v2_member, &reserved).picked;
                         // §6.3 step 5 / §9: a member that handed off and is not
                         // resuming its entry — urgent work won the pick, or the
                         // entry's next unit needs a model this member's backend
@@ -3175,6 +3244,11 @@ impl DriveLoop {
                         // Per-member admission budget (slice 001 M-A): fold on
                         // this member's claude-login profile only.
                         let member_budget = budget_for(agent);
+                        // Held from here to the assignment record below, so a
+                        // human verb asking keeperd about this entry while the
+                        // claim lands and the member spawns sees a holder
+                        // (report 172).
+                        self.daemon.claim_started(entry_top);
                         let outcome = self.supervisor.start_claiming(
                             spec,
                             member_budget,
@@ -3220,8 +3294,13 @@ impl DriveLoop {
                                     }
                                     _ => None,
                                 };
-                                let base_line =
-                                    first.as_ref().map(|fc| (fc.branch.as_str(), fc.base.as_str()));
+                                let base_line = first.as_ref().map(|fc| {
+                                    if fc.existing {
+                                        FirstStep::Resume { branch: &fc.branch }
+                                    } else {
+                                        FirstStep::Create { branch: &fc.branch, base: &fc.base }
+                                    }
+                                });
                                 let handoff = copy_entry_baton(
                                     entries,
                                     &**member_writer,
@@ -3243,6 +3322,10 @@ impl DriveLoop {
                                 Ok(())
                             },
                         );
+                        // Anything but a started session leaves no holder.
+                        if !matches!(outcome, StartOutcome::Started) {
+                            self.daemon.claim_ended(entry_top);
+                        }
                         match outcome {
                             StartOutcome::Started => {
                                 spoken_for.insert(pick.entry.clone());
@@ -3262,6 +3345,10 @@ impl DriveLoop {
                                     repo,
                                 };
                                 self.v2_assignments.insert(agent.clone(), assignment.clone());
+                                // Hold it in the overlay at once; the end-of-tick
+                                // publish repeats this.
+                                self.daemon.publish_v2_overlay(self.v2_overlay());
+                                self.daemon.claim_ended(entry_top);
                                 report.v2_started.push(assignment);
 
                                 // §8 restack detection at claim (queue-v2-git
@@ -3344,6 +3431,11 @@ impl DriveLoop {
                         }
                     }
                 }
+            } else {
+                // No snapshot (absent, torn, unreadable): the standing park and
+                // walk-block sets below could not be reconciled this tick, so
+                // `dispatch` must not page from them (review 061 F5).
+                report.v2_read_failed = true;
             }
         } else {
         // Read this tick's queue snapshot ONCE, before the re-roll: BOTH the
@@ -4087,7 +4179,12 @@ impl DriveLoop {
         // so a later re-block pages immediately instead of being swallowed by a
         // still-running reminder backoff. Items still in the set keep their
         // identity, so the ladder keeps stepping.
-        let parked_items: Vec<&str> = report.parked.iter().map(|(_, part)| part.as_str()).collect();
+        // The v2 standing set rides the same reconcile (report 170): entries this
+        // loop parked, and the items that stop an entry's walk.
+        let mut parked_items: Vec<&str> =
+            report.parked.iter().map(|(_, part)| part.as_str()).collect();
+        parked_items.extend(self.v2_parks.keys().map(String::as_str));
+        parked_items.extend(self.v2_walk_blocked.values().map(String::as_str));
         self.dispatcher.reconcile_blocked(&parked_items);
         // A part the spin guard parked pages as a spin park (task 069) — its own
         // identity and text — for as long as it stays parked.
@@ -4112,17 +4209,39 @@ impl DriveLoop {
                     .notify(&NotifyEvent::BlockedOnHuman { item: alert.clone() }, now);
             }
         }
-        for a in &report.v2_parked {
-            self.dispatcher
-                .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
+        // Every tick, like the legacy parked set: the dispatcher's ladder keeps a
+        // standing park to one page per window, and a re-block pages afresh.
+        //
+        // A tick with no snapshot (F5) pages no STANDING identity: the sets were
+        // not reconciled, so a block the human resolved meanwhile would page on
+        // the ladder. Their identities stay in `reconcile_blocked` above, so a
+        // block that is still standing after the outage does not page afresh.
+        // A park made this tick (`v2_parked`) is new, not stale, and pages.
+        for (entry, spin) in &self.v2_parks {
+            if report.v2_read_failed && !report.v2_parked.iter().any(|a| &a.entry == entry) {
+                continue;
+            }
+            let event = match *spin {
+                Some((sessions, dirty)) => NotifyEvent::SpinGuardParked {
+                    item: entry.clone(),
+                    sessions,
+                    dirty,
+                },
+                None => NotifyEvent::BlockedOnHuman { item: entry.clone() },
+            };
+            self.dispatcher.notify(&event, now);
         }
         // V1: a restack withheld over an upstream-tracking branch needs the human.
         for what in &report.v2_restack_blocked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: what.clone() }, now);
         }
-        // §2: a walk stopped at a human-`blocked` item (review R3).
-        for at in &report.v2_walk_blocked {
+        // §2: a walk stopped at a human-`blocked` item (review R3), standing so
+        // the ladder reminds and an un-block then re-block pages again.
+        for at in self.v2_walk_blocked.values() {
+            if report.v2_read_failed {
+                break;
+            }
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: at.clone() }, now);
         }
@@ -4436,6 +4555,7 @@ impl DriveLoop {
                     claimed: e.claimed.clone(),
                     parent: e.parent.clone(),
                     base: e.base.clone(),
+                    auto_restack: e.auto_restack,
                 })
                 .collect();
             if entries.is_empty() {
@@ -4530,6 +4650,7 @@ impl DriveLoop {
                 claimed: e.claimed.clone(),
                 parent: e.parent.clone(),
                 base: e.base.clone(),
+                auto_restack: e.auto_restack,
             })
             .collect();
         // Fresh reads: this runs after a restack the loop was told about, and
@@ -4869,7 +4990,8 @@ fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
 ///
 /// The §8 base line (queue-v2-git slice 002): a first claim passes the CONCRETE
 /// `(branch, base)` (computed by [`crate::first_claim`]) so the seeded baton
-/// reads `create <branch> from <base>`. A resume or a branchless entry (a
+/// reads `create <branch> from <base>` (`resume <branch>` when the branch
+/// already exists, report 171). A resume or a branchless entry (a
 /// restack) passes `None` and a seed carries no line. A first claim that finds a
 /// baton is a retry: the earlier attempt's seed gets this attempt's values,
 /// because they are what this claim records (V18).
@@ -4878,7 +5000,7 @@ fn copy_entry_baton(
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
-    base_line: Option<(&str, &str)>,
+    base_line: Option<FirstStep<'_>>,
 ) -> Result<Option<Handoff>, String> {
     let (baton, handoff) = match entries.read(entry_top) {
         Some(stored) => {
@@ -4886,8 +5008,8 @@ fn copy_entry_baton(
             // rewrites it: that write is the session's, this one is ours.
             let handoff = entries.mtime(entry_top).map(Handoff::At);
             let baton = match base_line {
-                Some((branch, base)) => {
-                    let baton = with_base_line(&stored, branch, base);
+                Some(step) => {
+                    let baton = with_base_line(&stored, step);
                     entries.write(entry_top, &baton)?;
                     baton
                 }
@@ -10078,6 +10200,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 pending: None,
                 fleet: true,
                 not_before: None,
+                auto_restack: true,
                 holder: None,
                 models: None,
             }],
@@ -10309,6 +10432,356 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r3 = loop_.tick(3);
         assert_eq!(r3.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
         assert_eq!(*parker.parked.lock().unwrap(), ["m1"]);
+    }
+
+    /// A v2 member with one entry, claimed and live, on a clean repo: the shared
+    /// setup for report 170's page tests. Returns the loop, the entry source, the
+    /// backend and the probe.
+    fn v2_park_page_rig(
+        name: &str,
+    ) -> (DriveLoop, FakeV2Source, Arc<FakeFleet>, Probe, Arc<ScriptedRepo>) {
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+        let source = FakeV2Source::with(snapshot(EntryStatus::Queued));
+        let (loop_, _d, backend, probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir(name),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set("h1", 0, 0);
+        loop_.tick(0); // a1 claims m1
+        source.set(snapshot(EntryStatus::Active));
+        (loop_, source, backend, probe, repo)
+    }
+
+    /// Report 170 — a v2 spin park pages as a spin park (069's text, the entry's
+    /// own identity), never as "blocked on a human decision".
+    #[test]
+    fn a_v2_spin_park_pages_as_a_spin_not_a_human_block() {
+        let (mut loop_, _source, backend, probe, _repo) = v2_park_page_rig("r170-spin");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "compile it (can't fix)");
+        assert!(loop_.tick(1).v2_parked.is_empty(), "the first repeat only arms the streak");
+        let r2 = loop_.tick(2);
+        assert_eq!(r2.v2_parked.iter().map(|a| a.entry.as_str()).collect::<Vec<_>>(), ["m1"]);
+        let lines = alert_lines(&probe);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("`m1` stuck (spin guard): 2 sessions ended"), "{lines:?}");
+        assert!(!lines[0].contains("blocked on a human decision"), "{lines:?}");
+    }
+
+    /// Report 170 — a member-declared v2 block is a human decision; blocked,
+    /// un-blocked, blocked again pages twice (the first identity was reconciled
+    /// away when the entry left `blocked`), and while it stands nothing re-pages.
+    #[test]
+    fn a_v2_block_unblock_reblock_pages_twice() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("r170-reblock");
+        let human = "growlightd alert: `m1` is blocked on a human decision".to_string();
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(1).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        assert_eq!(alert_lines(&probe), vec![human.clone()]);
+        loop_.tick(2);
+        loop_.tick(3);
+        assert_eq!(alert_lines(&probe).len(), 1, "a standing block stays quiet");
+
+        // The human un-blocks it; a1 re-claims and blocks on it again.
+        source.set(snapshot(EntryStatus::Queued));
+        loop_.tick(4);
+        assert!(loop_.v2_parks.is_empty(), "the park left with the block");
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(5).v2_parked.len(), 1);
+        assert_eq!(alert_lines(&probe), vec![human.clone(), human]);
+    }
+
+    /// Report 170 — the 071 ladder runs on v2: a standing block pages once inside
+    /// the first 30-minute window, then reminds.
+    #[test]
+    fn a_standing_v2_block_pages_once_over_the_first_window() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("r170-window");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        loop_.tick(100);
+        source.set(v2_milestone("m1", EntryStatus::Blocked, "001", None));
+        for now in [101, 600, 1200, 1899] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "once inside the 30-minute window");
+        loop_.tick(1900);
+        assert_eq!(alert_lines(&probe).len(), 2, "the first reminder lands at 30 minutes");
+    }
+
+    /// Review 061 F5 — a snapshot read that fails freezes the standing park set,
+    /// and dispatch used to keep paging it on the 071 ladder: a block the human
+    /// resolved during the outage re-paged at 30 minutes and 2 hours. Now the
+    /// outage is quiet, the resolved block is forgotten at the next good read,
+    /// and a re-block after recovery pages exactly once.
+    #[test]
+    fn a_v2_snapshot_outage_does_not_replay_a_resolved_park_page() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("f5-outage");
+        let human = "growlightd alert: `m1` is blocked on a human decision".to_string();
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(100).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        loop_.tick(101);
+        assert_eq!(alert_lines(&probe), vec![human.clone()]);
+
+        // queue.toml goes unparseable for over two hours. The ladder's 30-minute
+        // and 2-hour reminders must not fire from the frozen set.
+        source.failed.store(true, Ordering::SeqCst);
+        for now in [200, 1900, 3600, 7400] {
+            assert!(loop_.tick(now).v2_read_failed, "tick {now} read no snapshot");
+        }
+        assert_eq!(alert_lines(&probe), vec![human.clone()], "an outage pages nothing");
+
+        // The human resolved the block meanwhile; the next good read forgets it.
+        source.set(snapshot(EntryStatus::Queued));
+        let recovered = loop_.tick(7500);
+        assert!(!recovered.v2_read_failed);
+        assert!(loop_.v2_parks.is_empty(), "the resolved park left with the block");
+        assert_eq!(alert_lines(&probe).len(), 1, "recovery pages nothing either");
+
+        // A re-block after recovery is a new incident and pages once.
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(7600).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        loop_.tick(7601);
+        assert_eq!(alert_lines(&probe), vec![human.clone(), human]);
+    }
+
+    /// Review 061 F5 — the same for a walk stopped at a blocked slice: the
+    /// standing `v2_walk_blocked` set does not page through an outage.
+    #[test]
+    fn a_v2_snapshot_outage_does_not_replay_a_walk_block_page() {
+        let blocked = || {
+            let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+            snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Blocked;
+            snapshot
+        };
+        let source = FakeV2Source::with(blocked());
+        let (mut loop_, _d, _backend, probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir("f5-walk"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let walk = "growlightd alert: `m1:001` is blocked on a human decision".to_string();
+
+        loop_.tick(100);
+        assert_eq!(alert_lines(&probe), vec![walk.clone()]);
+        source.failed.store(true, Ordering::SeqCst);
+        for now in [1900, 7400] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "an outage pages nothing");
+
+        // Resolved during the outage, re-blocked after: one fresh page.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        loop_.tick(7500);
+        source.set(blocked());
+        loop_.tick(7600);
+        assert_eq!(alert_lines(&probe), vec![walk.clone(), walk]);
+    }
+
+    /// Review 061 F5 — a park made on a tick that read no snapshot is new, not
+    /// stale: it pages once, stays quiet through the outage, and does not
+    /// page again when the next good read confirms the entry `blocked`.
+    #[test]
+    fn a_park_made_during_a_snapshot_outage_pages_once() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("f5-park-in-outage");
+        source.failed.store(true, Ordering::SeqCst);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(100).v2_parked.len(), 1);
+        for now in [200, 900] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "paged at the park, quiet after");
+        source.set(v2_milestone("m1", EntryStatus::Blocked, "001", None));
+        loop_.tick(1000); // still inside the ladder's first 30-minute window
+        assert_eq!(alert_lines(&probe).len(), 1, "the confirming read does not re-page");
+        assert_eq!(loop_.v2_parks.len(), 1, "the park stands");
+    }
+
+    /// Report 169 — the v2 fallback reservation, end to end: `a` is pinned to an
+    /// empty project and falls back, `b` is pinned to `softfig` and is free. The
+    /// entry in `softfig` goes to `b` whatever the roster order, and `a` idles.
+    #[test]
+    fn v2_mode_a_fallback_member_never_takes_a_project_its_free_pinned_member_can() {
+        let pinned = |id: &str, pin: &str| {
+            FleetMember::pinned(spec(id), pin).with_backend(crate::fleet::MemberBackend::Opencode(
+                crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+            ))
+        };
+        for roster in [["a", "b"], ["b", "a"]] {
+            let fleet = roster
+                .iter()
+                .map(|id| pinned(id, if *id == "a" { "empty" } else { "softfig" }))
+                .collect();
+            let (mut loop_, _d, backend, _probe) = make_v2(
+                fleet,
+                FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+                v2_entries_dir(&format!("reserve-{}", roster.join(""))),
+                Arc::new(FakeV2Claimer::default()),
+                Arc::new(FakeV2Parker::default()),
+                Policy::default(),
+            );
+            let r = loop_.tick(0);
+            assert_eq!(
+                r.v2_started.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+                ["b"],
+                "roster {roster:?}: only the pinned member starts",
+            );
+            assert_eq!(backend.spawns(), vec!["b"], "roster {roster:?}");
+        }
+    }
+
+    /// Two entries in `softfig`, as `(id, lane, status)`, each with one queued
+    /// slice, for the reservation tests (review 061 F4).
+    fn v2_softfig_entries(rows: [(&str, Lane, EntryStatus); 2]) -> V2Snapshot {
+        let [(id1, lane1, status1), (id2, lane2, status2)] = rows;
+        let mut snapshot = v2_milestone(id1, status1, "001", None);
+        snapshot.entries[0].lane = lane1;
+        let mut second = v2_milestone(id2, status2, "001", None);
+        second.entries[0].lane = lane2;
+        snapshot.entries.append(&mut second.entries);
+        snapshot.trees.append(&mut second.trees);
+        snapshot
+    }
+
+    /// `a` is pinned to an empty project and falls back; `b` is pinned to
+    /// `softfig`.
+    fn v2_reservation_fleet() -> Vec<FleetMember> {
+        let pinned = |id: &str, pin: &str| {
+            FleetMember::pinned(spec(id), pin).with_backend(crate::fleet::MemberBackend::Opencode(
+                crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+            ))
+        };
+        vec![pinned("a", "empty"), pinned("b", "softfig")]
+    }
+
+    /// Review 061 F4 (a) — `b` handed off with `continues` (`v2_rolled`) and its
+    /// next spawn is rate-limit-held, so step 3 skips it every tick. It cannot
+    /// start, so it reserves nothing: `softfig`'s urgent `e2` goes to `a` rather
+    /// than waiting out the quota window.
+    #[test]
+    fn v2_mode_a_held_rolled_member_does_not_reserve_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("e1", Lane::Normal, EntryStatus::Active),
+            ("e2", Lane::Urgent, EntryStatus::Queued),
+        ]));
+        let (loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source,
+            v2_entries_dir("reserve-held-roll"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+        holds.lock().unwrap().extend("slot-b", 10_000);
+        let mut loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[
+                ("a", &["slot-a"]),
+                ("b", &["slot-b"]),
+            ])))
+            .with_rate_limit_holds(holds);
+        loop_.v2_rolled.insert("b".into(), "e1".into());
+
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("a", "e2")],
+            "the held member's project is open to a fallback",
+        );
+        assert_eq!(backend.spawns(), vec!["a"]);
+    }
+
+    /// Review 061 F4 (b) — `b` is live on `softfig`'s urgent `u`; the normal `n`
+    /// beside it is not blocked by `u` (the repo rule is normal-lane only). A
+    /// member merely live on an entry is busy, not exiting, so `a` takes `n` on
+    /// the next tick. While `b` was still free, the first tick reserves the
+    /// project for it.
+    #[test]
+    fn v2_mode_a_member_live_on_an_urgent_entry_does_not_reserve_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("u", Lane::Urgent, EntryStatus::Queued),
+            ("n", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source.clone(),
+            v2_entries_dir("reserve-live-urgent"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let first = loop_.tick(0);
+        assert_eq!(
+            first.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("b", "u")],
+            "free and pinned, b takes the urgent entry; a is held off softfig",
+        );
+
+        source.set(v2_softfig_entries([
+            ("u", Lane::Urgent, EntryStatus::Active),
+            ("n", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let second = loop_.tick(1);
+        assert_eq!(
+            second.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("a", "n")],
+            "b is busy on u and reserves nothing, so a takes n",
+        );
+        assert_eq!(backend.spawns(), vec!["b", "a"]);
+    }
+
+    /// Review 061 F4, the guard on the narrowing — a member that just rolled off
+    /// `e1` with `continues` (still terminating, so registered) and CAN start
+    /// still reserves its project: `e2` waits for it, not for `a`.
+    #[test]
+    fn v2_mode_a_rolled_member_that_can_start_still_reserves_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("e1", Lane::Urgent, EntryStatus::Queued),
+            ("e2", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source.clone(),
+            v2_entries_dir("reserve-rolled"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        assert_eq!(loop_.tick(0).v2_started.len(), 1, "b starts on e1");
+        // The handshake's bookkeeping: b keeps e1 (rolled), the entry stays active.
+        loop_.v2_assignments.remove("b");
+        loop_.v2_rolled.insert("b".into(), "e1".into());
+        source.set(v2_softfig_entries([
+            ("e1", Lane::Urgent, EntryStatus::Active),
+            ("e2", Lane::Normal, EntryStatus::Queued),
+        ]));
+
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "a must not take e2: {:?}", r.v2_started);
+        assert_eq!(backend.spawns(), vec!["b"]);
     }
 
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
@@ -10626,6 +11099,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 pending: None,
                 fleet: true,
                 not_before: None,
+                auto_restack: true,
                 holder: None,
                 models: None,
             }],
@@ -11523,6 +11997,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                     claimed: "2026-10-14T00:01:00Z".into(),
                     follow_ups: 0,
                     pending_status: None,
+                    auto_restack: true,
                     fleet: true,
                     not_before: None,
                 }],
@@ -11703,9 +12178,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
         /// `queue.toml` with these rows, all in project `softfig`.
         fn queue(&self, entries: Vec<Entry>) {
+            self.queue_in(&self.repo, entries);
+        }
+        /// [`Self::queue`] with project `softfig` naming `repo`.
+        fn queue_in(&self, repo: &Path, entries: Vec<Entry>) {
             let project = Project {
                 name: "softfig".into(),
-                repo: self.repo.display().to_string(),
+                repo: repo.display().to_string(),
                 main: "main".into(),
             };
             self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());
@@ -11765,6 +12244,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             },
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         }
@@ -12061,6 +12541,69 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(baton, seeded.replace(&old, &new), "only the line changes");
         let writes = backend.member_writes();
         assert_eq!(writes.last().unwrap().1, baton, "the member boots from the rewritten baton");
+    }
+
+    /// Report 171: the entry's branch already exists with work on it. The first
+    /// claim records the merge-base and seeds `resume <branch>` — never `create`,
+    /// which would invite a `checkout -B` over the branch's commits.
+    #[test]
+    fn v2_a_first_claim_of_an_existing_branch_seeds_resume_not_create() {
+        let garden = TestGarden::new("existing-branch");
+        let base = garden.main_tip();
+        for args in [&["checkout", "-q", "-b", "feat/m1"][..], &["commit", "-q", "--allow-empty", "-m", "work"][..], &["checkout", "-q", "main"][..]] {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(&garden.repo)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        garden.advance_main();
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "{r:?}");
+        assert_eq!(
+            claimer.bases.lock().unwrap().last(),
+            Some(&Some(base)),
+            "the claim records the branch's merge-base with main",
+        );
+        let baton = std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap();
+        assert!(baton.contains("# FIRST STEP\nresume feat/m1\n"), "{baton}");
+        assert!(!baton.contains("create "), "no create line: {baton}");
+        assert_eq!(backend.member_writes().last().unwrap().1, baton);
+    }
+
+    /// Report 171: a project whose repo is not a git repo fails the claim with a
+    /// reason that names the entry and the path, and backs off like any failed
+    /// claim — no spawn, and no claim written.
+    #[test]
+    fn v2_a_first_claim_in_a_non_repo_project_names_it_and_backs_off() {
+        let garden = TestGarden::new("non-repo");
+        let plain = garden.root.join("not-a-repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        garden.queue_in(&plain, vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, _d, backend, claimer, _parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_claim_failures.len(), 1, "{r:?}");
+        let f = &r.v2_claim_failures[0];
+        assert!(f.reason.contains("m1"), "{}", f.reason);
+        assert!(f.reason.contains(&plain.display().to_string()), "{}", f.reason);
+        assert!(f.reason.contains("not a git repository"), "{}", f.reason);
+        assert!(claimer.bases.lock().unwrap().is_empty(), "nothing was claimed");
+        assert_eq!(backend.spawn_count(), 0);
+
+        let r = loop_.tick(1);
+        assert!(r.v2_claim_failures.is_empty(), "backing off, not retried every tick: {r:?}");
     }
 
     /// V18: a restack has no branch, so its seed tells the session to create

@@ -47,7 +47,7 @@ pub use member_verbs::{
 #[cfg(test)]
 pub(crate) use v2::write::tests::unlocked;
 pub use queue_verbs::{
-    queue_add_entry, queue_add_project, queue_drop, queue_update_entry, queue_v2_enqueue_restack,
+    queue_add_entry, queue_add_project, queue_drop, queue_set_project_repo, queue_update_entry, queue_v2_enqueue_restack,
     slice_insert, slice_update,
 };
 pub use reports::{file_report, list_reports, update_report};

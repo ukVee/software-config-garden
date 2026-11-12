@@ -144,6 +144,10 @@ pub struct EntryView {
     /// a `queued` entry is not claimed before it. Kept raw, so a malformed
     /// value reaches the pick and holds (fail closed) rather than vanishing.
     pub not_before: Option<String>,
+    /// `false` holds the entry's branch out of the automatic restack (§8, review
+    /// 061 F1): a first claim that resumed an existing branch wrote it. The pick
+    /// ignores it; restack detection and the re-record read it. Default `true`.
+    pub auto_restack: bool,
     /// Who holds the entry. An `active` entry → the running member, or `None`
     /// when no running member holds it (an orphan any member resumes); a
     /// `paused` entry → the member that paused it (the step-2 resume
@@ -287,6 +291,10 @@ pub enum SkipReason {
     /// not an item whose `> Not before:` has arrived (growlight-schedule
     /// §3.10).
     Schedule,
+    /// The fallback leaves this project to the member pinned to it, who is
+    /// free (or exiting it) this tick and can take it (§2 fallback
+    /// reservation, report 169).
+    Reserved,
 }
 
 impl SkipReason {
@@ -309,6 +317,7 @@ impl SkipReason {
             SkipReason::NotYet => "not_yet",
             SkipReason::BadStartTime => "bad_start_time",
             SkipReason::Schedule => "schedule",
+            SkipReason::Reserved => "reserved",
         }
     }
 
@@ -369,6 +378,9 @@ impl SkipReason {
             }
             SkipReason::Schedule => {
                 "the schedule holds this member, and this is not a due timed item"
+            }
+            SkipReason::Reserved => {
+                "its project's own pinned member is free to take it, so the fallback leaves it (§2)"
             }
         }
     }
@@ -700,12 +712,15 @@ fn record(reasons: &mut [Option<SkipReason>], index: usize, reason: SkipReason) 
 /// Scan one lane in file order and take the first eligible entry; every
 /// examined entry that is not taken gets its reason recorded. `pin` restricts
 /// the scan to the pinned project (steps 1/3 — entries outside it record
-/// [`SkipReason::NotPinned`]); `None` is the unfiltered fallback scan (step 4).
+/// [`SkipReason::NotPinned`]); `None` is the unfiltered fallback scan (step 4),
+/// which leaves every `reserved` project to its own pinned member
+/// ([`SkipReason::Reserved`]).
 fn scan_lane(
     snapshot: &V2Snapshot,
     member: &Member,
     lane: Lane,
     pin: Option<&str>,
+    reserved: &BTreeSet<String>,
     reasons: &mut [Option<SkipReason>],
 ) -> Option<(usize, Unit, Option<ModelList>)> {
     for (index, entry) in snapshot.entries.iter().enumerate() {
@@ -717,6 +732,10 @@ fn scan_lane(
                 record(reasons, index, SkipReason::NotPinned);
                 continue;
             }
+        if pin.is_none() && reserved.contains(&entry.project) {
+            record(reasons, index, SkipReason::Reserved);
+            continue;
+        }
         match eligible(snapshot, member, entry) {
             Ok((unit, models)) => return Some((index, unit, models)),
             Err(reason) => record(reasons, index, reason),
@@ -740,6 +759,19 @@ fn scan_lane(
 /// next handshake (§9), pinned or not; step 4 then has nothing left to add.
 /// `None` when nothing is workable for this member anywhere.
 pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
+    pick_v2_reserving(snapshot, member, &BTreeSet::new())
+}
+
+/// [`pick_v2`] with the fallback reservation (§2, report 169): step 4 skips
+/// every project in `reserved`, the projects whose own pinned member is free
+/// (or just rolled off an entry) this tick — see [`reserved_projects`]. A
+/// member's pinned scans (steps 1/3) ignore the set, so a member always
+/// reaches its own project.
+pub fn pick_v2_reserving(
+    snapshot: &V2Snapshot,
+    member: &Member,
+    reserved: &BTreeSet<String>,
+) -> PickOutcome {
     let mut reasons: Vec<Option<SkipReason>> = vec![None; snapshot.entries.len()];
     // 1. Urgent lane, pinned project (every project for an unpinned member).
     let mut picked: Option<(usize, Unit, Option<ModelList>)> = scan_lane(
@@ -747,6 +779,7 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
         member,
         Lane::Urgent,
         member.pin.as_deref(),
+        reserved,
         &mut reasons,
     );
 
@@ -800,6 +833,7 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
             member,
             Lane::Normal,
             member.pin.as_deref(),
+            reserved,
             &mut reasons,
         );
     }
@@ -807,10 +841,10 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
     // 4. Fallback: repeat 1 and 3 with no pin filter (an unpinned member's
     // steps 1/3 already had none).
     if picked.is_none() && member.pin.is_some() {
-        picked = scan_lane(snapshot, member, Lane::Urgent, None, &mut reasons);
+        picked = scan_lane(snapshot, member, Lane::Urgent, None, reserved, &mut reasons);
     }
     if picked.is_none() && member.pin.is_some() {
-        picked = scan_lane(snapshot, member, Lane::Normal, None, &mut reasons);
+        picked = scan_lane(snapshot, member, Lane::Normal, None, reserved, &mut reasons);
     }
 
     if let Some((index, _, _)) = &picked {
@@ -832,6 +866,55 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
         declared,
     });
     PickOutcome { picked, skips }
+}
+
+/// The projects a fallback must leave alone this tick (§2, report 169; the v2
+/// twin of 068's legacy reservation, `de47894`): a project is reserved while a
+/// member pinned to it is
+///
+/// - `free`: able to start this tick (not held, retiring, or already running)
+///   and its own pick lands in that project, or
+/// - `exiting`: just rolled off an entry there with a handoff (`continues`) and
+///   able to start this tick, so the entry's next unit is its to resume.
+///
+/// A pinned member busy on another project reserves nothing, and an unpinned
+/// member never does. Neither does one that cannot start this tick (held by a
+/// rate limit or the schedule, retiring, stopped) or one that is merely live on
+/// an entry in P: the caller leaves those out, so a hold or an urgent entry
+/// does not keep P's other entries from a fallback member (review 061 F4).
+/// Because every member's reservation is computed before any member's fallback
+/// runs, the verdict does not depend on roster order.
+pub fn reserved_projects(
+    snapshot: &V2Snapshot,
+    free: &[&Member],
+    exiting: &[(&Member, &str)],
+) -> BTreeSet<String> {
+    let mut reserved = BTreeSet::new();
+    for member in free {
+        let Some(pin) = member.pin.as_deref() else {
+            continue;
+        };
+        let lands_in_pin = pick_v2(snapshot, member)
+            .picked
+            .and_then(|pick| snapshot.entries.iter().find(|e| e.id == pick.entry))
+            .is_some_and(|e| e.project == pin);
+        if lands_in_pin {
+            reserved.insert(pin.to_string());
+        }
+    }
+    for (member, entry) in exiting {
+        let Some(pin) = member.pin.as_deref() else {
+            continue;
+        };
+        if snapshot
+            .entries
+            .iter()
+            .any(|e| e.id == *entry && e.project == pin)
+        {
+            reserved.insert(pin.to_string());
+        }
+    }
+    reserved
 }
 
 #[cfg(test)]
@@ -863,6 +946,7 @@ mod tests {
             pending: None,
             fleet: true,
             not_before: None,
+            auto_restack: true,
             holder: None,
             models: None,
         }
@@ -2691,6 +2775,100 @@ mod tests {
 
             assert_eq!(pick_v2(&both, &member("m")).picked, None);
         }
+    }
+
+    /// Report 169: A (pinned to an empty project) must not fall back onto the
+    /// entry of P while B, pinned to P, is free to take it — whatever the
+    /// roster order.
+    fn two_projects_one_entry() -> V2Snapshot {
+        let mut e = entry("e");
+        e.project = "p".into();
+        let mut snapshot = snap(
+            vec![
+                project("empty", "~/projects/empty"),
+                project("p", "~/projects/p"),
+            ],
+            vec![e],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        snapshot
+    }
+
+    fn pinned(id: &str, pin: &str) -> Member {
+        Member {
+            pin: Some(pin.into()),
+            ..member(id)
+        }
+    }
+
+    /// The drive loop's tick in miniature: reserve, then each member in roster
+    /// order takes its pick unless an earlier member already did.
+    fn tick(snapshot: &V2Snapshot, roster: &[&Member]) -> BTreeMap<String, String> {
+        let reserved = reserved_projects(snapshot, roster, &[]);
+        let mut taken = BTreeMap::new();
+        for m in roster {
+            if let Some(pick) = pick_v2_reserving(snapshot, m, &reserved).picked
+                && !taken.values().any(|e| *e == pick.entry)
+            {
+                taken.insert(m.id.clone(), pick.entry);
+            }
+        }
+        taken
+    }
+
+    #[test]
+    fn a_fallback_member_never_outruns_the_free_member_pinned_to_the_project() {
+        let snapshot = two_projects_one_entry();
+        let (a, b) = (pinned("a", "empty"), pinned("b", "p"));
+        for roster in [[&a, &b], [&b, &a]] {
+            let taken = tick(&snapshot, &roster);
+            assert_eq!(taken.get("b").map(String::as_str), Some("e"), "{roster:?}");
+            assert_eq!(taken.get("a"), None, "{roster:?}");
+        }
+        // Without the reservation the roster order decides: the bug.
+        let plain = pick_v2(&snapshot, &a);
+        assert_eq!(plain.picked.map(|p| p.entry), Some("e".to_string()));
+    }
+
+    #[test]
+    fn the_reserved_project_is_reported_as_a_reserved_skip() {
+        let snapshot = two_projects_one_entry();
+        let reserved = BTreeSet::from(["p".to_string()]);
+        let outcome = pick_v2_reserving(&snapshot, &pinned("a", "empty"), &reserved);
+        assert_eq!(outcome.picked, None);
+        assert_eq!(reason_for(&outcome, "e"), Some(SkipReason::Reserved));
+        assert_eq!(SkipReason::Reserved.as_str(), "reserved");
+        // The pinned member itself is not held back by its own reservation.
+        assert!(pick_v2_reserving(&snapshot, &pinned("b", "p"), &reserved).picked.is_some());
+    }
+
+    #[test]
+    fn a_pinned_member_with_no_work_in_its_project_reserves_nothing() {
+        // Neither member has work in its own project, so nothing is reserved and
+        // P's entry goes to the first fallback in roster order, not stranded: the
+        // reservation holds only for a member who can use it.
+        let snapshot = two_projects_one_entry();
+        let (a, b) = (pinned("a", "empty"), pinned("b", "also-empty"));
+        for roster in [[&a, &b], [&b, &a]] {
+            assert!(reserved_projects(&snapshot, &roster, &[]).is_empty());
+            let taken = tick(&snapshot, &roster);
+            assert_eq!(taken.get(&roster[0].id).map(String::as_str), Some("e"));
+        }
+    }
+
+    #[test]
+    fn an_unpinned_member_reserves_nothing_and_a_busy_one_reserves_only_its_own_entry_project() {
+        let snapshot = two_projects_one_entry();
+        let unpinned = member("u");
+        assert!(reserved_projects(&snapshot, &[&unpinned], &[]).is_empty());
+        // A pinned member held on another project's entry reserves nothing for
+        // P; one exiting an entry in P reserves P even with nothing else queued.
+        let b = pinned("b", "p");
+        assert!(reserved_projects(&snapshot, &[], &[(&b, "elsewhere")]).is_empty());
+        assert_eq!(
+            reserved_projects(&snapshot, &[], &[(&b, "e")]),
+            BTreeSet::from(["p".to_string()]),
+        );
     }
 
     #[test]

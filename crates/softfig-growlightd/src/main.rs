@@ -13,6 +13,7 @@ use softfig_growlightd::baton_store::{runtime_entries_dir, FsEntryBatonStore};
 use softfig_growlightd::claim::KeeperdV2Keeper;
 use softfig_growlightd::fleet::garden_tag;
 use softfig_growlightd::member_handoff::HandoffSeams;
+use softfig_growlightd::singleton::InstanceLock;
 use softfig_growlightd::telemetry_capture::TelemetrySink;
 use softfig_growlightd::{
     garden_root_via_keeperd, load_fleet_config, reconcile_on_boot, spawn_bus_tailer, spawn_fleet,
@@ -52,6 +53,13 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // One growlightd per socket, decided before anything else: `Daemon::start`
+    // unlinks and re-binds the socket and `reconcile_on_boot` requeues every
+    // `active` entry it sees no holder for, so a second instance must not get as
+    // far as either (review 061 F3). The kernel drops the lock on any exit.
+    let socket = cli.socket.unwrap_or_else(growlightd_runtime_socket_path);
+    let _instance_lock = InstanceLock::acquire(&socket)?;
+
     // Derive the garden root the same way `softfig growlight start` does — a
     // read-only keeperd `status`, never a literal path (spec §2/§12). An
     // explicit `--garden-root` short-circuits it.
@@ -62,7 +70,6 @@ fn main() -> Result<()> {
             .context("deriving garden root from keeperd")?,
     };
 
-    let socket = cli.socket.unwrap_or_else(growlightd_runtime_socket_path);
     let mut policy = Policy::default();
     if let Some(n) = cli.max_concurrent_agents {
         policy.max_concurrent_agents = n;
@@ -119,10 +126,12 @@ fn main() -> Result<()> {
     // synchronously here, so the reset always completes before the loop's first
     // `pick()`. Two steps: SIGKILL stray `growlight-agent-*.scope` units from a prior
     // generation, then reset every orphaned-`active` item (no live holder exists
-    // post-restart) to `queued` so the scheduler can re-pick it. Gate off ⇒ skipped,
+    // post-restart) to `queued` so the scheduler can re-pick it — under
+    // `queue = "v2"` that includes every `active` entry of `queue.toml` (report
+    // 172), which the legacy snapshot never held. Gate off ⇒ skipped,
     // so growlightd stays byte-identical to today when disarmed.
     if fleet_config.enabled {
-        reconcile_on_boot(&keeperd_socket);
+        reconcile_on_boot(&keeperd_socket, &garden_root, fleet_config.queue);
     }
 
     // Token telemetry (token-telemetry-p1 slice 004): installed before

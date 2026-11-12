@@ -25,6 +25,13 @@
 //!    by definition, so this is unconditional at boot — NOT a running-time reaper
 //!    (no liveness check; there is no live state left to check against).
 //!
+//! 3. **Reap the v2 queue** (report 172). Under `queue = "v2"` the claim is a row of
+//!    `queue.toml`, which step 2 never reads. Every `active` entry goes back to its
+//!    `pending_status` if one is recorded, else to `queued`, through keeperd's
+//!    `queue_v2_set_status` — the op applies the pending change itself, exactly as
+//!    at a handshake. Same reasoning as step 2: post-restart nothing holds an
+//!    `active` entry. A failed read of the v2 files skips the step.
+//!
 //! Ordering is the crux: [`reconcile_on_boot`] runs synchronously and returns
 //! before `main` spawns the drive-loop thread, so the reset always completes before
 //! the first [`pick`](crate::scheduler::pick) — the loop can never race it.
@@ -44,8 +51,12 @@ use std::process::{Command, Stdio};
 
 use crate::claim::write_item_status;
 use crate::agent_harness::scope_kill_argv;
+use crate::fleet::QueueMode;
 use crate::queue_source::{parse_snapshot, BacklogReader, KeeperdBacklogReader};
 use crate::scheduler::{PartStatus, Snapshot};
+use softfig_ipc::queue_v2::EntryStatus;
+use softfig_ipc::verbs::{op, DaemonStatusArg, QueueV2SetStatusArgs, QueueV2SetStatusReply};
+use softfig_ipc::{call_reconnecting, Request, RetryPolicy};
 
 /// The status the reap writes: a dead `active` claim goes back to the ready pool.
 const REAP_STATUS: &str = "queued";
@@ -194,6 +205,70 @@ impl StatusResetter for KeeperdStatusResetter {
 }
 
 // ---------------------------------------------------------------------------
+// v2 reap: the `queue.toml` counterpart of the legacy reap above.
+// ---------------------------------------------------------------------------
+
+/// The seam the v2 reap reads and writes through: the `active` entries of the v2
+/// list, and the keeperd op that moves one off `active`. Production reads the
+/// mount and calls `queue_v2_set_status`; a test scripts both.
+pub(crate) trait V2Reaper: Send + Sync + fmt::Debug {
+    /// The ids of every `active` entry in the v2 list; empty when there is no v2
+    /// list yet. `Err` = the v2 files could not be read or did not validate.
+    fn active_entries(&self) -> Result<Vec<String>, String>;
+    /// Move one `active` entry to `queued`, or to its recorded `pending_status`
+    /// (the op applies it). Returns the status that landed.
+    fn requeue(&self, entry: &str) -> Result<String, String>;
+}
+
+/// Production [`V2Reaper`]: the same fail-closed read the drive loop schedules
+/// from ([`crate::v2_source::assemble`]) and an entry-level
+/// `queue_v2_set_status(entry, queued)` over keeperd's socket.
+#[derive(Debug, Clone)]
+struct KeeperdV2Reaper {
+    garden_root: PathBuf,
+    keeperd_socket: PathBuf,
+}
+
+impl V2Reaper for KeeperdV2Reaper {
+    fn active_entries(&self) -> Result<Vec<String>, String> {
+        match crate::v2_source::assemble(&self.garden_root) {
+            Ok(Some(snapshot)) => Ok(snapshot
+                .entries
+                .into_iter()
+                .filter(|e| e.status == EntryStatus::Active)
+                .map(|e| e.id)
+                .collect()),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn requeue(&self, entry: &str) -> Result<String, String> {
+        let args = serde_json::to_value(QueueV2SetStatusArgs {
+            entry: entry.to_string(),
+            unit: None,
+            new: DaemonStatusArg::Queued,
+        })
+        .map_err(|e| format!("encode queue_v2_set_status args: {e}"))?;
+        let req = Request::new(op::QUEUE_V2_SET_STATUS, args);
+        match call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default()) {
+            Ok(softfig_ipc::Response::Ok { data, .. }) => {
+                serde_json::from_value::<QueueV2SetStatusReply>(data)
+                    .map(|r| r.status)
+                    .map_err(|e| format!("decode queue_v2_set_status reply: {e}"))
+            }
+            Ok(softfig_ipc::Response::Err { kind, error, .. }) => {
+                Err(format!("keeperd refused ({kind:?}): {error}"))
+            }
+            Err(e) => Err(format!(
+                "queue_v2_set_status to keeperd at {} failed: {e}",
+                self.keeperd_socket.display()
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration.
 // ---------------------------------------------------------------------------
 
@@ -210,6 +285,13 @@ pub struct ReconcileReport {
     pub reset_failures: Vec<(String, String, String)>,
     /// A backlog-read failure that skipped the reap entirely (keeperd down / Locked).
     pub read_error: Option<String>,
+    /// `(entry, status)` for each v2 `active` entry moved off `active`; the status
+    /// is what landed (`queued`, or the entry's recorded `pending_status`).
+    pub v2_reset: Vec<(String, String)>,
+    /// `(entry, reason)` for each v2 move keeperd refused — logged, non-fatal.
+    pub v2_failures: Vec<(String, String)>,
+    /// A failure to read the v2 files, which skipped the v2 reap.
+    pub v2_read_error: Option<String>,
 }
 
 /// Run the two-step boot reconcile over injected seams (the tested core): kill stray
@@ -221,6 +303,7 @@ fn reconcile(
     scopes: &dyn ScopeKiller,
     reader: &dyn BacklogReader,
     resetter: &dyn StatusResetter,
+    v2: Option<&dyn V2Reaper>,
 ) -> ReconcileReport {
     let mut report = ReconcileReport::default();
 
@@ -246,6 +329,22 @@ fn reconcile(
         Err(reason) => report.read_error = Some(reason),
     }
 
+    // 3. Reap the v2 queue (report 172), only under `queue = "v2"`. Same
+    //    fail-closed shape: a failed read resets nothing.
+    if let Some(v2) = v2 {
+        match v2.active_entries() {
+            Ok(entries) => {
+                for entry in entries {
+                    match v2.requeue(&entry) {
+                        Ok(status) => report.v2_reset.push((entry, status)),
+                        Err(reason) => report.v2_failures.push((entry, reason)),
+                    }
+                }
+            }
+            Err(reason) => report.v2_read_error = Some(reason),
+        }
+    }
+
     report
 }
 
@@ -254,13 +353,18 @@ fn reconcile(
 /// synchronously (so it completes before the caller spawns the drive loop) and logs a
 /// one-line-per-effect summary. Best-effort — it never returns an error; a failure is
 /// logged and boot continues.
-pub fn reconcile_on_boot(keeperd_socket: &Path) {
+pub fn reconcile_on_boot(keeperd_socket: &Path, garden_root: &Path, queue: QueueMode) {
     let scopes = SystemctlScopeKiller;
     let reader = KeeperdBacklogReader::new(keeperd_socket.to_path_buf());
     let resetter = KeeperdStatusResetter {
         keeperd_socket: keeperd_socket.to_path_buf(),
     };
-    log_report(&reconcile(&scopes, &reader, &resetter));
+    let v2_reaper = KeeperdV2Reaper {
+        garden_root: garden_root.to_path_buf(),
+        keeperd_socket: keeperd_socket.to_path_buf(),
+    };
+    let v2 = (queue == QueueMode::V2).then_some(&v2_reaper as &dyn V2Reaper);
+    log_report(&reconcile(&scopes, &reader, &resetter, v2));
 }
 
 /// Emit the human-readable startup log for a [`ReconcileReport`] (nothing when the
@@ -278,6 +382,17 @@ fn log_report(report: &ReconcileReport) {
     }
     for (queue, item, reason) in &report.reset_failures {
         eprintln!("softfig-growlightd: boot reconcile FAILED to reset {item} ({queue}): {reason}");
+    }
+    for (entry, status) in &report.v2_reset {
+        eprintln!("softfig-growlightd: boot reconcile reset orphaned-active v2 entry {entry} -> {status}");
+    }
+    for (entry, reason) in &report.v2_failures {
+        eprintln!("softfig-growlightd: boot reconcile FAILED to reset v2 entry {entry}: {reason}");
+    }
+    if let Some(err) = &report.v2_read_error {
+        eprintln!(
+            "softfig-growlightd: boot reconcile skipped the v2 reap (queue files unreadable): {err}"
+        );
     }
     if let Some(err) = &report.read_error {
         eprintln!(
@@ -466,7 +581,7 @@ some-other.scope            loaded active running   unrelated
         };
         let resetter = SpyResetter { rec: Arc::clone(&rec), fail_ids: vec![] };
 
-        let report = reconcile(&scopes, &reader, &resetter);
+        let report = reconcile(&scopes, &reader, &resetter, None);
         assert_eq!(
             report.items_reset,
             vec![("default".to_string(), "m5b".to_string())],
@@ -492,7 +607,7 @@ some-other.scope            loaded active running   unrelated
         let reader = FakeReader { result: Ok(backlog_doc(&[("m5b", "active")])) };
         let resetter = SpyResetter { rec: Arc::clone(&rec), fail_ids: vec![] };
 
-        let report = reconcile(&scopes, &reader, &resetter);
+        let report = reconcile(&scopes, &reader, &resetter, None);
         assert_eq!(
             report.scopes_killed,
             vec![
@@ -521,7 +636,7 @@ some-other.scope            loaded active running   unrelated
         let reader = FakeReader { result: Err("keeperd Locked".to_string()) };
         let resetter = SpyResetter { rec: Arc::clone(&rec), fail_ids: vec![] };
 
-        let report = reconcile(&scopes, &reader, &resetter);
+        let report = reconcile(&scopes, &reader, &resetter, None);
         assert_eq!(report.scopes_killed.len(), 1, "the stray is still killed");
         assert!(report.items_reset.is_empty(), "no reap on a read failure — fail-closed");
         assert_eq!(report.read_error.as_deref(), Some("keeperd Locked"));
@@ -542,7 +657,7 @@ some-other.scope            loaded active running   unrelated
             fail_ids: vec!["m5b".to_string()],
         };
 
-        let report = reconcile(&scopes, &reader, &resetter);
+        let report = reconcile(&scopes, &reader, &resetter, None);
         assert_eq!(
             report.items_reset,
             vec![("default".to_string(), "other".to_string())],
@@ -563,8 +678,193 @@ some-other.scope            loaded active running   unrelated
         };
         let resetter = SpyResetter { rec: Arc::clone(&rec), fail_ids: vec![] };
 
-        let report = reconcile(&scopes, &reader, &resetter);
+        let report = reconcile(&scopes, &reader, &resetter, None);
         assert_eq!(report, ReconcileReport::default(), "nothing to do ⇒ empty report");
         assert!(rec.events().is_empty());
+    }
+
+    // ---- the v2 reap (report 172) ------------------------------------------
+
+    /// A scripted v2 list: the `active` ids it reports, and what `requeue` lands
+    /// per entry (the recorded `pending_status` a real keeperd applies).
+    #[derive(Debug)]
+    struct FakeV2 {
+        rec: Arc<Recorder>,
+        active: Result<Vec<String>, String>,
+        /// `entry -> landed status`; absent means `queued`.
+        pending: Vec<(String, String)>,
+        refuse: Vec<String>,
+    }
+    impl V2Reaper for FakeV2 {
+        fn active_entries(&self) -> Result<Vec<String>, String> {
+            self.active.clone()
+        }
+        fn requeue(&self, entry: &str) -> Result<String, String> {
+            if self.refuse.iter().any(|e| e == entry) {
+                return Err(format!("keeperd refused ({entry})"));
+            }
+            self.rec.record(format!("v2:{entry}"));
+            Ok(self
+                .pending
+                .iter()
+                .find(|(e, _)| e == entry)
+                .map_or_else(|| "queued".to_string(), |(_, s)| s.clone()))
+        }
+    }
+
+    fn v2_fixture(rec: &Arc<Recorder>, active: Result<Vec<&str>, &str>) -> FakeV2 {
+        FakeV2 {
+            rec: Arc::clone(rec),
+            active: active
+                .map(|v| v.into_iter().map(String::from).collect())
+                .map_err(String::from),
+            pending: vec![],
+            refuse: vec![],
+        }
+    }
+
+    fn quiet_legacy(rec: &Arc<Recorder>) -> (FakeScopeKiller, FakeReader, SpyResetter) {
+        (
+            FakeScopeKiller { units: vec![], rec: Arc::clone(rec) },
+            FakeReader { result: Ok(backlog_doc(&[])) },
+            SpyResetter { rec: Arc::clone(rec), fail_ids: vec![] },
+        )
+    }
+
+    #[test]
+    fn a_holder_less_active_v2_entry_goes_back_to_queued() {
+        let rec = Arc::new(Recorder::default());
+        let (scopes, reader, resetter) = quiet_legacy(&rec);
+        let v2 = v2_fixture(&rec, Ok(vec!["109"]));
+
+        let report = reconcile(&scopes, &reader, &resetter, Some(&v2));
+        assert_eq!(report.v2_reset, vec![("109".to_string(), "queued".to_string())]);
+        assert!(report.v2_failures.is_empty() && report.v2_read_error.is_none());
+        assert_eq!(rec.events(), vec!["v2:109".to_string()]);
+    }
+
+    #[test]
+    fn a_recorded_pending_status_is_the_one_that_lands() {
+        // keeperd's op applies the pending change; the report carries what it landed.
+        let rec = Arc::new(Recorder::default());
+        let (scopes, reader, resetter) = quiet_legacy(&rec);
+        let mut v2 = v2_fixture(&rec, Ok(vec!["109", "110"]));
+        v2.pending = vec![("109".to_string(), "deferred".to_string())];
+
+        let report = reconcile(&scopes, &reader, &resetter, Some(&v2));
+        assert_eq!(
+            report.v2_reset,
+            vec![
+                ("109".to_string(), "deferred".to_string()),
+                ("110".to_string(), "queued".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_v2_reap_runs_after_the_stray_scopes_are_killed() {
+        let rec = Arc::new(Recorder::default());
+        let scopes = FakeScopeKiller {
+            units: vec!["growlight-agent-a-0.scope".to_string()],
+            rec: Arc::clone(&rec),
+        };
+        let reader = FakeReader { result: Ok(backlog_doc(&[])) };
+        let resetter = SpyResetter { rec: Arc::clone(&rec), fail_ids: vec![] };
+        let v2 = v2_fixture(&rec, Ok(vec!["109"]));
+
+        reconcile(&scopes, &reader, &resetter, Some(&v2));
+        assert_eq!(
+            rec.events(),
+            vec!["kill:growlight-agent-a-0.scope".to_string(), "v2:109".to_string()],
+        );
+    }
+
+    #[test]
+    fn an_unreadable_v2_list_resets_nothing_and_says_why() {
+        let rec = Arc::new(Recorder::default());
+        let (scopes, reader, resetter) = quiet_legacy(&rec);
+        let v2 = v2_fixture(&rec, Err("queue.toml: invalid TOML at line 3, column 1: x"));
+
+        let report = reconcile(&scopes, &reader, &resetter, Some(&v2));
+        assert!(report.v2_reset.is_empty(), "fail closed");
+        assert_eq!(
+            report.v2_read_error.as_deref(),
+            Some("queue.toml: invalid TOML at line 3, column 1: x")
+        );
+        assert!(rec.events().is_empty());
+    }
+
+    #[test]
+    fn a_refused_v2_move_is_a_failure_and_the_next_entry_is_still_tried() {
+        let rec = Arc::new(Recorder::default());
+        let (scopes, reader, resetter) = quiet_legacy(&rec);
+        let mut v2 = v2_fixture(&rec, Ok(vec!["109", "110"]));
+        v2.refuse = vec!["109".to_string()];
+
+        let report = reconcile(&scopes, &reader, &resetter, Some(&v2));
+        assert_eq!(report.v2_reset, vec![("110".to_string(), "queued".to_string())]);
+        assert_eq!(report.v2_failures.len(), 1);
+        assert_eq!(report.v2_failures[0].0, "109");
+    }
+
+    #[test]
+    fn no_v2_reaper_leaves_the_v2_fields_empty() {
+        // The legacy queue mode hands `reconcile` no reaper.
+        let rec = Arc::new(Recorder::default());
+        let (scopes, reader, resetter) = quiet_legacy(&rec);
+        assert_eq!(reconcile(&scopes, &reader, &resetter, None), ReconcileReport::default());
+    }
+
+    /// The production reader over a real on-disk v2 list: only `active` rows,
+    /// no list at all is nothing to reap, and a file that does not parse is an
+    /// error rather than an empty list.
+    #[test]
+    fn the_production_v2_reaper_reads_active_entries_and_fails_closed() {
+        use softfig_ipc::queue_v2::{Entry, EntryKind, Lane, Project, QueueToml};
+
+        let root = std::env::temp_dir().join(format!("sf-reconcile-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backlog = root.join("growlight/backlog");
+        std::fs::create_dir_all(&backlog).unwrap();
+        let reaper = KeeperdV2Reaper {
+            garden_root: root.clone(),
+            keeperd_socket: root.join("no-keeperd.sock"),
+        };
+        assert_eq!(reaper.active_entries(), Ok(vec![]), "no queue.toml: nothing to reap");
+
+        let entry = |id: &str, status| Entry {
+            id: id.into(),
+            kind: EntryKind::Milestone,
+            title: format!("{id} title"),
+            project: "softfig".into(),
+            lane: Lane::Normal,
+            status,
+            after: vec![],
+            added: "2026-10-11T15:04:00Z".into(),
+            branch: format!("feat/{id}"),
+            parent: String::new(),
+            base: String::new(),
+            claimed: String::new(),
+            follow_ups: 0,
+            pending_status: None,
+            auto_restack: true,
+            fleet: false,
+            not_before: None,
+        };
+        let project = Project { name: "softfig".into(), repo: "~/p".into(), main: "main".into() };
+        let queue = QueueToml::new(
+            vec![project],
+            vec![entry("a", EntryStatus::Active), entry("b", EntryStatus::Queued)],
+        )
+        .to_toml()
+        .unwrap();
+        std::fs::write(backlog.join("queue.toml"), queue).unwrap();
+        assert_eq!(reaper.active_entries(), Ok(vec!["a".to_string()]));
+        // A human-only (`fleet = false`) entry is reaped too: that is the 109 case.
+
+        std::fs::write(backlog.join("queue.toml"), "not = [toml").unwrap();
+        let err = reaper.active_entries().unwrap_err();
+        assert!(err.contains("queue.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

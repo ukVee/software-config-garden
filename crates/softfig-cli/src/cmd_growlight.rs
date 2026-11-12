@@ -143,7 +143,7 @@ pub enum GrowlightCmd {
     Resources(ResourcesArgs),
 
     /// The queue v2 human surface (§6.9): `queue show` and the mutating forms —
-    /// `project add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each is
+    /// `project add`, `project set-repo`, `add`, `move`, `lane`, `after`, `status`, `repair`, `drop`. Each is
     /// a thin client over the matching §6.8 keeperd verb, with `--dry-run`
     /// (compute + validate + render the would-be list, write nothing), plus the
     /// read-only `queue pick`. These verbs touch only the v2 files; the fleet
@@ -2365,6 +2365,16 @@ pub enum QueueSub {
     /// is held until then. `""` clears it.
     NotBefore(QueueNotBeforeArgs),
 
+    /// Opt a resumed branch into the loop's automatic restack (`yes`), or hold
+    /// a fleet-cut branch out of it (`no`) — the row's `auto_restack` field. A
+    /// first claim that finds the branch already existing writes `no`.
+    AutoRestack(QueueAutoRestackArgs),
+
+    /// Repair a migrated entry's `branch`, `base` or `project` (report 171).
+    /// Refused `running` only while a live session holds the entry (an `active`
+    /// entry nothing holds takes it).
+    Repair(QueueRepairArgs),
+
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
     Drop(QueueDropArgs),
 
@@ -2414,6 +2424,26 @@ pub struct QueueMigrateArgs {
 pub enum QueueProjectSub {
     /// Append a `[[project]]` row: a name bound to a repo and its merge branch.
     Add(QueueProjectAddArgs),
+    /// Correct an existing project's repo (and optionally its merge branch):
+    /// the repair `add` cannot make, since a repeat is refused `exists`.
+    /// Refused `running` only while a live session holds one of the project's
+    /// `active` entries.
+    SetRepo(QueueProjectSetRepoArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueProjectSetRepoArgs {
+    /// The existing project's name.
+    pub name: String,
+    /// A local path (absolute, `~`, `~/…` or `~<you>/…`) or `host:path`, as
+    /// for `project add`.
+    pub repo: String,
+    /// The branch merges land on; omitted keeps the project's current one.
+    #[arg(long)]
+    pub main: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2587,12 +2617,48 @@ pub struct QueueFleetArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct QueueAutoRestackArgs {
+    /// The live entry id.
+    pub id: String,
+    /// yes lets the loop restack the entry's branch (it rewrites it, so only
+    /// for a branch no session outside the queue is using); no holds it out.
+    pub auto_restack: FleetArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct QueueNotBeforeArgs {
     /// The live entry id.
     pub id: String,
     /// `YYYY-MM-DD HH:MM ±HH:MM` (offset required; `T` and `Z` allowed), or
     /// `""` to clear the start time. An entry that has started ignores it.
     pub time: String,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("repair")
+        .required(true)
+        .multiple(true)
+        .args(["branch", "base", "project"])
+))]
+pub struct QueueRepairArgs {
+    /// The live entry id.
+    pub id: String,
+    /// The branch the entry's work lives on, a valid git branch name.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// The commit or parent branch the entry was cut from; `""` clears it.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Move the entry to another existing project.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2695,6 +2761,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Pick { member } => queue_pick(&growlightd_socket, member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
+            QueueProjectSub::SetRepo(a) => queue_project_set_repo(&socket, a),
         },
         QueueSub::Add(a) => queue_add(&socket, a),
         QueueSub::Move(a) => queue_move(&socket, a),
@@ -2703,6 +2770,8 @@ fn client_queue(args: QueueArgs) -> Result<()> {
         QueueSub::Status(a) => queue_status(&socket, a),
         QueueSub::Fleet(a) => queue_fleet(&socket, a),
         QueueSub::NotBefore(a) => queue_not_before(&socket, a),
+        QueueSub::AutoRestack(a) => queue_auto_restack(&socket, a),
+        QueueSub::Repair(a) => queue_repair(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
         QueueSub::Migrate(a) => queue_migrate(&socket, a),
     }
@@ -3372,7 +3441,7 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         let status = format!(
             "{}{}",
             e.status,
-            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref())
+            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref(), e.auto_restack)
         );
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -3517,6 +3586,19 @@ fn queue_project_add(socket: &Path, args: QueueProjectAddArgs) -> Result<()> {
     Ok(())
 }
 
+fn queue_project_set_repo(socket: &Path, args: QueueProjectSetRepoArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueSetProjectRepoArgs {
+        name: args.name,
+        repo: args.repo,
+        main: args.main,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_SET_PROJECT_REPO, serde_json::to_value(wire)?)?;
+    let reply: QueueAddProjectReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
 fn queue_add(socket: &Path, args: QueueAddArgs) -> Result<()> {
     // The CLI grammar (§6.9): a milestone/task carries its slug positionally;
     // a restack takes `--project` only. keeperd still owns the full arg rules
@@ -3572,6 +3654,10 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -3593,6 +3679,10 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -3611,6 +3701,10 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -3634,6 +3728,10 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
         }),
         fleet: None,
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -3652,6 +3750,32 @@ fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
         status: None,
         fleet: Some(args.fleet == FleetArg::Yes),
         not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_auto_restack(socket: &Path, args: QueueAutoRestackArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: Some(args.auto_restack == FleetArg::Yes),
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -3670,6 +3794,32 @@ fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
         status: None,
         fleet: None,
         not_before: Some(args.time),
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_repair(socket: &Path, args: QueueRepairArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: args.branch,
+        base: args.base,
+        project: args.project,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
@@ -5211,6 +5361,40 @@ mod tests {
             GrowlightCmd::Queue(_)
         ));
 
+        // report 171 repair forms
+        match TestCli::try_parse_from(["g", "queue", "project", "set-repo", "p", "~/r", "--main", "dev"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(q) => match q.cmd {
+                Some(QueueSub::Project { cmd: QueueProjectSub::SetRepo(p) }) => {
+                    assert_eq!((p.name.as_str(), p.repo.as_str()), ("p", "~/r"));
+                    assert_eq!(p.main.as_deref(), Some("dev"));
+                }
+                other => panic!("expected project set-repo, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "repair", "089", "--branch", "feat/remote-runner", "--base", "", "--project", "remote-runner",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(q) => match q.cmd {
+                Some(QueueSub::Repair(r)) => {
+                    assert_eq!(r.id, "089");
+                    assert_eq!(r.branch.as_deref(), Some("feat/remote-runner"));
+                    assert_eq!(r.base.as_deref(), Some(""));
+                    assert_eq!(r.project.as_deref(), Some("remote-runner"));
+                }
+                other => panic!("expected repair, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        // `repair` with nothing to repair is a usage error, not a no-op call.
+        assert!(TestCli::try_parse_from(["g", "queue", "repair", "089"]).is_err());
+
         // project add
         match TestCli::try_parse_from([
             "g",
@@ -5233,6 +5417,7 @@ mod tests {
                         assert_eq!(p.main.as_deref(), Some("main"));
                         assert!(!p.dry_run);
                     }
+                    other => panic!("expected project add, got {other:?}"),
                 },
                 other => panic!("expected project add, got {other:?}"),
             },
@@ -5610,6 +5795,7 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
             fleet: true,
             not_before: None,
         };
@@ -5697,6 +5883,7 @@ mod tests {
                 open: true,
                 open_unknown: false,
                 fleet: true,
+                auto_restack: true,
                 not_before: None,
                 doc_fleet: None,
                 doc_not_before: None,
@@ -5715,6 +5902,7 @@ mod tests {
                 open: false,
                 open_unknown: false,
                 fleet: false,
+                auto_restack: true,
                 not_before: Some("2026-11-08 09:00Z".into()),
                 doc_fleet: None,
                 doc_not_before: None,
@@ -5733,6 +5921,7 @@ mod tests {
                 open: false,
                 open_unknown: true,
                 fleet: true,
+                auto_restack: true,
                 not_before: None,
                 doc_fleet: Some("no".into()),
                 doc_not_before: None,

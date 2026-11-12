@@ -19,7 +19,7 @@ use softfig_ipc::growlightd::{
     QueuePickAssignment, QueuePickReply, QueuePickSkip, RefusalCode, ReleaseLeaseArgs,
     RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs,
     SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
-    QueueShowReply, BACKEND_CLAUDE, BACKEND_OPENCODE,
+    QueueLiveReply, QueueShowReply, BACKEND_CLAUDE, BACKEND_OPENCODE,
 };
 use softfig_ipc::model_choice::{Backend, ModelList};
 use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
@@ -162,6 +162,12 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         // assigns a member now, and why each skipped entry was skipped.
         op::QUEUE_PICK => write_one_shot(&mut stream, queue_pick(&daemon, &req)),
         op::QUEUE_SHOW => write_one_shot(&mut stream, queue_show(&daemon)),
+        // Which v2 entries a live member holds (report 172): keeperd's `running`
+        // refusals ask it. Answered from memory, never from a read.
+        op::QUEUE_LIVE => write_one_shot(
+            &mut stream,
+            ok_reply(&QueueLiveReply { held: daemon.v2_live() }, "queue_live"),
+        ),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -1293,6 +1299,7 @@ mod tests {
                 claimed: "2026-10-11T15:04:00Z".into(),
                 follow_ups: 0,
                 pending_status: None,
+                auto_restack: true,
                 fleet: false,
                 not_before: Some("2026-11-08 09:00Z".into()),
             }],

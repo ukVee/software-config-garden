@@ -344,11 +344,12 @@ impl KeeperConfig {
     }
 
     /// M4 deploy: the persistent plaintext deploy-cache root — the configured
-    /// override, else the shared [`softfig_deploy::default_cache_root`]. Both
-    /// this daemon path and the `softfig deploy` CLI resolve the default through
-    /// that one helper, so the two frontends can never diverge — a divergent
-    /// root would make each classify the other's managed symlinks as a Conflict
-    /// and a force-apply could clobber healthy symlinks.
+    /// override, else the shared [`softfig_deploy::default_cache_root`]. The
+    /// daemon is the only deploy path (the `softfig deploy` CLI is a thin client
+    /// of `deploy_plan` / `deploy_apply` and resolves no root), so this is the
+    /// one root there is; keeping the default in the shared helper stops a
+    /// future frontend that resolves its own from diverging, which would make
+    /// each classify the other's managed symlinks as a Conflict.
     pub fn deploy_cache_root(&self) -> PathBuf {
         self.deploy_cache_root
             .clone()
@@ -442,10 +443,10 @@ mod tests {
 
     #[test]
     fn deploy_cache_root_defaults_to_shared_helper() {
-        // No configured override → the daemon resolves the SAME default the
-        // `softfig deploy` CLI does (both call `softfig_deploy::default_cache_root`),
-        // so a relative $XDG_DATA_HOME can't make the two frontends classify each
-        // other's managed symlinks as Conflict. (Slice 005.)
+        // No configured override → the daemon resolves the shared
+        // `softfig_deploy::default_cache_root` (the CLI resolves no root since
+        // sweep-fixes 006), so a relative $XDG_DATA_HOME can't make a second
+        // frontend classify the daemon's managed symlinks as Conflict. (Slice 005.)
         let cfg = KeeperConfig::new("/garden");
         assert_eq!(cfg.deploy_cache_root(), softfig_deploy::default_cache_root());
     }

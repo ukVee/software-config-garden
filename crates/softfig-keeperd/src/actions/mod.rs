@@ -55,7 +55,7 @@ pub use growlight::{
     growlight_add_sub_milestone, growlight_block, growlight_complete_entry,
     growlight_complete_slice, growlight_init, growlight_set_resources,
     list_reports, log_baton, member_slice_insert, member_slice_update, post_message,
-    queue_add_entry, queue_add_project, queue_drop,
+    queue_add_entry, queue_add_project, queue_drop, queue_set_project_repo,
     queue_update_entry, queue_v2_add_sub, queue_v2_claim, queue_v2_deferred,
     queue_v2_enqueue_restack, queue_v2_follow_ups, queue_v2_migrate_apply, queue_v2_re_record_bases,
     queue_v2_session_log, queue_v2_set_status,
