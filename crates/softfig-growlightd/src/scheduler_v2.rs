@@ -764,8 +764,9 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
 
 /// [`pick_v2`] with the fallback reservation (§4, report 169): step 4 skips
 /// every project in `reserved`, the projects whose own pinned member is free
-/// (or exiting) this tick — see [`reserved_projects`]. A member's pinned scans
-/// (steps 1/3) ignore the set, so a member always reaches its own project.
+/// (or just rolled off an entry) this tick — see [`reserved_projects`]. A
+/// member's pinned scans (steps 1/3) ignore the set, so a member always
+/// reaches its own project.
 pub fn pick_v2_reserving(
     snapshot: &V2Snapshot,
     member: &Member,
@@ -873,12 +874,16 @@ pub fn pick_v2_reserving(
 ///
 /// - `free`: able to start this tick (not held, retiring, or already running)
 ///   and its own pick lands in that project, or
-/// - `exiting`: holding an entry there as the tick began (live on it or just
-///   rolled off it), so the entry's next unit is its to resume.
+/// - `exiting`: just rolled off an entry there with a handoff (`continues`) and
+///   able to start this tick, so the entry's next unit is its to resume.
 ///
 /// A pinned member busy on another project reserves nothing, and an unpinned
-/// member never does. Because every member's reservation is computed before any
-/// member's fallback runs, the verdict does not depend on roster order.
+/// member never does. Neither does one that cannot start this tick (held by a
+/// rate limit or the schedule, retiring, stopped) or one that is merely live on
+/// an entry in P: the caller leaves those out, so a hold or an urgent entry
+/// does not keep P's other entries from a fallback member (review 061 F4).
+/// Because every member's reservation is computed before any member's fallback
+/// runs, the verdict does not depend on roster order.
 pub fn reserved_projects(
     snapshot: &V2Snapshot,
     free: &[&Member],

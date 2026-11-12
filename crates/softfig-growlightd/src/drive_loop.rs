@@ -2981,35 +2981,35 @@ impl DriveLoop {
                 // own pinned member is free or exiting at the tick's start, which
                 // no member's step-4 fallback may take. Computed once, before any
                 // member's pick, so roster order never decides it.
+                //
+                // Only a member that could take its project's next entry this
+                // tick reserves it (review 061 F4): not one held by a rate-limit
+                // or the schedule, retiring or stopped, and not one merely live
+                // on an entry (a live member is busy on it; the entry a handshake
+                // rolled it off is `v2_rolled`, which is what "exiting" means).
                 let reserved = {
+                    let can_start = |agent: &str| {
+                        !self.retiring.contains(agent)
+                            && !self.stopped.contains(agent)
+                            && !matches!(admission(agent), Admission::Held(_))
+                            && !self
+                                .rate_limit_holds
+                                .lock()
+                                .unwrap()
+                                .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
+                    };
                     let free: Vec<&scheduler_v2::Member> = fleet
                         .iter()
                         .filter(|m| {
                             let agent = &m.spec.agent;
-                            !self.supervisor.is_registered(agent)
-                                && !self.retiring.contains(agent)
-                                && !self.stopped.contains(agent)
-                                && !matches!(admission(agent), Admission::Held(_))
-                                && !self
-                                    .rate_limit_holds
-                                    .lock()
-                                    .unwrap()
-                                    .member_fully_held(
-                                        &self.profiles_resolver.admission_profiles(agent),
-                                    )
+                            !self.supervisor.is_registered(agent) && can_start(agent)
                         })
                         .filter_map(|m| v2_members.get(m.spec.agent.as_str()))
                         .collect();
                     let exiting: Vec<(&scheduler_v2::Member, &str)> = v2_members
                         .values()
-                        .filter_map(|m| {
-                            let entry = self
-                                .v2_assignments
-                                .get(&m.id)
-                                .map(|a| a.entry.as_str())
-                                .or_else(|| self.v2_rolled.get(&m.id).map(String::as_str))?;
-                            Some((m, entry))
-                        })
+                        .filter(|m| can_start(&m.id))
+                        .filter_map(|m| Some((m, self.v2_rolled.get(&m.id)?.as_str())))
                         .collect();
                     scheduler_v2::reserved_projects(snapshot, &free, &exiting)
                 };
@@ -10531,6 +10531,137 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             );
             assert_eq!(backend.spawns(), vec!["b"], "roster {roster:?}");
         }
+    }
+
+    /// Two entries in `softfig`, as `(id, lane, status)`, each with one queued
+    /// slice, for the reservation tests (review 061 F4).
+    fn v2_softfig_entries(rows: [(&str, Lane, EntryStatus); 2]) -> V2Snapshot {
+        let [(id1, lane1, status1), (id2, lane2, status2)] = rows;
+        let mut snapshot = v2_milestone(id1, status1, "001", None);
+        snapshot.entries[0].lane = lane1;
+        let mut second = v2_milestone(id2, status2, "001", None);
+        second.entries[0].lane = lane2;
+        snapshot.entries.append(&mut second.entries);
+        snapshot.trees.append(&mut second.trees);
+        snapshot
+    }
+
+    /// `a` is pinned to an empty project and falls back; `b` is pinned to
+    /// `softfig`.
+    fn v2_reservation_fleet() -> Vec<FleetMember> {
+        let pinned = |id: &str, pin: &str| {
+            FleetMember::pinned(spec(id), pin).with_backend(crate::fleet::MemberBackend::Opencode(
+                crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
+            ))
+        };
+        vec![pinned("a", "empty"), pinned("b", "softfig")]
+    }
+
+    /// Review 061 F4 (a) — `b` handed off with `continues` (`v2_rolled`) and its
+    /// next spawn is rate-limit-held, so step 3 skips it every tick. It cannot
+    /// start, so it reserves nothing: `softfig`'s urgent `e2` goes to `a` rather
+    /// than waiting out the quota window.
+    #[test]
+    fn v2_mode_a_held_rolled_member_does_not_reserve_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("e1", Lane::Normal, EntryStatus::Active),
+            ("e2", Lane::Urgent, EntryStatus::Queued),
+        ]));
+        let (loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source,
+            v2_entries_dir("reserve-held-roll"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+        holds.lock().unwrap().extend("slot-b", 10_000);
+        let mut loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[
+                ("a", &["slot-a"]),
+                ("b", &["slot-b"]),
+            ])))
+            .with_rate_limit_holds(holds);
+        loop_.v2_rolled.insert("b".into(), "e1".into());
+
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("a", "e2")],
+            "the held member's project is open to a fallback",
+        );
+        assert_eq!(backend.spawns(), vec!["a"]);
+    }
+
+    /// Review 061 F4 (b) — `b` is live on `softfig`'s urgent `u`; the normal `n`
+    /// beside it is not blocked by `u` (the repo rule is normal-lane only). A
+    /// member merely live on an entry is busy, not exiting, so `a` takes `n` on
+    /// the next tick. While `b` was still free, the first tick reserves the
+    /// project for it.
+    #[test]
+    fn v2_mode_a_member_live_on_an_urgent_entry_does_not_reserve_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("u", Lane::Urgent, EntryStatus::Queued),
+            ("n", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source.clone(),
+            v2_entries_dir("reserve-live-urgent"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let first = loop_.tick(0);
+        assert_eq!(
+            first.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("b", "u")],
+            "free and pinned, b takes the urgent entry; a is held off softfig",
+        );
+
+        source.set(v2_softfig_entries([
+            ("u", Lane::Urgent, EntryStatus::Active),
+            ("n", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let second = loop_.tick(1);
+        assert_eq!(
+            second.v2_started.iter().map(|s| (s.agent.as_str(), s.entry.as_str())).collect::<Vec<_>>(),
+            [("a", "n")],
+            "b is busy on u and reserves nothing, so a takes n",
+        );
+        assert_eq!(backend.spawns(), vec!["b", "a"]);
+    }
+
+    /// Review 061 F4, the guard on the narrowing — a member that just rolled off
+    /// `e1` with `continues` (still terminating, so registered) and CAN start
+    /// still reserves its project: `e2` waits for it, not for `a`.
+    #[test]
+    fn v2_mode_a_rolled_member_that_can_start_still_reserves_its_project() {
+        let source = FakeV2Source::with(v2_softfig_entries([
+            ("e1", Lane::Urgent, EntryStatus::Queued),
+            ("e2", Lane::Normal, EntryStatus::Queued),
+        ]));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            v2_reservation_fleet(),
+            source.clone(),
+            v2_entries_dir("reserve-rolled"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        assert_eq!(loop_.tick(0).v2_started.len(), 1, "b starts on e1");
+        // The handshake's bookkeeping: b keeps e1 (rolled), the entry stays active.
+        loop_.v2_assignments.remove("b");
+        loop_.v2_rolled.insert("b".into(), "e1".into());
+        source.set(v2_softfig_entries([
+            ("e1", Lane::Urgent, EntryStatus::Active),
+            ("e2", Lane::Normal, EntryStatus::Queued),
+        ]));
+
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "a must not take e2: {:?}", r.v2_started);
+        assert_eq!(backend.spawns(), vec!["b"]);
     }
 
     /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
