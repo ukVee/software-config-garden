@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "soft-fig IPC: JSON-Lines protocol types + Unix-socket client helpers."
+description = "soft-fig IPC facade: re-exports the keeperd/growlightd wire crates and softfig-client, and keeps the daemon-shared garden modules. Not a public surface."
 
 [dependencies]
 softfig-protocol-keeperd.workspace = true

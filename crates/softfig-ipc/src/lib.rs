@@ -1,5 +1,27 @@
-//! soft-fig IPC: JSON-Lines protocol shared by the daemon, the CLI's
-//! daemon-bridge code path, and the MCP bridge.
+//! soft-fig IPC: a **facade** for in-repo consumers, not a public surface,
+//! and no longer the protocol itself (`docs/protocol-stability.md`).
+//!
+//! `feat/tui-split-protocol` moved the wire out; every moved item is
+//! re-exported here unchanged, so every pre-split `softfig_ipc::...` path
+//! still compiles. A frontend depends on the concrete crate; this facade is
+//! what keeps the daemons and the CLI unedited (the mergeability argument in
+//! `meta/spec-softfig-tui-frontend-split.md` §3).
+//!
+//! - `softfig-protocol-keeperd` — the JSON-Lines envelope (`Request`,
+//!   `Response`, `ErrorKind`), the keeperd verb types, `PROTOCOL_VERSION`, and
+//!   the pure value rules the wire surface reads:
+//!   `fleet::{holds, parse_not_before, days_from_civil}` and
+//!   `queue_v2::{EntryKind, Lane, SliceStatus, RestackBranch,
+//!   hold_annotation}` with the IO-free `queue_v2::migrate::{Answers,
+//!   BatonMove, CallClass}`.
+//! - `softfig-protocol-growlightd` — the growlightd wire types (`growlightd`).
+//! - `softfig-client` — `client`, `socket`, and the reconnecting call.
+//!
+//! What is left here is the daemon-shared garden code: `backlog_doc`, `baton`,
+//! `claude_profiles`, `item_meta`, `item_repo`, `member`, `model_choice`,
+//! `opencode`, `slot_name`, `testing`, `tz`, `usage`, the `queue_v2` state-file
+//! half (`validate`, and the IO-bound `migrate` plan) and the `fleet` item-doc
+//! scanner.
 //!
 //! Wire format: one JSON object per line, `\n`-terminated. Both directions
 //! identical. See `meta/spec-keeper.md` "IPC protocol" in the soft-fig

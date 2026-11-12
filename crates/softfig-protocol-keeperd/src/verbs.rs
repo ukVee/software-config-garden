@@ -3260,6 +3260,30 @@ pub fn human_age_secs(secs: u64) -> String {
     }
 }
 
+/// The five member-verb `op` strings are a wire contract with every already
+/// deployed fleet member. D2 single-sources them so the crates cannot
+/// *diverge*; it cannot stop a *value* change, which would keep every crate
+/// agreeing and break every deployed client (review 060 F5). Pin the strings.
+#[cfg(test)]
+mod op_wire_values {
+    use super::op;
+
+    #[test]
+    fn member_verb_op_values_are_frozen() {
+        assert_eq!(
+            op::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            "growlight_add_follow_up_session"
+        );
+        assert_eq!(op::GROWLIGHT_COMPLETE_SLICE, "growlight_complete_slice");
+        assert_eq!(op::GROWLIGHT_COMPLETE_ENTRY, "growlight_complete_entry");
+        assert_eq!(op::GROWLIGHT_BLOCK, "growlight_block");
+        assert_eq!(
+            op::GROWLIGHT_ADD_SUB_MILESTONE,
+            "growlight_add_sub_milestone"
+        );
+    }
+}
+
 #[cfg(test)]
 mod display_tests {
     use super::human_age_secs;

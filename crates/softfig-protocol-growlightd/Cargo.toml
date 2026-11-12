@@ -12,4 +12,9 @@ description = "soft-fig growlightd wire protocol, unstable: any version bump may
 [dependencies]
 softfig-protocol-keeperd.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+# Only the `mod tests` block builds JSON values; the wire types are serde
+# only, so a keeperd-only client of this unstable crate does not pull it
+# (review 060 F7).
 serde_json.workspace = true

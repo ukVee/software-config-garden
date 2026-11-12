@@ -392,7 +392,12 @@ pub struct SliceItem {
 
 // The closed vocabularies render into the §3.4 derived views and into alert
 // text, so each has a `Display` that is exactly its TOML wire name — the name
-// serde reads and writes. `display_matches_wire_names` pins the lockstep.
+// serde reads and writes. Three of the six are defined here (`EntryStatus`,
+// `FinalStatus`, `SliceKind`); `EntryKind`, `Lane` and `SliceStatus` are
+// defined in `softfig_protocol_keeperd::queue_v2` and re-exported above,
+// because `verbs.rs` needs them. Each crate pins its own half (`wire_names`
+// there, `display_matches_wire_names` here), and the test here still covers
+// all six through the re-export.
 impl fmt::Display for EntryStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
