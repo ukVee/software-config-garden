@@ -1,6 +1,10 @@
 //! The queue v2 vocabularies that cross the keeperd wire. The rest of the state
 //! model stays in `softfig-ipc::queue_v2`, which re-exports these.
 
+pub mod migrate;
+
+pub use migrate::RestackBranch;
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +75,37 @@ impl fmt::Display for SliceStatus {
             Self::Deferred => "deferred",
         })
     }
+}
+
+/// The serde default of `Entry::fleet` and `Entry::auto_restack`,
+/// which stay in `softfig-ipc`: an entry the fleet may claim (§3.1).
+pub fn fleet_default() -> bool {
+    true
+}
+
+pub fn is_fleet_default(fleet: &bool) -> bool {
+    *fleet
+}
+
+/// The §2 holds as a surface prints them beside an entry's status:
+/// ` (human-only)` for `fleet = false`, ` (not before <at>)` for a start
+/// time as written, whether or not it is still ahead, and
+/// ` (no auto-restack)` for an `auto_restack = false` branch the loop will not
+/// rewrite (§8, review 061). Empty when none is set. The one wording, so
+/// `queue show`, the `growlight status` lanes and the TUI can't drift about
+/// the same hold.
+pub fn hold_annotation(fleet: bool, not_before: Option<&str>, auto_restack: bool) -> String {
+    let mut out = String::new();
+    if !fleet {
+        out.push_str(" (human-only)");
+    }
+    if let Some(at) = not_before {
+        out.push_str(&format!(" (not before {at})"));
+    }
+    if !auto_restack {
+        out.push_str(" (no auto-restack)");
+    }
+    out
 }
 
 #[cfg(test)]

@@ -14,4 +14,7 @@ pub mod growlightd;
 
 pub use growlightd::*;
 
-use softfig_protocol_keeperd::verbs;
+// The pure keeperd vocabulary this crate's wire types name as `crate::verbs`,
+// `crate::queue_v2` and `crate::fleet` — imported here so those paths read as the
+// daemon's own (the crate has no IO and no modules of those names).
+use softfig_protocol_keeperd::{fleet, queue_v2, verbs};

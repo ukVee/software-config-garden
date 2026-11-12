@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod fleet;
 pub mod proto;
 pub mod queue_v2;
 pub mod verbs;

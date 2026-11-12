@@ -49,7 +49,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use softfig_protocol_keeperd::queue_v2::{EntryKind, Lane, SliceStatus};
+use softfig_protocol_keeperd::queue_v2::{fleet_default, is_fleet_default};
+pub use softfig_protocol_keeperd::queue_v2::migrate::{Answers, BatonMove, CallClass};
+pub use softfig_protocol_keeperd::queue_v2::{
+    hold_annotation, EntryKind, Lane, RestackBranch, SliceStatus,
+};
 
 /// The schema version every file writes and the only version parsing accepts.
 /// Bump only with a migration: a reader of the old build refuses the new file
@@ -299,55 +303,6 @@ pub struct Entry {
     /// pre-existing file round-trips byte-identical.
     #[serde(default = "fleet_default", skip_serializing_if = "is_fleet_default")]
     pub auto_restack: bool,
-}
-
-/// [`Entry::fleet`]'s default: an entry the fleet may claim.
-pub(crate) fn fleet_default() -> bool {
-    true
-}
-
-pub(crate) fn is_fleet_default(fleet: &bool) -> bool {
-    *fleet
-}
-
-/// The §2 holds as a surface prints them beside an entry's status:
-/// ` (human-only)` for `fleet = false`, ` (not before <at>)` for a start
-/// time as written, whether or not it is still ahead, and
-/// ` (no auto-restack)` for an `auto_restack = false` branch the loop will not
-/// rewrite (§8, review 061). Empty when none is set. The one wording, so
-/// `queue show`, the `growlight status` lanes and the TUI can't drift about
-/// the same hold.
-pub fn hold_annotation(fleet: bool, not_before: Option<&str>, auto_restack: bool) -> String {
-    let mut out = String::new();
-    if !fleet {
-        out.push_str(" (human-only)");
-    }
-    if let Some(at) = not_before {
-        out.push_str(&format!(" (not before {at})"));
-    }
-    if !auto_restack {
-        out.push_str(" (no auto-restack)");
-    }
-    out
-}
-
-/// One branch in a restack's ordered stack (§8): what to rebase, and onto what.
-/// growlightd resolves `onto` (keeperd runs no git); the restack doc
-/// (`tasks/NNN-restack-<project>.md`) renders one step per branch from these.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RestackBranch {
-    /// The branch to rebase (`feat/<id>` / `fix/<id>`).
-    pub branch: String,
-    /// The recorded `parent` — the entry this branch was cut from; `""` =
-    /// `main` (§8).
-    pub parent: String,
-    /// The recorded `base` — the commit cut from (local) / the parent branch
-    /// name (remote).
-    pub base: String,
-    /// The `--onto` target: the parent's branch, or `main` for a main-rooted
-    /// branch. growlightd resolves it from the parent entry's branch.
-    pub onto: String,
 }
 
 /// The archive's outcome (§3.2): `done` satisfies `after` links, `dropped`
