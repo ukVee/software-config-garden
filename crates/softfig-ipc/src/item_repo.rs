@@ -87,12 +87,26 @@ pub fn resolve_repo(
         v.map(|v| v.trim().trim_matches('`').trim()).filter(|v| !v.is_empty())
     }
     let value = present(worktree).or_else(|| present(registry))?;
-    let path = if value == "~" {
-        home?.to_path_buf()
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home?.join(rest)
-    } else {
-        PathBuf::from(value)
+    expand_home(value, home, None)
+}
+
+/// `value` as a local absolute path: `~`, `~/…`, and — when `user` names the
+/// current user — `~<user>` and `~<user>/…` expand against `home`. The one
+/// tilde expander, shared by [`resolve_repo`] (which passes no `user`, so its
+/// `~user` stays `None`) and the v2 repo resolver (which passes `$USER`, to
+/// match [`RepoLocality`](crate::queue_v2::RepoLocality)'s `Local`). Anything
+/// that is not absolute after that — relative, another user's `~`, a remote
+/// `host:/path`, `~` with no `home` — gives `None`.
+pub fn expand_home(value: &str, home: Option<&Path>, user: Option<&str>) -> Option<PathBuf> {
+    let path = match value.strip_prefix('~') {
+        Some(rest) => {
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if !name.is_empty() && Some(name) != user {
+                return None;
+            }
+            if tail.is_empty() { home?.to_path_buf() } else { home?.join(tail) }
+        }
+        None => PathBuf::from(value),
     };
     path.is_absolute().then_some(path)
 }
@@ -307,11 +321,41 @@ fn hash_content(full: &Path, meta: &fs::Metadata, hasher: &mut DefaultHasher) {
     }
 }
 
+/// Git's repo-local environment, as `git rev-parse --local-env-vars` lists it. A
+/// process started under a git hook or `rebase --exec` inherits these, and they
+/// outrank `-C`: `GIT_DIR` alone would answer a probe from the wrong repo.
+const GIT_LOCAL_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
+/// Clear [`GIT_LOCAL_ENV`] from a git `cmd`, so the repo it runs against is the
+/// one its `-C` names and not one the daemon's own environment points at.
+pub fn scrub_git_env(cmd: &mut Command) -> &mut Command {
+    for key in GIT_LOCAL_ENV {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 /// Run `git --no-optional-locks -C <repo> <args>` and return its exit status and
 /// stdout, killing it after [`GIT_TIMEOUT`]. stdout is drained on its own thread
 /// so a large dirty tree can't fill the pipe and stall the child.
 fn git(repo: &Path, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), String> {
-    let mut child = Command::new("git")
+    let mut child = scrub_git_env(&mut Command::new("git"))
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo)
@@ -378,6 +422,22 @@ mod tests {
     }
 
     #[test]
+    fn expand_home_expands_the_current_users_tilde_forms_only() {
+        let home = Some(Path::new("/home/u"));
+        let e = |v| expand_home(v, home, Some("u"));
+        assert_eq!(e("/r"), Some(PathBuf::from("/r")));
+        assert_eq!(e("~"), Some(PathBuf::from("/home/u")));
+        assert_eq!(e("~/p/x"), Some(PathBuf::from("/home/u/p/x")));
+        assert_eq!(e("~u"), Some(PathBuf::from("/home/u")));
+        assert_eq!(e("~u/p"), Some(PathBuf::from("/home/u/p")));
+        assert_eq!(e("~bob/p"), None, "another user's home is not ours to guess");
+        assert_eq!(expand_home("~u/p", home, None), None, "no user: ~user stays unexpanded");
+        assert_eq!(e("p/x"), None, "relative");
+        assert_eq!(e("host:/x"), None, "remote");
+        assert_eq!(expand_home("~/p", None, Some("u")), None, "no home to expand against");
+    }
+
+    #[test]
     fn resolve_repo_refuses_what_it_cannot_probe_locally() {
         let home = Some(Path::new("/home/u"));
         let remote = "otg-travel:/home/sshukv/projects/roadeye (REMOTE — ssh otg-travel)";
@@ -389,6 +449,32 @@ mod tests {
     }
 
     use crate::testing::{git as sh_git, git_with_stdin};
+
+    /// V20: an inherited `GIT_DIR` outranks `-C`. Setting it here would race
+    /// every other test's git, so the probe runs in a child of this test binary.
+    #[test]
+    fn an_inherited_git_dir_does_not_redirect_a_probe() {
+        const REPO: &str = "SOFTFIG_TEST_PROBE_REPO";
+        if let Some(repo) = std::env::var_os(REPO) {
+            assert_eq!(probe(Path::new(&repo)).unwrap().head, None, "probed the unborn repo");
+            return;
+        }
+        let here = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        sh_git(here.path(), &["init", "-q"]);
+        sh_git(elsewhere.path(), &["init", "-q"]);
+        sh_git(elsewhere.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "item_repo::tests::an_inherited_git_dir_does_not_redirect_a_probe"])
+            .env(REPO, here.path())
+            .env("GIT_DIR", elsewhere.path().join(".git"))
+            .env("GIT_WORK_TREE", elsewhere.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}");
+    }
 
     #[test]
     fn probe_tracks_head_and_the_dirty_trees_content() {

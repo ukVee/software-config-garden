@@ -86,3 +86,48 @@ fleet_enabled = false
 # backend = "opencode"                     # claude (default) | opencode
 # model   = "deepseek/deepseek-flash"      # opencode only; REQUIRED (no model ⇒ refused)
 # variant = "high"                         # opencode only, optional
+
+# The schedule (spec-growlight-schedule §3). Omit the table, or leave `enabled`
+# false, and an armed fleet admits members at any hour. With it enabled,
+# `fleet_enabled` stays the master arm (growlightd never writes it) and members
+# are admitted only inside a window, in LOCAL time ($TZ, else /etc/localtime; an
+# unreadable zone closes the schedule). A close never kills: a member
+# mid-iteration finishes, then its re-roll waits for the next open window. A
+# window that opened while the device slept opens late on wake. Unknown keys are
+# refused, and like every config error here they disable the fleet.
+#
+# [schedule]
+# enabled = true
+# windows = ["23:00-07:00"]       # every day, every member; may cross midnight;
+#                                 # "HH:MM-HH:MM" with start == end is the whole day
+# close_grace_minutes = 45        # past a close, a still-running member is flagged
+#                                 # `overrun` (one alert; information, never a kill)
+# tasks = true                    # an item whose `> Not before:` has arrived is
+#                                 # admissible outside every window
+# reserve_weekly_pct = { slot1 = 20, "*" = 0 }
+#                                 # per claude-login slot ("*" = every other slot):
+#                                 # stop spawning on a slot once its 7d window is
+#                                 # used to 100 − this. An unreadable 7d reading
+#                                 # shows `unknown` and does not hold. 0 keeps nothing.
+#
+# [[schedule.window]]             # the full form; rows and `windows` strings union
+# days     = ["mon-fri"]          # mon..sun, ranges, or "daily"; absent ⇒ every day.
+#                                 # A window crossing midnight belongs to its start day.
+# start    = "10:00"
+# end      = "20:00"
+# backends = ["opencode"]         # optional: claude | opencode
+# members  = ["b"]                # optional: [[fleet]] agent ids; both filters must match
+
+# Build caps: the throttle every member's `systemd-run --user --scope` gets.
+# They only slow a build, never kill one. A missing table, or a missing key,
+# takes the default shown. `softfig growlight resources set` adjusts the first three live
+# and persists them here.
+#
+# [build_caps]
+# cargo_build_jobs = 2            # CARGO_BUILD_JOBS — the parallel-rustc ceiling
+# memory_high      = "3G"         # MemoryHigh, a SOFT throttle (never MemoryMax)
+# cpu_weight       = 50           # CPUWeight 1..=10000 (systemd default 100)
+# cpu_quota        = "50%"        # CPUQuota; unset by default. The thermal lever
+#                                 # on a fanless device: it caps a lone build too
+# test_threads     = 2            # RUST_TEST_THREADS — tests one test binary runs
+#                                 # at once; 0 is refused (libtest rejects it)

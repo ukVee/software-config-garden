@@ -186,6 +186,23 @@ pub mod op {
     /// overlaid as its own pick sees them. No v2 list → `list: false`.
     pub const QUEUE_PICK: &str = "queue_pick";
 
+    /// `queue_show() -> `[`QueueShowReply`]. Read-only (spec-growlight-queue
+    /// §6.9 `growlight status` / `queue show`): the live v2 list reduced to
+    /// what the human surfaces render — both lanes' entries, the per-repo
+    /// stack with its live git-stack annotations (which branches are still
+    /// open, via slice 001's stack model), and the §3.5 session log. growlightd
+    /// answers it because the stack model and the read-only git surface live
+    /// there (queue-v2-git slice 006). No v2 list -> `list: false`.
+    pub const QUEUE_SHOW: &str = "queue_show";
+
+    /// `queue_live() -> `[`QueueLiveReply`]. Read-only: the v2 entries a live
+    /// session holds right now (report 172). keeperd asks it before it reads an
+    /// `active` entry as running, so a human `drop` / `done` / repair of an entry
+    /// nothing holds is not trapped behind a status no one will ever clear.
+    /// Answered from the drive loop's published holds plus the claims in flight,
+    /// never from a git or file read.
+    pub const QUEUE_LIVE: &str = "queue_live";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,
@@ -228,6 +245,12 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) so a pre-field decoder reads it back as `false`.
     #[serde(default)]
     pub fleet_enabled: bool,
+    /// Which queue model the §11 switch selects (`config/growlight.toml` `queue`):
+    /// `legacy` or `v2`, as read at boot. Reported whether or not the fleet is
+    /// armed. Additive (`#[serde(default)]`): an older growlightd sends nothing,
+    /// and a pre-field decoder reads it back as empty, not as `legacy`.
+    #[serde(default)]
+    pub queue: String,
     /// The configured roster from `config/growlight.toml` (`[[fleet]]` members),
     /// in config order — surfaced so `growlight status` lists the fleet even when
     /// the gate is off (the agents haven't spawned). Additive/defaulted for wire
@@ -258,6 +281,108 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) for wire back-compat.
     #[serde(default)]
     pub held: Vec<HeldPartSummary>,
+    /// The `[schedule]` as the drive loop last evaluated it (growlight-schedule
+    /// spec §3.8). `None` when no schedule is enabled, or the fleet is
+    /// disarmed (no loop evaluates one). Additive and skipped when absent, so
+    /// an older peer reads and writes the reply it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSummary>,
+}
+
+/// The `[schedule]` block of [`FleetStatusReply`] (growlight-schedule §3.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSummary {
+    /// Is any window open for any member?
+    #[serde(default)]
+    pub open: bool,
+    /// Labels of the windows open now, e.g. `daily 23:00-07:00 [claude]`.
+    #[serde(default)]
+    pub current_windows: Vec<String>,
+    /// The next open or close edge, Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_edge: Option<i64>,
+    /// [`next_edge`](Self::next_edge) in local time, e.g. `2026-10-31 23:00 -04:00`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_edge_local: Option<String>,
+    /// The local zone's name, or `unreadable: <why>` (the schedule is then
+    /// closed to everyone).
+    #[serde(default)]
+    pub zone: String,
+    /// Members the schedule holds, with why.
+    #[serde(default)]
+    pub held_members: Vec<ScheduleHeld>,
+    /// Items waiting on their `> Not before:` time.
+    #[serde(default)]
+    pub held_items: Vec<String>,
+    /// The weekly reserve of every slot in a member's admission pool.
+    #[serde(default)]
+    pub reserve: Vec<ReserveSummary>,
+    /// The budget projection per pool (slice 008): one row per slot and
+    /// [`PoolProjection::window`].
+    #[serde(default)]
+    pub projection: Vec<PoolProjection>,
+}
+
+/// One member the schedule holds ([`ScheduleSummary::held_members`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleHeld {
+    pub agent: String,
+    /// `outside window`, `backend not in window`, `reserve`,
+    /// `local time unreadable`, or `overrun` — still running more than
+    /// `close_grace_minutes` past its window's close (information only:
+    /// nothing is killed).
+    pub reason: String,
+}
+
+/// One claude-login slot's weekly reserve ([`ScheduleSummary::reserve`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReserveSummary {
+    pub slot: String,
+    /// The share of the week kept back, `0..=100`. `0` keeps nothing.
+    pub reserve_pct: u8,
+    /// The slot's vouchable 7d used percentage. `None` when no reading can
+    /// vouch for one, or the slot keeps no reserve (it is not read then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_7d_pct: Option<u8>,
+    /// No new spawn on this slot until its 7d window resets.
+    #[serde(default)]
+    pub held: bool,
+    /// When the 7d window resets, Unix seconds, if the reading said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// One pool's budget projection ([`ScheduleSummary::projection`], slice 008):
+/// when one of a slot's rate windows is projected to reach `target_pct`, as a
+/// range over the recent burn rates, never a point (§3.11).
+///
+/// No cap time and `resets_first == false` is `unknown`: fewer than two
+/// vouchable samples in the current window. An older peer sends neither
+/// `window` nor `target_pct`; it never sent a projection either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolProjection {
+    pub slot: String,
+    /// `5h` or `7d` — the window projected to its full cap — or `reserve`,
+    /// the 7d window projected to its reserve threshold (`100 − reserve`).
+    #[serde(default)]
+    pub window: String,
+    /// The used percentage the projection runs to.
+    #[serde(default)]
+    pub target_pct: u8,
+    /// The earliest Unix time the window is projected to reach `target_pct`
+    /// (the fastest recent burn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_at_earliest: Option<i64>,
+    /// The latest Unix time (the slowest recent burn). `None` beside an
+    /// earliest time: the slowest burn reaches no cap before the reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_at_latest: Option<i64>,
+    /// When the window resets, Unix seconds, if the readings said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// Even the fastest recent burn reaches no cap before the window resets.
+    #[serde(default)]
+    pub resets_first: bool,
 }
 
 /// One configured roster member echoed in [`FleetStatusReply::roster`] — the
@@ -685,6 +810,14 @@ pub struct BuildCapsSummary {
     /// `CPUWeight` — the deprioritizing CPU weight (1..=10000). Applied live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_weight: Option<u32>,
+    /// `CPUQuota` — the hard CPU-time ceiling (a systemd percentage, e.g.
+    /// `"50%"`). Still a throttle. Read from the config at spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_quota: Option<String>,
+    /// `RUST_TEST_THREADS` — test threads per libtest binary (env var ⇒ next
+    /// spawn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_threads: Option<u32>,
 }
 
 /// Args for `set_resources`: a **partial** adjustment of the live build-resource
@@ -1238,6 +1371,255 @@ pub struct QueuePickSkip {
     pub detail: String,
 }
 
+/// One entry in the [`QueueShowReply`] list, in file (list) order. Fields
+/// are the TOML wire names (rendered verbatim), so the surfaces never re-word
+/// a status or lane the writer owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowEntry {
+    pub id: String,
+    pub kind: String,
+    pub project: String,
+    pub lane: String,
+    pub status: String,
+    pub after: Vec<String>,
+    pub branch: String,
+    pub base: String,
+    pub claimed: String,
+    /// A human status change recorded on an `active` entry and waiting for the
+    /// session's next handshake (§6.8), as its wire word. Absent when none is
+    /// pending, and on a reply from a daemon that predates the field — so a
+    /// surface that shows only `status` reads a blocked-but-still-`active`
+    /// entry as plain `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_status: Option<String>,
+    /// The live git-stack annotation: this entry's branch is an *open* stack
+    /// candidate (started and — for a local repo — not yet merged into `main`).
+    /// `false` for a never-claimed entry, a restack (no branch), or a local
+    /// branch already fast-forwarded into `main`.
+    pub open: bool,
+    /// This entry has a started branch in a repo whose stack could not be read
+    /// ([`QueueProjectStack::stack_unknown`]), so `open` says nothing about it:
+    /// a surface must not render that `false` as merged. Absent when `open` is
+    /// an answer, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_unknown: bool,
+    /// The row's `fleet` field (§3.1): `false` holds the entry for the human.
+    /// Absent when `true`, as in the TOML, and on a reply from a daemon that
+    /// predates the field — which reads as no hold shown, not as human-only.
+    #[serde(
+        default = "crate::queue_v2::fleet_default",
+        skip_serializing_if = "crate::queue_v2::is_fleet_default"
+    )]
+    pub fleet: bool,
+    /// The row's `auto_restack` field (§8): `false` holds the entry's branch out
+    /// of the loop's automatic restack (a first claim that resumed an existing
+    /// branch writes it). Absent when `true`, and on a reply from a daemon that
+    /// predates the field — which reads as no annotation, not as held out.
+    #[serde(
+        default = "crate::queue_v2::fleet_default",
+        skip_serializing_if = "crate::queue_v2::is_fleet_default"
+    )]
+    pub auto_restack: bool,
+    /// The row's `not_before` start time (§3.1), as written. Absent when none,
+    /// and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    /// The entry's own doc's `> Fleet:` line value, as written (`Some("")` for
+    /// a line with no value), or `None` when the doc carries no such line or
+    /// could not be read. Under v2 the line holds nothing — the TOML is the only
+    /// source of a hold — so this is carried only for
+    /// [`doc_hold_warning`](Self::doc_hold_warning). Always `None` on an archive
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_fleet: Option<String>,
+    /// The entry's own doc's `> Not before:` line value, as written; `None` as
+    /// for [`doc_fleet`](Self::doc_fleet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_not_before: Option<String>,
+}
+
+impl QueueShowEntry {
+    /// The §2 holds as the surfaces print them beside the status
+    /// ([`crate::queue_v2::hold_annotation`]).
+    pub fn hold_annotation(&self) -> String {
+        crate::queue_v2::hold_annotation(self.fleet, self.not_before.as_deref(), self.auto_restack)
+    }
+
+    /// One line when the entry's doc carries a `> Fleet:` or `> Not before:`
+    /// line that disagrees with the entry, `None` otherwise. A human who writes
+    /// `> Fleet: no` by habit gets no hold under v2, and this is what tells
+    /// them. A doc without the lines never disagrees: a new v2 doc doesn't carry
+    /// them. A `> Fleet:` value reads as the legacy reader reads it
+    /// ([`crate::fleet::holds`]), and two start times that parse are compared as
+    /// instants, so `Z` and `+00:00` agree.
+    pub fn doc_hold_warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(line) = &self.doc_fleet
+            && crate::fleet::holds(line) == self.fleet
+        {
+            let (fix, now) = if self.fleet {
+                (format!("softfig growlight queue fleet {} no", self.id), "fleet = true")
+            } else {
+                (format!("softfig growlight queue fleet {} yes", self.id), "fleet = false")
+            };
+            parts.push(format!("`> Fleet: {line}` but the entry has {now} (to match the line: `{fix}`)"));
+        }
+        if let Some(line) = &self.doc_not_before {
+            let parse = crate::fleet::parse_not_before;
+            let same = match self.not_before.as_deref() {
+                Some(at) => match (parse(line), parse(at)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => line.trim() == at.trim(),
+                },
+                None => false,
+            };
+            if !same {
+                let now = match &self.not_before {
+                    Some(at) => format!("not_before = \"{at}\""),
+                    None => "no not_before".to_string(),
+                };
+                parts.push(format!(
+                    "`> Not before: {line}` but the entry has {now} (to match the line: \
+                     `softfig growlight queue not-before {} \"{line}\"`)",
+                    self.id
+                ));
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "warning: {}: its doc says {} — under queue v2 only the entry holds, so the doc \
+             line does nothing; set the entry, or delete the line",
+            self.id,
+            parts.join("; and "),
+        ))
+    }
+}
+
+/// One branch of a repo's open stack, in claim order (oldest first) — the §8
+/// "stack per repo" a human reads to spot a pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueStackBranch {
+    /// The entry that owns the branch.
+    pub entry: String,
+    pub branch: String,
+    /// The recorded `parent` (`""` = `main`).
+    pub parent: String,
+    /// The recorded `base` (the cut-from commit, local; the branch name, remote).
+    pub base: String,
+    pub claimed: String,
+}
+
+/// One repo's stack, as [`QueueShowReply`] carries it (§8: the stack is per
+/// repo).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueProjectStack {
+    /// The project naming this repo, or all of them, comma-joined in table
+    /// order. `main` is the first one's.
+    pub name: String,
+    pub repo: String,
+    pub main: String,
+    /// `true` when growlightd ran read-only git here (a local path); `false`
+    /// for a `host:path` remote, where list state stands in and every claimed
+    /// entry is a candidate (§8).
+    pub local: bool,
+    /// The still-open branches in claim order; empty when the stack is empty
+    /// (the next branch cuts from `main`).
+    pub stack: Vec<QueueStackBranch>,
+    /// Why this repo's stack could not be read (a wedged repo past the probe
+    /// deadline, a path that isn't a repo). An empty `stack` then means "not
+    /// known", not "empty". Absent when the stack was read, and on a reply from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_unknown: Option<String>,
+}
+
+/// One unit's §3.5 session-log lines, verbatim (`- <ts> · …`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowSession {
+    /// The top-level entry id.
+    pub entry: String,
+    /// The sub-milestone identity (`<entry>/<sub>`) when the unit sits in a
+    /// sub-tree, where a slice NNN can repeat one in the parent. `None` for the
+    /// entry's own tree, and on a reply from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The slice NNN, or `None` for the entry's own close-out / task / restack
+    /// doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The garden-relative doc the lines were read from.
+    pub path: String,
+    /// The `## Sessions` lines, in the order written.
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+/// One slice item of a milestone's `slices.toml` tree (§3.3), as the surface
+/// reply carries it — the `id` (the `NNN`, or a sub-milestone slug) + `kind` +
+/// `status` the TUI's expanded milestone renders and its `slice_update` action
+/// addresses. The slice-list half of §6.9's "expands to its slice list".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowSlice {
+    /// `slice`: the `NNN` of `slices/NNN-<slug>.md`; `sub`: the sub-milestone slug.
+    pub id: String,
+    /// The item kind, verbatim (`slice` | `sub`).
+    pub kind: String,
+    /// The item status, verbatim (`queued` | `active` | `done` | `split` |
+    /// `blocked` | `deferred`).
+    pub status: String,
+}
+
+/// One milestone's slice tree (`slices.toml` items in file order, §3.3), as
+/// [`QueueShowReply`] carries it so a surface can expand an entry to its slice
+/// list without a second read. `milestone` is a top-level id, or `"<parent>/<sub>"`
+/// for a sub-milestone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowTree {
+    pub milestone: String,
+    #[serde(default)]
+    pub slices: Vec<QueueShowSlice>,
+}
+
+/// Reply to [`op::QUEUE_LIVE`]: the v2 entry ids a live member holds now — a
+/// running session, a claim whose spawn has not landed, or a handoff still in
+/// flight. An `active` entry absent from this list has no holder. A fleet that
+/// is not armed holds nothing, so the list is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueLiveReply {
+    pub held: Vec<String>,
+}
+
+/// Reply to [`op::QUEUE_SHOW`]: the live v2 list and its annotations, for the
+/// `growlight status` and `queue show` surfaces (§6.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowReply {
+    /// `false`: no `queue.toml` — there is no v2 list to show (§3.4), and the
+    /// other fields are empty.
+    pub list: bool,
+    /// One row per project, each with its open stack.
+    #[serde(default)]
+    pub projects: Vec<QueueProjectStack>,
+    /// One row per entry, in file (list) order.
+    #[serde(default)]
+    pub entries: Vec<QueueShowEntry>,
+    /// The archive rows (§3.2), in the order they left the list. Each row's
+    /// `status` carries its `final_status` (`done` | `dropped`) and `lane` is
+    /// empty (archive rows have no lane); `open` is always `false`. The TUI's
+    /// collapsed archive section (§6.9) renders these.
+    #[serde(default)]
+    pub archived: Vec<QueueShowEntry>,
+    /// The §3.5 session-log lines across the list's units.
+    #[serde(default)]
+    pub sessions: Vec<QueueShowSession>,
+    /// Each live milestone's slice tree (§3.3), in file order — the "expands to
+    /// its slice list" half of §6.9, carried so the TUI needs no second read on
+    /// expand. A sub-milestone's identity is `"<parent>/<sub>"`.
+    #[serde(default)]
+    pub trees: Vec<QueueShowTree>,
+}
+
 /// Reply to a member verb. `state` is a documented string (like
 /// [`LeaseReply::state`]) so the handshake's states join it without a
 /// wire-enum bump: [`MEMBER_VERB_OK`] (the handoff committed; `next` names
@@ -1315,6 +1697,124 @@ impl MemberVerbReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read stack leaves the unknown fields off the wire, and a reply from a
+    /// daemon that predates them still decodes as "the answer is known".
+    #[test]
+    fn stack_unknown_fields_are_absent_when_known_and_tolerated_when_missing() {
+        let project: QueueProjectStack = serde_json::from_value(serde_json::json!({
+            "name": "p", "repo": "~/p", "main": "main", "local": true, "stack": [],
+        }))
+        .unwrap();
+        assert_eq!(project.stack_unknown, None);
+        assert!(serde_json::to_value(&project).unwrap().get("stack_unknown").is_none());
+
+        let entry: QueueShowEntry = serde_json::from_value(serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "active",
+            "after": [], "branch": "feat/e", "base": "", "claimed": "", "open": false,
+        }))
+        .unwrap();
+        assert!(!entry.open_unknown);
+        assert!(serde_json::to_value(&entry).unwrap().get("open_unknown").is_none());
+    }
+
+    /// An older daemon's entry carries no hold fields: it decodes as no hold
+    /// (not as human-only) with no doc lines, and an entry at those defaults
+    /// leaves them off the wire, so an older client reads exactly what it did.
+    /// A hold round-trips.
+    #[test]
+    fn hold_fields_default_on_an_older_reply_and_round_trip_when_set() {
+        let old = serde_json::json!({
+            "id": "e", "kind": "task", "project": "p", "lane": "normal", "status": "queued",
+            "after": [], "branch": "fix/e", "base": "", "claimed": "", "open": false,
+        });
+        let entry: QueueShowEntry = serde_json::from_value(old.clone()).unwrap();
+        assert!(entry.fleet, "an older reply reads as no hold");
+        assert_eq!((entry.not_before.as_deref(), entry.doc_fleet.as_deref()), (None, None));
+        assert_eq!(entry.doc_not_before, None);
+        assert_eq!(entry.hold_annotation(), "");
+        assert_eq!(entry.doc_hold_warning(), None);
+        assert_eq!(serde_json::to_value(&entry).unwrap(), old, "defaults stay off the wire");
+
+        let held = QueueShowEntry {
+            fleet: false,
+            auto_restack: false,
+            not_before: Some("2026-11-08 09:00 +01:00".into()),
+            doc_fleet: Some("no".into()),
+            doc_not_before: Some("2026-11-08 08:00Z".into()),
+            ..entry
+        };
+        let wire = serde_json::to_value(&held).unwrap();
+        assert_eq!(wire["fleet"], false);
+        assert_eq!(wire["auto_restack"], false);
+        assert_eq!(serde_json::from_value::<QueueShowEntry>(wire).unwrap(), held);
+        assert_eq!(
+            held.hold_annotation(),
+            " (human-only) (not before 2026-11-08 09:00 +01:00) (no auto-restack)"
+        );
+        assert_eq!(held.doc_hold_warning(), None, "the line and the entry agree, as instants");
+    }
+
+    /// `queue show`'s one line per entry: a doc line that disagrees with the
+    /// entry names both sides and the command that makes the entry match, and
+    /// both lines land in the same one line. A doc with no lines never warns.
+    #[test]
+    fn a_doc_hold_line_that_disagrees_with_its_entry_warns_in_one_line() {
+        let entry = |fleet: bool, nb: Option<&str>, doc_fleet: Option<&str>, doc_nb: Option<&str>| {
+            QueueShowEntry {
+                id: "m1".into(),
+                kind: "milestone".into(),
+                project: "p".into(),
+                lane: "normal".into(),
+                status: "queued".into(),
+                after: vec![],
+                branch: "feat/m1".into(),
+                base: String::new(),
+                claimed: String::new(),
+                pending_status: None,
+                open: false,
+                open_unknown: false,
+                fleet,
+                auto_restack: true,
+                not_before: nb.map(str::to_string),
+                doc_fleet: doc_fleet.map(str::to_string),
+                doc_not_before: doc_nb.map(str::to_string),
+            }
+        };
+        // A human's `> Fleet: no` by habit: the entry holds nothing.
+        let w = entry(true, None, Some("no"), None).doc_hold_warning().expect("warns");
+        assert!(w.starts_with("warning: m1: "), "{w}");
+        assert!(w.contains("`> Fleet: no` but the entry has fleet = true"), "{w}");
+        assert!(w.contains("`softfig growlight queue fleet m1 no`"), "{w}");
+        assert!(!w.contains('\n'), "one line: {w}");
+        // Any non-`yes` value holds, as the legacy reader reads it (a typo too).
+        assert!(entry(true, None, Some("nope"), None).doc_hold_warning().is_some());
+        assert!(entry(true, None, Some(""), None).doc_hold_warning().is_some());
+        // The other way round: the doc frees, the entry holds.
+        let w = entry(false, None, Some("YES"), None).doc_hold_warning().expect("warns");
+        assert!(w.contains("but the entry has fleet = false"), "{w}");
+        // Agreement, and no line at all, are silent.
+        assert_eq!(entry(false, None, Some("no"), None).doc_hold_warning(), None);
+        assert_eq!(entry(true, None, Some("yes"), None).doc_hold_warning(), None);
+        assert_eq!(entry(false, Some("2026-11-08 09:00Z"), None, None).doc_hold_warning(), None);
+
+        // A start time only the doc carries, or a different one.
+        let w = entry(true, None, None, Some("2026-11-08 09:00Z")).doc_hold_warning().expect("warns");
+        assert!(w.contains("`> Not before: 2026-11-08 09:00Z` but the entry has no not_before"), "{w}");
+        assert!(w.contains("`softfig growlight queue not-before m1 \"2026-11-08 09:00Z\"`"), "{w}");
+        let w = entry(true, Some("2026-11-09 09:00Z"), None, Some("2026-11-08 09:00Z"))
+            .doc_hold_warning()
+            .expect("warns");
+        assert!(w.contains("the entry has not_before = \"2026-11-09 09:00Z\""), "{w}");
+        // An unparseable pair compares as written.
+        assert_eq!(entry(true, Some("soon"), None, Some(" soon")).doc_hold_warning(), None);
+        assert!(entry(true, Some("soon"), None, Some("later")).doc_hold_warning().is_some());
+
+        // Both lines disagree: still one line, naming both.
+        let w = entry(true, None, Some("no"), Some("2026-11-08 09:00Z")).doc_hold_warning().unwrap();
+        assert!(w.contains("`> Fleet: no`") && w.contains("`> Not before:"), "{w}");
+        assert_eq!(w.lines().count(), 1, "{w}");
+    }
 
     /// The closed lists' wire names are serde's names (no drift between the
     /// `as_str` the messages print and the JSON a client decodes), and a
@@ -1490,8 +1990,12 @@ mod tests {
             cargo_build_jobs: Some(2),
             memory_high: None,
             cpu_weight: Some(50),
+            cpu_quota: None,
+            test_threads: Some(2),
         };
         let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"test_threads\":2"));
+        assert!(!json.contains("cpu_quota"), "an unset quota is omitted: {json}");
         assert!(json.contains("\"cargo_build_jobs\":2"));
         assert!(!json.contains("memory_high"), "an unset cap is omitted: {json}");
         assert_eq!(serde_json::from_str::<BuildCapsSummary>(&json).unwrap(), s);
@@ -1504,6 +2008,8 @@ mod tests {
                 cargo_build_jobs: Some(4),
                 memory_high: Some("5G".into()),
                 cpu_weight: Some(60),
+                cpu_quota: Some("50%".into()),
+                test_threads: Some(2),
             },
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
@@ -1684,9 +2190,11 @@ mod tests {
         let reply: FleetStatusReply = serde_json::from_str(json).unwrap();
         assert!(!reply.paused, "missing paused decodes as not-paused");
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
+        assert!(reply.queue.is_empty(), "missing queue decodes as unknown, not legacy");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
         assert!(reply.held.is_empty(), "missing held decodes as empty");
+        assert_eq!(reply.schedule, None, "missing schedule decodes as no schedule");
         assert_eq!(
             reply.build_caps,
             BuildCapsSummary::default(),
@@ -1710,6 +2218,7 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: true,
+            queue: "legacy".into(),
             roster: vec![
                 FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },
@@ -1727,9 +2236,11 @@ mod tests {
                 part: "hover-view-sticky".into(),
                 reason: "human-only (> Fleet: no)".into(),
             }],
+            schedule: None,
         };
-        let back: FleetStatusReply =
-            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("schedule"), "no schedule is omitted, as an older peer sends: {json}");
+        let back: FleetStatusReply = serde_json::from_str(&json).unwrap();
         assert!(back.fleet_enabled);
         assert_eq!(back.roster.len(), 2);
         assert_eq!(back.roster[0].agent, "builder");
@@ -1738,6 +2249,53 @@ mod tests {
         assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
         assert_eq!(back.agents, reply.agents, "the live rows round-trip whole");
         assert_eq!(back.held, reply.held, "the held parts round-trip whole");
+    }
+
+    #[test]
+    fn fleet_status_round_trips_the_schedule_block() {
+        let json = r#"{"state":"running","garden_root":"/g","protocol_version":1,
+            "policy":{"max_concurrent_agents":2,"ctx_roll_pct":50,"ctx_handoff_pct":60,
+            "session_5h_halt_pct":85,"session_7d_halt_pct":90}}"#;
+        let mut reply: FleetStatusReply = serde_json::from_str(json).unwrap();
+        reply.schedule = Some(ScheduleSummary {
+            open: false,
+            current_windows: Vec::new(),
+            next_edge: Some(1_793_500_000),
+            next_edge_local: Some("2026-10-31 23:00 -04:00".into()),
+            zone: "America/New_York".into(),
+            held_members: vec![
+                ScheduleHeld { agent: "a".into(), reason: "outside window".into() },
+                ScheduleHeld { agent: "b".into(), reason: "overrun".into() },
+            ],
+            held_items: vec!["default/084 at 2026-11-01 02:00 -04:00".into()],
+            reserve: vec![ReserveSummary {
+                slot: "slot1".into(),
+                reserve_pct: 20,
+                used_7d_pct: None,
+                held: false,
+                resets_at: None,
+            }],
+            projection: vec![PoolProjection {
+                slot: "slot1".into(),
+                window: "reserve".into(),
+                target_pct: 80,
+                cap_at_earliest: Some(1_793_600_000),
+                cap_at_latest: None,
+                resets_at: Some(1_793_700_000),
+                resets_first: false,
+            }],
+        });
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("used_7d_pct"), "an unknown reading is omitted: {json}");
+        assert!(!json.contains("cap_at_latest"), "{json}");
+        let back: FleetStatusReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schedule, reply.schedule);
+        // A bare block (a newer peer that sends only what it knows) decodes too.
+        let bare: ScheduleSummary = serde_json::from_str(r#"{"open":true}"#).unwrap();
+        assert!(bare.open && bare.zone.is_empty() && bare.reserve.is_empty());
+        // A pre-008 projection row (no window, target or resets_first) decodes too.
+        let old: PoolProjection = serde_json::from_str(r#"{"slot":"home"}"#).unwrap();
+        assert!(old.window.is_empty() && old.target_pct == 0 && !old.resets_first);
     }
 
     #[test]

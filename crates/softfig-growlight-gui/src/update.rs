@@ -13,7 +13,8 @@ use crate::state::{App, ConnState, ThoughtLine};
 #[derive(Debug, Clone)]
 pub enum Message {
     /// The fleet `status` one-shot landed (initial load or a manual refresh).
-    StatusLoaded(FleetStatusReply),
+    /// Boxed: the reply dwarfs every other message.
+    StatusLoaded(Box<FleetStatusReply>),
     /// A `set_resources` reply landed (the resources panel adjusted the build
     /// caps): refresh the active caps and the now-vs-next-spawn outcome line. The
     /// live `subscribe` stream carries no caps event, so this reply is how the
@@ -39,7 +40,7 @@ impl From<ClientEvent> for Message {
 /// logic is unit-tested without a window.
 pub fn update(app: &mut App, msg: Message) {
     match msg {
-        Message::StatusLoaded(reply) => app.apply_status(reply),
+        Message::StatusLoaded(reply) => app.apply_status(*reply),
         Message::ResourcesApplied(reply) => app.apply_resources(reply),
         Message::Stream(ev) => apply_client_event(app, ev),
         Message::HumanPosted { to, kind, body } => app.push_human_post(&to, &kind, &body),
@@ -284,6 +285,8 @@ mod tests {
                     cargo_build_jobs: Some(2),
                     memory_high: Some("3G".into()),
                     cpu_weight: Some(50),
+                    cpu_quota: None,
+                    test_threads: None,
                 },
                 applied_live: vec!["MemoryHigh".into()],
                 next_spawn: vec!["CARGO_BUILD_JOBS".into()],

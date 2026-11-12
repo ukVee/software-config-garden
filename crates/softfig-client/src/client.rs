@@ -2,7 +2,7 @@
 //! in `softfig-keeperd`; this module is consumed by the CLI's daemon
 //! bridge and the MCP bridge.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -36,6 +36,19 @@ impl ClientError {
             _ => false,
         }
     }
+
+    /// True if the peer accepted but did not answer in time (a read/write
+    /// timeout or an exhausted call deadline) — distinct from a refused or
+    /// absent socket.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            ClientError::Io(e) => matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            _ => false,
+        }
+    }
 }
 
 /// The one-shot request/response timeout: long enough that a healthy daemon
@@ -52,9 +65,14 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// its duration, surfacing an EAGAIN/`WouldBlock` (os error 11) as a fatal read
 /// error. Use [`connect_stream`] for those.
 pub fn connect(path: &Path) -> Result<UnixStream, ClientError> {
+    connect_with_timeout(path, CALL_TIMEOUT)
+}
+
+/// [`connect`] with a caller-chosen read/write timeout.
+fn connect_with_timeout(path: &Path, timeout: Duration) -> Result<UnixStream, ClientError> {
     let stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
-    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     Ok(stream)
 }
 
@@ -98,6 +116,34 @@ fn read_response(stream: &mut UnixStream) -> Result<Response, ClientError> {
     Ok(resp)
 }
 
+/// [`read_response`] under a wall-clock `deadline` for the whole line. A plain
+/// read timeout is per `read(2)`, so a peer dribbling a byte at a time would
+/// never trip it; this re-arms the timeout with the time left before every
+/// read and fails with `TimedOut` once the deadline passes.
+fn read_response_by(stream: &mut UnixStream, deadline: Instant) -> Result<Response, ClientError> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.iter().position(|b| *b == b'\n') {
+            buf.truncate(end);
+            break;
+        }
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "no complete reply before the deadline"))?;
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut chunk) {
+            Ok(0) if buf.is_empty() => return Err(ClientError::UnexpectedEof),
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 /// Convenience: call + unwrap to the data payload, mapping daemon errors
 /// to `ClientError::Daemon`.
 pub fn call_data(
@@ -126,6 +172,11 @@ pub struct RetryPolicy {
     pub initial_backoff: Duration,
     /// Cap on the per-retry backoff.
     pub max_backoff: Duration,
+    /// Wall-clock cap on one attempt's connect-to-reply exchange: it sets the
+    /// socket read/write timeout and is a deadline for the whole reply line, so
+    /// a peer that accepts and never answers (or dribbles) fails the attempt
+    /// here. `budget` does not cover this; only the pre-send reconnect loop.
+    pub call_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -134,6 +185,7 @@ impl Default for RetryPolicy {
             budget: Duration::from_secs(3),
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_millis(400),
+            call_timeout: CALL_TIMEOUT,
         }
     }
 }
@@ -189,15 +241,16 @@ enum Attempt {
 }
 
 /// One connect + send (pre-framed bytes) + receive against the socket.
-fn attempt(socket: &Path, framed: &[u8]) -> Attempt {
-    let mut stream = match connect(socket) {
+fn attempt(socket: &Path, framed: &[u8], call_timeout: Duration) -> Attempt {
+    let deadline = Instant::now() + call_timeout;
+    let mut stream = match connect_with_timeout(socket, call_timeout) {
         Ok(s) => s,
         Err(e) => return Attempt::PreSend(e),
     };
     if let Err(e) = stream.write_all(framed).and_then(|_| stream.flush()) {
         return Attempt::PreSend(ClientError::Io(e));
     }
-    match read_response(&mut stream) {
+    match read_response_by(&mut stream, deadline) {
         Ok(resp) => Attempt::Ok(resp),
         Err(e) => Attempt::Ambiguous(e),
     }
@@ -225,7 +278,7 @@ pub fn call_reconnecting(
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;
-        match attempt(socket, &framed) {
+        match attempt(socket, &framed, policy.call_timeout) {
             Attempt::Ok(resp) => return Ok(resp),
             Attempt::Ambiguous(source) => {
                 return Err(ReconnectError::Ambiguous {

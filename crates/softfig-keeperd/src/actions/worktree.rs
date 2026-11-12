@@ -110,21 +110,26 @@ impl<'a> WorkTree<'a> {
     /// [`check_write`](Self::check_write) plus the content check
     /// [`write`](Self::write) makes for these exact bytes: the member guards —
     /// no hand edit of a daemon-managed region ([`member_region_refusal`]),
-    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
+    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` /
+    /// `> Not before:` lines
     /// ([`member_reserved_refusal`]) and the `> Fleet:` hold
     /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
     /// this over each before its first write, like `check_write`.
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
+        if is_budgeted_claude_md(rel) {
+            claude_md_budget(rel, self.read(rel).as_deref(), bytes)?;
+        }
         self.guard_member_write(rel, Some(bytes), Bytes::Caller)
     }
 
     /// The member guards for replacing `rel` with `new` (`None` = removing it).
     /// Anywhere in the garden, the caller's bytes may not change a
     /// daemon-managed region ([`member_region_refusal`]; `bytes` says whether
-    /// they are the caller's). Under `growlight/backlog/`, the three reserved
-    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`) are
+    /// they are the caller's). Under `growlight/backlog/`, the four reserved
+    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`,
+    /// `> Not before:`) are
     /// member-immutable and the `> Fleet:` line is member-tighten-only (see
     /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
     /// this request runs for a fleet member ([`crate::caller`]).
@@ -132,7 +137,7 @@ impl<'a> WorkTree<'a> {
         if crate::caller::member().is_none() {
             return Ok(());
         }
-        guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
+        self.guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
     }
 
     /// [`check_write_bytes`](Self::check_write_bytes) against a known prior
@@ -142,18 +147,24 @@ impl<'a> WorkTree<'a> {
     pub fn check_write_bytes_over(&self, rel: &str, old: Option<&[u8]>, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
-        guard_member_change(rel, old, Some(bytes), Bytes::Caller)
+        if is_budgeted_claude_md(rel) {
+            claude_md_budget(rel, old, bytes)?;
+        }
+        self.guard_member_change(rel, old, Some(bytes), Bytes::Caller)
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
     /// refused for a member when it removes a reserved `> Model:` / `> Grants:`
-    /// / `> Worktree:` line or loosens a held `> Fleet:` line under
+    /// / `> Worktree:` / `> Not before:` line or loosens a held `> Fleet:` line under
     /// `growlight/backlog/` — a doc there carrying one, a directory holding such
     /// a doc, or an ancestor of the backlog itself.
     fn guard_member_removal(&self, rel: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
+        if spans_config(rel) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "removes")));
+        }
         let scope = if spans_backlog(rel) {
             super::growlight::paths::backlog_dir()
         } else if is_backlog_rel(rel) {
@@ -164,7 +175,9 @@ impl<'a> WorkTree<'a> {
         if let Some((doc, text)) = self.first_reserved_doc(&scope) {
             return Err(reserved_refusal(&member, &doc, Some(&text), None));
         }
-        if let Some((doc, text)) = self.first_fleet_doc(&scope) {
+        if self.fleet_lines_hold()
+            && let Some((doc, text)) = self.first_fleet_doc(&scope)
+        {
             return Err(fleet_refusal(&member, &doc, Some(&text), None));
         }
         if let Some((doc, text)) = self.first_doc_with(&scope, |t| !super::managed::regions(t).is_empty()) {
@@ -172,13 +185,17 @@ impl<'a> WorkTree<'a> {
                 .expect("a doc carrying a managed region");
             return Err((ErrorKind::BadArgs, why));
         }
+        if let Some(file) = self.first_queue_state_file(&scope) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, &file, "removes")));
+        }
         Ok(())
     }
 
     /// The guard for a rename: moving `from` removes its lines from where they
     /// were, moving it into the backlog adds them at `to` (whatever `from`
     /// is), and replacing an existing `to` removes the destination's. A reserved
-    /// `> Model:` / `> Grants:` / `> Worktree:` line is refused in both
+    /// `> Model:` / `> Grants:` / `> Worktree:` / `> Not before:` line is
+    /// refused in both
     /// directions; `> Fleet:` only in the loosening one (a member may move a
     /// held doc *into* the backlog — that tightens).
     fn guard_member_rename(&self, from: &str, to: &str) -> ActionResult {
@@ -197,7 +214,75 @@ impl<'a> WorkTree<'a> {
         if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_item_doc_path(l)) {
             return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, &landing, "rename lands on")));
         }
+        if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_queue_state_path(l)) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, &landing, "rename lands on")));
+        }
+        if self.landings(from, to).iter().any(|l| *l == growlight_config_rel()) {
+            return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "rename lands on")));
+        }
+        if is_config_rel(to) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, to, "renames onto")));
+        }
         self.guard_member_removal(to)
+    }
+
+    /// The member guards for replacing canonical `rel` from `old` to `new` (`None`
+    /// = absent / removed) — see [`guard_member_write`](Self::guard_member_write).
+    /// A no-op for a request that runs for no fleet member.
+    fn guard_member_change(&self, rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
+        let Some(member) = crate::caller::member() else {
+            return Ok(());
+        };
+        if old != new && is_queue_state_path(rel) {
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, "write changes")));
+        }
+        if old != new && rel == growlight_config_rel() {
+            return Err((ErrorKind::BadArgs, member_growlight_config_refusal(&member, "write changes")));
+        }
+        if is_config_rel(rel) {
+            return Err((ErrorKind::BadArgs, member_config_refusal(&member, rel, "writes")));
+        }
+        let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
+        let (old, new) = (text(old), text(new));
+        if bytes == Bytes::Caller
+            && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
+        {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if !is_backlog_rel(rel) {
+            return Ok(());
+        }
+        if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if self.fleet_lines_hold()
+            && let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref())
+        {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if old.is_none() && new.is_some() && is_item_doc_path(rel) {
+            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
+        }
+        Ok(())
+    }
+
+    /// Whether an item doc's `> Fleet:` line is a hold, so the member guard must
+    /// keep a member from loosening it: under `queue = "legacy"` it is the claim
+    /// hold; under `queue = "v2"` the TOML is the only source of a hold and the
+    /// line holds nothing, so it is the member's to edit like any other line
+    /// (owner ruling 2026-11-07; `queue show` warns when one disagrees with its
+    /// entry). The switch is read from `config/growlight.toml` through this
+    /// worktree, so it is mount-safe under the daemon lock; one that can't be
+    /// read keeps the guard ([`crate::growlight_unit::queue_v2`]).
+    ///
+    /// A member can't move the switch: [`member_growlight_config_refusal`].
+    /// Removing the file would read as legacy, which keeps the guard; the
+    /// `config/` guard ([`member_config_refusal`]) refuses that too.
+    fn fleet_lines_hold(&self) -> bool {
+        !self.read_to_string(&growlight_config_rel()).is_some_and(|raw| crate::growlight_unit::queue_v2(&raw))
     }
 
     /// Where each file at or under `from` lands when `from` is renamed to
@@ -238,7 +323,7 @@ impl<'a> WorkTree<'a> {
     }
 
     /// The first file at or under `rel` carrying a reserved `> Model:` /
-    /// `> Grants:` / `> Worktree:` line, with its text.
+    /// `> Grants:` / `> Worktree:` / `> Not before:` line, with its text.
     fn first_reserved_doc(&self, rel: &str) -> Option<(String, String)> {
         use softfig_ipc::queue_v2::{reserved_field, SUB_DOC_RESERVED};
         self.first_doc_with(rel, |t| reserved_field(t, &SUB_DOC_RESERVED).is_some())
@@ -248,6 +333,14 @@ impl<'a> WorkTree<'a> {
     /// its text.
     fn first_fleet_doc(&self, rel: &str) -> Option<(String, String)> {
         self.first_doc_with(rel, softfig_ipc::fleet::held)
+    }
+
+    /// The first queue v2 state file ([`is_queue_state_path`]) present at or
+    /// under `rel`.
+    fn first_queue_state_file(&self, rel: &str) -> Option<String> {
+        self.landings(rel, rel)
+            .into_iter()
+            .find(|f| is_queue_state_path(f) && self.exists(f))
     }
 
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
@@ -351,7 +444,8 @@ impl<'a> WorkTree<'a> {
     ///
     /// For a fleet member's request, a write under `growlight/backlog/` that
     /// adds, removes or changes a reserved `> Model:` / `> Grants:` /
-    /// `> Worktree:` line (or loosens a `> Fleet:` hold) is refused here
+    /// `> Worktree:` / `> Not before:` line (or loosens a `> Fleet:` hold) is
+    /// refused here
     /// (§6.7) — see [`check_write_bytes`](Self::check_write_bytes).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
@@ -363,11 +457,34 @@ impl<'a> WorkTree<'a> {
     /// the docs keeperd builds itself from a verb's typed fields — the v2 queue
     /// writer ([`super::growlight::v2::apply`]), whose generated `001-plan`
     /// slice carries keeperd's own `> Model:` line, not the caller's. The verb
-    /// holds a member's text fields to §6.7 before it gets here.
+    /// holds a member's text fields to §6.7 before it gets here. The state-file
+    /// refusal still applies: see [`check_structured`](Self::check_structured).
     pub fn write_structured(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
-        self.check_write(rel)?;
+        self.check_structured(rel)?;
         self.stage(rel, bytes)
+    }
+
+    /// Every check [`write_structured`](Self::write_structured) makes, without
+    /// writing: [`check_write`](Self::check_write), and for a fleet member a
+    /// refusal of any queue v2 state file ([`is_queue_state_path`]) unless the
+    /// verb running has vouched for it ([`crate::caller::vouch_for_state`]).
+    /// The raw-byte routes refuse a member the state files outright
+    /// ([`guard_member_change`](Self::guard_member_change)); this is the typed
+    /// writer's half, so a member-callable verb that reaches `v2::apply`
+    /// without holding the member to §6.7 can't write them either (review 054
+    /// F8).
+    pub fn check_structured(&self, rel: &str) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        if let Some(member) = crate::caller::member()
+            && is_queue_state_path(rel)
+            && crate::caller::state_vouch().is_none()
+        {
+            let what = "typed write, which no verb vouched for, reaches";
+            return Err((ErrorKind::BadArgs, member_queue_file_refusal(&member, rel, what)));
+        }
+        Ok(())
     }
 
     /// [`write`](Self::write) for the daemon's own re-derivation of a managed
@@ -458,38 +575,67 @@ impl<'a> WorkTree<'a> {
             }
         }
     }
+
+    /// Put `rel` back the way it was before a verb that failed staged over
+    /// it: `prior`'s bytes, or absent. Every byte restored is one the tree
+    /// already held, so no write guard applies — a guard that refused the
+    /// rollback would leave the failed verb's writes staged for the next
+    /// commit. Only [`v2::apply`](super::growlight::v2::write::apply) calls it.
+    pub(crate) fn unstage(&self, rel: &str, prior: Option<&[u8]>) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        if let Some(bytes) = prior {
+            return self.stage(rel, bytes);
+        }
+        match self {
+            WorkTree::Disk { daemon, garden_root } => {
+                let abs = garden_root.join(rel);
+                daemon.mark_self_write(abs.clone());
+                match std::fs::remove_file(&abs) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err((ErrorKind::Io, format!("remove_file {rel}: {e}")))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            WorkTree::Fuse { mount } => {
+                mount.stage_remove(rel);
+                Ok(())
+            }
+        }
+    }
 }
 
-/// The member guards for replacing canonical `rel` from `old` to `new` (`None`
-/// = absent / removed) — see [`WorkTree::guard_member_write`]. A no-op for a
-/// request that runs for no fleet member.
-fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
-    let Some(member) = crate::caller::member() else {
+/// The limit on hand-written text in a routing `CLAUDE.md`. These docs auto-load
+/// once a session reads a file under their dir, so every byte is charged to
+/// every session passing through (`meta/conventions.md`).
+const CLAUDE_MD_PROSE_LIMIT: usize = 8 * 1024;
+
+/// Whether the budget covers `rel`. `growlight/backlog/` is out for now: item
+/// docs are where the protocol still tells agents to write, and `add_queue`
+/// grows the queue doc's prose.
+fn is_budgeted_claude_md(rel: &str) -> bool {
+    Path::new(rel).file_name().is_some_and(|n| n == "CLAUDE.md") && !is_backlog_rel(rel)
+}
+
+/// Refuse a caller's write that leaves `rel` over the limit and larger than it
+/// was. Managed regions don't count, and a doc already over the limit may
+/// always shrink. Daemon upkeep (`write_derived`, `write_structured`) never
+/// reaches this.
+fn claude_md_budget(rel: &str, old: Option<&[u8]>, new: &[u8]) -> ActionResult {
+    let prose = |b: &[u8]| super::managed::prose_len(&String::from_utf8_lossy(b));
+    let after = prose(new);
+    if after <= CLAUDE_MD_PROSE_LIMIT || after <= old.map_or(0, prose) {
         return Ok(());
-    };
-    let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
-    let (old, new) = (text(old), text(new));
-    if bytes == Bytes::Caller
-        && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
-    {
-        return Err((ErrorKind::BadArgs, why));
     }
-    if !is_backlog_rel(rel) {
-        return Ok(());
-    }
-    if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-        return Err((ErrorKind::BadArgs, why));
-    }
-    if old.is_none() && new.is_some() && is_item_doc_path(rel) {
-        return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
-    }
-    Ok(())
+    Err((
+        ErrorKind::BadArgs,
+        format!(
+            "{rel} would hold {after} bytes of hand-written text, over the \
+             {CLAUDE_MD_PROSE_LIMIT}-byte limit for a CLAUDE.md, and this write grows it. \
+             A CLAUDE.md routes: put the content in notes/ or state.md and leave a pointer \
+             (meta/conventions.md)."
+        ),
+    ))
 }
 
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree
@@ -498,6 +644,38 @@ fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether canonical `rel` lies under the garden's `config/` tree — the
+/// daemons' own settings (`growlight.toml`, `keeper.toml`, `pricing.toml`,
+/// `peers.toml`, `deploy.toml`).
+fn is_config_rel(rel: &str) -> bool {
+    rel.strip_prefix(crate::keeper_toml::CONFIG_DIR)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether `rel` is `config/`, something under it, or the garden root:
+/// removing it removes (part of) the config tree.
+fn spans_config(rel: &str) -> bool {
+    rel.is_empty() || is_config_rel(rel)
+}
+
+/// Review 056 F6 (report 121): a fleet member may not change the daemons'
+/// settings. `config/growlight.toml` is the fleet's admission control — the
+/// `[schedule]` windows, the reserve, the build caps — and growlightd reads it
+/// at its next start, so a member's `patch_file` there would widen its own
+/// window. `folder-grants` is not the general fix (its spec excludes garden
+/// writes and leaves claude members advisory), so keeperd refuses it at the
+/// write. This does not confine a member's shell, which can still write the
+/// mount directly (spec-growlight-queue §6.7). The refusal text leads with the
+/// wire code, `member_not_allowed`.
+fn member_config_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {rel}, and fleet member {member} may not change anything \
+         under config/ — growlightd and keeperd read their settings from there, so a member's \
+         edit would be its own admission control. The human edits config/; if a setting is \
+         wrong, file_report it or post_message @human. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// The inline `<vault id="…">…</vault>` regions in `text` at repo-relative
@@ -553,8 +731,8 @@ pub(crate) fn member_vault_refusal(
             "member_not_allowed: this write adds, removes or changes an inline `<vault>` region in \
              {rel}, and fleet member {member} may not seal or unseal anything under \
              growlight/backlog/ — a sealed region reads as `[encrypted]` to growlightd, so it \
-             could hide a `> Fleet:` / `> Model:` / `> Worktree:` line. Write the text in the \
-             clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
+             could hide a `> Fleet:` / `> Model:` / `> Worktree:` / `> Not before:` line. Write \
+             the text in the clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
         )
     })
 }
@@ -598,7 +776,7 @@ fn spans_backlog(rel: &str) -> bool {
 
 /// [`member_reserved_refusal`] as the worktree's error, for a change the caller
 /// already knows touches a reserved `> Model:` / `> Grants:` / `> Worktree:`
-/// line.
+/// / `> Not before:` line.
 fn reserved_refusal(
     member: &str,
     rel: &str,
@@ -614,7 +792,8 @@ fn reserved_refusal(
 /// `old` with `new` at `rel` (`None` = absent / removed) adds, removes or
 /// changes a `> <key>:` line for any key in
 /// [`softfig_ipc::queue_v2::SUB_DOC_RESERVED`] — the `> Model:`, `> Grants:`
-/// and `> Worktree:` lines §6.7 reserves to humans. Two reads of the one
+/// and `> Worktree:` lines §6.7 reserves to humans, and the `> Not before:`
+/// start time (growlight-schedule slice 007). Two reads of the one
 /// scanner ([`softfig_ipc::item_meta`]) are compared: every raw line (fenced or
 /// not — an edit to a fenced example is refused too), and the value a resolver
 /// reads ([`softfig_ipc::item_meta::field`] — so a fence opened or closed
@@ -687,6 +866,60 @@ pub(crate) fn member_region_refusal(
          @human. (spec-growlight-queue §6.7)",
         changed.join("`, `")
     ))
+}
+
+/// Whether canonical `rel` is one of queue v2's state files: the live
+/// `queue.toml`, `queue-archive.toml`, or a milestone's or sub-milestone's
+/// `slices.toml` (`milestones/**/slices.toml`).
+fn is_queue_state_path(rel: &str) -> bool {
+    use softfig_ipc::queue_v2::{MILESTONES_DIR, QUEUE_ARCHIVE_FILE, QUEUE_FILE};
+    rel == QUEUE_FILE
+        || rel == QUEUE_ARCHIVE_FILE
+        || rel
+            .strip_prefix(MILESTONES_DIR)
+            .is_some_and(|rest| rest.starts_with('/') && rest.ends_with("/slices.toml"))
+}
+
+/// `config/growlight.toml`, garden-relative: the fleet config growlightd runs
+/// from, and the §11 `queue` switch the `> Fleet:` guard reads
+/// ([`WorkTree::fleet_lines_hold`]).
+fn growlight_config_rel() -> String {
+    format!("{}/{}", softfig_ipc::GARDEN_CONFIG_DIR, softfig_ipc::GROWLIGHT_CONFIG_FILE)
+}
+
+/// queue-v2-parity-fixes slice 003: a member may not write or rename onto
+/// `config/growlight.toml`. The `> Fleet:` guard stands down under `queue =
+/// "v2"`, so a member that could set the switch could free a legacy hold — set
+/// `v2`, strip the line, set it back — while growlightd, which reads the switch
+/// at boot, still schedules from the doc lines. The fleet config is the human's
+/// (`set_resources` is a human verb). The refusal text leads with the wire code,
+/// `member_not_allowed`.
+fn member_growlight_config_refusal(member: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {}, and fleet member {member} may not edit the fleet \
+         config — growlightd runs from it, and its `queue` switch decides which holds the \
+         member guards keep. If it needs a change, post_message @human.",
+        growlight_config_rel()
+    )
+}
+
+/// queue-v2-parity row 5 (the v2 counterpart of the legacy queue-table
+/// region guard): a member may not write, remove or rename onto a queue v2
+/// state file ([`is_queue_state_path`]). growlightd schedules from them, and
+/// they move only through the queue verbs — keeperd's typed writer
+/// (`write_structured`), which validates the whole file and which a member
+/// reaches with `queue_add_entry` (the one verb that vouches for it,
+/// [`WorkTree::check_structured`]) or through growlightd (`slice_insert` /
+/// `slice_update`, the handshake). The refusal text leads with the wire code,
+/// `member_not_allowed`.
+fn member_queue_file_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} {rel}, and fleet member {member} may not edit queue v2's \
+         state files by hand — `queue.toml`, `queue-archive.toml` and a milestone's \
+         `slices.toml` move only through the queue verbs, which validate them, and growlightd \
+         schedules from them. Use slice_insert / slice_update or the growlight_* member verbs; \
+         if a row is wrong, file_report it or post_message @human. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// [`member_fleet_refusal`] as the worktree's error, for a change the caller
@@ -820,6 +1053,11 @@ mod tests {
             ("Model", "# slice\n\n> Model: flash\n\nbody\n", "# slice\n\n> Model: claude\n\nbody\n"),
             ("Grants", "# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
             ("Worktree", "# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+            (
+                "Not before",
+                "# t\n\n> Not before: 2026-11-01 02:00Z\n\nbody\n",
+                "# t\n\n> Not before: 2026-11-01 03:00Z\n\nbody\n",
+            ),
         ];
         for (key, doc, changed) in cases {
             let add = member_reserved_refusal("c", rel, Some("# slice\n\nbody\n"), Some(doc)).unwrap();
@@ -884,12 +1122,45 @@ mod tests {
         }
     }
 
-    /// The same worktree-level guard refuses a member's add, change and remove
-    /// of a `> Grants:` or `> Worktree:` line (report 020), across write,
-    /// `check_write_bytes`, `unlink` (remove) and rename-out. A human may set
-    /// and change either.
+    /// The `CLAUDE.md` budget: a caller's write may not grow a routing doc's
+    /// hand-written text past the limit. Managed regions don't count, an
+    /// over-limit doc may shrink, and daemon upkeep and other docs are exempt.
     #[test]
-    fn a_members_backlog_write_may_not_touch_a_grants_or_worktree_line() {
+    fn a_write_may_not_grow_a_claude_md_past_the_budget() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let over = "x".repeat(CLAUDE_MD_PROSE_LIMIT + 1);
+
+        let err = wt.write("a/CLAUDE.md", over.as_bytes()).unwrap_err();
+        assert!(err.1.contains("A CLAUDE.md routes"), "{}", err.1);
+        wt.check_write_bytes_over("a/CLAUDE.md", None, over.as_bytes()).unwrap_err();
+        wt.write("a/CLAUDE.md", b"short\n").expect("under the limit");
+
+        let region = format!(
+            "<!-- softfig:index notes -->\n{}\n<!-- /softfig:index notes -->\n",
+            "r".repeat(CLAUDE_MD_PROSE_LIMIT * 2)
+        );
+        wt.write("b/CLAUDE.md", format!("short\n\n{region}").as_bytes())
+            .expect("a managed region doesn't count");
+
+        wt.write_derived("c/CLAUDE.md", over.as_bytes()).expect("daemon upkeep is exempt");
+        let longer = format!("{over}y");
+        wt.write("c/CLAUDE.md", longer.as_bytes()).unwrap_err();
+        wt.write("c/CLAUDE.md", &over.as_bytes()[1..]).expect("an over-limit doc may shrink");
+
+        wt.write("c/notes.md", over.as_bytes()).expect("only CLAUDE.md is budgeted");
+        wt.write("growlight/backlog/milestones/m/CLAUDE.md", over.as_bytes())
+            .expect("the backlog is out for now");
+    }
+
+    /// The same worktree-level guard refuses a member's add, change and remove
+    /// of a `> Grants:`, `> Worktree:` (report 020) or `> Not before:` line
+    /// (growlight-schedule slice 007), across write, `check_write_bytes`,
+    /// `unlink` (remove) and rename-out. A human may set and change each.
+    #[test]
+    fn a_members_backlog_write_may_not_touch_a_grants_worktree_or_not_before_line() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let inner = daemon.inner.lock().unwrap();
@@ -897,6 +1168,7 @@ mod tests {
         let cases = [
             ("# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
             ("# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+            ("# a\n\n> Not before: 2026-11-01 02:00Z\n\nbody\n", "# a\n\n> Not before: 2026-11-02 02:00Z\n\nbody\n"),
         ];
         for (doc, changed) in cases {
             wt.write(SLICE, b"# a\n\nbody\n").expect("reset");
@@ -1233,6 +1505,158 @@ Example:
             .expect("the daemon's re-derivation of the region");
     }
 
+    const QUEUE: &str = "growlight/backlog/queue.toml";
+    const ARCHIVE: &str = "growlight/backlog/queue-archive.toml";
+    const SLICES: &str = "growlight/backlog/milestones/m/slices.toml";
+
+    #[test]
+    fn the_queue_state_paths_are_the_three_v2_files() {
+        assert!(is_queue_state_path(QUEUE));
+        assert!(is_queue_state_path(ARCHIVE));
+        assert!(is_queue_state_path(SLICES));
+        assert!(is_queue_state_path("growlight/backlog/milestones/m/subs/s/slices.toml"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones/m/slices/001-a.md"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones-old/m/slices.toml"));
+        assert!(!is_queue_state_path("growlight/backlog/milestones/m/slices.toml.bak"));
+        assert!(!is_queue_state_path("projects/p/queue.toml"));
+    }
+
+    /// queue-v2-parity row 5: a member's write to `queue.toml` is refused
+    /// whatever road it takes — any spelling of the path, the batch pre-check,
+    /// a derived write — and so is creating a `slices.toml`. Re-sending the
+    /// bytes unchanged, and keeperd's typed writer, still land.
+    #[test]
+    fn a_member_may_not_patch_queue_toml() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(QUEUE, b"schema = 1\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for path in [QUEUE, "growlight/./backlog//queue.toml"] {
+            let err = wt.write(path, b"schema = 1\n# moved\n").unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs);
+            assert!(
+                err.1.starts_with("member_not_allowed: this write changes growlight/backlog/queue.toml"),
+                "{err:?}"
+            );
+        }
+        assert!(wt.check_write_bytes(QUEUE, b"x").is_err(), "the pre-check agrees");
+        assert!(wt.check_write_bytes_over(QUEUE, Some(b"schema = 1\n"), b"x").is_err(), "a batch op");
+        assert!(wt.write_derived(QUEUE, b"x").is_err(), "no derived bypass");
+        assert!(wt.write(SLICES, b"schema = 1\n").is_err(), "creating a slices.toml");
+        assert_eq!(wt.read(QUEUE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        assert!(!wt.exists(SLICES));
+        wt.write(QUEUE, b"schema = 1\n").expect("the same bytes change nothing");
+        // F8: the typed writer refuses a member too, unless the verb vouched.
+        for path in [QUEUE, ARCHIVE, SLICES] {
+            let err = wt.write_structured(path, b"schema = 1\n# keeperd\n").unwrap_err();
+            assert!(
+                err.1.starts_with(&format!("member_not_allowed: this typed write, which no verb vouched for, reaches {path}")),
+                "{err:?}"
+            );
+            assert!(wt.check_structured(path).is_err(), "the pre-check agrees");
+        }
+        assert_eq!(wt.read(QUEUE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        let _vouch = caller::vouch_for_state("queue_add_entry");
+        wt.write_structured(QUEUE, b"schema = 1\n# keeperd\n").expect("a vouched typed write");
+    }
+
+    /// queue-v2-parity row 5: a member may not replace the archive, unlink it,
+    /// rename it away, or remove a directory holding a `slices.toml`.
+    #[test]
+    fn a_member_may_not_replace_or_unlink_the_archive() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(ARCHIVE, b"schema = 1\n").unwrap();
+        wt.write(SLICES, b"schema = 1\n").unwrap();
+        wt.write("growlight/backlog/milestones/m/notes/001-x.md", b"# n\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(ARCHIVE, b"schema = 1\n[[entry]]\n").unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed: this write changes"), "{err:?}");
+        let err = wt.remove(ARCHIVE).unwrap_err();
+        assert!(err.1.starts_with(&format!("member_not_allowed: this removes {ARCHIVE}")), "{err:?}");
+        assert!(wt.rename(ARCHIVE, "projects/p/archive.toml").is_err(), "renaming it away");
+        let err = wt.remove("growlight/backlog/milestones/m").unwrap_err();
+        assert!(err.1.contains(&format!("removes {SLICES}")), "{err:?}");
+        assert_eq!(wt.read(ARCHIVE).as_deref(), Some(&b"schema = 1\n"[..]), "untouched");
+        assert!(wt.exists(SLICES) && !wt.exists("projects/p/archive.toml"));
+        wt.remove("growlight/backlog/milestones/m/notes/001-x.md")
+            .expect("a backlog file that is not queue state");
+    }
+
+    /// queue-v2-parity row 5: a member may not rename a file — or a directory
+    /// whose files land there — onto a milestone's or sub-milestone's
+    /// `slices.toml`.
+    #[test]
+    fn a_member_may_not_rename_onto_a_slices_toml() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write("projects/p/drafts/slices.toml", b"schema = 1\n").unwrap();
+        wt.write("projects/p/drafts/n/slices.toml", b"schema = 1\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.rename("projects/p/drafts/slices.toml", SLICES).unwrap_err();
+        assert!(
+            err.1.starts_with(&format!("member_not_allowed: this rename lands on {SLICES}")),
+            "{err:?}"
+        );
+        let sub = "growlight/backlog/milestones/m/subs/s/slices.toml";
+        assert!(wt.rename("projects/p/drafts/slices.toml", sub).is_err(), "a sub-milestone's");
+        let err = wt.rename("projects/p/drafts/n", "growlight/backlog/milestones/n").unwrap_err();
+        assert!(err.1.contains("lands on growlight/backlog/milestones/n/slices.toml"), "{err:?}");
+        assert!(!wt.exists(SLICES) && !wt.exists(sub));
+        assert!(!wt.exists("growlight/backlog/milestones/n/slices.toml"));
+        wt.rename("projects/p/drafts/slices.toml", "projects/p/drafts/old.toml")
+            .expect("a rename outside the queue");
+    }
+
+    /// Review 056 F6 (report 121): a member may not write, remove, or rename
+    /// onto anything under `config/` (nor remove the tree above it), by any
+    /// spelling of the path; a human may. The refusal names the file.
+    #[test]
+    fn a_member_may_not_change_config() {
+        assert!(is_config_rel("config/growlight.toml"));
+        assert!(is_config_rel("config/source/dots/x"));
+        assert!(is_config_rel("config"));
+        assert!(!is_config_rel("configs/x"), "a sibling that merely shares the prefix");
+        assert!(!is_config_rel("projects/p/config/x"), "only the garden's own config/");
+        assert!(spans_config("") && spans_config("config") && !spans_config("projects"));
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let toml = "config/growlight.toml";
+        wt.write(toml, b"[schedule]\nenabled = true\n").unwrap();
+        wt.write("projects/p/notes/001-x.md", b"# n\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+
+        let err = wt.write(toml, b"[schedule]\nenabled = false\n").unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains(toml), "{err:?}");
+        assert!(wt.write("config/pricing.toml", b"x = 1\n").is_err(), "creating one too");
+        assert!(wt.write("./config//growlight.toml", b"x\n").is_err(), "an alias of it");
+        assert!(wt.check_write_bytes(toml, b"x\n").is_err(), "the pre-check agrees");
+        assert!(wt.check_write_bytes_over(toml, None, b"x\n").is_err(), "so does the batch's");
+        assert!(wt.write_derived(toml, b"x\n").is_err(), "a derived write for a member too");
+        assert!(wt.remove(toml).is_err(), "removing the file");
+        assert!(wt.remove("config").is_err(), "removing the tree");
+        assert!(wt.remove("").is_err(), "removing the garden root");
+        assert!(wt.rename(toml, "projects/p/notes/002-y.md").is_err(), "renaming it away");
+        assert!(wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").is_err(), "renaming onto config/");
+        assert_eq!(wt.read_to_string(toml).as_deref(), Some("[schedule]\nenabled = true\n"));
+        assert!(!wt.exists("config/deploy.toml") && wt.exists("projects/p/notes/001-x.md"));
+        wt.write("projects/p/notes/001-x.md", b"# edited\n").expect("a notes/ write still works");
+
+        drop(_member);
+        wt.write(toml, b"[schedule]\nenabled = false\n").expect("a human's write");
+        wt.rename("projects/p/notes/001-x.md", "config/deploy.toml").expect("a human's rename");
+        wt.remove("config/deploy.toml").expect("a human's removal");
+    }
+
     /// Review 042 G74-3: every spelling of a garden path canonicalises to one,
     /// and a member's write, removal or rename through an alias of a guarded
     /// backlog doc is refused exactly as through its canonical path.
@@ -1277,6 +1701,11 @@ Example:
         let why = member_reserved_refusal("c", rel, Some(declared), Some(hidden)).unwrap();
         assert!(why.contains("changes which `> Worktree:` line"), "{why}");
         assert!(member_reserved_refusal("c", rel, Some(hidden), Some(declared)).is_some(), "un-hiding");
+        let scheduled = "# t\n\n> Not before: 2026-11-01 02:00Z\n";
+        let unscheduled = "# t\n\n~~~\n> Not before: 2026-11-01 02:00Z\n";
+        let why = member_reserved_refusal("c", rel, Some(scheduled), Some(unscheduled)).unwrap();
+        assert!(why.contains("changes which `> Not before:` line"), "{why}");
+        assert!(member_reserved_refusal("c", rel, Some(unscheduled), Some(scheduled)).is_some(), "re-scheduling");
 
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
@@ -1414,5 +1843,58 @@ Example:
         assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "op 1 unstaged");
         drop(inner);
         super::super::batch(&daemon, args).expect("a human's batch lands");
+    }
+
+    /// Owner ruling 2026-11-07 (slice 003): under `queue = "v2"` a doc's
+    /// `> Fleet:` line holds nothing, so a member may loosen or remove it —
+    /// by write, pre-check, batch-style `check_write_bytes_over` or unlink.
+    /// Under legacy, with no config, and with a switch growlightd would refuse,
+    /// the guard stays. A member can't move the switch: a write or a rename
+    /// onto `config/growlight.toml` is refused, and a human's still lands.
+    #[test]
+    fn the_fleet_guard_stands_down_under_queue_v2_only() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let config = growlight_config_rel();
+        let loosened = FLEET_HELD.replace("> Fleet: no", "> Fleet: yes");
+        let switches = [
+            (None, true),
+            (Some("fleet_enabled = true\nqueue = \"legacy\"\n"), true),
+            (Some("queue = \"v3\"\n"), true),
+            (Some("fleet_enabled = true\nqueue = \"v2\"\n"), false),
+        ];
+        for (switch, guarded) in switches {
+            if let Some(raw) = switch {
+                wt.write(&config, raw.as_bytes()).expect("a human sets the switch");
+            }
+            wt.write(SLICE, FLEET_HELD.as_bytes()).expect("reset");
+            let _member = caller::enter(Some("c".into()));
+            let refused = [
+                wt.check_write_bytes(SLICE, b"# slice\n\nbody\n").is_err(),
+                wt.check_write_bytes_over(SLICE, Some(FLEET_HELD.as_bytes()), loosened.as_bytes()).is_err(),
+                wt.write(SLICE, loosened.as_bytes()).is_err(),
+            ];
+            assert_eq!(refused, [guarded; 3], "{switch:?}");
+            if guarded {
+                let err = wt.remove(SLICE).unwrap_err();
+                assert!(err.1.contains("loosens or removes"), "{switch:?}: {err:?}");
+            } else {
+                wt.write(SLICE, b"# slice\n\nbody\n").expect("v2: the line is the member's");
+                wt.remove(SLICE).expect("v2: unlinking a doc that still says `> Fleet: no`");
+            }
+        }
+
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(&config, b"queue = \"legacy\"\n").unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs);
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("config/growlight.toml"), "{err:?}");
+        wt.write("projects/p/notes/001-g.md", b"queue = \"legacy\"\n").expect("seed outside");
+        let err = wt.rename("projects/p/notes/001-g.md", &config).unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:"), "rename onto the config: {err:?}");
+        assert!(wt.read_to_string(&config).is_some_and(|raw| raw.contains("\"v2\"")), "switch untouched");
+        drop(_member);
+        wt.write(&config, b"queue = \"legacy\"\n").expect("the human's write lands");
     }
 }

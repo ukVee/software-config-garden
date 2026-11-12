@@ -2,27 +2,33 @@
 //! (`queue-v2-scheduling` slice 010): keeperd writes the sub-milestone's docs
 //! from the structured fields, so none of that text may carry the metadata
 //! lines the resolvers and the grants enforcement read — `> Model:`,
-//! `> Grants:`, `> Worktree:`. Otherwise a member could hand its own sub a
-//! model, a folder grant or a worktree the parent never allowed.
+//! `> Grants:`, `> Worktree:`, `> Not before:`. Otherwise a member could hand
+//! its own sub a model, a folder grant or a worktree the parent never allowed,
+//! or a start time the human never set (growlight-schedule slice 007).
 //!
 //! One rule, two callers: growlightd's §6.3 validation (the `field_not_allowed`
 //! refusal the agent sees, before anything commits) and keeperd's
 //! `queue_v2_add_sub` (the writer's backstop). Pure.
 //!
 //! **Where each key is refused.** The mission, the finish criteria and every
-//! slice title may carry none of the three. A slice **body** may carry
+//! slice title may carry none of the four. A slice **body** may carry
 //! `> Model:` — §6.7's one exception, held to the subset rule instead
-//! (`model_choice::validate_declared_subset`) — but not `> Grants:` or
-//! `> Worktree:`.
+//! (`model_choice::validate_declared_subset`) — but not `> Grants:`,
+//! `> Worktree:` or `> Not before:`.
 
 /// The blockquote metadata keys a member may not write into a sub-milestone
 /// (§6.7), lowercase.
-pub const SUB_DOC_RESERVED: [&str; 3] =
-    [crate::item_meta::MODEL, crate::item_meta::GRANTS, crate::item_meta::WORKTREE];
+pub const SUB_DOC_RESERVED: [&str; 4] = [
+    crate::item_meta::MODEL,
+    crate::item_meta::GRANTS,
+    crate::item_meta::WORKTREE,
+    crate::item_meta::NOT_BEFORE,
+];
 
 /// The reserved keys a member-supplied slice body may not carry: everything
 /// but `model`, which §6.7 lets a slice body declare (subset-checked).
-pub const SLICE_BODY_RESERVED: [&str; 2] = [crate::item_meta::GRANTS, crate::item_meta::WORKTREE];
+pub const SLICE_BODY_RESERVED: [&str; 3] =
+    [crate::item_meta::GRANTS, crate::item_meta::WORKTREE, crate::item_meta::NOT_BEFORE];
 
 /// The guard-side reads of the shared metadata scanner, re-exported where the
 /// §6.7 rule has always named them: [`reserved_field`] finds the first
@@ -44,7 +50,8 @@ pub struct SubSliceText<'a> {
 pub struct FieldViolation {
     /// `mission`, `finish_criteria`, `slices[<i>].title` or `slices[<i>].body`.
     pub field: String,
-    /// The reserved key, lowercase (`model`, `grants`, `worktree`).
+    /// The reserved key, lowercase (`model`, `grants`, `worktree`,
+    /// `not before`).
     pub key: &'static str,
 }
 
@@ -59,7 +66,8 @@ impl FieldViolation {
             match self.key {
                 "model" => "its model",
                 "grants" => "its folder grants",
-                _ => "its worktree",
+                "worktree" => "its worktree",
+                _ => "its start time",
             },
             if self.key == "model" && !self.field.ends_with(".body") {
                 " (a slice body may declare `> Model:`, a subset of what it inherits)"
@@ -107,9 +115,11 @@ mod tests {
         assert_eq!(reserved_field("> Model: flash", &SUB_DOC_RESERVED), Some("model"));
         assert_eq!(reserved_field("  >   grants : ~/x", &SUB_DOC_RESERVED), Some("grants"));
         assert_eq!(reserved_field("> WORKTREE:", &SUB_DOC_RESERVED), Some("worktree"), "an empty value counts");
+        assert_eq!(reserved_field(">  not BEFORE : 2026-11-01 02:00Z", &SUB_DOC_RESERVED), Some("not before"));
         assert_eq!(reserved_field("Model: flash (prose)", &SUB_DOC_RESERVED), None, "prose is not metadata");
         assert_eq!(reserved_field("> Last reviewed: 2026-10-14", &SUB_DOC_RESERVED), None);
         assert_eq!(reserved_field("> Model: flash", &SLICE_BODY_RESERVED), None);
+        assert_eq!(reserved_field("> Not before: 2026-11-01 02:00Z", &SLICE_BODY_RESERVED), Some("not before"));
     }
 
     #[test]
@@ -121,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_criteria_and_titles_refuse_all_three_and_bodies_refuse_grants_and_worktree() {
+    fn mission_criteria_and_titles_refuse_all_four_and_bodies_refuse_all_but_model() {
         let clean = [slice("Build it", "> Model: flash\n\nwork")];
         assert_eq!(sub_doc_violation("do x", "x works", &clean), None, "a body may declare a model");
 
@@ -134,5 +144,10 @@ mod tests {
         let v = sub_doc_violation("do x", "ok", &[clean[0], slice("t", "> Grants: ~/projects")]).unwrap();
         assert_eq!((v.field.as_str(), v.key), ("slices[1].body", "grants"));
         assert!(v.message().contains("`slices[1].body` carries a `> Grants:` line"), "{}", v.message());
+        let v = sub_doc_violation("do x\n> Not before: 2026-11-01 02:00Z", "ok", &clean).unwrap();
+        assert_eq!((v.field.as_str(), v.key), ("mission", "not before"));
+        let v = sub_doc_violation("do x", "ok", &[slice("t", "> Not before: 2026-11-01 02:00Z\n\nwork")]).unwrap();
+        assert_eq!((v.field.as_str(), v.key), ("slices[0].body", "not before"));
+        assert!(v.message().contains("carries a `> Not before:` line") && v.message().contains("its start time"), "{}", v.message());
     }
 }

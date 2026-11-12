@@ -18,6 +18,8 @@ pub mod hit;
 pub mod ipc;
 pub mod listpane;
 pub mod prefs;
+pub mod queue_v2_view;
+pub mod redraw;
 pub mod textarea;
 pub mod tree;
 pub mod ui;

@@ -3,7 +3,7 @@
 //! keeperd `Daemon`/`DaemonHandle` split: the accept loop hands `Arc`-shared
 //! clones to each connection handler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -15,11 +15,13 @@ use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs}
 use crate::backend_router::BackendRouter;
 use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::{Control, LiveKill};
+use crate::git_probe::ProbeCache;
 use crate::hub::EventHub;
 use crate::leases::{DrainOutcome, LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 use crate::persist::ResourcePersister;
 use crate::resume::{ItemResumer, ResumeOutcome};
 use crate::state::State;
+use crate::telemetry_capture::TelemetrySink;
 
 #[derive(Debug, Error)]
 pub enum GrowlightdError {
@@ -63,6 +65,10 @@ pub struct DaemonInner {
     /// last tick — what `status` lists under `held`. Empty until the loop's first
     /// tick, and always empty for a disarmed fleet (no loop runs).
     pub held_parts: Vec<softfig_ipc::growlightd::HeldPartSummary>,
+    /// The `[schedule]` block `status` reports (growlight-schedule slice 006),
+    /// as the drive loop last evaluated it. `None` until the loop's first tick,
+    /// while no schedule is enabled, and always for a disarmed fleet.
+    pub schedule_summary: Option<softfig_ipc::growlightd::ScheduleSummary>,
     // The live `claude -p` child *kill* handles do NOT live here under the daemon
     // lock — they are in [`Daemon::kill_handles`], a registry the backend shares
     // by `Arc` and fills on every spawn, so the hard-kill path never has to take
@@ -80,6 +86,7 @@ impl DaemonInner {
             fleet: crate::fleet::FleetConfig::disabled(),
             member_lifecycles: BTreeMap::new(),
             held_parts: Vec::new(),
+            schedule_summary: None,
         }
     }
 }
@@ -92,6 +99,12 @@ pub struct Daemon {
     /// never has to take the daemon lock to publish — and so `publish` can't
     /// contend with anything holding `inner` (the hub has its own brief lock).
     pub hub: EventHub,
+    /// The bounded git probes behind `queue_show` (F7). Its own cache, not the
+    /// drive loop's: that one's clock and answers advance only when the loop
+    /// ticks, and a human reading the list must not put a repo on hold for the
+    /// scheduler. Lives *outside* `inner` (like `hub`) so a probe's deadline is
+    /// waited out without the daemon lock.
+    pub surface_probes: ProbeCache,
     /// The §4d rung-2 thrash hook, invoked when a lease is granted over a
     /// contended target. Lives *outside* `inner` (like `hub`) so it is called
     /// without the daemon lock held — the production impl reaches keeperd over
@@ -177,6 +190,12 @@ pub struct Daemon {
     /// `main` installs them; a verb that validates without them errors and
     /// leaves the session running.
     pub v2_handoff: Option<Arc<crate::member_handoff::HandoffSeams>>,
+    /// Where every backend's token-telemetry rows go (token-telemetry-p1
+    /// slice 004): the recorder `main` feeds the flush thread from, plus the
+    /// price table. `None` until `main` installs it; the fleet then builds its
+    /// backends on the default sink, which drops every row. Lives *outside*
+    /// `inner` (like `backends`) so assembly reads it without the daemon lock.
+    pub telemetry: Arc<Mutex<Option<TelemetrySink>>>,
 }
 
 /// One member's handoff as the mirror tracks it.
@@ -201,6 +220,12 @@ pub struct V2Mirror {
     /// the accepted model changes) — what `queue pick` applies to its own read
     /// of the v2 list (slice 012).
     pub overlay: crate::drive_loop::V2Overlay,
+    /// Entries the loop is claiming right now: marked before the keeperd claim
+    /// and cleared once the assignment is recorded or the start failed. The
+    /// overlay above is published at the end of a tick, so without this an
+    /// entry keeperd already shows `active` would read holder-less across the
+    /// spawn (report 172).
+    pub claiming: BTreeSet<String>,
 }
 
 impl Daemon {
@@ -208,6 +233,7 @@ impl Daemon {
         Self {
             inner: Arc::new(Mutex::new(DaemonInner::new(config))),
             hub: EventHub::new(),
+            surface_probes: ProbeCache::new(),
             thrash_clear: None,
             resumer: None,
             persister: None,
@@ -217,6 +243,7 @@ impl Daemon {
             backends: Arc::new(Mutex::new(None)),
             v2_mirror: Arc::new(Mutex::new(V2Mirror::default())),
             v2_handoff: None,
+            telemetry: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -267,6 +294,38 @@ impl Daemon {
     /// first tick and on a legacy loop.
     pub fn v2_overlay(&self) -> crate::drive_loop::V2Overlay {
         self.v2_mirror.lock().unwrap().overlay.clone()
+    }
+
+    /// Mark `entry` as being claimed: from before the keeperd claim until the
+    /// assignment is recorded or the start fails ([`claim_ended`](Self::claim_ended)).
+    pub fn claim_started(&self, entry: &str) {
+        self.v2_mirror.lock().unwrap().claiming.insert(entry.to_string());
+    }
+
+    /// The claim of `entry` is over: it is held through the overlay now, or
+    /// nothing holds it.
+    pub fn claim_ended(&self, entry: &str) {
+        self.v2_mirror.lock().unwrap().claiming.remove(entry);
+    }
+
+    /// The v2 entry ids a live member holds right now (report 172): every hold
+    /// in the loop's overlay except a paused entry's remembered pauser (that
+    /// session is over), plus the claims in flight. Sorted, deduplicated. Empty
+    /// on a legacy or disarmed fleet, which publishes no holds.
+    pub fn v2_live(&self) -> Vec<String> {
+        use softfig_ipc::queue_v2::EntryStatus;
+        let mirror = self.v2_mirror.lock().unwrap();
+        let mut held: BTreeSet<String> = mirror
+            .overlay
+            .holds
+            .iter()
+            .filter(|h| h.status != Some(EntryStatus::Paused))
+            // A sub-milestone's slice holds `<parent>/<sub>`; the queue row is
+            // the parent's.
+            .map(|h| h.entry.split('/').next().unwrap_or(&h.entry).to_string())
+            .collect();
+        held.extend(mirror.claiming.iter().cloned());
+        held.into_iter().collect()
     }
 
     /// `agent`'s live v2 assignment, if it holds one — the member verbs'
@@ -350,6 +409,20 @@ impl Daemon {
         self.backends.lock().unwrap().clone()
     }
 
+    /// Install the sink the fleet's backends record token-telemetry rows into
+    /// (token-telemetry-p1 slice 004). Called by `main` BEFORE
+    /// [`spawn_fleet`](crate::fleet::spawn_fleet): the backends take their copy
+    /// at assembly, so a later call reaches none of them.
+    pub fn set_telemetry(&self, sink: TelemetrySink) {
+        *self.telemetry.lock().unwrap() = Some(sink);
+    }
+
+    /// The installed telemetry sink, or the default (drop-every-row) sink when
+    /// `main` installed none.
+    pub fn telemetry(&self) -> TelemetrySink {
+        self.telemetry.lock().unwrap().clone().unwrap_or_default()
+    }
+
     /// Install the §4d thrash-clear hook (builder-style). Phase 6 binds this to
     /// keeperd's `ThrashDetector::clear_flag` over the bus bridge; tests pass a
     /// spy to prove a granted lease over a flagged target clears that flag.
@@ -409,6 +482,12 @@ impl Daemon {
         // 003). Done before the cell is moved into the backend at `assemble_fleet`.
         *self.build_caps.lock().unwrap() = fleet.build_caps.clone();
         self.inner.lock().unwrap().fleet = fleet;
+    }
+
+    /// The fleet's `[schedule]` (growlight-schedule slice 003), read by the drive
+    /// loop once per tick. `None` when the table is absent. Brief-lock clone.
+    pub fn schedule(&self) -> Option<crate::schedule::ScheduleConfig> {
+        self.inner.lock().unwrap().fleet.schedule.clone()
     }
 
     /// The current runtime per-device [`Policy`] — the single source of truth the
@@ -585,6 +664,16 @@ impl Daemon {
     /// A brief lock write, like [`record_member_lifecycle`](Self::record_member_lifecycle).
     pub fn record_held_parts(&self, held: Vec<softfig_ipc::growlightd::HeldPartSummary>) {
         self.inner.lock().unwrap().held_parts = held;
+    }
+
+    /// Replace the `[schedule]` block `status` reports (growlight-schedule
+    /// slice 006). The drive loop calls this once per tick; `None` while no
+    /// schedule is enabled.
+    pub fn record_schedule_summary(
+        &self,
+        summary: Option<softfig_ipc::growlightd::ScheduleSummary>,
+    ) {
+        self.inner.lock().unwrap().schedule_summary = summary;
     }
 
     /// `request_lease` (spec §4c): arbitrate a lease over the shared resource
@@ -812,6 +901,38 @@ mod tests {
 
     fn test_daemon() -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
+    }
+
+    #[test]
+    fn v2_live_lists_holds_and_claims_in_flight_but_not_a_pausers_memory() {
+        use crate::drive_loop::{V2Hold, V2Overlay};
+        use softfig_ipc::queue_v2::EntryStatus;
+        let daemon = test_daemon();
+        assert!(daemon.v2_live().is_empty(), "no loop, no holds");
+
+        let hold = |entry: &str, status| V2Hold {
+            entry: entry.to_string(),
+            agent: "c".to_string(),
+            status,
+        };
+        daemon.publish_v2_overlay(V2Overlay {
+            holds: vec![
+                hold("running", None),
+                hold("sub-parent/sub", None),
+                hold("rolled", Some(EntryStatus::Active)),
+                // A paused entry remembers who paused it; that session is over.
+                hold("paused", Some(EntryStatus::Paused)),
+            ],
+            model_overrides: vec![],
+        });
+        assert_eq!(daemon.v2_live(), ["rolled", "running", "sub-parent"]);
+
+        // A claim in flight is held before the overlay knows of it, and is gone
+        // once the claim ends.
+        daemon.claim_started("claiming");
+        assert_eq!(daemon.v2_live(), ["claiming", "rolled", "running", "sub-parent"]);
+        daemon.claim_ended("claiming");
+        assert_eq!(daemon.v2_live(), ["rolled", "running", "sub-parent"]);
     }
 
     /// A fake agent child that, when killed, checks whether the kill-registry lock

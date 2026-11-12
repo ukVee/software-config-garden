@@ -619,8 +619,8 @@ fn check_sub_placement(verb: &MemberVerb, ctx: &Ctx<'_>) -> Result<(), VerbError
 
 /// §6.7, sub-milestone docs: keeperd writes them from the structured fields,
 /// so a member's mission, criteria and slice titles may carry no `> Model:`,
-/// `> Grants:` or `> Worktree:` line, and its slice bodies no `> Grants:` or
-/// `> Worktree:` (a body's `> Model:` is the subset rule's, next). The rule is
+/// `> Grants:`, `> Worktree:` or `> Not before:` line, and its slice bodies
+/// none but `> Model:` (a body's `> Model:` is the subset rule's, next). The rule is
 /// `softfig_ipc::queue_v2::sub_doc_violation`, which keeperd's
 /// `queue_v2_add_sub` re-checks as the writer's backstop.
 fn check_sub_fields(verb: &MemberVerb) -> Result<(), VerbError> {
@@ -833,9 +833,15 @@ mod tests {
             lane: Lane::Normal,
             status,
             after: vec![],
+            branch: String::new(),
             claimed: "2026-10-14T00:00Z".into(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
+            fleet: true,
+            not_before: None,
+            auto_restack: true,
             holder: None,
             models: None,
         }
@@ -865,6 +871,8 @@ mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/r".into(),
+                locality: softfig_ipc::queue_v2::RepoLocality::Local,
+                main: "main".into(),
             }],
             entries: vec![
                 entry("m", EntryKind::Milestone, EntryStatus::Active),
@@ -882,6 +890,10 @@ mod tests {
                 },
             )]),
             done_ids: BTreeSet::new(),
+            now_unix: 0,
+            done_branches: Default::default(),
+            done_projects: Default::default(),
+            re_records_due: Default::default(),
         }
     }
 
@@ -894,6 +906,7 @@ mod tests {
                 slice: id.into(),
             },
             resolved_model: ModelChoice::opencode(DEEPSEEK_FLASH),
+            repo: None,
         }
     }
 
@@ -1442,7 +1455,7 @@ mod tests {
     }
 
     /// §6.7: keeperd writes the sub's docs from its fields, so the member's
-    /// text may set no model, grants or worktree there; a slice body's
+    /// text may set no model, grants, worktree or start time there; a slice body's
     /// `> Model:` is the subset rule's instead.
     #[test]
     fn a_sub_milestones_text_may_not_carry_reserved_lines() {
@@ -1466,6 +1479,11 @@ mod tests {
             RefusalCode::FieldNotAllowed,
         );
         assert!(msg.contains("`slices[0].body`"), "{msg}");
+        let msg = refused(
+            run(&a, &s, with_sub(|x| x.slices[0].body = "> Not before: 2026-11-01 02:00Z\n\nwork".into())),
+            RefusalCode::FieldNotAllowed,
+        );
+        assert!(msg.contains("`slices[0].body` carries a `> Not before:` line"), "{msg}");
         // m declares nothing, so a body may declare nothing (the subset rule).
         refused(
             run(&a, &s, with_sub(|x| x.slices[0].body = "> Model: flash\n\nwork".into())),

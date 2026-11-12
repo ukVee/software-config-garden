@@ -29,7 +29,10 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod drive_loop;
+pub mod first_claim;
 pub mod fleet;
+pub mod git_probe;
+pub mod git_stack;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
@@ -46,25 +49,31 @@ pub mod persist;
 pub mod preapproval;
 pub mod profile_budget;
 pub mod profile_pin;
+pub mod projection;
 pub mod queue_source;
+pub mod queue_show;
 pub mod rate_limit_holds;
 pub mod reconcile;
 pub mod resume;
+pub mod schedule;
 pub mod scheduler;
 pub mod scheduler_v2;
 pub mod server;
+pub mod singleton;
 pub mod state;
 pub mod supervisor;
+pub mod telemetry_capture;
 pub mod thrash_bridge;
 pub mod usage;
 pub mod usage_file;
+pub mod v2_repo;
 pub mod v2_source;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
 pub use backend_router::{BackendHandle, BackendRouter};
-pub use baton_store::{FsBatonStore, FsEntryBatonStore};
+pub use baton_store::{FirstStep, FsBatonStore, FsEntryBatonStore};
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
 pub use agent_harness::{AgentHealthState, BackendFlavor, Harness, LineObserver};
@@ -96,6 +105,7 @@ pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use profile_budget::{
     headroom_from, pool_headroom, profile_budget_path, read_profile_budget, slot_headroom,
+    slot_readings, slot_vouchable_7d, vouchable_7d,
     Headroom, STALE_FLOOR_SECS,
 };
 pub use profile_pin::{

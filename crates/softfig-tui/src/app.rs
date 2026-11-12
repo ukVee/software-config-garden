@@ -4,7 +4,7 @@
 //! their own modules and carry the unit tests; this module wires them to
 //! the worker-thread [`IpcClient`] and the key stream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crossterm::event::{
@@ -13,7 +13,7 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use serde_json::{json, Value};
-use softfig_protocol_growlightd::{BatonReply, FleetStatusReply};
+use softfig_protocol_growlightd::{BatonReply, FleetStatusReply, QueueShowReply};
 use softfig_protocol_keeperd::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
@@ -34,8 +34,9 @@ use crate::editor::{Editor, EditorMode};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::hit::{self, Hit, HitMap, ListId};
-use crate::ipc::{IpcClient, Reply, Tag};
+use crate::ipc::{IpcClient, ReqId, Reply, Tag};
 use crate::prefs::{self, UiPrefs};
+use crate::queue_v2_view::{self, HumanStatus, QueueV2View, StatusTarget, V2Action, V2RowKind};
 use crate::listpane::ListPane;
 use crate::tree::{
     derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
@@ -149,7 +150,7 @@ pub enum FleetHeader {
     #[default]
     Unknown,
     /// A decoded live growlightd `status` reply.
-    Live(FleetStatusReply),
+    Live(Box<FleetStatusReply>),
     /// The last poll couldn't reach growlightd — render one dim line, keep the
     /// garden-only page fully functional.
     Unreachable,
@@ -193,6 +194,14 @@ pub enum BackupRow {
 pub enum PairField {
     Fingerprint,
     Endpoint,
+}
+
+/// One in-flight §6.9 request: the action it carries and which half of the
+/// dry-run/commit pair it is (see [`App::growlight_v2_pending`]).
+#[derive(Debug, Clone)]
+pub struct PendingV2 {
+    pub action: V2Action,
+    pub dry_run: bool,
 }
 
 #[derive(Debug)]
@@ -263,6 +272,40 @@ pub enum Overlay {
     /// `<target>.softfig-bak` and overwrite it. Gates the destructive path
     /// behind an explicit y/n (a plain `a` apply never forces).
     DeployForce {
+        error: Option<String>,
+    },
+    /// growlight slice 007: confirm a §6.9 mutating action. `preview` is the
+    /// `--dry-run` result's `view` (the would-be list); `action` is the typed,
+    /// non-dry-run verb to re-issue on `y`. `error` carries the daemon's refusal
+    /// text (e.g. `running`, `linked_from`) so the user sees why the dry-run
+    /// can't proceed.
+    QueueConfirm {
+        action: V2Action,
+        preview: String,
+        error: Option<String>,
+    },
+    /// Pick the human status for the selected entry or slice (`s`). `target`
+    /// is what the picker opened on; `current` its status then; `selected` an
+    /// index into [`HumanStatus::ALL`]. Choosing issues the usual dry-run and
+    /// confirm, so `done` (which archives an entry) is still one `y` away.
+    QueueStatusPick {
+        target: StatusTarget,
+        current: String,
+        selected: usize,
+    },
+    /// growlight slice 007: collect the comma-separated `after` link list to
+    /// replace the selected entry's links (`a`). `buf` is the raw input;
+    /// `entry` the entry being edited.
+    QueueEditAfter {
+        buf: String,
+        entry: String,
+        error: Option<String>,
+    },
+    /// growlight slice 007: collect the `--reason` for dropping the selected
+    /// entry (`d`). `buf` is the raw input; `entry` the entry being dropped.
+    QueueDrop {
+        buf: String,
+        entry: String,
         error: Option<String>,
     },
     /// M5d slice 004: register a new shared subtree — collect the garden-relative
@@ -513,6 +556,29 @@ pub struct App {
     /// down. Empty until the first reply (or genuinely no messages); the detail
     /// pane renders a calm placeholder then.
     pub growlight_bus: Vec<BusRow>,
+    /// The queue-v2 two-lane snapshot (slice 007), from growlightd's `queue_show`
+    /// verb on the second channel. `None` until the first reply; `Some(list:
+    /// false)` when the garden has no `queue.toml` (the live legacy case) — the
+    /// two-lane view stays off then. The selection/expansion state lives in
+    /// [`Self::growlight_v2`]; this is the data the rows and the detail pane read.
+    pub growlight_queue_v2: Option<QueueShowReply>,
+    /// Whether the two-lane v2 view (vs the legacy [`Self::growlight_tree`]) is
+    /// the active left pane. Only reachable when [`Self::growlight_queue_v2`] is
+    /// `Some(list: true)`; `v` toggles.
+    pub growlight_v2_view: bool,
+    /// The two-lane selection + expansion state (see [`QueueV2View`]).
+    pub growlight_v2: QueueV2View,
+    /// The in-flight §6.9 requests, by request id. Each carries its own action
+    /// and which half of the pair it is: a `dry_run` reply opens the confirm
+    /// overlay for ITS action, a committed one reloads. Keyed by id (the worker
+    /// answers in order, but a single slot let one action's commit reply be
+    /// read as another's preview).
+    pub growlight_v2_pending: HashMap<ReqId, PendingV2>,
+    /// Set when the v2 snapshot is stale (tab entry, refresh, a confirmed action)
+    /// and cleared by the run loop once `queue_show` is re-fired. Mirrors
+    /// `growlight_stale` but rides the growlightd channel, so it is drained by
+    /// the run loop (which owns that channel) rather than `load_growlight`.
+    pub growlight_v2_stale: bool,
     /// Per-frame pointer/touch geometry, recorded by the renderer and consumed
     /// by [`Self::handle_mouse`]. Rebuilt on every draw; empty before the first
     /// frame (taps then fall through to no-ops / the preview-scroll default).
@@ -617,6 +683,11 @@ impl App {
             fleet: FleetHeader::Unknown,
             growlight_runtime_baton: None,
             growlight_bus: Vec::new(),
+            growlight_queue_v2: None,
+            growlight_v2_view: false,
+            growlight_v2: QueueV2View::new(),
+            growlight_v2_pending: HashMap::new(),
+            growlight_v2_stale: false,
             hits: HitMap::new(),
             drag: None,
             fab_drag: None,
@@ -777,6 +848,27 @@ impl App {
         growlightd.send("baton", json!({}), Tag::GrowlightRuntimeBaton);
     }
 
+    /// Whether the queue-v2 snapshot should be (re)fetched this tick: on the
+    /// active Growlight tab, enabled, and marked stale (entry / refresh / a
+    /// confirmed action). One-shot, unlike the fleet/baton poll — the snapshot
+    /// is a heavier garden read that only changes on a write.
+    pub fn should_poll_queue_v2(&self) -> bool {
+        self.view == View::Growlight && self.growlight_enabled == Some(true) && self.growlight_v2_stale
+    }
+
+    /// Fire one one-shot growlightd `queue_show` on the growlightd channel,
+    /// tagged [`Tag::GrowlightQueueShow`]. The reply feeds `apply_reply`, which
+    /// decodes it into [`Self::growlight_queue_v2`] (soft-failing to `None`).
+    pub fn poll_queue_v2(&self, growlightd: &mut IpcClient) {
+        growlightd.send("queue_show", json!({}), Tag::GrowlightQueueShow);
+    }
+
+    /// Mark the v2 snapshot stale so the run loop re-fetches it. Called on tab
+    /// entry, refresh, and after a confirmed action lands.
+    fn mark_growlight_v2_stale(&mut self) {
+        self.growlight_v2_stale = true;
+    }
+
     /// Push the live runtime baton's active slice (see [`baton_active_slice`]) into
     /// the tree's `active` overlay so the slice the loop is working right now renders
     /// `active`. No baton, an unreadable one, or a baton that isn't `IN_PROGRESS`
@@ -865,6 +957,7 @@ impl App {
         if self.growlight.loaded {
             if self.view == View::Growlight {
                 self.load_growlight(ipc);
+                self.mark_growlight_v2_stale();
             } else {
                 self.growlight_stale = true;
             }
@@ -1668,16 +1761,25 @@ impl App {
                 // Live process-state → the header. A version-skewed / malformed
                 // reply degrades to the dim line rather than a splat.
                 Ok(v) => {
+                    // growlightd came back: the v2 snapshot went with it, so
+                    // fetch it again or `v` stays inert until the tab is left.
+                    if matches!(self.fleet, FleetHeader::Unreachable) {
+                        self.mark_growlight_v2_stale();
+                    }
                     self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
-                        Ok(reply) => FleetHeader::Live(reply),
+                        Ok(reply) => FleetHeader::Live(Box::new(reply)),
                         Err(_) => FleetHeader::Unreachable,
                     };
                 }
                 // Soft-fail (load-bearing): growlightd down / disarmed → the
                 // connect errors on the worker. One dim header line — deliberately
                 // NEVER `self.status` (no status splat) and never touching the
-                // garden-sourced tree/preview, so the page keeps working.
-                Err(_) => self.fleet = FleetHeader::Unreachable,
+                // garden-sourced tree/preview, so the page keeps working. The
+                // v2 view is growlightd-sourced, so it falls back to that tree.
+                Err(_) => {
+                    self.fleet = FleetHeader::Unreachable;
+                    self.leave_growlight_v2();
+                }
             },
             Tag::GrowlightRuntimeBaton => {
                 match reply.result {
@@ -1707,6 +1809,64 @@ impl App {
                 },
                 Err((_, m)) => self.status = format!("growlight bus: {m}"),
             },
+            Tag::GrowlightQueueShow => match reply.result {
+                // The queue-v2 snapshot → `growlight_queue_v2`. A growlightd read
+                // like the header/baton, so it soft-fails to `None` (never a status
+                // splat) — the legacy tree keeps rendering with growlightd down.
+                Ok(v) => {
+                    self.growlight_queue_v2 = serde_json::from_value::<QueueShowReply>(v).ok();
+                    // Drop expansion state for entries that left the list, and
+                    // clamp the cursor into the new row count.
+                    if let Some(r) = &self.growlight_queue_v2 {
+                        self.growlight_v2.retain(&queue_v2_view::live_entry_ids(r));
+                        self.growlight_v2.clamp(self.growlight_v2.rows(r).len());
+                    }
+                    // A legacy garden answers `list: false` — force the legacy
+                    // tree so the (empty) two-lane view can't be toggled on.
+                    if self
+                        .growlight_queue_v2
+                        .as_ref()
+                        .is_none_or(|r| !r.list)
+                    {
+                        self.growlight_v2_view = false;
+                    }
+                }
+                Err(_) => self.leave_growlight_v2(),
+            },
+            Tag::GrowlightQueueAction => {
+                // One half of a §6.9 action pair, matched to its request by id.
+                // A dry-run reply is its action's preview → open the confirm
+                // overlay for THAT action. Anything else is a committed write →
+                // reload the snapshot + the legacy queue and report.
+                let pending = self.growlight_v2_pending.remove(&reply.id);
+                match reply.result {
+                    Ok(v) => {
+                        if let Some(PendingV2 { action, dry_run: true }) = pending {
+                            let view = action.view_from(&v).unwrap_or_else(|| {
+                                "(the dry-run reply could not be decoded)".to_string()
+                            });
+                            self.overlay = Overlay::QueueConfirm {
+                                action,
+                                preview: view,
+                                error: None,
+                            };
+                        } else {
+                            self.status = "queue v2: updated".into();
+                            self.mark_growlight_v2_stale();
+                            // The legacy queue table may have shifted too (a drop /
+                            // status change), so refire it for the tree on the other
+                            // side of the toggle.
+                            ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+                        }
+                    }
+                    Err((kind, m)) => {
+                        // A refusal (e.g. `running`, `linked_from`) is a status line:
+                        // the dry-run itself was refused, so there is nothing to
+                        // preview or confirm.
+                        self.status = format!("queue v2 action failed ({kind:?}): {m}");
+                    }
+                }
+            }
             Tag::GrowlightInjectedProtocol => match reply.result {
                 // The protocol half of the injected-context node — a keeperd garden
                 // read (`growlight/protocol.md`). Cache it; the detail pane assembles
@@ -1862,6 +2022,10 @@ impl App {
             Overlay::ReplicaGrant { .. } => self.handle_key_replica_grant(key, ipc),
             Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
             Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
+            Overlay::QueueConfirm { .. } => self.handle_key_queue_confirm(key, ipc),
+            Overlay::QueueStatusPick { .. } => self.handle_key_queue_status_pick(key, ipc),
+            Overlay::QueueEditAfter { .. } => self.handle_key_queue_edit_after(key, ipc),
+            Overlay::QueueDrop { .. } => self.handle_key_queue_drop(key, ipc),
             Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
             Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
             // M3c: save/discard/back for an editor with unsaved edits.
@@ -1964,6 +2128,9 @@ impl App {
                     self.growlight_stale = false;
                     self.load_growlight(ipc);
                 }
+                // The v2 snapshot rides the growlightd channel, so the run loop
+                // re-fetches it (this method only has the keeperd `ipc`).
+                self.mark_growlight_v2_stale();
             }
             // M5e slice 004: the Coordination tab is ALWAYS available when
             // unlocked — no growlight-style presence gate; its content is live
@@ -1974,6 +2141,31 @@ impl App {
                     self.load_coordination(ipc);
                 }
             }
+            // growlight queue-v2 two-lane actions (slice 007). Guarded by
+            // `in_growlight_v2` so they only fire on the v2 sub-view; the keys
+            // are free in the legacy Growlight view (verified: lowercase k/j nav,
+            // and `a`/`d`/`s` are bound only in Deploy/Shares/editor views).
+            KeyCode::Char('v')
+                if self.view == View::Growlight
+                    && self
+                        .growlight_queue_v2
+                        .as_ref()
+                        .is_some_and(|r| r.list) =>
+            {
+                self.toggle_growlight_v2()
+            }
+            KeyCode::Char('K') if self.in_growlight_v2() => {
+                self.v2_run(ipc, |r, v| queue_v2_view::move_selected(r, v, true))
+            }
+            KeyCode::Char('J') if self.in_growlight_v2() => {
+                self.v2_run(ipc, |r, v| queue_v2_view::move_selected(r, v, false))
+            }
+            KeyCode::Char('t') if self.in_growlight_v2() => {
+                self.v2_run(ipc, queue_v2_view::lane_toggle)
+            }
+            KeyCode::Char('s') if self.in_growlight_v2() => self.start_status_pick(),
+            KeyCode::Char('a') if self.in_growlight_v2() => self.start_edit_after(),
+            KeyCode::Char('d') if self.in_growlight_v2() => self.start_queue_drop(),
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
             // Preview reading view: `b` flips raw ↔ bionic (the preview's
@@ -2301,7 +2493,7 @@ impl App {
                 // select then tap again was too slow on touch). The flat lists
                 // keep select-then-activate, since activation there can prompt
                 // (Vault reveal, pair confirm) or is just a hint.
-                let instant = matches!(list, ListId::Browse | ListId::Growlight);
+                let instant = matches!(list, ListId::Browse | ListId::Growlight | ListId::GrowlightV2);
                 if activate || already || instant {
                     self.activate(ipc);
                 }
@@ -2454,6 +2646,7 @@ impl App {
             ListId::Deploy => Some(self.deploy.selected),
             ListId::Shares => Some(self.shares_selected),
             ListId::Growlight => Some(self.growlight_tree.selected),
+            ListId::GrowlightV2 => Some(self.growlight_v2.selected),
             ListId::Coordination => Some(self.coordination_selected),
         }
     }
@@ -2498,6 +2691,10 @@ impl App {
             ListId::Growlight => {
                 self.growlight_tree.select(index);
                 self.refresh_growlight_selection(ipc);
+            }
+            ListId::GrowlightV2 => {
+                let len = self.growlight_v2_len();
+                self.growlight_v2.select(index, len);
             }
             ListId::Coordination => {
                 if index < self.coordination_rows.len() {
@@ -2581,8 +2778,13 @@ impl App {
                 self.shares_selected = self.shares_selected.saturating_sub(1);
             }
             View::Growlight => {
-                self.growlight_tree.move_up();
-                self.refresh_growlight_selection(ipc);
+                if self.growlight_v2_view {
+                    let len = self.growlight_v2_len();
+                    self.growlight_v2.move_up(len);
+                } else {
+                    self.growlight_tree.move_up();
+                    self.refresh_growlight_selection(ipc);
+                }
             }
             View::Coordination => {
                 self.coordination_selected = self.coordination_selected.saturating_sub(1);
@@ -2614,8 +2816,13 @@ impl App {
                 }
             }
             View::Growlight => {
-                self.growlight_tree.move_down();
-                self.refresh_growlight_selection(ipc);
+                if self.growlight_v2_view {
+                    let len = self.growlight_v2_len();
+                    self.growlight_v2.move_down(len);
+                } else {
+                    self.growlight_tree.move_down();
+                    self.refresh_growlight_selection(ipc);
+                }
             }
             View::Coordination => {
                 if self.coordination_selected + 1 < self.coordination_rows.len() {
@@ -2669,7 +2876,14 @@ impl App {
             View::Shares => self.hint_shares_actions(),
             // Growlight is read-only: Enter/l toggles a milestone's slices
             // (lazy-reading its CLAUDE.md on first expand); leaves just hint.
-            View::Growlight => self.activate_growlight(ipc),
+            // On the v2 sub-view it toggles the two-lane tree instead.
+            View::Growlight => {
+                if self.growlight_v2_view {
+                    self.activate_growlight_v2();
+                } else {
+                    self.activate_growlight(ipc);
+                }
+            }
             // Coordination is read-only: Enter previews a conflict sidecar (a
             // read), else a no-op hint.
             View::Coordination => self.activate_coordination(ipc),
@@ -2733,12 +2947,16 @@ impl App {
                     }
             }
             View::Growlight => {
-                if let Some(row) = self.growlight_tree.selected_row()
-                    && row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
-                        self.growlight_tree.collapse(&row.item_id);
-                        self.growlight_tree.clamp_selection();
-                    }
-                self.refresh_growlight_selection(ipc);
+                if self.growlight_v2_view {
+                    self.collapse_growlight_v2();
+                } else {
+                    if let Some(row) = self.growlight_tree.selected_row()
+                        && row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
+                            self.growlight_tree.collapse(&row.item_id);
+                            self.growlight_tree.clamp_selection();
+                        }
+                    self.refresh_growlight_selection(ipc);
+                }
             }
             _ => {}
         }
@@ -3634,6 +3852,371 @@ impl App {
         };
     }
 
+    // ---- Growlight queue-v2 two-lane view (slice 007) ----
+
+    /// Whether the two-lane v2 view owns the Growlight tab's keys this tick.
+    fn in_growlight_v2(&self) -> bool {
+        self.view == View::Growlight && self.growlight_v2_view
+    }
+
+    /// The current visible row count of the v2 two-lane view (0 without a snapshot).
+    fn growlight_v2_len(&self) -> usize {
+        self.growlight_queue_v2
+            .as_ref()
+            .map(|r| self.growlight_v2.rows(r).len())
+            .unwrap_or(0)
+    }
+
+    /// growlightd stopped answering: forget the snapshot and go back to the
+    /// legacy tree. Left on, the view would be stuck, because `v` only toggles
+    /// while a snapshot says `list: true`.
+    fn leave_growlight_v2(&mut self) {
+        self.growlight_queue_v2 = None;
+        self.growlight_v2_view = false;
+    }
+
+    /// `v` — toggle between the legacy backlog tree and the two-lane v2 view.
+    /// Only reachable when the snapshot answers `list: true` (a v2 list exists);
+    /// the live legacy garden answers `list: false` so the toggle is inert there.
+    fn toggle_growlight_v2(&mut self) {
+        let list = self.growlight_queue_v2.as_ref().is_some_and(|r| r.list);
+        if !list {
+            return;
+        }
+        self.growlight_v2_view = !self.growlight_v2_view;
+        if self.growlight_v2_view {
+            let len = self.growlight_v2_len();
+            self.mark_growlight_v2_stale();
+            self.growlight_v2.clamp(len);
+        }
+    }
+
+    /// Fire one §6.9 action's dry-run (the `build` closure turns the current
+    /// selection into a typed action, or `None` when the key doesn't apply).
+    fn v2_run(
+        &mut self,
+        ipc: &mut IpcClient,
+        build: impl FnOnce(&QueueShowReply, &QueueV2View) -> Option<V2Action>,
+    ) {
+        let Some(reply) = &self.growlight_queue_v2 else { return };
+        let Some(action) = build(reply, &self.growlight_v2) else {
+            self.status = "that action doesn't apply to this row".into();
+            return;
+        };
+        self.run_v2_action(action, ipc);
+    }
+
+    /// Issue the action's `--dry-run` (storing it so the reply opens the
+    /// confirm overlay); the overlay's `y` re-issues it with `dry_run: false`.
+    fn run_v2_action(&mut self, action: V2Action, ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before editing the queue".into();
+            return;
+        }
+        let id = ipc.send(action.op(), action.to_value(true), Tag::GrowlightQueueAction);
+        self.growlight_v2_pending.insert(id, PendingV2 { action, dry_run: true });
+    }
+
+    /// `y` — re-issue the confirmed (non-dry-run) action from the overlay.
+    fn handle_key_queue_confirm(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "queue v2 action cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let Overlay::QueueConfirm { action, .. } = &self.overlay else {
+                    return;
+                };
+                let action = action.clone();
+                self.overlay = Overlay::None;
+                // Tagged as the commit half, so its reply cannot reopen the overlay.
+                let id = ipc.send(action.op(), action.to_value(false), Tag::GrowlightQueueAction);
+                self.growlight_v2_pending.insert(id, PendingV2 { action, dry_run: false });
+            }
+            _ => {}
+        }
+    }
+
+    /// `s` — open the status picker on the selected entry or slice.
+    fn start_status_pick(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some((target, current)) = queue_v2_view::status_pick(r, &self.growlight_v2) else {
+            self.status = "that action doesn't apply to this row".into();
+            return;
+        };
+        let selected = HumanStatus::ALL
+            .iter()
+            .position(|s| s.word() == current)
+            .unwrap_or(0);
+        self.overlay = Overlay::QueueStatusPick { target, current, selected };
+    }
+
+    fn handle_key_queue_status_pick(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::QueueStatusPick { selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let n = HumanStatus::ALL.len();
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => *selected = (*selected + n - 1) % n,
+            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1) % n,
+            KeyCode::Enter => {
+                let at = *selected;
+                self.choose_status(at, ipc);
+            }
+            // `1`..`4` pick directly (and are the touch chips' keys).
+            KeyCode::Char(c @ '1'..='4') => self.choose_status(c as usize - '1' as usize, ipc),
+            _ => {}
+        }
+    }
+
+    /// Close the picker and issue the dry-run for status `HumanStatus::ALL[at]`
+    /// on the target the picker captured.
+    fn choose_status(&mut self, at: usize, ipc: &mut IpcClient) {
+        let Overlay::QueueStatusPick { target, .. } = &self.overlay else {
+            return;
+        };
+        let action = queue_v2_view::status_action(target, HumanStatus::ALL[at]);
+        self.overlay = Overlay::None;
+        self.run_v2_action(action, ipc);
+    }
+
+    /// `a` — open the `after`-links editor for the selected entry.
+    fn start_edit_after(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some(row) = self.growlight_v2.rows(r).into_iter().nth(self.growlight_v2.selected) else {
+            return;
+        };
+        if !matches!(row.kind, V2RowKind::Urgent | V2RowKind::Normal) {
+            self.status = "edit links needs an entry row".into();
+            return;
+        }
+        let Some(buf) = queue_v2_view::after_text(r, &row.entry_id) else { return };
+        self.overlay = Overlay::QueueEditAfter {
+            buf,
+            entry: row.entry_id.clone(),
+            error: None,
+        };
+    }
+
+    fn handle_key_queue_edit_after(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::QueueEditAfter { buf, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Enter => self.submit_edit_after(ipc),
+            _ => {}
+        }
+    }
+
+    fn submit_edit_after(&mut self, ipc: &mut IpcClient) {
+        let Overlay::QueueEditAfter { buf, entry, error } = &mut self.overlay else {
+            return;
+        };
+        let entry = entry.clone();
+        let after: Vec<String> = buf
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        *error = None;
+        self.overlay = Overlay::None;
+        let Some(reply) = &self.growlight_queue_v2 else { return };
+        let Some(action) = queue_v2_view::entry_after(reply, &entry, after) else {
+            self.status = format!("edit links: {entry} is no longer in the queue");
+            return;
+        };
+        self.run_v2_action(action, ipc);
+    }
+
+    /// `d` — open the drop-reason prompt for the selected entry.
+    fn start_queue_drop(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some(row) = self.growlight_v2.rows(r).into_iter().nth(self.growlight_v2.selected) else {
+            return;
+        };
+        if !matches!(row.kind, V2RowKind::Urgent | V2RowKind::Normal) {
+            self.status = "drop needs an entry row".into();
+            return;
+        }
+        self.overlay = Overlay::QueueDrop {
+            buf: String::new(),
+            entry: row.entry_id.clone(),
+            error: None,
+        };
+    }
+
+    fn handle_key_queue_drop(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::QueueDrop { buf, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Enter => self.submit_queue_drop(ipc),
+            _ => {}
+        }
+    }
+
+    fn submit_queue_drop(&mut self, ipc: &mut IpcClient) {
+        let Overlay::QueueDrop { buf, entry, error } = &mut self.overlay else {
+            return;
+        };
+        let entry = entry.clone();
+        let reason = buf.trim().to_string();
+        if reason.is_empty() {
+            *error = Some("a drop needs a reason".into());
+            return;
+        }
+        *error = None;
+        self.overlay = Overlay::None;
+        let Some(reply) = &self.growlight_queue_v2 else { return };
+        let Some(action) = queue_v2_view::entry_drop(reply, &entry, reason) else {
+            self.status = format!("drop: {entry} is no longer in the queue");
+            return;
+        };
+        self.run_v2_action(action, ipc);
+    }
+
+    /// `Enter`/`l` in the v2 view: expand/collapse a milestone or the archive.
+    fn activate_growlight_v2(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some(row) = self.growlight_v2.rows(r).into_iter().nth(self.growlight_v2.selected) else {
+            return;
+        };
+        match row.kind {
+            V2RowKind::Archive => self.growlight_v2.toggle_archive(),
+            V2RowKind::Urgent | V2RowKind::Normal if row.expandable => {
+                if row.expanded {
+                    self.growlight_v2.collapse(&row.entry_id);
+                } else {
+                    self.growlight_v2.expand(&row.entry_id);
+                }
+            }
+            V2RowKind::Slice if row.expandable => self.growlight_v2.toggle(&row.key),
+            _ => {}
+        }
+        self.growlight_v2.clamp(self.growlight_v2.rows(r).len());
+    }
+
+    /// The right-pane body for the selected v2 row: an entry's fields + its
+    /// §3.5 session-log lines (or a slice's), a slice's status, or a calm hint
+    /// for the archive header. Returns `(title, body)`.
+    pub fn v2_detail_view(&self) -> (String, String) {
+        let Some(reply) = &self.growlight_queue_v2 else {
+            return (
+                "queue v2 detail (read-only)".into(),
+                "(loading the queue-v2 list…)".into(),
+            );
+        };
+        let Some(row) = self.growlight_v2.rows(reply).into_iter().nth(self.growlight_v2.selected) else {
+            return (
+                "queue v2 detail (read-only)".into(),
+                "(select a row to view it)".into(),
+            );
+        };
+        match row.kind {
+            V2RowKind::Archive => (
+                "queue v2 archive (read-only)".into(),
+                format!(
+                    "{}. Press Enter to expand/collapse.",
+                    row.label
+                ),
+            ),
+            V2RowKind::Urgent | V2RowKind::Normal => {
+                let Some(entry) = reply.entries.iter().find(|e| e.id == row.entry_id) else {
+                    return ("queue v2 detail (read-only)".into(), "(entry gone)".into());
+                };
+                let mut body = format!(
+                    "{}  {}\nproject: {}\nlane: {}\nstatus: {}\n",
+                    entry.id, entry.kind, entry.project, entry.lane, entry.status
+                );
+                if !entry.branch.is_empty() {
+                    let open = if entry.open { " (open)" } else { "" };
+                    body.push_str(&format!("branch: {}{}\n", entry.branch, open));
+                }
+                if !entry.base.is_empty() {
+                    body.push_str(&format!("base: {}\n", entry.base));
+                }
+                if let Some(p) = &entry.pending_status {
+                    body.push_str(&format!("pending status: {p} (applies at the next handshake)\n"));
+                }
+                if !entry.claimed.is_empty() {
+                    body.push_str(&format!("claimed: {}\n", entry.claimed));
+                }
+                if !entry.after.is_empty() {
+                    body.push_str(&format!("after: {}\n", entry.after.join(", ")));
+                }
+                push_v2_sessions(&mut body, reply, &entry.id, &entry.id, None);
+                ("queue v2 entry (read-only)".into(), body)
+            }
+            V2RowKind::Slice => {
+                let Some(tree) = reply.trees.iter().find(|t| t.milestone == row.milestone.as_deref().unwrap_or_default()) else {
+                    return ("queue v2 slice (read-only)".into(), "(slice gone)".into());
+                };
+                let Some(s) = tree.slices.iter().find(|s| s.id == row.slice_id.as_deref().unwrap_or_default()) else {
+                    return ("queue v2 slice (read-only)".into(), "(slice gone)".into());
+                };
+                let mut body = format!(
+                    "slice {} of {}\nkind: {}\nstatus: {}\n",
+                    s.id, tree.milestone, s.kind, s.status
+                );
+                // A sub item's log is its own close-out, keyed by its tree.
+                let (log_tree, unit) = if s.kind == "sub" {
+                    (row.key.as_str(), None)
+                } else {
+                    (tree.milestone.as_str(), Some(s.id.as_str()))
+                };
+                push_v2_sessions(&mut body, reply, &row.entry_id, log_tree, unit);
+                ("queue v2 slice (read-only)".into(), body)
+            }
+            V2RowKind::ArchiveEntry => {
+                let Some(entry) = reply.archived.iter().find(|e| e.id == row.entry_id) else {
+                    return ("queue v2 archive (read-only)".into(), "(entry gone)".into());
+                };
+                let mut body = format!(
+                    "{}  (archived {})\nproject: {}\n",
+                    entry.id, entry.status, entry.project
+                );
+                if !entry.branch.is_empty() {
+                    body.push_str(&format!("branch: {}\n", entry.branch));
+                }
+                body.push_str("\n(archived rows satisfy only `done` links; a `dropped` row satisfies none.)");
+                ("queue v2 archive (read-only)".into(), body)
+            }
+        }
+    }
+
+    /// `h`/`Left` in the v2 view: collapse the expanded milestone/archive.
+    fn collapse_growlight_v2(&mut self) {
+        let Some(r) = &self.growlight_queue_v2 else { return };
+        let Some(row) = self.growlight_v2.rows(r).into_iter().nth(self.growlight_v2.selected) else {
+            return;
+        };
+        match row.kind {
+            V2RowKind::Archive if row.expanded => self.growlight_v2.toggle_archive(),
+            V2RowKind::Urgent | V2RowKind::Normal if row.expanded => {
+                self.growlight_v2.collapse(&row.entry_id);
+            }
+            V2RowKind::Slice if row.expanded => self.growlight_v2.collapse(&row.key),
+            V2RowKind::Slice => {
+                // collapse the tree this row sits in: the entry, or its sub
+                self.growlight_v2.collapse(row.milestone.as_deref().unwrap_or(&row.entry_id));
+            }
+            _ => {}
+        }
+        self.growlight_v2.clamp(self.growlight_v2.rows(r).len());
+    }
+
     // ---- M5d Shares tab (shared-subtree membership + ceremony) ----
 
     /// `a` / `:share` — open the "share a folder" overlay. The daemon derives the
@@ -4038,6 +4621,34 @@ pub fn latest_baton_path(entries: &[softfig_protocol_keeperd::TreeEntry]) -> Opt
         })
         .max_by_key(|(num, _)| *num)
         .map(|(_, path)| path)
+}
+
+/// Append an entry's (or, with `unit`, a slice of `tree`'s) §3.5 session-log
+/// lines to a queue-v2 detail body. `tree` is the entry id for its own tree, so
+/// a sub's `001` and its parent's `001` stay apart. Pure — no IO.
+fn push_v2_sessions(
+    body: &mut String,
+    reply: &QueueShowReply,
+    entry: &str,
+    tree: &str,
+    unit: Option<&str>,
+) {
+    let lines: Vec<&str> = reply
+        .sessions
+        .iter()
+        .filter(|s| {
+            s.entry == entry
+                && s.tree.as_deref().unwrap_or(entry) == tree
+                && s.unit.as_deref() == unit
+        })
+        .flat_map(|s| s.lines.iter().map(|l| l.as_str()))
+        .collect();
+    if !lines.is_empty() {
+        body.push_str("\nSessions:\n");
+        for l in lines {
+            body.push_str(&format!("  {l}\n"));
+        }
+    }
 }
 
 /// Is this tree entry a conflict sidecar — a `<path>.conflict-<device>-<ts>.md`
@@ -7448,5 +8059,637 @@ mod tests {
         assert_eq!(app.view, View::Browse);
         assert!(app.editor.is_none(), "a clean save-and-exit closes the editor");
         assert_eq!(app.status, "saved");
+    }
+
+    // ---- queue v2 actions address the captured entry (review 044 V12) ------
+
+    fn v2_entry(id: &str) -> softfig_ipc::growlightd::QueueShowEntry {
+        softfig_ipc::growlightd::QueueShowEntry {
+            id: id.into(),
+            kind: "milestone".into(),
+            project: "softfig".into(),
+            lane: "normal".into(),
+            status: "queued".into(),
+            after: Vec::new(),
+            branch: String::new(),
+            base: String::new(),
+            claimed: String::new(),
+            pending_status: None,
+            open: false,
+            open_unknown: false,
+            fleet: true,
+            auto_restack: true,
+            not_before: None,
+            doc_fleet: None,
+            doc_not_before: None,
+        }
+    }
+
+    /// An app showing a two-entry v2 list (`a`, `b`) with the cursor on `b`.
+    fn v2_app_cursor_on_b() -> App {
+        let mut app = App::new();
+        app.locked = false;
+        app.growlight_queue_v2 = Some(QueueShowReply {
+            list: true,
+            projects: Vec::new(),
+            entries: vec![v2_entry("a"), v2_entry("b")],
+            archived: Vec::new(),
+            sessions: Vec::new(),
+            trees: Vec::new(),
+        });
+        app.growlight_v2.select(1, 2);
+        app.view = View::Growlight;
+        app.growlight_v2_view = true;
+        app
+    }
+
+    /// `m` holding sub `m/s`, both with a slice `001` that has its own log line.
+    fn v2_app_with_a_sub() -> App {
+        let mut app = v2_app_cursor_on_b();
+        let reply = app.growlight_queue_v2.as_mut().unwrap();
+        reply.entries = vec![v2_entry("m")];
+        let slice = |id: &str, kind: &str| softfig_ipc::growlightd::QueueShowSlice {
+            id: id.into(),
+            kind: kind.into(),
+            status: "queued".into(),
+        };
+        reply.trees = vec![
+            softfig_ipc::growlightd::QueueShowTree {
+                milestone: "m".into(),
+                slices: vec![slice("001", "slice"), slice("s", "sub")],
+            },
+            softfig_ipc::growlightd::QueueShowTree {
+                milestone: "m/s".into(),
+                slices: vec![slice("001", "slice")],
+            },
+        ];
+        let log = |tree: Option<&str>, line: &str| softfig_ipc::growlightd::QueueShowSession {
+            entry: "m".into(),
+            tree: tree.map(str::to_string),
+            unit: Some("001".into()),
+            path: "doc.md".into(),
+            lines: vec![line.into()],
+        };
+        let mut close = log(Some("m/s"), "- sub close-out");
+        close.unit = None;
+        reply.sessions = vec![log(None, "- parent line"), log(Some("m/s"), "- sub line"), close];
+        app.growlight_v2.select(0, 1);
+        app
+    }
+
+    fn select_v2_row(app: &mut App, key: &str) {
+        let rows = app.growlight_v2.rows(app.growlight_queue_v2.as_ref().unwrap());
+        let at = rows.iter().position(|r| r.key == key).unwrap();
+        app.growlight_v2.select(at, rows.len());
+    }
+
+    #[test]
+    fn enter_opens_a_sub_and_each_slice_shows_only_its_own_tree_s_sessions() {
+        let mut app = v2_app_with_a_sub();
+        app.activate_growlight_v2();
+        select_v2_row(&mut app, "m/s");
+        app.activate_growlight_v2();
+
+        select_v2_row(&mut app, "m/001");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- parent line") && !body.contains("- sub line"), "{body}");
+
+        select_v2_row(&mut app, "m/s/001");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- sub line") && !body.contains("- parent line"), "{body}");
+
+        select_v2_row(&mut app, "m/s");
+        let (_, body) = app.v2_detail_view();
+        assert!(body.contains("- sub close-out") && !body.contains("- sub line"), "{body}");
+    }
+
+    #[test]
+    fn collapsing_inside_a_sub_closes_the_sub_and_not_the_entry() {
+        let mut app = v2_app_with_a_sub();
+        app.growlight_v2.expand("m");
+        app.growlight_v2.expand("m/s");
+        select_v2_row(&mut app, "m/s/001");
+        app.collapse_growlight_v2();
+        assert!(!app.growlight_v2.is_expanded("m/s"));
+        assert!(app.growlight_v2.is_expanded("m"));
+    }
+
+    #[test]
+    fn a_failed_queue_show_leaves_the_v2_view() {
+        let mut app = v2_app_cursor_on_b();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueueShow,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(!app.growlight_v2_view);
+        assert!(app.growlight_queue_v2.is_none());
+    }
+
+    /// `queue_show` is one-shot, so a daemon that dies while the view is open
+    /// shows up on the status poll first.
+    #[test]
+    fn growlightd_going_down_leaves_the_v2_view_and_coming_back_refetches_it() {
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2_stale = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(!app.growlight_v2_view);
+        assert!(app.growlight_queue_v2.is_none());
+        assert!(!app.growlight_v2_stale);
+
+        app.apply_reply(
+            Reply { id: 2, tag: Tag::FleetStatus, result: Ok(json!({})) },
+            &mut ipc,
+        );
+        assert!(app.growlight_v2_stale, "the snapshot must be fetched again");
+    }
+
+    fn only_pending(app: &App) -> &PendingV2 {
+        assert_eq!(app.growlight_v2_pending.len(), 1, "{:?}", app.growlight_v2_pending);
+        app.growlight_v2_pending.values().next().unwrap()
+    }
+
+    #[test]
+    fn drop_submit_targets_the_captured_entry_not_the_cursor_row() {
+        // The overlay opened on `a`; a reload since then left the cursor on `b`.
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueDrop {
+            buf: "obsolete".into(),
+            entry: "a".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_queue_drop(&mut ipc);
+        let p = only_pending(&app);
+        assert!(p.dry_run, "the first send is the dry-run half");
+        let V2Action::Drop(args) = &p.action else { panic!("expected a drop") };
+        assert_eq!(args.id, "a", "the drop must hit the entry the overlay named");
+    }
+
+    #[test]
+    fn edit_after_submit_targets_the_captured_entry_not_the_cursor_row() {
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueEditAfter {
+            buf: "b".into(),
+            entry: "a".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_edit_after(&mut ipc);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.id, "a");
+        assert_eq!(args.after.as_deref(), Some(&["b".to_string()][..]));
+    }
+
+    #[test]
+    fn a_captured_entry_that_left_the_list_is_refused_not_retargeted() {
+        let mut app = v2_app_cursor_on_b();
+        app.overlay = Overlay::QueueDrop {
+            buf: "obsolete".into(),
+            entry: "gone".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_queue_drop(&mut ipc);
+        assert!(app.growlight_v2_pending.is_empty(), "nothing was sent");
+        assert!(app.status.contains("gone"), "{}", app.status);
+    }
+
+    #[test]
+    fn replies_are_matched_to_their_own_request_by_id() {
+        // A's dry-run (id 1) and B's committed write (id 2) are both in flight.
+        let mut app = v2_app_cursor_on_b();
+        let drop = |id: &str| {
+            V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+                id: id.into(),
+                reason: "r".into(),
+                dry_run: false,
+            })
+        };
+        app.growlight_v2_pending.insert(1, PendingV2 { action: drop("a"), dry_run: true });
+        app.growlight_v2_pending.insert(2, PendingV2 { action: drop("b"), dry_run: false });
+        let mut ipc = dummy_ipc();
+        // B's commit reply lands first. It must not open a confirm overlay.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueueAction,
+                result: Ok(json!({"id": "b", "view": "v", "hash": "h"})),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert_eq!(app.status, "queue v2: updated");
+        // A's dry-run reply then opens the overlay for A, and only A.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueueAction,
+                result: Ok(json!({"id": "a", "view": "would-be", "hash": "h"})),
+            },
+            &mut ipc,
+        );
+        let Overlay::QueueConfirm { action, preview, .. } = &app.overlay else {
+            panic!("expected the confirm overlay, got {:?}", app.overlay)
+        };
+        assert_eq!(action.target(), "a");
+        assert_eq!(preview, "would-be");
+        assert!(app.growlight_v2_pending.is_empty());
+    }
+
+    // ---- queue v2 status picker (review 044 V11) ---------------------------
+
+    #[test]
+    fn the_status_picker_sets_the_chosen_status_on_the_captured_entry() {
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2.select(0, 2);
+        let mut ipc = dummy_ipc();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        let Overlay::QueueStatusPick { target, selected, .. } = &app.overlay else {
+            panic!("`s` opens the picker, got {:?}", app.overlay)
+        };
+        assert_eq!(*target, StatusTarget::Entry("a".into()));
+        assert_eq!(*selected, 0, "preselects the current status (queued)");
+        // The cursor moves on; the pick still lands on `a`.
+        app.growlight_v2.select(1, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        let p = only_pending(&app);
+        assert!(p.dry_run);
+        let V2Action::EntryUpdate(args) = &p.action else { panic!("expected an entry update") };
+        assert_eq!(args.id, "a");
+        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Blocked));
+    }
+
+    #[test]
+    fn a_digit_picks_directly_and_esc_sends_nothing() {
+        let mut app = v2_app_cursor_on_b();
+        let mut ipc = dummy_ipc();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.growlight_v2_pending.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &mut ipc);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else { panic!() };
+        assert_eq!(args.id, "b");
+        assert_eq!(args.status, Some(softfig_ipc::verbs::QueueStatusArg::Deferred));
+    }
+
+    // ---- queue v2 glue: keys, the action pair, the gates (review 044 V22) ---
+
+    fn press(app: &mut App, ipc: &mut IpcClient, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), ipc);
+    }
+
+    fn press_char(app: &mut App, ipc: &mut IpcClient, c: char) {
+        press(app, ipc, KeyCode::Char(c));
+    }
+
+    /// What a [`recording_ipc`] socket received. Dropping it removes the socket.
+    struct Wire {
+        requests: std::sync::mpsc::Receiver<softfig_ipc::Request>,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for Wire {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A stand-in keeperd on a real socket: it records every request the
+    /// client's worker sends and answers each with a verb reply carrying
+    /// `would-be`, so a test reads what actually went over the wire.
+    fn recording_ipc(tag: &str) -> (IpcClient, Wire) {
+        use std::io::{BufRead, BufReader, Write};
+        let path = std::env::temp_dir().join(format!(
+            "softfig-tui-{tag}-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let _ = tx.send(serde_json::from_str(&line).unwrap());
+                let reply = softfig_ipc::Response::ok(json!({
+                    "id": "a", "view": "would-be", "hash": "h"
+                }));
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                stream.write_all(&bytes).unwrap();
+            }
+        });
+        (IpcClient::spawn(path.clone()), Wire { requests: rx, path })
+    }
+
+    /// The next request off the wire, and its reply applied to `app` the way
+    /// the run loop would.
+    fn settle(app: &mut App, ipc: &mut IpcClient, wire: &Wire) -> softfig_ipc::Request {
+        let req = wire.requests.recv_timeout(std::time::Duration::from_secs(10)).expect("a request");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let replies = ipc.drain();
+            if !replies.is_empty() {
+                for reply in replies {
+                    app.apply_reply(reply, ipc);
+                }
+                return req;
+            }
+            assert!(std::time::Instant::now() < deadline, "no reply reached the client");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_confirmed_action_goes_out_dry_then_for_real_and_reloads() {
+        let (mut ipc, wire) = recording_ipc("pair");
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2_stale = false;
+        press_char(&mut app, &mut ipc, 't');
+
+        let dry = settle(&mut app, &mut ipc, &wire);
+        assert_eq!(dry.op, softfig_ipc::op::QUEUE_UPDATE_ENTRY);
+        assert_eq!(dry.args["id"], "b");
+        assert_eq!(dry.args["dry_run"], true);
+        let Overlay::QueueConfirm { action, preview, .. } = &app.overlay else {
+            panic!("the dry-run reply opens the confirm, got {:?}", app.overlay)
+        };
+        assert_eq!(action.target(), "b");
+        assert_eq!(preview, "would-be");
+        assert!(!app.growlight_v2_stale, "nothing has been written yet");
+
+        press_char(&mut app, &mut ipc, 'y');
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        let commit = settle(&mut app, &mut ipc, &wire);
+        assert_eq!(commit.op, dry.op);
+        assert_eq!(commit.args["id"], "b");
+        assert_eq!(commit.args["lane"], dry.args["lane"]);
+        assert_eq!(commit.args["dry_run"], false);
+
+        // The commit's reply reloads and never reopens the overlay. Its reload
+        // of the legacy table is a third request, answered like the others.
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert_eq!(app.status, "queue v2: updated");
+        assert!(app.growlight_v2_stale);
+        assert_eq!(settle(&mut app, &mut ipc, &wire).op, softfig_ipc::op::GROWLIGHT_QUEUE);
+    }
+
+    #[test]
+    fn a_cancelled_confirm_sends_nothing_more() {
+        for key in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('N')] {
+            let (mut ipc, wire) = recording_ipc("cancel");
+            let mut app = v2_app_cursor_on_b();
+            press_char(&mut app, &mut ipc, 't');
+            settle(&mut app, &mut ipc, &wire);
+            assert!(matches!(app.overlay, Overlay::QueueConfirm { .. }), "{:?}", app.overlay);
+
+            press(&mut app, &mut ipc, key);
+            assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+            assert_eq!(app.status, "queue v2 action cancelled");
+            assert!(app.growlight_v2_pending.is_empty());
+            assert!(
+                wire.requests.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+                "{key:?} must not send the commit"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_and_a_capital_y_confirm_like_y() {
+        for key in [KeyCode::Enter, KeyCode::Char('Y')] {
+            let mut ipc = dummy_ipc();
+            let mut app = v2_app_cursor_on_b();
+            let action = V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+                id: "a".into(),
+                reason: "r".into(),
+                dry_run: false,
+            });
+            app.overlay = Overlay::QueueConfirm { action, preview: "p".into(), error: None };
+            press(&mut app, &mut ipc, key);
+            assert!(!only_pending(&app).dry_run, "{key:?} is the commit half");
+        }
+    }
+
+    #[test]
+    fn k_and_j_move_the_selected_entry_within_its_lane() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 'K');
+        let p = only_pending(&app);
+        assert!(p.dry_run);
+        let V2Action::EntryUpdate(args) = &p.action else { panic!("expected an entry update") };
+        assert_eq!(args.id, "b");
+        let spec = args.move_spec.as_ref().expect("a move");
+        assert_eq!((spec.to.as_str(), spec.ref_id.as_deref()), ("before", Some("a")));
+
+        app.growlight_v2_pending.clear();
+        app.growlight_v2.select(0, 2);
+        press_char(&mut app, &mut ipc, 'J');
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.id, "a");
+        let spec = args.move_spec.as_ref().expect("a move");
+        assert_eq!((spec.to.as_str(), spec.ref_id.as_deref()), ("after", Some("b")));
+    }
+
+    #[test]
+    fn a_move_past_the_lane_end_says_so_and_sends_nothing() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 'J');
+        assert!(app.growlight_v2_pending.is_empty());
+        assert_eq!(app.status, "that action doesn't apply to this row");
+    }
+
+    #[test]
+    fn t_toggles_the_selected_entrys_lane() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 't');
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.id, "b");
+        assert_eq!(args.lane, Some(softfig_ipc::queue_v2::Lane::Urgent));
+    }
+
+    #[test]
+    fn d_collects_a_reason_before_it_sends_the_drop() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 'd');
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let Overlay::QueueDrop { error, .. } = &app.overlay else {
+            panic!("an empty reason keeps the prompt open, got {:?}", app.overlay)
+        };
+        assert!(error.is_some());
+        assert!(app.growlight_v2_pending.is_empty());
+
+        for c in "old".chars() {
+            press_char(&mut app, &mut ipc, c);
+        }
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let p = only_pending(&app);
+        assert!(p.dry_run);
+        let V2Action::Drop(args) = &p.action else { panic!("expected a drop") };
+        assert_eq!((args.id.as_str(), args.reason.as_str()), ("b", "old"));
+    }
+
+    /// `b` linked to two entries, with the cursor on it.
+    fn v2_app_with_links() -> App {
+        let mut app = v2_app_cursor_on_b();
+        let reply = app.growlight_queue_v2.as_mut().unwrap();
+        reply.entries[1].after = vec!["a".into(), "c".into()];
+        app
+    }
+
+    #[test]
+    fn the_links_editor_opens_on_the_entrys_current_links() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        let Overlay::QueueEditAfter { buf, entry, .. } = &app.overlay else {
+            panic!("`a` opens the editor, got {:?}", app.overlay)
+        };
+        assert_eq!((buf.as_str(), entry.as_str()), ("a, c", "b"));
+    }
+
+    #[test]
+    fn a_bare_enter_in_the_links_editor_keeps_every_link() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.after.as_deref(), Some(&["a".to_string(), "c".to_string()][..]));
+    }
+
+    #[test]
+    fn deleting_the_text_still_clears_the_links() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_with_links();
+        press_char(&mut app, &mut ipc, 'a');
+        for _ in 0.."a, c".len() {
+            press(&mut app, &mut ipc, KeyCode::Backspace);
+        }
+        press(&mut app, &mut ipc, KeyCode::Enter);
+        let V2Action::EntryUpdate(args) = &only_pending(&app).action else {
+            panic!("expected an entry update")
+        };
+        assert_eq!(args.after.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_locked_app_sends_no_action() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        app.locked = true;
+        press_char(&mut app, &mut ipc, 'K');
+        assert!(app.growlight_v2_pending.is_empty());
+        assert!(app.status.contains("locked"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_action_keys_do_nothing_outside_the_v2_view() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        app.growlight_v2_view = false;
+        for c in ['K', 'J', 't', 's', 'a', 'd'] {
+            press_char(&mut app, &mut ipc, c);
+            assert!(matches!(app.overlay, Overlay::None), "{c}: {:?}", app.overlay);
+            assert!(app.growlight_v2_pending.is_empty(), "{c}");
+        }
+    }
+
+    #[test]
+    fn v_toggles_the_view_only_while_a_v2_list_exists() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 'v');
+        assert!(!app.growlight_v2_view);
+        press_char(&mut app, &mut ipc, 'v');
+        assert!(app.growlight_v2_view);
+
+        app.growlight_v2_view = false;
+        app.growlight_queue_v2.as_mut().unwrap().list = false;
+        press_char(&mut app, &mut ipc, 'v');
+        assert!(!app.growlight_v2_view, "`list: false` leaves nothing to show");
+    }
+
+    #[test]
+    fn a_list_false_reply_forces_the_legacy_tree() {
+        let mut app = v2_app_cursor_on_b();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply { id: 1, tag: Tag::GrowlightQueueShow, result: Ok(json!({"list": false})) },
+            &mut ipc,
+        );
+        assert!(!app.growlight_v2_view);
+    }
+
+    #[test]
+    fn a_refused_dry_run_opens_no_confirm_and_names_the_refusal() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        press_char(&mut app, &mut ipc, 't');
+        let id = *app.growlight_v2_pending.keys().next().unwrap();
+        app.growlight_v2_stale = false;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::GrowlightQueueAction,
+                result: Err((ErrorKind::BadArgs, "running".into())),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert!(app.growlight_v2_pending.is_empty());
+        assert!(app.status.contains("running"), "{}", app.status);
+        assert!(!app.growlight_v2_stale, "a refusal wrote nothing to reload");
+    }
+
+    #[test]
+    fn a_refused_commit_reports_it_and_does_not_claim_an_update() {
+        let mut ipc = dummy_ipc();
+        let mut app = v2_app_cursor_on_b();
+        let action = V2Action::Drop(softfig_ipc::verbs::QueueDropArgs {
+            id: "a".into(),
+            reason: "r".into(),
+            dry_run: false,
+        });
+        app.growlight_v2_pending.insert(7, PendingV2 { action, dry_run: false });
+        app.apply_reply(
+            Reply {
+                id: 7,
+                tag: Tag::GrowlightQueueAction,
+                result: Err((ErrorKind::BadArgs, "linked_from".into())),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert!(app.status.contains("linked_from"), "{}", app.status);
     }
 }

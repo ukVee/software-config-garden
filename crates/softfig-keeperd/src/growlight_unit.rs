@@ -82,6 +82,57 @@ pub fn fleet_enabled(garden_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The two `config/growlight.toml` switches the §11 migration apply gates on
+/// (queue-v2-migrate slice 005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateSwitches {
+    /// `fleet_enabled = true`.
+    pub fleet_enabled: bool,
+    /// `queue = "v2"`.
+    pub queue_v2: bool,
+}
+
+/// Parse [`MigrateSwitches`] from the file's text (`None` = absent: both off,
+/// the defaults). Unlike [`fleet_enabled`] this fails **closed toward a
+/// refusal**: the apply must not write v2 state under a config it cannot
+/// read, so malformed TOML or a `queue` value other than `legacy` / `v2` is an
+/// error, never a default. The caller reads the text through its WorkTree.
+pub fn migrate_switches(text: Option<&str>) -> Result<MigrateSwitches, String> {
+    #[derive(Deserialize)]
+    struct Switches {
+        #[serde(default)]
+        fleet_enabled: bool,
+        #[serde(default)]
+        queue: Option<String>,
+    }
+    let Some(text) = text else {
+        return Ok(MigrateSwitches { fleet_enabled: false, queue_v2: false });
+    };
+    let s: Switches = toml::from_str(text).map_err(|e| e.to_string())?;
+    let queue_v2 = match s.queue.as_deref() {
+        None | Some("legacy") => false,
+        Some("v2") => true,
+        Some(other) => return Err(format!("unknown `queue = {other:?}` (expected \"legacy\" or \"v2\")")),
+    };
+    Ok(MigrateSwitches { fleet_enabled: s.fleet_enabled, queue_v2 })
+}
+
+/// Whether `config/growlight.toml`'s text sets the §11 switch to `queue =
+/// "v2"`. Fail-closed toward legacy: an absent key, any other value (growlightd
+/// refuses an unknown one at arm time) or a file that doesn't parse reads as
+/// `false`, so the guards that only legacy needs stay on whenever the switch
+/// can't be read. Like [`fleet_enabled`], a one-key reader: the roster and the
+/// rest of the schema stay growlightd's. The caller reads the file the way its
+/// context allows — [`WorkTree`](crate::actions::worktree::WorkTree) reads it
+/// mount-safe while it holds the daemon lock.
+pub fn queue_v2(raw: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Switch {
+        queue: Option<String>,
+    }
+    toml::from_str::<Switch>(raw).is_ok_and(|s| s.queue.as_deref() == Some("v2"))
+}
+
 /// On an unlock/resume: bring the growlightd unit into line with the in-garden
 /// `fleet_enabled` gate — **start** it if the gate is on, **ensure it is stopped**
 /// if the gate is off. The stop half is what makes a *live disable* take effect:
@@ -254,6 +305,16 @@ mod tests {
         std::fs::write(cd.join(softfig_ipc::GROWLIGHT_CONFIG_FILE), body).unwrap();
     }
 
+    /// Only an exact `queue = "v2"` reads as v2; the key absent, `legacy`, an
+    /// unknown value and an unparseable file all read as legacy.
+    #[test]
+    fn the_queue_switch_reads_v2_only_when_set_and_parseable() {
+        assert!(queue_v2("fleet_enabled = true\nqueue = \"v2\"\n[[fleet]]\nagent = \"a\"\n"));
+        for raw in ["", "queue = \"legacy\"\n", "queue = \"V2\"\n", "queue = \"v3\"\n", "queue = 2\n", "queue = \"v2\n"] {
+            assert!(!queue_v2(raw), "{raw:?}");
+        }
+    }
+
     #[test]
     fn gate_absent_config_is_disabled() {
         let dir = tempfile::tempdir().unwrap();
@@ -350,5 +411,20 @@ mod tests {
         // construct the Command.
         stop_on_terminal_lock(false, false); // supervision off
         stop_on_terminal_lock(true, true); // resume pending
+    }
+
+    #[test]
+    fn migrate_switches_default_off_and_fail_closed() {
+        let off = MigrateSwitches { fleet_enabled: false, queue_v2: false };
+        assert_eq!(migrate_switches(None), Ok(off));
+        assert_eq!(migrate_switches(Some("claude_bin = \"x\"\n")), Ok(off));
+        assert_eq!(migrate_switches(Some("queue = \"legacy\"\n")), Ok(off));
+        assert_eq!(
+            migrate_switches(Some("fleet_enabled = true\nqueue = \"v2\"\n")),
+            Ok(MigrateSwitches { fleet_enabled: true, queue_v2: true })
+        );
+        // Unreadable config refuses the apply instead of defaulting.
+        assert!(migrate_switches(Some("queue = \"v3\"\n")).is_err());
+        assert!(migrate_switches(Some("fleet_enabled = \n")).is_err());
     }
 }

@@ -27,14 +27,16 @@ use softfig_ipc::{
     claude_profiles,
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
-        PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
-        StopLevel, StopReply,
+        PausedReply, QueueShowEntry, QueueShowReply, ResumeItemArgs, ResumeItemReply,
+        SetResourcesArgs, SetResourcesReply, StopLevel, StopReply,
     },
-    queue_v2::{Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
+    backlog_doc::BACKLOG_DOC,
+    queue_v2::{migrate, Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
     verbs::{
         GrowlightInitArgs, GrowlightInitReply, ListReportsArgs, ListReportsReply, PostMessageArgs,
         PostMessageReply, QueueAddEntryReply, QueueAddProjectReply, QueueDropReply, QueueMoveSpec,
-        QueueStatusArg, QueueUpdateEntryReply, ReadFileArgs, ReadFileReply, ReportRow,
+        QueueStatusArg, QueueUpdateEntryReply, QueueV2MigrateApplyArgs, QueueV2MigrateApplyReply,
+        ReadFileArgs, ReadFileReply, ReportRow,
         SliceInsertReply, SliceUpdateReply, StatusReply, op,
     },
 };
@@ -141,7 +143,7 @@ pub enum GrowlightCmd {
     Resources(ResourcesArgs),
 
     /// The queue v2 human surface (§6.9): `queue show` and the mutating forms —
-    /// `project add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each is
+    /// `project add`, `project set-repo`, `add`, `move`, `lane`, `after`, `status`, `repair`, `drop`. Each is
     /// a thin client over the matching §6.8 keeperd verb, with `--dry-run`
     /// (compute + validate + render the would-be list, write nothing), plus the
     /// read-only `queue pick`. These verbs touch only the v2 files; the fleet
@@ -478,6 +480,8 @@ fn start(args: StartArgs) -> Result<()> {
             &statusline_path,
             &garden_root,
             &claude_projects,
+            &softfig_bin_path(),
+            &runtime,
         ),
     )?;
     // `--settings` only *permits* softfig-mcp; this *attaches* it, so the
@@ -1121,7 +1125,7 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
 
 /// Ask the daemon where the garden is mounted (so injection paths are derived,
 /// never literal — spec §3/§12). `--garden-root` bypasses the query.
-fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
     }
@@ -1255,7 +1259,7 @@ fn runtime_grant_root(runtime: &Path) -> &Path {
     }
 }
 
-fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
     }
@@ -1303,7 +1307,8 @@ fn seed_if_absent(path: &Path, content: &str) -> Result<bool> {
 /// The isolated settings file the launcher passes to `--settings`. A
 /// SessionStart hook re-injects `inject.sh` on both `startup` and `clear`
 /// (so `/clear` is the roll mechanism, spec §2); the statusLine tees the
-/// budgets to `usage.json` (spec §6).
+/// budgets to `usage.json` (spec §6); the SessionEnd hook ingests the
+/// session's transcript into the telemetry db (spec-token-telemetry §4.2).
 ///
 /// The `permissions` block lets the loop agent actually do its job: a headless
 /// `-p` iteration can't answer a permission prompt, so without an allow-list it
@@ -1328,8 +1333,19 @@ fn loop_json(
     statusline: &Path,
     garden_root: &Path,
     claude_projects: &Path,
+    softfig: &Path,
+    runtime: &Path,
 ) -> String {
     let inject = inject.display().to_string();
+    // The garden root + runtime dir are baked in so the rows are priced from,
+    // and keyed by, the same garden and root baton this launch used, with no
+    // daemon round-trip at session end. The verb always exits 0.
+    let session_end = format!(
+        "{} telemetry ingest-transcript --garden-root {} --config-dir {}",
+        shell_quote(softfig),
+        shell_quote(garden_root),
+        shell_quote(runtime)
+    );
     let session_start_block = |source: &str| {
         serde_json::json!({
             "matcher": source,
@@ -1362,6 +1378,9 @@ fn loop_json(
             "SessionStart": [
                 session_start_block("startup"),
                 session_start_block("clear"),
+            ],
+            "SessionEnd": [
+                { "hooks": [ { "type": "command", "command": session_end } ] }
             ]
         }
     });
@@ -1635,7 +1654,61 @@ fn client_status(args: ClientArgs) -> Result<()> {
     let reply: FleetStatusReply =
         growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
     print_fleet_status(&reply);
+    // The v2 queue view (§6.9): both lanes, the stack per repo, and the
+    // session log — the same annotations `queue show` layers onto its TOML.
+    // Best-effort: the fleet status above is the core render.
+    if let Some(view) = fetch_queue_view(&socket)? {
+        let rendered = render_status_queue(&view);
+        if !rendered.is_empty() {
+            println!();
+            print!("{rendered}");
+        }
+    }
     Ok(())
+}
+
+/// The queue block `status` appends to the fleet status: nothing at all when
+/// there is no v2 list (`status` is not the place to explain an absent
+/// `queue.toml` — `queue show` is).
+fn render_status_queue(view: &QueueShowReply) -> String {
+    if !view.list {
+        return String::new();
+    }
+    format!(
+        "queue v2\n{}{}",
+        render_queue_lanes(view),
+        render_annotations(view)
+    )
+}
+
+/// `QUEUE_SHOW` against growlightd, best-effort: it is an annotation layered
+/// onto a verb that already has its own answer, so a daemon that cannot serve
+/// it must not fail the verb. `None` when growlightd is absent, or when it
+/// rejects the call with `BadArgs` — what a daemon older than the verb says,
+/// whether for the unknown op or a protocol-version mismatch (growlightd
+/// reports both as `BadArgs`); that case also leaves one line on stderr. Any
+/// other daemon error is still surfaced.
+fn fetch_queue_view(socket: &Path) -> Result<Option<QueueShowReply>> {
+    match try_daemon_call(socket, growlightd::op::QUEUE_SHOW, serde_json::Value::Null) {
+        Ok(Some(value)) => Ok(Some(serde_json::from_value(value)?)),
+        Ok(None) => Ok(None),
+        Err(ClientError::Daemon { kind: ErrorKind::BadArgs, message }) => {
+            eprintln!("queue annotations unavailable — growlightd rejected queue show ({message})");
+            Ok(None)
+        }
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("growlightd error ({kind:?}): {message}"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// The §11 switch's status line. `protocol` above is the wire version and stays
+/// `v1` under either queue, so this is the line that shows a flip took. A
+/// growlightd older than the field sends nothing, which says nothing about which
+/// queue it runs, so no line is printed.
+fn queue_switch_line(r: &FleetStatusReply) -> Option<String> {
+    (!r.queue.is_empty()).then(|| format!("queue         {}", r.queue))
 }
 
 /// Render a [`FleetStatusReply`] for the terminal.
@@ -1646,6 +1719,9 @@ fn print_fleet_status(r: &FleetStatusReply) {
     // The config-level arm/disarm gate (`config/growlight.toml fleet_enabled`),
     // distinct from `paused` (the runtime admission gate over an armed fleet).
     println!("fleet         {}", if r.fleet_enabled { "enabled" } else { "disabled" });
+    if let Some(line) = queue_switch_line(r) {
+        println!("{line}");
+    }
     println!("paused        {}", r.paused);
     println!(
         "policy        max_agents={} ctx_roll={}% ctx_handoff={}% 5h_halt={}% 7d_halt={}%",
@@ -1689,6 +1765,11 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
         }
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    print!("{}", render_schedule(r.schedule.as_ref(), now));
+    print!("{}", render_build_caps(&r.build_caps));
 }
 
 /// One `agents:` row: id, status, the claude-login slot the member's last
@@ -1834,10 +1915,80 @@ fn render_build_caps(c: &BuildCapsSummary) -> String {
         .map(|w| w.to_string())
         .unwrap_or_else(|| "(unset)".to_string());
     let mem = c.memory_high.as_deref().unwrap_or("(unset)");
+    let quota = c.cpu_quota.as_deref().unwrap_or("(unset)");
+    let threads = c
+        .test_threads
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "(unset)".to_string());
     format!(
         "build caps    (live default — the next spawn's throttle)\n  \
-         cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n",
+         cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n  \
+         cpu_quota         {quota}\n  test_threads      {threads}\n",
     )
+}
+
+/// Render the `[schedule]` block of `status` (growlight-schedule slice 006).
+/// `now` (Unix seconds) turns a reserve's reset into "resets in …". Pure, so
+/// it is unit-tested without a daemon.
+fn render_schedule(s: Option<&growlightd::ScheduleSummary>, now: i64) -> String {
+    let Some(s) = s else {
+        return "schedule      (none)\n".to_string();
+    };
+    let state = if s.open { "open" } else { "closed" };
+    let mut out = format!("schedule      {state} (zone {})\n", s.zone);
+    if !s.current_windows.is_empty() {
+        out += &format!("  open now      {}\n", s.current_windows.join(", "));
+    }
+    // No edge in the week ahead: an open schedule stays open throughout, a
+    // closed one has no window that opens.
+    let edge = s.next_edge_local.as_deref().unwrap_or(if s.open {
+        "(none within a week — open throughout)"
+    } else {
+        "(none within a week — no window opens)"
+    });
+    out += &format!("  next edge     {edge}\n");
+    for h in &s.held_members {
+        out += &format!("  held          {:<16} {}\n", h.agent, h.reason);
+    }
+    for item in &s.held_items {
+        out += &format!("  waiting       {item}\n");
+    }
+    for r in &s.reserve {
+        let used = r.used_7d_pct.map_or_else(|| "unknown".to_string(), |p| format!("{p}%"));
+        let state = if r.held { "held" } else { "clear" };
+        let resets = r
+            .resets_at
+            .map(|at| format!(", resets in {}", softfig_ipc::human_age_secs(at.saturating_sub(now).max(0) as u64)))
+            .unwrap_or_default();
+        out += &format!(
+            "  reserve       {:<16} keep {}% · 7d used {used} · {state}{resets}\n",
+            r.slot, r.reserve_pct
+        );
+    }
+    for p in &s.projection {
+        out += &format!("  projection    {:<16} {:<12} {}\n", p.slot, projection_label(p), projection_eta(p, now));
+    }
+    out
+}
+
+/// Which cap a projection row runs to: `5h`, `7d`, or `reserve 80%`.
+fn projection_label(p: &growlightd::PoolProjection) -> String {
+    if p.window == "reserve" { format!("reserve {}%", p.target_pct) } else { p.window.clone() }
+}
+
+/// A projection row's range, relative to `now` (§3.11): never a point.
+fn projection_eta(p: &growlightd::PoolProjection, now: i64) -> String {
+    let until = |at: i64| softfig_ipc::human_age_secs(at.saturating_sub(now).max(0) as u64);
+    let resets = p.resets_at.map(|at| format!(", resets in {}", until(at))).unwrap_or_default();
+    match (p.cap_at_earliest, p.cap_at_latest) {
+        (Some(e), Some(l)) => match (until(e), until(l)) {
+            (e, l) if e == l => format!("cap in ~{e}{resets}"),
+            (e, l) => format!("cap in {e}–{l}{resets}"),
+        },
+        (Some(e), None) => format!("cap in {} at the earliest, or resets first{resets}", until(e)),
+        (None, _) if p.resets_first => format!("resets first{resets}"),
+        (None, _) => "unknown".to_string(),
+    }
 }
 
 /// Render `resources show`: the live default caps + the genuinely-running scope
@@ -2152,6 +2303,12 @@ pub struct QueueArgs {
     /// keeperd socket. Defaults to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    /// growlightd socket, for `show`'s live git-stack + session annotations
+    /// (growlightd runs the read-only git) and for `pick`. Goes before the
+    /// subcommand, like `--socket`. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long, value_name = "SOCKET")]
+    pub growlightd_socket: Option<PathBuf>,
     #[command(subcommand)]
     pub cmd: Option<QueueSub>,
 }
@@ -2161,22 +2318,19 @@ pub enum QueueSub {
     /// (default) show the live v2 list from `queue.toml` — both lanes, one row
     /// per entry in file order: id, kind, title, project, lane, status, the
     /// `after` links, and the stack columns (branch/base/claimed) verbatim
-    /// from the TOML. TOML state only — the live git-stack annotations
-    /// (merge-base / restack flags) are queue-v2-git's (finding 3).
+    /// from the TOML. Then, when growlightd answers, the live annotations:
+    /// the open flag per branch, the stack per repo and the session log.
+    /// Best-effort — a stopped or older growlightd just omits them.
     Show,
 
     /// Read-only: what `pick_v2` assigns a member now, and why every skipped
     /// entry was skipped (§6.9). This form is **growlightd's** verb (the pick
-    /// lives there, not in keeperd), so it takes its own socket flag.
+    /// lives there, not in keeperd), so it answers on `--growlightd-socket`.
     Pick {
         /// A roster member id. Omitted: an unpinned member on the default
         /// backend.
         #[arg(long)]
         member: Option<String>,
-        /// growlightd's socket. Defaults to
-        /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
-        #[arg(long, value_name = "SOCKET")]
-        growlightd_socket: Option<PathBuf>,
     },
 
     /// Append a `[[project]]` row — `queue project add`.
@@ -2203,21 +2357,101 @@ pub enum QueueSub {
     /// Set an entry's status (`queued | blocked | deferred | done`).
     Status(QueueStatusArgs),
 
+    /// Hold an entry for the human (`no`: the fleet never claims it) or
+    /// release it to the fleet (`yes`) — the row's `fleet` field.
+    Fleet(QueueFleetArgs),
+
+    /// Set an entry's start time (the row's `not_before`): a `queued` entry
+    /// is held until then. `""` clears it.
+    NotBefore(QueueNotBeforeArgs),
+
+    /// Opt a resumed branch into the loop's automatic restack (`yes`), or hold
+    /// a fleet-cut branch out of it (`no`) — the row's `auto_restack` field. A
+    /// first claim that finds the branch already existing writes `no`.
+    AutoRestack(QueueAutoRestackArgs),
+
+    /// Repair a migrated entry's `branch`, `base` or `project` (report 171).
+    /// Refused `running` only while a live session holds the entry (an `active`
+    /// entry nothing holds takes it).
+    Repair(QueueRepairArgs),
+
     /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
     Drop(QueueDropArgs),
+
+    /// Convert the legacy backlog to the v2 files (§11). `--dry-run` reads the
+    /// backlog off the mount and the runtime batons, and prints the plan,
+    /// every judgment call and every refusal. It writes nothing and calls no
+    /// daemon. `--apply` has keeperd write the v2 files in one commit, then
+    /// copies the in-flight batons into `entries/<id>/baton.md`.
+    Migrate(QueueMigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueMigrateArgs {
+    /// Print the plan; write nothing.
+    #[arg(long, required_unless_present = "apply", conflicts_with = "apply")]
+    pub dry_run: bool,
+    /// Write the v2 files in one keeperd commit. keeperd refuses while the
+    /// fleet is armed, the switch says v2, a v2 file exists, the snapshot
+    /// moved off `--expect`, or a call is still open. Never flips the switch.
+    #[arg(long, requires = "answers", requires = "expect")]
+    pub apply: bool,
+    /// The owner's settlements (`schema = 1`, `[class]`, `[call]`).
+    /// Omitted: every call stays open.
+    #[arg(long, value_name = "TOML")]
+    pub answers: Option<PathBuf>,
+    /// The snapshot version the dry run printed; `--apply` refuses if any
+    /// backlog file or baton has changed since.
+    #[arg(long, value_name = "VERSION", requires = "apply")]
+    pub expect: Option<String>,
+    /// The mounted garden the dry run reads. Defaults to `~/soft-fig_garden`.
+    /// Refused with `--apply`: keeperd reads its own garden, so a path here
+    /// would name a copy the apply never looks at.
+    #[arg(long, value_name = "PATH", conflicts_with = "apply")]
+    pub garden: Option<PathBuf>,
+    /// With `--dry-run`: ask git for every open `stack_base` call and write
+    /// the answers to OUT as an answers file you review, edit, and pass back
+    /// as `--answers`. Nothing applies it by itself. An existing OUT is refused.
+    #[arg(long, value_name = "OUT", requires = "dry_run", conflicts_with = "apply")]
+    pub stack_answers: Option<PathBuf>,
+    /// The growlight runtime dir the batons live in. Defaults to
+    /// `$XDG_CONFIG_HOME/softfig/growlight`.
+    #[arg(long, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum QueueProjectSub {
     /// Append a `[[project]]` row: a name bound to a repo and its merge branch.
     Add(QueueProjectAddArgs),
+    /// Correct an existing project's repo (and optionally its merge branch):
+    /// the repair `add` cannot make, since a repeat is refused `exists`.
+    /// Refused `running` only while a live session holds one of the project's
+    /// `active` entries.
+    SetRepo(QueueProjectSetRepoArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueProjectSetRepoArgs {
+    /// The existing project's name.
+    pub name: String,
+    /// A local path (absolute, `~`, `~/…` or `~<you>/…`) or `host:path`, as
+    /// for `project add`.
+    pub repo: String,
+    /// The branch merges land on; omitted keeps the project's current one.
+    #[arg(long)]
+    pub main: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct QueueProjectAddArgs {
     /// `[a-z0-9-]+` — the project name entries reference.
     pub name: String,
-    /// A local path (`~` allowed) or `host:path`.
+    /// A local path (absolute, `~`, `~/…` or `~<you>/…`) or `host:path`.
+    /// Another user's `~<name>/…` or a relative path is refused.
     pub repo: String,
     /// The branch merges land on; defaults to `main`.
     #[arg(long)]
@@ -2274,6 +2508,13 @@ pub struct QueueAddArgs {
     /// `after` position, §6.9).
     #[arg(long, conflicts_with_all = ["front", "before"])]
     pub behind: Option<String>,
+    /// Make the entry human-only (`fleet = false`): the fleet never claims it.
+    #[arg(long)]
+    pub no_fleet: bool,
+    /// Hold the entry until this time (`not_before`): `YYYY-MM-DD HH:MM
+    /// ±HH:MM`, offset required.
+    #[arg(long, value_name = "TIME")]
+    pub not_before: Option<String>,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2351,6 +2592,73 @@ pub struct QueueStatusArgs {
     /// queued (also unblocks/un-defers) | blocked | deferred | done (archives
     /// the row).
     pub status: HumanStatus,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The `queue fleet` words: yes (the fleet may claim it) | no (human-only).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetArg {
+    Yes,
+    No,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueFleetArgs {
+    /// The live entry id.
+    pub id: String,
+    /// yes releases the entry to the fleet; no holds it for the human. A
+    /// live-held active entry keeps running.
+    pub fleet: FleetArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueAutoRestackArgs {
+    /// The live entry id.
+    pub id: String,
+    /// yes lets the loop restack the entry's branch (it rewrites it, so only
+    /// for a branch no session outside the queue is using); no holds it out.
+    pub auto_restack: FleetArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueNotBeforeArgs {
+    /// The live entry id.
+    pub id: String,
+    /// `YYYY-MM-DD HH:MM ±HH:MM` (offset required; `T` and `Z` allowed), or
+    /// `""` to clear the start time. An entry that has started ignores it.
+    pub time: String,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("repair")
+        .required(true)
+        .multiple(true)
+        .args(["branch", "base", "project"])
+))]
+pub struct QueueRepairArgs {
+    /// The live entry id.
+    pub id: String,
+    /// The branch the entry's work lives on, a valid git branch name.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// The commit or parent branch the entry was cut from; `""` clears it.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Move the entry to another existing project.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Compute + validate + render the would-be state, write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -2447,21 +2755,25 @@ pub struct SliceStatusArgs {
 
 fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let growlightd_socket = growlight_socket(args.growlightd_socket);
     match args.cmd.unwrap_or(QueueSub::Show) {
-        QueueSub::Show => queue_show(&socket),
-        QueueSub::Pick {
-            member,
-            growlightd_socket,
-        } => queue_pick(&growlight_socket(growlightd_socket), member.as_deref()),
+        QueueSub::Show => queue_show(&socket, &growlightd_socket),
+        QueueSub::Pick { member } => queue_pick(&growlightd_socket, member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
+            QueueProjectSub::SetRepo(a) => queue_project_set_repo(&socket, a),
         },
         QueueSub::Add(a) => queue_add(&socket, a),
         QueueSub::Move(a) => queue_move(&socket, a),
         QueueSub::Lane(a) => queue_lane(&socket, a),
         QueueSub::After(a) => queue_after(&socket, a),
         QueueSub::Status(a) => queue_status(&socket, a),
+        QueueSub::Fleet(a) => queue_fleet(&socket, a),
+        QueueSub::NotBefore(a) => queue_not_before(&socket, a),
+        QueueSub::AutoRestack(a) => queue_auto_restack(&socket, a),
+        QueueSub::Repair(a) => queue_repair(&socket, a),
         QueueSub::Drop(a) => queue_drop(&socket, a),
+        QueueSub::Migrate(a) => queue_migrate(&socket, a),
     }
 }
 
@@ -2503,6 +2815,14 @@ fn print_verb_reply(dry_run: bool, view: &str, hash: &str) {
     }
 }
 
+/// The edit's notes — what it kept but does not do (a start time on an
+/// entry it cannot hold, F2) — one `note:` line each, after the list.
+fn print_notes(notes: &[String]) {
+    for note in notes {
+        println!("note: {note}");
+    }
+}
+
 /// §6.9: a value starting with `@` is read from that file. Anything else
 /// passes through unchanged.
 fn value_or_file(value: &str) -> Result<String> {
@@ -2534,7 +2854,7 @@ fn placement(to: MoveTarget, ref_id: Option<String>) -> Result<(String, Option<S
     }
 }
 
-fn queue_show(socket: &Path) -> Result<()> {
+fn queue_show(socket: &Path, growlightd_socket: &Path) -> Result<()> {
     let read = try_daemon_call(
         socket,
         op::READ_FILE,
@@ -2549,6 +2869,17 @@ fn queue_show(socket: &Path) -> Result<()> {
                 anyhow!("{QUEUE_FILE} does not parse ({e}) — keeperd writes it, so this is corruption")
             })?;
             print!("{}", render_queue_show(&queue));
+            // The live git-stack + session annotations (queue-v2-git slice
+            // 006) — growlightd runs the read-only git, keeperd can't (§8).
+            // Best-effort: a stopped growlightd, or one too old to know the
+            // verb, just skips the annotations (the TOML table above is the
+            // core render).
+            if let Some(view) = fetch_queue_view(growlightd_socket)?
+                && view.list
+            {
+                print!("{}", render_doc_hold_warnings(&view));
+                print!("{}", render_annotations(&view));
+            }
             Ok(())
         }
         // §3.4: the view renders only when the TOML file exists. A missing
@@ -2588,6 +2919,433 @@ fn queue_pick(socket: &Path, member: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `queue migrate`. `--dry-run`: snapshot the legacy files, plan, print —
+/// plain file reads, no daemon call. `--apply`: see [`queue_migrate_apply`].
+fn queue_migrate(socket: &Path, args: QueueMigrateArgs) -> Result<()> {
+    let runtime = runtime_dir(args.config_dir)?;
+    let answers = match &args.answers {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml::from_str::<migrate::Answers>(&text)
+                .with_context(|| format!("parsing {}", path.display()))?
+        }
+        None => migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: Default::default(),
+        },
+    };
+    if args.apply {
+        let expect = args.expect.ok_or_else(|| anyhow!("--apply needs --expect"))?;
+        return queue_migrate_apply(socket, &runtime, answers, expect);
+    }
+    let garden = match args.garden {
+        Some(p) => p,
+        None => home_dir()?.join("soft-fig_garden"),
+    };
+    let files = migrate_snapshot(&garden, &runtime)?;
+    if !files.garden.contains_key(BACKLOG_DOC) {
+        bail!("no {BACKLOG_DOC} under {}", garden.display());
+    }
+    let version = files.digest();
+    let legacy = migrate::read_legacy(&files)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let plan = migrate::plan(&legacy, &answers, &crate::cmd_repo::iso8601(now));
+    print!("{}", render_migrate_dry_run(&plan, &version));
+    if let Some(out) = &args.stack_answers {
+        let home = home_dir().ok();
+        let user = std::env::var("USER").ok();
+        let lines: Vec<_> = migrate::stack_base_questions(&plan)
+            .into_iter()
+            .map(|q| {
+                let answer = stack_base_from_git(&q, home.as_deref(), user.as_deref());
+                (q.id, answer)
+            })
+            .collect();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out)
+            .with_context(|| format!("creating {} (an existing file is never overwritten)", out.display()))?;
+        file.write_all(render_stack_answers(&lines, &version).as_bytes())
+            .with_context(|| format!("writing {}", out.display()))?;
+        let count = |f: fn(&StackAnswer) -> bool| lines.iter().filter(|(_, a)| f(a)).count();
+        println!(
+            "stack answers: {} known, {} unknown base, {} left open -> {}",
+            count(|a| matches!(a, StackAnswer::Known { .. })),
+            count(|a| matches!(a, StackAnswer::Unknown { .. })),
+            count(|a| matches!(a, StackAnswer::Open { .. })),
+            out.display()
+        );
+    }
+    Ok(())
+}
+
+/// The overall git budget for one `stack_base` question: each call keeps its
+/// own timeout inside it, so a wedged repo costs one budget, not one per call.
+const STACK_ANSWER_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What git says about one open `stack_base` call (slice 006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StackAnswer {
+    /// The branch is live and unmerged: `base` is its merge-base with the
+    /// parent's branch, else with `main`.
+    Known { parent: String, base: String, why: String },
+    /// The branch is gone or merged into `main`: the explicit unknown base.
+    Unknown { parent: String, why: String },
+    /// Git can't settle it here; the call stays open.
+    Open { why: String },
+}
+
+/// Ask git about `q` in the project's repo, read-only. A repo that is remote,
+/// ambiguous or unreadable leaves the call open, never guessed.
+fn stack_base_from_git(q: &migrate::StackBaseQuestion, home: Option<&Path>, user: Option<&str>) -> StackAnswer {
+    use softfig_ipc::queue_v2::RepoLocality;
+    if let Some(named) = &q.stray_parent {
+        return StackAnswer::Open { why: format!("the prose names parent `{named}`, which is no other item") };
+    }
+    if q.repo.trim().is_empty() {
+        return StackAnswer::Open { why: "the project has no repo yet; settle its `project_repo` call and re-run".into() };
+    }
+    let repo = match RepoLocality::of(&q.repo, user) {
+        RepoLocality::Local => softfig_ipc::item_repo::expand_home(q.repo.trim(), home, user),
+        RepoLocality::Remote => {
+            return StackAnswer::Open { why: format!("repo `{}` is on another machine; answer it there", q.repo) };
+        }
+        RepoLocality::Ambiguous => None,
+    };
+    let Some(repo) = repo else {
+        return StackAnswer::Open { why: format!("repo `{}` is not a local path here", q.repo) };
+    };
+    let git = softfig_growlightd::git_stack::Git::new(repo)
+        .with_deadline(std::time::Instant::now() + STACK_ANSWER_GIT_BUDGET);
+    stack_base_git(&git, q).unwrap_or_else(|e| StackAnswer::Open { why: format!("git can't read the repo ({e})") })
+}
+
+fn stack_base_git(
+    git: &softfig_growlightd::git_stack::Git,
+    q: &migrate::StackBaseQuestion,
+) -> Result<StackAnswer, softfig_growlightd::git_stack::GitError> {
+    let parent = q.parent.as_ref().map_or("", |(id, _)| id.as_str()).to_string();
+    let (branch, main) = (q.branch.as_str(), q.main.as_str());
+    if !git.branch_exists(main)? {
+        return Ok(StackAnswer::Open { why: format!("the repo has no `{main}` branch") });
+    }
+    if !git.branch_exists(branch)? {
+        // A missing branch says nothing about a name the owner hasn't settled.
+        if q.branch_open {
+            return Ok(StackAnswer::Open {
+                why: format!("`{branch}` is not in the repo, and it is only the open `branch:{}` call's proposal; settle that and re-run", q.id),
+            });
+        }
+        return Ok(StackAnswer::Unknown { parent, why: format!("`{branch}` is gone") });
+    }
+    if git.is_ancestor(branch, main)? {
+        return Ok(StackAnswer::Unknown { parent, why: format!("`{branch}` is merged into `{main}`") });
+    }
+    let onto = match &q.parent {
+        Some((_, theirs)) if !theirs.is_empty() && git.branch_exists(theirs)? => theirs.as_str(),
+        _ => main,
+    };
+    let base = git.merge_base(branch, onto)?;
+    Ok(StackAnswer::Known { parent, base, why: format!("merge-base of `{branch}` and `{onto}`") })
+}
+
+/// The `--stack-answers` file: an answers file (`schema`, `[call]`) with one
+/// commented line per call saying where its answer came from. A call git
+/// can't settle is written commented out, so feeding the file back leaves it
+/// open.
+fn render_stack_answers(lines: &[(String, StackAnswer)], version: &str) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let mut out = format!(
+        "# stack_base answers from git (`queue migrate --stack-answers`), snapshot {version}.\n\
+         # Review every line: nothing applies this file by itself. Pass it alone as\n\
+         # --answers, or paste the lines below `[call]` into your answers file's own\n\
+         # `[call]` table. A commented-out line is a call git could not settle here.\n\
+         schema = {}\n\n[call]\n",
+        migrate::ANSWERS_SCHEMA_VERSION
+    );
+    for (id, answer) in lines {
+        let key = quote(&format!("stack_base:{id}"));
+        let line = match answer {
+            StackAnswer::Known { parent, base, why } => format!("# {why}\n{key} = {}\n", quote(&format!("parent={parent} base={base}"))),
+            StackAnswer::Unknown { parent, why } => format!("# {why}\n{key} = {}\n", quote(&format!("parent={parent} base="))),
+            StackAnswer::Open { why } => format!("# left open: {why}\n# {key} = \"parent= base=\"\n"),
+        };
+        out.push_str(&line);
+    }
+    out
+}
+
+/// `queue migrate --apply`: a thin client. keeperd reads the garden half from
+/// its own WorkTree and recomputes the plan; the runtime batons, which keeperd
+/// cannot see, ride in the args. Once the commit lands, the batons the plan
+/// names are copied into the per-entry store (§3.6).
+fn queue_migrate_apply(
+    socket: &Path,
+    runtime: &Path,
+    answers: migrate::Answers,
+    expect: String,
+) -> Result<()> {
+    let batons = migrate_batons(runtime)?;
+    let wire = QueueV2MigrateApplyArgs { answers, expect, batons: batons.clone() };
+    let value = queue_call(socket, op::QUEUE_V2_MIGRATE_APPLY, serde_json::to_value(wire)?)?;
+    let reply: QueueV2MigrateApplyReply = serde_json::from_value(value)?;
+    println!("queue migrate --apply — commit {}", short_hash(&reply.hash));
+    println!(
+        "wrote: {} entries, {} archived, {} slices files",
+        reply.entries, reply.archived, reply.slices
+    );
+    println!("baton copies: {}", reply.batons.len());
+    copy_migrated_batons(runtime, &batons, &reply.batons, |line| println!("{line}"))
+        .with_context(|| format!("after commit {}", short_hash(&reply.hash)))?;
+    println!("the switch is unchanged; flip `queue = \"v2\"` yourself, with the fleet disarmed");
+    Ok(())
+}
+
+/// Run every §3.6 copy under `<runtime>/entries`, reporting one line each
+/// through `report`. Any failure is an error, after `report` has printed the
+/// shell command that finishes each failed copy: the commit has landed, so a
+/// second `--apply` refuses `v2_files_present` and those commands are the
+/// only way to finish. `cp -n` keeps the copy's never-overwrite rule.
+fn copy_migrated_batons(
+    runtime: &Path,
+    sent: &std::collections::BTreeMap<String, String>,
+    moves: &[migrate::BatonMove],
+    mut report: impl FnMut(String),
+) -> Result<()> {
+    let entries = runtime.join("entries");
+    let mut failed = Vec::new();
+    for mv in moves {
+        let outcome = match copy_migrated_baton(&entries, sent, mv) {
+            Ok(BatonCopy::Copied) => "copied".to_string(),
+            Ok(BatonCopy::TargetExists) => "skipped, target exists".to_string(),
+            Err(e) => {
+                let dir = entries.join(&mv.entry);
+                failed.push(format!(
+                    "mkdir -p {} && cp -n {} {}",
+                    shell_quote(&dir),
+                    shell_quote(&runtime.join(&mv.from)),
+                    shell_quote(&dir.join("baton.md")),
+                ));
+                format!("FAILED, {e:#}")
+            }
+        };
+        report(format!("  {} -> entries/{}/baton.md: {outcome}", mv.from, mv.entry));
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    report("the v2 files are committed; finish each failed copy by hand:".to_string());
+    for cmd in &failed {
+        report(format!("  {cmd}"));
+    }
+    bail!("{} of {} baton copies failed", failed.len(), moves.len())
+}
+
+/// What one §3.6 baton copy did.
+#[derive(Debug, PartialEq, Eq)]
+enum BatonCopy {
+    Copied,
+    TargetExists,
+}
+
+/// Copy one planned baton into `<entries>/<entry>/baton.md`. The bytes are
+/// the ones sent to keeperd, so what lands is what the plan judged. A copy
+/// never overwrites a target (`create_new`, so no check-then-write race) and
+/// never touches the source.
+fn copy_migrated_baton(
+    entries: &Path,
+    sent: &std::collections::BTreeMap<String, String>,
+    mv: &migrate::BatonMove,
+) -> Result<BatonCopy> {
+    let mut parts = Path::new(&mv.entry).components();
+    if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+        bail!("entry id {:?} is not a single path component", mv.entry);
+    }
+    let text = sent
+        .get(&mv.from)
+        .ok_or_else(|| anyhow!("{} was not among the batons sent", mv.from))?;
+    let dir = entries.join(&mv.entry);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let target = dir.join("baton.md");
+    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(BatonCopy::TargetExists),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", target.display())),
+    };
+    if let Err(e) = file.write_all(text.as_bytes()) {
+        // A partial target would read as `TargetExists` to every later copy.
+        drop(file);
+        let _ = fs::remove_file(&target);
+        return Err(e).with_context(|| format!("writing {}", target.display()));
+    }
+    Ok(BatonCopy::Copied)
+}
+
+/// The converter's snapshot: every `.md` under the garden's
+/// `growlight/backlog/` (garden-relative keys), plus the runtime's root
+/// `baton.md` and each `agents/<id>/baton.md` (runtime-relative keys).
+fn migrate_snapshot(garden: &Path, runtime: &Path) -> Result<migrate::LegacyFiles> {
+    fn walk(root: &Path, dir: &Path, into: &mut std::collections::BTreeMap<String, String>) -> Result<()> {
+        let entries = fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(root, &path, into)?;
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "md") {
+                let rel = path.strip_prefix(root).expect("walked under root");
+                let key = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", path.display()))?;
+                let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+                into.insert(key.to_string(), text);
+            }
+        }
+        Ok(())
+    }
+    let mut files = migrate::LegacyFiles::default();
+    let backlog = garden.join(BACKLOG_DOC);
+    let backlog_dir = backlog.parent().expect("BACKLOG_DOC has a parent");
+    walk(garden, backlog_dir, &mut files.garden)?;
+    files.batons = migrate_batons(runtime)?;
+    Ok(files)
+}
+
+/// The runtime half of the snapshot: the root `baton.md` and each
+/// `agents/<id>/baton.md`, keyed runtime-relative.
+fn migrate_batons(runtime: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut batons = vec![PathBuf::from("baton.md")];
+    if let Ok(agents) = fs::read_dir(runtime.join("agents")) {
+        for agent in agents.flatten() {
+            if agent.file_type().is_ok_and(|k| k.is_dir()) {
+                batons.push(Path::new("agents").join(agent.file_name()).join("baton.md"));
+            }
+        }
+    }
+    for rel in batons {
+        let path = runtime.join(&rel);
+        if path.is_file() {
+            let key = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", path.display()))?;
+            let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            out.insert(key.to_string(), text);
+        }
+    }
+    Ok(out)
+}
+
+/// The `queue migrate --dry-run` rendering: the snapshot's version, the
+/// counts, the projects, the entries in list order, the slices files, the
+/// baton copies, every call (open and settled), every refusal, and the
+/// `N calls need you` line last.
+fn render_migrate_dry_run(plan: &migrate::MigrationPlan, version: &str) -> String {
+    let mut out = String::from("queue migrate --dry-run — nothing written\n");
+    out.push_str(&format!("snapshot version: {version}\n"));
+    out.push_str(&format!(
+        "plan: {} projects, {} entries, {} archived, {} slices files, {} baton copies\n",
+        plan.queue.projects.len(),
+        plan.queue.entries.len(),
+        plan.archive.entries.len(),
+        plan.slices.len(),
+        plan.batons.len(),
+    ));
+
+    out.push_str("\nprojects:\n");
+    for p in &plan.queue.projects {
+        out.push_str(&format!("  {}  repo={}  main={}\n", p.name, p.repo, p.main));
+    }
+
+    out.push_str("\nentries (list order):\n");
+    for e in &plan.queue.entries {
+        let mut line = format!("  {} {} {} {} {}", e.id, e.kind, e.project, e.lane, e.status);
+        if !e.fleet {
+            line.push_str(" fleet=false");
+        }
+        if let Some(t) = &e.not_before {
+            line.push_str(&format!(" not_before={t}"));
+        }
+        if !e.after.is_empty() {
+            line.push_str(&format!(" after={}", e.after.join(",")));
+        }
+        if !e.branch.is_empty() {
+            line.push_str(&format!(" branch={}", e.branch));
+        }
+        if !e.base.is_empty() {
+            line.push_str(&format!(" parent={} base={}", e.parent, e.base));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    out.push_str(&format!("\narchived: {} rows\n", plan.archive.entries.len()));
+
+    if !plan.slices.is_empty() {
+        out.push_str("\nslices:\n");
+        for (id, slices) in &plan.slices {
+            let done = slices.items.iter().filter(|s| s.status == SliceStatus::Done).count();
+            out.push_str(&format!("  {id}: {} items, {done} done\n", slices.items.len()));
+        }
+    }
+
+    if !plan.batons.is_empty() {
+        out.push_str("\nbaton copies:\n");
+        for b in &plan.batons {
+            out.push_str(&format!("  {} -> entries/{}/baton.md\n", b.from, b.entry));
+        }
+    }
+
+    let open = plan.open_calls().count();
+    out.push_str(&format!(
+        "\njudgment calls: {} ({open} open, {} settled)\n",
+        plan.calls.len(),
+        plan.calls.len() - open
+    ));
+    for c in &plan.calls {
+        match &c.settled {
+            Some(answer) => out.push_str(&format!("  [settled] {} = {}\n", c.key, hang(answer, 6))),
+            None => out.push_str(&format!("  [open] {}\n", c.key)),
+        }
+        out.push_str(&format!("      evidence: {}\n", hang(&c.evidence, 16)));
+        out.push_str(&format!("      proposed: {}\n", hang(&c.proposed, 16)));
+    }
+
+    out.push_str(&format!("\nrefusals: {}\n", plan.refusals.len()));
+    for r in &plan.refusals {
+        out.push_str(&format!("  {}: {}\n", r.subject, hang(&r.reason, 4)));
+    }
+
+    out.push('\n');
+    if !plan.refusals.is_empty() {
+        let n = plan.refusals.len();
+        out.push_str(&match n {
+            1 => "1 refusal blocks the apply\n".to_string(),
+            n => format!("{n} refusals block the apply\n"),
+        });
+    }
+    out.push_str(&match open {
+        1 => "1 call needs you\n".to_string(),
+        n => format!("{n} calls need you\n"),
+    });
+    out
+}
+
+/// `text` with every continuation line indented by `indent` spaces, so a
+/// multi-line value (branch-policy prose quoted as evidence) stays inside its
+/// call's block instead of spilling into the list; blank lines stay blank.
+fn hang(text: &str, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| if i == 0 || line.is_empty() { line.to_string() } else { format!("{pad}{line}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The `queue pick` rendering: who the pick ran for, the assignment (or its
 /// absence), and one line per skipped entry with its stable reason slug and a
 /// sentence explaining it.
@@ -2616,6 +3374,7 @@ fn render_queue_pick(reply: &growlightd::QueuePickReply) -> String {
         }
         None => out.push_str("picked: nothing workable for this member\n"),
     }
+    out.push_str("schedule: not applied — a member the [schedule] holds is not handed this\n");
 
     if reply.skips.is_empty() {
         out.push_str("skipped: none\n");
@@ -2638,8 +3397,8 @@ const SHOW_SEPARATOR: &str =
 
 /// The `queue show` rendering (§6.9): both lanes, one row per entry in file
 /// order, with the stack columns verbatim from the TOML. TOML state only — the
-/// live git-stack annotations (merge-base / restack flags) are queue-v2-git's
-/// (finding 3). Same cell rules as the §3.4 derived view (literal `|` escaped,
+/// live git-stack annotations come from growlightd and are rendered after it by
+/// [`render_annotations`]. Same cell rules as the §3.4 derived view (literal `|` escaped,
 /// empty cells an em-dash).
 fn render_queue_show(queue: &QueueToml) -> String {
     let mut out = String::from("queue.toml (schema ");
@@ -2676,6 +3435,14 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         } else {
             e.after.join(", ")
         };
+        // The §2 Holds beside the status: a human-only entry (`fleet = false`)
+        // is left for the human whatever the status reads, and a start time
+        // (`not_before`) is shown as written, whether or not it is still ahead.
+        let status = format!(
+            "{}{}",
+            e.status,
+            softfig_ipc::queue_v2::hold_annotation(e.fleet, e.not_before.as_deref(), e.auto_restack)
+        );
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -2684,7 +3451,7 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
             cell(&e.title),
             cell(&e.project),
             cell(&e.lane.to_string()),
-            cell(&e.status.to_string()),
+            cell(&status),
             cell(&after),
             cell(&e.branch),
             cell(&e.base),
@@ -2692,6 +3459,118 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         ));
     }
     out.push('\n');
+}
+
+/// The `growlight status` queue v2 lanes (§6.9): both lanes, one row per entry
+/// in file order — id, status, project, the `after` links, and the branch with
+/// its live open annotation (the git-stack flag). `queue show` keeps
+/// [`render_queue_show`]'s TOML table instead; this is the growlightd-side
+/// form, so it omits the TOML-only columns (kind/title/base/claimed).
+fn render_queue_lanes(view: &QueueShowReply) -> String {
+    let mut out = String::from("### Urgent\n\n");
+    lane_rows(&mut out, view.entries.iter().filter(|e| e.lane == "urgent"));
+    out.push_str("\n### Normal\n\n");
+    lane_rows(&mut out, view.entries.iter().filter(|e| e.lane == "normal"));
+    out
+}
+
+fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry>) {
+    let cell = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.replace('|', "\\|")
+        }
+    };
+    out.push_str("| id | status | project | after | branch |\n|---|---|---|---|---|");
+    for e in rows {
+        let after = if e.after.is_empty() {
+            String::new()
+        } else {
+            e.after.join(", ")
+        };
+        let branch = if e.open_unknown {
+            format!("{} (stack unknown)", e.branch)
+        } else if e.open {
+            format!("{} (open)", e.branch)
+        } else {
+            e.branch.clone()
+        };
+        // A recorded human status change on an `active` entry applies at the
+        // session's next handshake; show it rather than a plain `active`. The
+        // §2 holds follow, as `queue show` prints them.
+        let mut status = match &e.pending_status {
+            Some(p) => format!("{} (→ {p} pending)", e.status),
+            None => e.status.clone(),
+        };
+        status.push_str(&e.hold_annotation());
+        out.push_str(&format!(
+            "\n| {} | {} | {} | {} | {} |",
+            cell(&e.id),
+            cell(&status),
+            cell(&e.project),
+            cell(&after),
+            cell(&branch),
+        ));
+    }
+    out.push('\n');
+}
+
+/// `queue show`'s doc-line warnings: one line per entry whose doc carries a
+/// `> Fleet:` or `> Not before:` line that disagrees with the entry
+/// ([`QueueShowEntry::doc_hold_warning`]). Under v2 those lines hold nothing,
+/// so a human who wrote one by habit learns it here. Empty when none disagree.
+/// The doc lines come from growlightd, so a stopped growlightd shows none.
+fn render_doc_hold_warnings(view: &QueueShowReply) -> String {
+    let lines: Vec<String> = view.entries.iter().filter_map(QueueShowEntry::doc_hold_warning).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\n{}\n", lines.join("\n"))
+}
+
+/// The §6.9 live annotations layered onto both surfaces (queue-v2-git slice
+/// 006): the stack per repo (the git-stack candidates in claim order) and the
+/// §3.5 session log. Shared by `queue show` and `growlight status` so the two
+/// surfaces can never drift about the same stack.
+fn render_annotations(view: &QueueShowReply) -> String {
+    let mut out = String::from("\n### Stack per repo\n\n");
+    if view.projects.is_empty() {
+        out.push_str("(no projects)\n");
+    }
+    for p in &view.projects {
+        let kind = if p.local { "local" } else { "remote" };
+        out.push_str(&format!("- {} ({}, main = {}) {}\n", p.name, kind, p.main, p.repo));
+        if let Some(reason) = &p.stack_unknown {
+            out.push_str(&format!("  (stack unknown — {reason})\n"));
+        } else if p.stack.is_empty() {
+            out.push_str("  (empty — the next branch cuts from main)\n");
+        } else {
+            for b in &p.stack {
+                let parent = if b.parent.is_empty() { "main".to_string() } else { b.parent.clone() };
+                out.push_str(&format!(
+                    "  - {}  parent={}  base={}  claimed={}\n",
+                    b.branch, parent, b.base, b.claimed
+                ));
+            }
+        }
+    }
+    out.push_str("\n### Sessions\n\n");
+    if view.sessions.is_empty() {
+        out.push_str("(no sessions logged)\n");
+    }
+    for s in &view.sessions {
+        let unit = match &s.unit {
+            Some(u) => format!("/{u}"),
+            None => String::new(),
+        };
+        let tree = s.tree.as_deref().unwrap_or(&s.entry);
+        out.push_str(&format!("{tree}{unit} ({})\n", s.path));
+        for line in &s.lines {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out
 }
 
 fn queue_project_add(socket: &Path, args: QueueProjectAddArgs) -> Result<()> {
@@ -2702,6 +3581,19 @@ fn queue_project_add(socket: &Path, args: QueueProjectAddArgs) -> Result<()> {
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_ADD_PROJECT, serde_json::to_value(wire)?)?;
+    let reply: QueueAddProjectReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_project_set_repo(socket: &Path, args: QueueProjectSetRepoArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueSetProjectRepoArgs {
+        name: args.name,
+        repo: args.repo,
+        main: args.main,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_SET_PROJECT_REPO, serde_json::to_value(wire)?)?;
     let reply: QueueAddProjectReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
     Ok(())
@@ -2742,6 +3634,8 @@ fn queue_add(socket: &Path, args: QueueAddArgs) -> Result<()> {
         position,
         ref_id,
         slices: Vec::new(),
+        fleet: args.no_fleet.then_some(false),
+        not_before: args.not_before,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_ADD_ENTRY, serde_json::to_value(wire)?)?;
@@ -2758,11 +3652,18 @@ fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
         move_spec: Some(QueueMoveSpec { to, ref_id }),
         after: None,
         status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -2776,11 +3677,18 @@ fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
         move_spec: None,
         after: None,
         status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -2791,11 +3699,18 @@ fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
         move_spec: None,
         after: Some(args.ids),
         status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -2811,11 +3726,106 @@ fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
             HumanStatus::Deferred => QueueStatusArg::Deferred,
             HumanStatus::Done => QueueStatusArg::Done,
         }),
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
         dry_run: args.dry_run,
     };
     let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
     let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
     print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_fleet(socket: &Path, args: QueueFleetArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: Some(args.fleet == FleetArg::Yes),
+        not_before: None,
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_auto_restack(socket: &Path, args: QueueAutoRestackArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: Some(args.auto_restack == FleetArg::Yes),
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_not_before(socket: &Path, args: QueueNotBeforeArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: Some(args.time),
+        auto_restack: None,
+        branch: None,
+        base: None,
+        project: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
+    Ok(())
+}
+
+fn queue_repair(socket: &Path, args: QueueRepairArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: None,
+        fleet: None,
+        not_before: None,
+        auto_restack: None,
+        branch: args.branch,
+        base: args.base,
+        project: args.project,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    print_notes(&reply.notes);
     Ok(())
 }
 
@@ -2921,14 +3931,22 @@ mod tests {
     }
 
     #[test]
-    fn loop_json_wires_both_session_starts_and_the_statusline() {
+    fn loop_json_wires_the_session_hooks_and_the_statusline() {
         let inject = Path::new("/run/softfig/growlight/inject.sh");
         let statusline = Path::new("/run/softfig/growlight/statusline.sh");
         let garden = Path::new("/home/ukv/soft-fig_garden");
         let claude_projects = Path::new("/home/ukv/.claude/projects");
-        let json: serde_json::Value =
-            serde_json::from_str(&loop_json(inject, statusline, garden, claude_projects))
-                .expect("valid JSON");
+        let softfig = Path::new("/home/ukv/.local/bin/soft fig");
+        let runtime = Path::new("/home/ukv/.config/softfig/growlight");
+        let json: serde_json::Value = serde_json::from_str(&loop_json(
+            inject,
+            statusline,
+            garden,
+            claude_projects,
+            softfig,
+            runtime,
+        ))
+        .expect("valid JSON");
 
         assert_eq!(json["statusLine"]["type"], "command");
         assert_eq!(
@@ -2947,6 +3965,21 @@ mod tests {
             assert_eq!(cmd["type"], "command");
             assert_eq!(cmd["command"], inject.display().to_string());
         }
+
+        // SessionEnd runs the semi-auto telemetry ingest (spec-token-telemetry
+        // §4.2) on every end reason, so it carries no matcher. Each path is
+        // single-quoted, so a space in one survives the hook's shell.
+        let ends = json["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert!(ends[0].get("matcher").is_none());
+        let cmd = &ends[0]["hooks"][0];
+        assert_eq!(cmd["type"], "command");
+        assert_eq!(
+            cmd["command"],
+            "'/home/ukv/.local/bin/soft fig' telemetry ingest-transcript \
+             --garden-root '/home/ukv/soft-fig_garden' \
+             --config-dir '/home/ukv/.config/softfig/growlight'"
+        );
     }
 
     #[test]
@@ -2962,6 +3995,8 @@ mod tests {
             Path::new("/run/softfig/growlight/statusline.sh"),
             garden,
             claude_projects,
+            Path::new("/usr/bin/softfig"),
+            Path::new("/run/softfig/growlight"),
         ))
         .expect("valid JSON");
 
@@ -3284,10 +4319,95 @@ mod tests {
             cargo_build_jobs: Some(2),
             memory_high: Some("3G".into()),
             cpu_weight: None,
+            cpu_quota: Some("50%".into()),
+            test_threads: Some(2),
         });
         assert!(text.contains("cargo_build_jobs  2"));
         assert!(text.contains("memory_high       3G"));
         assert!(text.contains("cpu_weight        (unset)"), "an unset knob reads (unset): {text}");
+        assert!(text.contains("cpu_quota         50%"));
+        assert!(text.contains("test_threads      2"));
+    }
+
+    #[test]
+    fn render_schedule_shows_the_edge_the_holds_and_the_reserves() {
+        assert_eq!(render_schedule(None, 0), "schedule      (none)\n");
+        let s = growlightd::ScheduleSummary {
+            open: true,
+            current_windows: vec!["daily 23:00-07:00 [claude]".into()],
+            next_edge: Some(1_000),
+            next_edge_local: Some("2026-11-01 07:00 -05:00".into()),
+            zone: "America/New_York".into(),
+            held_members: vec![
+                growlightd::ScheduleHeld { agent: "b1".into(), reason: "backend not in window".into() },
+                growlightd::ScheduleHeld { agent: "a2".into(), reason: "overrun".into() },
+            ],
+            held_items: vec!["default/084 at 2026-11-01 02:00 -04:00".into()],
+            reserve: vec![
+                growlightd::ReserveSummary {
+                    slot: "slot1".into(),
+                    reserve_pct: 20,
+                    used_7d_pct: Some(85),
+                    held: true,
+                    resets_at: Some(7_200),
+                },
+                growlightd::ReserveSummary {
+                    slot: "slot2".into(),
+                    reserve_pct: 20,
+                    used_7d_pct: None,
+                    held: false,
+                    resets_at: None,
+                },
+            ],
+            projection: vec![
+                projection("slot1", "7d", 100, (Some(3_600), Some(10_800)), false),
+                projection("slot1", "reserve", 80, (Some(3_600), None), false),
+                projection("slot1", "5h", 100, (None, None), true),
+                projection("slot2", "7d", 100, (None, None), false),
+            ],
+        };
+        let text = render_schedule(Some(&s), 0);
+        assert!(text.starts_with("schedule      open (zone America/New_York)\n"), "{text}");
+        assert!(text.contains("  open now      daily 23:00-07:00 [claude]\n"));
+        assert!(text.contains("  next edge     2026-11-01 07:00 -05:00\n"));
+        assert!(text.contains("  held          b1               backend not in window\n"));
+        assert!(text.contains("  held          a2               overrun\n"));
+        assert!(text.contains("  waiting       default/084 at 2026-11-01 02:00 -04:00\n"));
+        assert!(text.contains("slot1            keep 20% · 7d used 85% · held, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot2            keep 20% · 7d used unknown · clear\n"), "{text}");
+        assert!(text.contains("projection    slot1            7d           cap in 1h–3h, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot1            reserve 80%  cap in 1h at the earliest, or resets first, resets in 2h\n"), "{text}");
+        assert!(text.contains("slot1            5h           resets first, resets in 2h\n"), "{text}");
+        assert!(text.contains("projection    slot2            7d           unknown\n"), "{text}");
+    }
+
+    #[test]
+    fn render_schedule_says_why_there_is_no_next_edge() {
+        let mut s = growlightd::ScheduleSummary { open: true, zone: "UTC".into(), ..Default::default() };
+        let open = render_schedule(Some(&s), 0);
+        assert!(open.contains("  next edge     (none within a week — open throughout)\n"), "{open}");
+        s.open = false;
+        let closed = render_schedule(Some(&s), 0);
+        assert!(closed.contains("  next edge     (none within a week — no window opens)\n"), "{closed}");
+    }
+
+    fn projection(
+        slot: &str,
+        window: &str,
+        target_pct: u8,
+        (cap_at_earliest, cap_at_latest): (Option<i64>, Option<i64>),
+        resets_first: bool,
+    ) -> growlightd::PoolProjection {
+        let resets_at = (slot == "slot1").then_some(7_200);
+        growlightd::PoolProjection {
+            slot: slot.into(),
+            window: window.into(),
+            target_pct,
+            cap_at_earliest,
+            cap_at_latest,
+            resets_at,
+            resets_first,
+        }
     }
 
     #[test]
@@ -3299,6 +4419,8 @@ mod tests {
                 cargo_build_jobs: Some(2),
                 memory_high: Some("6G".into()),
                 cpu_weight: Some(70),
+                cpu_quota: None,
+                test_threads: Some(2),
             },
             applied_live: vec![],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
@@ -3355,10 +4477,12 @@ mod tests {
             build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: enabled,
+            queue: "legacy".into(),
             roster: Vec::new(),
             agents: Vec::new(),
             live_scopes: live,
             held: Vec::new(),
+            schedule: None,
         };
 
         // Running scopes: the exact gen-suffixed unit names, verbatim.
@@ -3374,6 +4498,36 @@ mod tests {
         // Armed but nothing running vs disarmed read differently.
         assert!(render_resources_show(&base(true, vec![])).contains("scopes        (none running)"));
         assert!(render_resources_show(&base(false, vec![])).contains("(none — fleet disarmed)"));
+    }
+
+    /// V23: the status line names the switch's value, and an older growlightd
+    /// that sends none gets no line rather than a guess.
+    #[test]
+    fn status_names_the_queue_switch_and_guesses_nothing() {
+        let reply = |queue: Option<&str>| {
+            let mut json = serde_json::json!({
+                "state": "running",
+                "garden_root": "/g",
+                "protocol_version": 1,
+                "policy": {
+                    "max_concurrent_agents": 2,
+                    "ctx_roll_pct": 50,
+                    "ctx_handoff_pct": 60,
+                    "session_5h_halt_pct": 85,
+                    "session_7d_halt_pct": 90
+                }
+            });
+            if let Some(queue) = queue {
+                json["queue"] = serde_json::json!(queue);
+            }
+            serde_json::from_value::<FleetStatusReply>(json).unwrap()
+        };
+        assert_eq!(queue_switch_line(&reply(Some("v2"))).as_deref(), Some("queue         v2"));
+        assert_eq!(
+            queue_switch_line(&reply(Some("legacy"))).as_deref(),
+            Some("queue         legacy")
+        );
+        assert_eq!(queue_switch_line(&reply(None)), None);
     }
 
     #[test]
@@ -4207,6 +5361,40 @@ mod tests {
             GrowlightCmd::Queue(_)
         ));
 
+        // report 171 repair forms
+        match TestCli::try_parse_from(["g", "queue", "project", "set-repo", "p", "~/r", "--main", "dev"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(q) => match q.cmd {
+                Some(QueueSub::Project { cmd: QueueProjectSub::SetRepo(p) }) => {
+                    assert_eq!((p.name.as_str(), p.repo.as_str()), ("p", "~/r"));
+                    assert_eq!(p.main.as_deref(), Some("dev"));
+                }
+                other => panic!("expected project set-repo, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "repair", "089", "--branch", "feat/remote-runner", "--base", "", "--project", "remote-runner",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(q) => match q.cmd {
+                Some(QueueSub::Repair(r)) => {
+                    assert_eq!(r.id, "089");
+                    assert_eq!(r.branch.as_deref(), Some("feat/remote-runner"));
+                    assert_eq!(r.base.as_deref(), Some(""));
+                    assert_eq!(r.project.as_deref(), Some("remote-runner"));
+                }
+                other => panic!("expected repair, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        // `repair` with nothing to repair is a usage error, not a no-op call.
+        assert!(TestCli::try_parse_from(["g", "queue", "repair", "089"]).is_err());
+
         // project add
         match TestCli::try_parse_from([
             "g",
@@ -4229,6 +5417,7 @@ mod tests {
                         assert_eq!(p.main.as_deref(), Some("main"));
                         assert!(!p.dry_run);
                     }
+                    other => panic!("expected project add, got {other:?}"),
                 },
                 other => panic!("expected project add, got {other:?}"),
             },
@@ -4343,6 +5532,53 @@ mod tests {
                     assert_eq!(s.status, HumanStatus::Done);
                 }
                 other => panic!("expected status, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "fleet", "m1", "no"]).unwrap().cmd {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Fleet(f) => {
+                    assert_eq!(f.id, "m1");
+                    assert_eq!(f.fleet, FleetArg::No);
+                }
+                other => panic!("expected fleet, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "add", "task", "t1", "--project", "softfig", "--no-fleet",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => assert!(q.no_fleet),
+                other => panic!("expected add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "not-before", "m1", ""]).unwrap().cmd {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::NotBefore(n) => {
+                    assert_eq!(n.id, "m1");
+                    assert_eq!(n.time, "", "an empty time clears it");
+                }
+                other => panic!("expected not-before, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from([
+            "g", "queue", "add", "task", "t1", "--project", "softfig", "--not-before",
+            "2026-11-01 02:00 -04:00",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => {
+                    assert_eq!(q.not_before.as_deref(), Some("2026-11-01 02:00 -04:00"))
+                }
+                other => panic!("expected add, got {other:?}"),
             },
             other => panic!("expected Queue, got {other:?}"),
         }
@@ -4490,18 +5726,28 @@ mod tests {
                 unit: "slice 002 of m".into(),
                 declared: Some("reasoning, flash".into()),
             }),
-            skips: vec![growlightd::QueuePickSkip {
-                entry: "n".into(),
-                reason: "blocked_walk".into(),
-                detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
-            }],
+            skips: vec![
+                growlightd::QueuePickSkip {
+                    entry: "n".into(),
+                    reason: "blocked_walk".into(),
+                    detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
+                },
+                growlightd::QueuePickSkip {
+                    entry: "t".into(),
+                    reason: "not_yet".into(),
+                    detail: "a queued entry whose `not_before` start time is still ahead (§2 Holds)"
+                        .into(),
+                },
+            ],
         };
         let out = render_queue_pick(&reply);
         assert!(out.contains("member c (backend claude, pin default)"), "{out}");
         assert!(out.contains("picked: m / slice 002 of m"), "{out}");
         assert!(out.contains("model: reasoning, flash"), "{out}");
-        assert!(out.contains("skipped: 1"), "{out}");
+        assert!(out.contains("skipped: 2"), "{out}");
         assert!(out.contains("  - n: blocked_walk — its walk stops"), "{out}");
+        assert!(out.contains("  - t: not_yet — a queued entry whose `not_before`"), "{out}");
+        assert!(out.contains("schedule: not applied"), "the dry-run says it ignores the schedule: {out}");
     }
 
     #[test]
@@ -4516,6 +5762,19 @@ mod tests {
         };
         assert_eq!(render_queue_pick(&reply), format!("{}\n", queue_empty_line()));
         assert!(queue_empty_line().contains("the v2 queue is empty (§3.4"));
+    }
+
+    #[test]
+    fn status_prints_no_queue_block_when_there_is_no_v2_list() {
+        let none = QueueShowReply {
+            list: false,
+            projects: vec![],
+            entries: vec![],
+            archived: vec![],
+            sessions: vec![],
+            trees: vec![],
+        };
+        assert_eq!(render_status_queue(&none), "");
     }
 
     #[test]
@@ -4536,6 +5795,9 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
+            fleet: true,
+            not_before: None,
         };
         let mut linked = e("normal-a", Lane::Normal, "feat/normal-a", "");
         linked.after = vec!["u1".into()];
@@ -4576,6 +5838,279 @@ mod tests {
         let piped_body = render_queue_show(&QueueToml::new(vec![], vec![piped]));
         assert!(piped_body.contains("a \\| b"), "{piped_body}");
         assert!(piped_body.contains("p\\|1"), "{piped_body}");
+        // A human-only entry is marked beside its status (queue-v2-parity
+        // slice 002); a fleet entry's status cell stays bare, as above.
+        let mut human = e("h1", Lane::Normal, "", "");
+        human.fleet = false;
+        let human_body = render_queue_show(&QueueToml::new(vec![], vec![human]));
+        assert!(
+            human_body.contains("| h1 | milestone | h1 title | softfig | normal | queued (human-only) |"),
+            "{human_body}"
+        );
+        // A start time is shown as written (slice 003), after the human-only
+        // marker when both apply.
+        let mut timed = e("t1", Lane::Normal, "", "");
+        timed.not_before = Some("2026-10-31 02:00 -04:00".into());
+        let mut both = e("t2", Lane::Normal, "", "");
+        both.not_before = Some("2026-10-31 02:00 -04:00".into());
+        both.fleet = false;
+        let timed_body = render_queue_show(&QueueToml::new(vec![], vec![timed, both]));
+        assert!(
+            timed_body.contains("| normal | queued (not before 2026-10-31 02:00 -04:00) |"),
+            "{timed_body}"
+        );
+        assert!(
+            timed_body
+                .contains("| normal | queued (human-only) (not before 2026-10-31 02:00 -04:00) |"),
+            "{timed_body}"
+        );
+    }
+
+    #[test]
+    fn queue_show_lanes_render_status_project_links_and_the_open_flag() {
+        let entries = vec![
+            QueueShowEntry {
+                id: "u1".into(),
+                kind: "milestone".into(),
+                project: "softfig".into(),
+                lane: "urgent".into(),
+                status: "active".into(),
+                after: vec!["done-x".into()],
+                branch: "feat/u1".into(),
+                base: String::new(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                pending_status: Some("blocked".into()),
+                open: true,
+                open_unknown: false,
+                fleet: true,
+                auto_restack: true,
+                not_before: None,
+                doc_fleet: None,
+                doc_not_before: None,
+            },
+            QueueShowEntry {
+                id: "n1".into(),
+                kind: "milestone".into(),
+                project: "softfig".into(),
+                lane: "normal".into(),
+                status: "queued".into(),
+                after: vec![],
+                branch: String::new(),
+                base: String::new(),
+                claimed: String::new(),
+                pending_status: None,
+                open: false,
+                open_unknown: false,
+                fleet: false,
+                auto_restack: true,
+                not_before: Some("2026-11-08 09:00Z".into()),
+                doc_fleet: None,
+                doc_not_before: None,
+            },
+            QueueShowEntry {
+                id: "w1".into(),
+                kind: "milestone".into(),
+                project: "wedged".into(),
+                lane: "normal".into(),
+                status: "active".into(),
+                after: vec![],
+                branch: "feat/w1".into(),
+                base: String::new(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                pending_status: None,
+                open: false,
+                open_unknown: true,
+                fleet: true,
+                auto_restack: true,
+                not_before: None,
+                doc_fleet: Some("no".into()),
+                doc_not_before: None,
+            },
+        ];
+        let view = QueueShowReply {
+            list: true,
+            projects: Vec::new(),
+            entries,
+            archived: Vec::new(),
+            sessions: Vec::new(),
+            trees: Vec::new(),
+        };
+        let body = render_queue_lanes(&view);
+        let urgent = body.find("### Urgent").expect("urgent lane");
+        let normal = body.find("### Normal").expect("normal lane");
+        assert!(urgent < normal, "urgent lane renders first: {body}");
+        // status, project and after links; the open branch carries its flag.
+        assert!(
+            body.contains("| u1 | active (→ blocked pending) | softfig | done-x | feat/u1 (open) |"),
+            "{body}"
+        );
+        // The §2 holds, worded as `queue show` words them.
+        assert!(
+            body.contains("| n1 | queued (human-only) (not before 2026-11-08 09:00Z) | softfig | — | — |"),
+            "{body}"
+        );
+        // A branch whose repo couldn't be read is not shown as merged.
+        assert!(body.contains("| w1 | active | wedged | — | feat/w1 (stack unknown) |"), "{body}");
+
+        // `queue show` warns once for the entry whose doc line disagrees (w1's
+        // `> Fleet: no` on a claimable entry), and not for n1, whose doc has no
+        // lines. The lanes themselves don't carry the warning.
+        assert!(!body.contains("warning"), "{body}");
+        let warnings = render_doc_hold_warnings(&view);
+        let lines: Vec<&str> = warnings.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{warnings}");
+        assert!(lines[0].starts_with("warning: w1: its doc says `> Fleet: no`"), "{warnings}");
+        let quiet = QueueShowReply { entries: view.entries[..2].to_vec(), ..view };
+        assert_eq!(render_doc_hold_warnings(&quiet), "", "no disagreement, no output");
+    }
+
+    /// One flag, one place: `pick` reads the `queue`-level socket, and the old
+    /// per-`pick` spelling is refused rather than beating it silently (V21).
+    #[test]
+    fn queue_pick_answers_on_the_queue_level_growlightd_socket() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.sock");
+        let gone_str = gone.to_str().unwrap();
+        let cli = TestCli::try_parse_from(["g", "queue", "--growlightd-socket", gone_str, "pick"])
+            .unwrap();
+        let GrowlightCmd::Queue(args) = cli.cmd else { panic!("expected Queue") };
+        let err = client_queue(args).unwrap_err().to_string();
+        assert!(err.contains(gone_str), "{err}");
+
+        assert!(
+            TestCli::try_parse_from(["g", "queue", "pick", "--growlightd-socket", gone_str]).is_err(),
+            "a second spelling of the flag must not parse"
+        );
+    }
+
+    /// A growlightd stand-in on a real socket that answers one call with
+    /// `reply` and hands back the op it was asked for.
+    fn one_shot_growlightd(
+        dir: &Path,
+        reply: softfig_ipc::Response,
+    ) -> (PathBuf, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = dir.join("growlightd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let req: softfig_ipc::Request = serde_json::from_str(&line).unwrap();
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+            req.op
+        });
+        (sock, served)
+    }
+
+    #[test]
+    fn a_queue_view_from_growlightd_is_decoded_and_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::ok(serde_json::json!({
+            "list": true,
+            "projects": [{
+                "name": "softfig", "repo": "~/p", "main": "main", "local": true, "stack": [],
+            }],
+        }));
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let view = fetch_queue_view(&sock).unwrap().expect("a reply is a view");
+        assert_eq!(served.join().unwrap(), growlightd::op::QUEUE_SHOW);
+        assert!(view.list);
+        assert_eq!(view.projects[0].name, "softfig");
+    }
+
+    #[test]
+    fn a_growlightd_too_old_for_queue_show_costs_only_the_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::BadArgs, "unknown op");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        assert_eq!(fetch_queue_view(&sock).unwrap(), None);
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn any_other_growlightd_error_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = softfig_ipc::Response::err(ErrorKind::Internal, "boom");
+        let (sock, served) = one_shot_growlightd(dir.path(), reply);
+        let err = fetch_queue_view(&sock).unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn no_growlightd_at_all_is_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch_queue_view(&dir.path().join("absent.sock")).unwrap(), None);
+    }
+
+    #[test]
+    fn queue_show_annotations_render_stack_and_sessions() {
+        use softfig_ipc::growlightd::{QueueProjectStack, QueueShowSession, QueueStackBranch};
+        let view = QueueShowReply {
+            list: true,
+            projects: vec![
+                QueueProjectStack {
+                    name: "softfig".into(),
+                    repo: "~/p".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: vec![QueueStackBranch {
+                        entry: "one".into(),
+                        branch: "feat/one".into(),
+                        parent: String::new(),
+                        base: "abc123".into(),
+                        claimed: "2026-10-11T15:04:00Z".into(),
+                    }],
+                    stack_unknown: None,
+                },
+                QueueProjectStack {
+                    name: "wedged".into(),
+                    repo: "~/w".into(),
+                    main: "main".into(),
+                    local: true,
+                    stack: Vec::new(),
+                    stack_unknown: Some("git probe in ~/w: timed out after 10s".into()),
+                },
+            ],
+            entries: Vec::new(),
+            archived: Vec::new(),
+            sessions: vec![QueueShowSession {
+                entry: "one".into(),
+                tree: None,
+                unit: None,
+                path: "growlight/backlog/milestones/one/CLAUDE.md".into(),
+                lines: vec!["- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04".into()],
+            }],
+            trees: Vec::new(),
+        };
+        let body = render_annotations(&view);
+        assert!(body.contains("### Stack per repo"), "{body}");
+        assert!(
+            body.contains("- softfig (local, main = main) ~/p"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- feat/one  parent=main  base=abc123  claimed=2026-10-11T15:04:00Z"),
+            "{body}"
+        );
+        // An unread stack says so, with the reason, and never reads as empty.
+        assert!(
+            body.contains("- wedged (local, main = main) ~/w\n  (stack unknown — git probe in ~/w: timed out after 10s)\n"),
+            "{body}"
+        );
+        assert!(body.contains("### Sessions"), "{body}");
+        assert!(body.contains("one (growlight/backlog/milestones/one/CLAUDE.md)"), "{body}");
+        assert!(body.contains("  - 2026-10-11T15:40Z · completed"), "{body}");
     }
 
     // The e2e fixture: a REAL keeperd on a temp garden (no FUSE, no watcher,
@@ -4668,6 +6203,8 @@ mod tests {
             front: false,
             before: None,
             behind: None,
+            no_fleet: false,
+            not_before: None,
             dry_run,
         }
     }
@@ -4678,7 +6215,7 @@ mod tests {
 
         // Fresh garden: no queue.toml — `queue show` exits clean with the
         // §3.4 "renders only when the file exists" message.
-        queue_show(&socket).unwrap();
+        queue_show(&socket, &dir.join("growlightd-absent.sock")).unwrap();
 
         // project add → ok; a duplicate is refused and the wire code leads.
         queue_project_add(
@@ -4738,6 +6275,8 @@ mod tests {
             front: false,
             before: None,
             behind: None,
+            no_fleet: false,
+            not_before: None,
             dry_run: true,
         };
         queue_add(&socket, task).unwrap();
@@ -4758,6 +6297,8 @@ mod tests {
                 front: false,
                 before: None,
                 behind: None,
+                no_fleet: false,
+                not_before: None,
                 dry_run: false,
             },
         )
@@ -4802,6 +6343,31 @@ mod tests {
             },
         )
         .unwrap();
+
+        // fleet: hold for the human, then release.
+        let fleet_of = |socket: &Path| {
+            e2e_queue(socket).entries.iter().find(|e| e.id == "m1").unwrap().fleet
+        };
+        queue_fleet(&socket, QueueFleetArgs { id: "m1".into(), fleet: FleetArg::No, dry_run: false })
+            .unwrap();
+        assert!(!fleet_of(&socket), "queue fleet m1 no holds it");
+        queue_fleet(&socket, QueueFleetArgs { id: "m1".into(), fleet: FleetArg::Yes, dry_run: false })
+            .unwrap();
+        assert!(fleet_of(&socket), "queue fleet m1 yes releases it");
+
+        // not-before: schedule, refuse a bad time, then clear.
+        let nb_of = |socket: &Path| {
+            e2e_queue(socket).entries.iter().find(|e| e.id == "m1").unwrap().not_before.clone()
+        };
+        let at = "2026-11-01 02:00 -04:00";
+        let nb = |time: &str| QueueNotBeforeArgs { id: "m1".into(), time: time.into(), dry_run: false };
+        queue_not_before(&socket, nb(at)).unwrap();
+        assert_eq!(nb_of(&socket).as_deref(), Some(at), "queue not-before m1 <time> schedules it");
+        let err = queue_not_before(&socket, nb("tomorrow")).unwrap_err();
+        assert!(format!("{err:#}").contains("bad_start_time"), "{err:#}");
+        assert_eq!(nb_of(&socket).as_deref(), Some(at), "a refused time changes nothing");
+        queue_not_before(&socket, nb("")).unwrap();
+        assert_eq!(nb_of(&socket), None, "queue not-before m1 \"\" clears it");
 
         // A dry-run status edit leaves the state untouched.
         queue_status(
@@ -4911,7 +6477,7 @@ mod tests {
         assert!(format!("{err:#}").contains("bad_name"), "{err:#}");
 
         // `queue show` still renders the surviving state end to end.
-        queue_show(&socket).unwrap();
+        queue_show(&socket, &dir.join("growlightd-absent.sock")).unwrap();
 
         handle.shutdown();
         handle.join().unwrap();
@@ -5231,5 +6797,314 @@ mod tests {
             hint.ends_with("--model claude-opus-4-7 --effort high"),
             "hint tail: {hint}",
         );
+    }
+
+    /// `queue migrate` takes exactly one of `--dry-run` / `--apply`;
+    /// `--apply` needs `--answers` and `--expect`, and `--expect` only means
+    /// something under `--apply` (queue-v2-migrate slice 005).
+    #[test]
+    fn migrate_modes_are_an_either_or_and_apply_needs_its_inputs() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+        let parse = |tail: &[&str]| {
+            let argv = ["g", "queue", "migrate"].iter().chain(tail).copied();
+            TestCli::try_parse_from(argv).map(|c| match c.cmd {
+                GrowlightCmd::Queue(q) => match q.cmd {
+                    Some(QueueSub::Migrate(m)) => m,
+                    other => panic!("expected migrate, got {other:?}"),
+                },
+                other => panic!("expected Queue, got {other:?}"),
+            })
+        };
+        assert!(parse(&[]).is_err(), "a mode is required");
+        assert!(parse(&["--dry-run", "--apply", "--answers", "a.toml", "--expect", "v"]).is_err());
+        assert!(parse(&["--apply"]).is_err(), "--apply without --answers/--expect");
+        assert!(parse(&["--apply", "--answers", "a.toml"]).is_err(), "--apply without --expect");
+        assert!(parse(&["--apply", "--expect", "v"]).is_err(), "--apply without --answers");
+        assert!(parse(&["--dry-run", "--expect", "v"]).is_err(), "--expect is an apply input");
+        assert!(
+            parse(&["--apply", "--answers", "a.toml", "--expect", "v", "--garden", "/tmp/copy"]).is_err(),
+            "--garden is a dry-run input; the apply reads keeperd's garden"
+        );
+        assert!(parse(&["--dry-run", "--garden", "/tmp/copy"]).unwrap().garden.is_some());
+        assert!(
+            parse(&["--apply", "--answers", "a.toml", "--expect", "v", "--stack-answers", "o.toml"]).is_err(),
+            "--stack-answers never rides an apply"
+        );
+        assert!(parse(&["--stack-answers", "o.toml"]).is_err(), "--stack-answers needs --dry-run");
+        assert!(parse(&["--dry-run", "--stack-answers", "o.toml"]).unwrap().stack_answers.is_some());
+        let dry = parse(&["--dry-run", "--answers", "a.toml"]).unwrap();
+        assert!(dry.dry_run && !dry.apply);
+        let apply = parse(&["--apply", "--answers", "a.toml", "--expect", "v1"]).unwrap();
+        assert!(apply.apply && !apply.dry_run);
+        assert_eq!(apply.expect.as_deref(), Some("v1"));
+    }
+
+    /// The §3.6 copy after `--apply`: the bytes the plan saw land at
+    /// `entries/<id>/baton.md`; an existing target is skipped, never
+    /// overwritten; the source is never touched; an id that is not one path
+    /// component, or a `from` that was never sent, is refused.
+    #[test]
+    fn migrated_baton_copy_never_overwrites_and_never_moves() {
+        let runtime = tempfile::tempdir().unwrap();
+        let entries = runtime.path().join("entries");
+        fs::create_dir_all(runtime.path().join("agents/a")).unwrap();
+        let source = runtime.path().join("agents/a/baton.md");
+        fs::write(&source, "on disk\n").unwrap();
+        let sent: std::collections::BTreeMap<String, String> =
+            [("agents/a/baton.md".to_string(), "sent\n".to_string())].into();
+        let mv = |entry: &str, from: &str| migrate::BatonMove { from: from.into(), entry: entry.into() };
+
+        let first = copy_migrated_baton(&entries, &sent, &mv("001", "agents/a/baton.md")).unwrap();
+        assert_eq!(first, BatonCopy::Copied);
+        assert_eq!(fs::read_to_string(entries.join("001/baton.md")).unwrap(), "sent\n");
+
+        fs::create_dir_all(entries.join("002")).unwrap();
+        fs::write(entries.join("002/baton.md"), "existing\n").unwrap();
+        let skip = copy_migrated_baton(&entries, &sent, &mv("002", "agents/a/baton.md")).unwrap();
+        assert_eq!(skip, BatonCopy::TargetExists);
+        assert_eq!(fs::read_to_string(entries.join("002/baton.md")).unwrap(), "existing\n");
+        // A re-run is a skip too, not a second write.
+        let again = copy_migrated_baton(&entries, &sent, &mv("001", "agents/a/baton.md")).unwrap();
+        assert_eq!(again, BatonCopy::TargetExists);
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "on disk\n", "the source stays put");
+        for bad in ["../x", "a/b", "", ".", "/abs"] {
+            assert!(copy_migrated_baton(&entries, &sent, &mv(bad, "agents/a/baton.md")).is_err(), "{bad:?}");
+        }
+        assert!(copy_migrated_baton(&entries, &sent, &mv("003", "baton.md")).is_err(), "never sent");
+        assert!(!entries.join("003").exists());
+    }
+
+    /// A copy that fails after the commit (queue-v2-migrate-fixes F11) is an
+    /// error, not a printed line: the others still run, and the report ends
+    /// with the exact command that finishes the failed one.
+    #[test]
+    fn a_failed_baton_copy_errors_and_prints_its_recovery() {
+        let runtime = tempfile::tempdir().unwrap();
+        let entries = runtime.path().join("entries");
+        fs::create_dir_all(&entries).unwrap();
+        // `entries/002` is a file, so its directory can't be made.
+        fs::write(entries.join("002"), "in the way\n").unwrap();
+        let sent: std::collections::BTreeMap<String, String> = [
+            ("agents/a/baton.md".to_string(), "a\n".to_string()),
+            ("agents/b/baton.md".to_string(), "b\n".to_string()),
+        ]
+        .into();
+        let moves = [
+            migrate::BatonMove { from: "agents/a/baton.md".into(), entry: "001".into() },
+            migrate::BatonMove { from: "agents/b/baton.md".into(), entry: "002".into() },
+        ];
+        let mut lines = Vec::new();
+        let err = copy_migrated_batons(runtime.path(), &sent, &moves, |l| lines.push(l)).unwrap_err();
+        assert_eq!(err.to_string(), "1 of 2 baton copies failed");
+        assert_eq!(fs::read_to_string(entries.join("001/baton.md")).unwrap(), "a\n", "the good copy ran");
+        assert_eq!(lines[0], "  agents/a/baton.md -> entries/001/baton.md: copied");
+        assert!(lines[1].starts_with("  agents/b/baton.md -> entries/002/baton.md: FAILED, "), "{lines:?}");
+        let rt = runtime.path().display();
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("  mkdir -p '{rt}/entries/002' && cp -n '{rt}/agents/b/baton.md' '{rt}/entries/002/baton.md'")
+        );
+        // Nothing failed: Ok, and no recovery block.
+        let mut quiet = Vec::new();
+        copy_migrated_batons(runtime.path(), &sent, &moves[..1], |l| quiet.push(l)).unwrap();
+        assert_eq!(quiet, ["  agents/a/baton.md -> entries/001/baton.md: skipped, target exists"]);
+    }
+
+    /// `queue migrate --dry-run` (queue-v2-migrate slice 004): the snapshot
+    /// takes the backlog's `.md` files and the root + member batons only, and
+    /// the rendering carries the version, the counts, every call with its
+    /// evidence and proposal, every refusal, and the open-call line last.
+    #[test]
+    fn migrate_dry_run_snapshot_and_rendering() {
+        let garden = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let backlog = garden.path().join("growlight/backlog");
+        fs::create_dir_all(backlog.join("tasks")).unwrap();
+        let doc = "# backlog\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                   |---|----|------|-------|--------|\n| 1 | 001 | task | First | queued |\n\n\
+                   <!-- /softfig:queue -->\n\n<!-- softfig:queue:ghost -->\n<!-- /softfig:queue:ghost -->\n";
+        fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
+        let task = "# First\n\n## Branch policy\n\nOff `main`.\n\nSecond paragraph.\n";
+        fs::write(backlog.join("tasks/001-first.md"), task).unwrap();
+        fs::write(backlog.join("tasks/.seq"), "1\n").unwrap();
+        fs::create_dir_all(runtime.path().join("agents/a")).unwrap();
+        let head = "---\nstatus: IN_PROGRESS\nitem: 001\n---\n";
+        fs::write(runtime.path().join("agents/a/baton.md"), head).unwrap();
+        fs::write(runtime.path().join("baton.x.parked.md"), head).unwrap();
+
+        let files = migrate_snapshot(garden.path(), runtime.path()).unwrap();
+        let keys: Vec<_> = files.garden.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["growlight/backlog/CLAUDE.md", "growlight/backlog/tasks/001-first.md"]);
+        let batons: Vec<_> = files.batons.keys().map(String::as_str).collect();
+        assert_eq!(batons, vec!["agents/a/baton.md"]);
+
+        let answers = migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: [("project_main:softfig".to_string(), "main".to_string())].into(),
+        };
+        let legacy = migrate::read_legacy(&files).unwrap();
+        let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        let out = render_migrate_dry_run(&plan, "v123");
+
+        assert!(out.starts_with("queue migrate --dry-run — nothing written\nsnapshot version: v123\n"));
+        assert!(out.contains("plan: 1 projects, 1 entries, 0 archived, 0 slices files, 1 baton copies\n"));
+        assert!(out.contains("  001 task softfig normal "), "{out}");
+        assert!(out.contains("  agents/a/baton.md -> entries/001/baton.md\n"), "{out}");
+        assert!(out.contains("  [settled] project_main:softfig = main\n"), "{out}");
+        assert!(out.contains("  [open] project_repo:softfig\n      evidence: "), "{out}");
+        assert!(out.contains("\n      proposed: "), "{out}");
+        assert!(out.contains("refusals: 1\n  queue:ghost: "), "{out}");
+        // Multi-line policy prose quoted as evidence hangs under its call
+        // instead of spilling into the list (the live dry run's 71 stray lines).
+        assert!(out.contains("Off `main`.\n\n                Second paragraph.\n      proposed: "), "{out}");
+        let calls = &out[out.find("\njudgment calls:").unwrap() + 1..out.find("\nrefusals:").unwrap()];
+        for line in calls.lines().skip(1).filter(|l| !l.is_empty()) {
+            assert!(line.starts_with("  "), "unindented line in the call list: {line:?}\n{out}");
+        }
+        let open = plan.open_calls().count();
+        assert!(open > 0);
+        let last = if open == 1 { "1 call needs you\n".to_string() } else { format!("{open} calls need you\n") };
+        assert!(out.ends_with(&format!("1 refusal blocks the apply\n{last}")), "{out}");
+    }
+
+    /// `queue migrate --stack-answers` (queue-v2-migrate-fixes slice 006): git
+    /// answers each open `stack_base` call. A live stacked branch gets its
+    /// merge-base with the parent's branch, a live branch off `main` its
+    /// merge-base with `main`, a merged or gone branch the explicit unknown
+    /// base. Fed back as answers, no `stack_base` call stays open.
+    #[test]
+    fn stack_answers_come_from_git_and_settle_every_stack_base_call() {
+        use softfig_ipc::testing::git;
+        let repo = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let commit = |msg: &str| {
+            fs::write(r.join("f.txt"), msg).unwrap();
+            git(r, &["add", "."]);
+            git(r, &["commit", "-q", "-m", msg]);
+        };
+        let head = || {
+            let out = std::process::Command::new("git").arg("-C").arg(r).args(["rev-parse", "HEAD"]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(r, &["init", "-q", "-b", "main"]);
+        commit("c0");
+        let c0 = head();
+        git(r, &["checkout", "-q", "-b", "fix/002"]);
+        commit("parent");
+        let parent_tip = head();
+        git(r, &["checkout", "-q", "-b", "fix/001"]);
+        commit("child");
+        git(r, &["checkout", "-q", "fix/002"]);
+        commit("parent moves on");
+        git(r, &["checkout", "-q", "-b", "fix/003", "main"]);
+        commit("merged");
+        git(r, &["checkout", "-q", "main"]);
+        git(r, &["merge", "-q", "--no-ff", "-m", "merge 003", "fix/003"]);
+        // fix/004 was never cut (or was deleted after its merge).
+
+        let garden = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let backlog = garden.path().join("growlight/backlog");
+        fs::create_dir_all(backlog.join("tasks")).unwrap();
+        let doc = "# backlog\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                   |---|----|------|-------|--------|\n| 1 | 001 | task | Child | active |\n\
+                   | 2 | 002 | task | Parent | blocked |\n| 3 | 003 | task | Merged | blocked |\n\
+                   | 4 | 004 | task | Gone | blocked |\n| 5 | 005 | task | Unsettled | blocked |\n\n\
+                   <!-- /softfig:queue -->\n";
+        fs::write(backlog.join("CLAUDE.md"), doc).unwrap();
+        let tasks = [
+            ("001-child", "Branch `fix/001`, stacked on `fix/002`."),
+            ("002-parent", "Branch `fix/002` off `main`."),
+            ("003-merged", "Branch `fix/003` off `main`."),
+            ("004-gone", "Branch `fix/004` off `main`."),
+            ("005-unsettled", "Branch `fix/005` or `fix/005-b`."),
+        ];
+        for (name, policy) in tasks {
+            fs::write(backlog.join(format!("tasks/{name}.md")), format!("# t\n\n## Branch policy\n\n{policy}\n")).unwrap();
+        }
+        let mut answers = migrate::Answers {
+            schema: migrate::ANSWERS_SCHEMA_VERSION,
+            class: Default::default(),
+            call: [
+                ("project_main:softfig".to_string(), "main".to_string()),
+                ("project_repo:softfig".to_string(), r.display().to_string()),
+            ]
+            .into(),
+        };
+        let files = migrate_snapshot(garden.path(), runtime.path()).unwrap();
+        let legacy = migrate::read_legacy(&files).unwrap();
+        let plan = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        let questions = migrate::stack_base_questions(&plan);
+        assert_eq!(questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["001", "002", "003", "004", "005"]);
+        assert_eq!(questions[0].parent, Some(("002".to_string(), "fix/002".to_string())));
+
+        let lines: Vec<_> =
+            questions.iter().map(|q| (q.id.clone(), stack_base_from_git(q, None, None))).collect();
+        let answer = |id: &str| lines.iter().find(|(i, _)| i == id).map(|(_, a)| a.clone()).unwrap();
+        assert!(
+            matches!(answer("001"), StackAnswer::Known { parent, base, .. } if parent == "002" && base == parent_tip),
+            "the parent's tip the child was cut from, not the parent's moved tip: {:?}",
+            answer("001")
+        );
+        assert!(matches!(answer("002"), StackAnswer::Known { parent, base, .. } if parent.is_empty() && base == c0));
+        assert!(matches!(answer("003"), StackAnswer::Unknown { why, .. } if why.contains("merged")), "{:?}", answer("003"));
+        assert!(matches!(answer("004"), StackAnswer::Unknown { why, .. } if why.contains("gone")), "{:?}", answer("004"));
+        // 005's branch is an open `branch` call: a missing proposal is no verdict.
+        assert!(matches!(answer("005"), StackAnswer::Open { why } if why.contains("branch:005")), "{:?}", answer("005"));
+
+        let text = render_stack_answers(&lines, "v1");
+        assert!(text.contains(&format!("\"stack_base:001\" = \"parent=002 base={parent_tip}\"\n")), "{text}");
+        assert!(text.contains("\"stack_base:004\" = \"parent= base=\"\n"), "{text}");
+        let generated: migrate::Answers = toml::from_str(&text).unwrap();
+        answers.call.extend(generated.call);
+        let settled = migrate::plan(&legacy, &answers, "2026-11-01T00:00:00Z");
+        assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
+        let open: Vec<_> = settled
+            .open_calls()
+            .filter(|c| c.key.class == migrate::CallClass::StackBase)
+            .map(|c| c.key.subject.as_str())
+            .collect();
+        assert_eq!(open, ["005"], "only the call git left open");
+        let child = settled.queue.entries.iter().find(|e| e.id == "001").unwrap();
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("002", parent_tip.as_str()));
+    }
+
+    /// A repo git can't read here leaves its call open with the reason, and the
+    /// rendered line is commented out, so feeding the file back keeps it open.
+    #[test]
+    fn stack_answers_leave_a_remote_or_unreadable_repo_open() {
+        let q = |repo: &str| migrate::StackBaseQuestion {
+            id: "x".into(),
+            branch: "fix/x".into(),
+            branch_open: false,
+            repo: repo.into(),
+            main: "main".into(),
+            parent: None,
+            stray_parent: None,
+        };
+        let remote = stack_base_from_git(&q("build-host:/srv/repo"), None, Some("u"));
+        assert!(matches!(&remote, StackAnswer::Open { why } if why.contains("another machine")), "{remote:?}");
+        let other_user = stack_base_from_git(&q("~someone/repo"), Some(Path::new("/home/u")), Some("u"));
+        assert!(matches!(&other_user, StackAnswer::Open { why } if why.contains("not a local path")), "{other_user:?}");
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let unreadable = stack_base_from_git(&q(&not_a_repo.path().display().to_string()), None, None);
+        assert!(matches!(&unreadable, StackAnswer::Open { .. }), "{unreadable:?}");
+        assert!(matches!(&unreadable, StackAnswer::Open { why } if why.starts_with("git can't read the repo")));
+        let unsettled = stack_base_from_git(&q(""), None, None);
+        assert!(matches!(&unsettled, StackAnswer::Open { why } if why.contains("project_repo")), "{unsettled:?}");
+        let stray = migrate::StackBaseQuestion { stray_parent: Some("ghost".into()), ..q("/r") };
+        assert!(matches!(stack_base_from_git(&stray, None, None), StackAnswer::Open { why } if why.contains("ghost")));
+
+        let text = render_stack_answers(&[("x".to_string(), remote)], "v1");
+        assert!(text.contains("# left open: repo `build-host:/srv/repo` is on another machine"), "{text}");
+        let parsed: migrate::Answers = toml::from_str(&text).unwrap();
+        assert!(parsed.call.is_empty(), "an open call writes no live line: {text}");
     }
 }

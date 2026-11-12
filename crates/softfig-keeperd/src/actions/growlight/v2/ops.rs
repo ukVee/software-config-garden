@@ -12,7 +12,7 @@
 //!   slice `active → done | split | blocked | deferred | queued`;
 //! - [`queue_v2_follow_ups`] — the §7 counter, written as an absolute value;
 //! - [`queue_v2_session_log`] — the §3.5 line, appended to the unit doc's
-//!   `## Sessions`;
+//!   `## Sessions` (a milestone close-out's to its `sessions.md`);
 //! - [`queue_v2_deferred`] — the §6.5/protocol §7b `## Deferred verification`
 //!   section.
 //! - [`queue_v2_add_sub`] (slice 010) — the §7 sub-milestone: its docs and
@@ -67,13 +67,22 @@ use softfig_ipc::queue_v2::{
     QueueRefusal, SliceItem, SliceKind, SliceStatus, SlicesToml, SubSliceText,
     QUEUE_ARCHIVE_FILE,
 };
+use std::collections::BTreeMap;
+
+use softfig_ipc::backlog_doc::BACKLOG_DOC;
+use softfig_ipc::queue_v2::migrate::{self, ApplyRefusal};
 use softfig_ipc::verbs::{
     DaemonStatusArg, QueueV2AddSubArgs, QueueV2AddSubReply, QueueV2ClaimArgs, QueueV2ClaimReply,
     QueueV2DeferredArgs,
-    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply, QueueV2SessionLogArgs,
+    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply,
+    QueueV2MigrateApplyArgs, QueueV2MigrateApplyReply,
+    QueueV2ReRecordBasesArgs, QueueV2ReRecordBasesReply, QueueV2SessionLogArgs,
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
-use softfig_ipc::ErrorKind;
+use softfig_ipc::{ErrorKind, GARDEN_CONFIG_DIR, GROWLIGHT_CONFIG_FILE};
+use softfig_fuse::SealedQuery;
+
+use softfig_ipc::queue_v2::{milestone_doc, sessions_file};
 
 use super::{
     apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
@@ -86,6 +95,7 @@ use crate::actions::sections::{self, edit};
 use crate::actions::{conventions, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
+use crate::layer_b::LayerBHook;
 use crate::server::err_to_response;
 
 /// The `queue.toml` row id for an op's `entry` argument: the first path
@@ -163,12 +173,13 @@ fn load_entry_row(
     })
 }
 
-/// The unit doc's garden-relative path for `entry`/`unit` (the `## Sessions`
-/// and `## Deferred verification` target, §3.5/§6.5): a milestone's
+/// The unit doc's garden-relative path for `entry`/`unit` (the `## Deferred
+/// verification` target, §6.5, and the `## Sessions` one, §3.5, for all but a
+/// milestone close-out — see [`session_log_rel`]): a milestone's
 /// `CLAUDE.md` for a close-out, its `slices/NNN-<slug>.md` for a unit (the
 /// NNN resolves through the folder, since `slices.toml` carries no slug), a
 /// task's or restack's `tasks/NNN-<slug>.md` otherwise.
-fn unit_doc_rel(
+pub(in crate::actions::growlight) fn unit_doc_rel(
     wt: &WorkTree,
     kind: EntryKind,
     entry: &str,
@@ -176,7 +187,7 @@ fn unit_doc_rel(
 ) -> Result<String, (ErrorKind, String)> {
     match kind {
         EntryKind::Milestone => match unit {
-            None => Ok(format!("{}/CLAUDE.md", milestone_path(entry))),
+            None => Ok(milestone_doc(entry)),
             Some(id) => {
                 let n: u32 = id.parse().map_err(|_| {
                     (
@@ -215,6 +226,32 @@ fn unit_doc_rel(
         }
     }
 }
+
+/// Where §3.5 puts the session line for `entry`/`unit`, and whether the op
+/// may create that doc. A milestone close-out's line goes to the milestone's
+/// `sessions.md` (live state stays out of `CLAUDE.md`, task 104), which its
+/// first line creates — but only beside an existing milestone doc, so a
+/// close-out for a milestone with no doc is refused, not given a directory.
+/// Every other line goes to its [`unit_doc_rel`], which must exist.
+fn session_log_rel(
+    wt: &WorkTree,
+    kind: EntryKind,
+    entry: &str,
+    unit: Option<&str>,
+) -> Result<(String, bool), (ErrorKind, String)> {
+    let rel = unit_doc_rel(wt, kind, entry, unit)?;
+    match (kind, unit) {
+        (EntryKind::Milestone, None) => match wt.exists(&rel) {
+            true => Ok((sessions_file(entry), true)),
+            false => Err((ErrorKind::NotFound, format!("{rel}: unit doc missing"))),
+        },
+        _ => Ok((rel, false)),
+    }
+}
+
+/// What a milestone's `sessions.md` holds before its first line.
+const SESSIONS_DOC_STUB: &str = "# Session log\n\n\
+Written by keeperd when a session closes the milestone out (spec-growlight-queue §3.5).\n";
 
 /// Read a unit doc as plaintext for a doc-level op, refusing (not skipping)
 /// files that are sealed, vault-tagged or missing. Returns the content and
@@ -295,9 +332,31 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     // resumable by any member — the slice doc's "queued → active" is the
     // first-claim case, the resume is the §2 case); `active` is an
     // idempotent re-claim; anything else is a protocol bug, refused loud.
+    //
+    // §8 first claim (queue-v2-git slice 002): a never-claimed entry records
+    // the `parent`/`base` growlightd computed from the stack, and keeperd (the
+    // writer) stamps `claimed` itself. A resume or a re-claim — `claimed`
+    // already set — leaves all three untouched, so an already-recorded base is
+    // never overwritten by a stale first-claim attempt.
+    let first_claim = queue.entries[eidx].claimed.is_empty();
     let entry_changed = match queue.entries[eidx].status {
         EntryStatus::Queued | EntryStatus::Paused => {
             queue.entries[eidx].status = EntryStatus::Active;
+            if first_claim {
+                queue.entries[eidx].claimed = conventions::now_rfc3339();
+                if let Some(parent) = args.parent.as_deref() {
+                    queue.entries[eidx].parent = parent.to_string();
+                }
+                if let Some(base) = args.base.as_deref() {
+                    queue.entries[eidx].base = base.to_string();
+                }
+                // A branch that pre-existed its claim is resumed work, not the
+                // loop's to rewrite: hold it out of the automatic restack until a
+                // human opts it in (review 061 F1, report 178).
+                if args.existing {
+                    queue.entries[eidx].auto_restack = false;
+                }
+            }
             true
         }
         EntryStatus::Active => false,
@@ -370,7 +429,8 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     }
 
     // Backstop: every §3.1 invariant still holds (the claim is what takes a
-    // second entry in a repo `active` — invariant 5 refuses it here).
+    // second entry in a repo `active` — invariant 5 refuses it here, and
+    // invariant 6 refuses a restack beside any active entry in its repo).
     queue.validate(&archive).map_err(refuse)?;
 
     if !entry_changed && !slice_changed {
@@ -566,11 +626,13 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
                 DaemonStatusArg::Done => {
                     let mut row = queue.entries.remove(eidx);
                     row.pending_status = None;
+                    let re_record_due = row.kind == EntryKind::Restack;
                     archive.entries.push(ArchivedEntry {
                         row,
                         finished: conventions::now_rfc3339(),
                         final_status: FinalStatus::Done,
                         reason: None,
+                        re_record_due,
                     });
                     effective = "done".to_string();
                     files.push(FileWrite {
@@ -856,8 +918,13 @@ pub fn queue_v2_session_log(daemon: &Daemon, args: serde_json::Value) -> Handler
         let wt = WorkTree::new(daemon, &inner);
         let loaded = load_entry_row(&wt, &inner, &args.entry)?;
         let kind = loaded.queue.entries[loaded.entry_idx].kind;
-        let rel = unit_doc_rel(&wt, kind, &args.entry, args.unit.as_deref())?;
-        let (content, version) = load_unit_doc(&wt, &inner, &rel)?;
+        let (rel, creatable) = session_log_rel(&wt, kind, &args.entry, args.unit.as_deref())?;
+        // A close-out's `sessions.md` is made by its first line: `None` is the
+        // first-creation CAS token.
+        let (content, version) = match creatable && !wt.exists(&rel) {
+            true => (SESSIONS_DOC_STUB.to_string(), None),
+            false => load_unit_doc(&wt, &inner, &rel).map(|(c, v)| (c, Some(v)))?,
+        };
         (rel, content, version)
     };
 
@@ -878,7 +945,7 @@ pub fn queue_v2_session_log(daemon: &Daemon, args: serde_json::Value) -> Handler
         serde_json::json!({ "entry": args.entry, "unit": args.unit }),
         &[FileWrite {
             rel: rel.clone(),
-            expected: Some(version),
+            expected: version,
             bytes: new.into_bytes(),
         }],
         &[],
@@ -977,8 +1044,8 @@ fn sub_doc(identity: &str, parent: &str, slice: &str, title: &str, mission: &str
          > Sub-milestone `{identity}`, filed from slice {slice} of `{parent}` when its work \
          outgrew it (spec-growlight-queue §7). It runs inside its top-level entry and \
          shares that entry's baton; its status is its item in `{parent}`'s `slices.toml`, \
-         its slices run in the order of the derived table below, and it is done when its \
-         close-out completes.\n\n\
+         its slices run in the order of the derived table in `slices.md`, and it is done \
+         when its close-out completes.\n\n\
          ## Mission\n\n{}\n\n\
          ## Finish criteria\n\n{}\n",
         mission.trim_end_matches('\n'),
@@ -1037,7 +1104,7 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
-    let doc_rel = slices_view_host(&identity);
+    let doc_rel = milestone_doc(&identity);
     let slices_dir = format!("{}/slices", milestone_path(&identity));
     let (mut parent, parent_version) = {
         let wt = WorkTree::new(daemon, &inner);
@@ -1135,7 +1202,7 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
             body: Some(slices_view(&parent)),
         },
         ViewWrite {
-            host: doc_rel.clone(),
+            host: slices_view_host(&identity),
             tag: SLICES_V2_TAG,
             body: Some(slices_view(&sub)),
         },
@@ -1192,10 +1259,307 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     .unwrap())
 }
 
+/// `queue_v2_re_record_bases` (queue-v2-git slice 004): keeperd↔growlightd only —
+/// growlightd recomputed each restacked branch's base read-only after the
+/// restack completed (§8, `git merge-base`) and writes them back: each named
+/// live entry's `base` is replaced, and each `settled` archive row stops being
+/// due, so the bases and the answered trigger can't land apart. An all-no-op
+/// write (every `base` already the given value, nothing due) mints no commit.
+/// One commit, `queue_v2_bases_rerecorded`; the derived view re-renders.
+pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2ReRecordBasesArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_re_record_bases args: {e}")))?;
+    if args.entries.is_empty() && args.settled.is_empty() {
+        return Err((ErrorKind::BadArgs, "entries and settled are both empty".to_string()));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, mut archive, archive_version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_queue_state(&wt, &inner) {
+            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model, qs.archive.version),
+            Ok(None) => {
+                return Err((
+                    ErrorKind::NotFound,
+                    "no queue.toml — there is no v2 state".to_string(),
+                ))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+
+    let mut changed = false;
+    for rec in &args.entries {
+        let Some(e) = queue.entries.iter_mut().find(|e| e.id == rec.entry) else {
+            return Err(refuse(QueueRefusal::UnknownId { id: rec.entry.clone() }));
+        };
+        if e.base != rec.base {
+            e.base = rec.base.clone();
+            changed = true;
+        }
+    }
+    let mut settled = false;
+    for id in &args.settled {
+        let Some(a) = archive.entries.iter_mut().find(|a| a.row.id == *id) else {
+            return Err(refuse(QueueRefusal::UnknownId { id: id.clone() }));
+        };
+        settled |= std::mem::take(&mut a.re_record_due);
+    }
+    queue.validate(&archive).map_err(refuse)?;
+
+    if !changed && !settled {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash }).unwrap());
+    }
+
+    let mut files = vec![FileWrite {
+        rel: QUEUE_FILE.to_string(),
+        expected: queue_version,
+        bytes: queue
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    if settled {
+        files.push(FileWrite {
+            rel: QUEUE_ARCHIVE_FILE.to_string(),
+            expected: archive_version,
+            bytes: archive
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        });
+    }
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_bases_rerecorded",
+        serde_json::json!({ "entries": args.entries.len(), "settled": args.settled }),
+        &files,
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(queue_view(&queue)),
+        }],
+        &ExtraWrites::NONE,
+    )?;
+
+    Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash: hash.to_string() }).unwrap())
+}
+
+// ---- queue_v2_migrate_apply ----------------------------------------------
+
+/// An [`ApplyRefusal`] as a wire error; the message leads with its code.
+/// `legacy_changed` is the CAS miss, so it is `Conflict` like every stale
+/// write; `v2_files_present` is `PathAlreadyExists`; the rest are state
+/// refusals, `BadArgs` as [`refuse`] maps them.
+fn apply_refusal(r: ApplyRefusal, detail: impl std::fmt::Display) -> (ErrorKind, String) {
+    let kind = match r {
+        ApplyRefusal::LegacyChanged => ErrorKind::Conflict,
+        ApplyRefusal::V2FilesPresent => ErrorKind::PathAlreadyExists,
+        _ => ErrorKind::BadArgs,
+    };
+    (kind, format!("{}: {detail}", r.code()))
+}
+
+/// The apply's half of the dry run's snapshot, read through the worktree.
+struct BacklogSnapshot {
+    /// Every `.md` under the backlog dir, garden-relative path → text as the
+    /// redacted read view serves it ([`read_view`]).
+    md: BTreeMap<String, String>,
+    /// The v2 files already present there (`queue.toml`,
+    /// `queue-archive.toml`, any `slices.toml`, sub-milestones included), in
+    /// path order.
+    v2_present: Vec<String>,
+}
+
+fn migrate_snapshot(wt: &WorkTree, hook: &LayerBHook) -> Result<BacklogSnapshot, (ErrorKind, String)> {
+    fn walk(
+        wt: &WorkTree,
+        hook: &LayerBHook,
+        dir: &str,
+        md: &mut BTreeMap<String, String>,
+        v2: &mut Vec<String>,
+    ) -> Result<(), (ErrorKind, String)> {
+        let mut children = wt.read_dir(dir);
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in children {
+            let rel = format!("{dir}/{}", child.name);
+            if child.is_dir {
+                walk(wt, hook, &rel, md, v2)?;
+            } else if rel == QUEUE_FILE || rel == QUEUE_ARCHIVE_FILE || child.name == "slices.toml" {
+                v2.push(rel);
+            } else if child.name.ends_with(".md") {
+                let text = read_view(wt, hook, &rel).ok_or_else(|| (ErrorKind::Io, format!("{rel}: unreadable")))?;
+                md.insert(rel, text);
+            }
+        }
+        Ok(())
+    }
+    let dir = BACKLOG_DOC.rsplit_once('/').expect("BACKLOG_DOC has a parent").0;
+    let mut snap = BacklogSnapshot { md: BTreeMap::new(), v2_present: Vec::new() };
+    walk(wt, hook, dir, &mut snap.md, &mut snap.v2_present)?;
+    Ok(snap)
+}
+
+/// `rel`'s working-tree text projected the way `read_file` and the FUSE mount
+/// serve it (`reads::read_committed_file`): a whole-file-sealed doc is its
+/// `[sealed:<path>]` placeholder, an inline region's body `[encrypted]`. The
+/// converter then reads the bytes the CLI's dry run reads, so the two plans
+/// agree, and `item_meta::unreadable_metadata` sees what hides a metadata line
+/// (report 128) instead of base64 ciphertext or a sealed envelope.
+fn read_view(wt: &WorkTree, hook: &LayerBHook, rel: &str) -> Option<String> {
+    if hook.snapshot().is_sealed(rel) {
+        return Some(format!("[sealed:{rel}]\n"));
+    }
+    String::from_utf8(hook.redact_regions(rel, wt.read(rel)?)).ok()
+}
+
+/// `queue_v2_migrate_apply` (`queue-v2-migrate` slice 005, spec §11): the
+/// legacy→v2 converter's write. keeperd rebuilds the snapshot from its own
+/// worktree (the runtime batons ride in the args), recomputes the plan under
+/// the owner's answers, and checks every [`ApplyRefusal`] before anything is
+/// staged: the fleet armed, the switch already `v2`, any v2 file present, the
+/// snapshot (backlog files plus batons, [`migrate::LegacyFiles::digest`]) not
+/// the `expect` version, a plan refusal or open call.
+/// Otherwise `queue.toml`, `queue-archive.toml` and every `slices.toml`, with
+/// their §3.4 views, land in one commit, `queue_v2_migrated`. The legacy
+/// tables are never edited and the switch is never flipped; the reply's baton
+/// copies are the caller's to make.
+pub fn queue_v2_migrate_apply(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2MigrateApplyArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_migrate_apply args: {e}")))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (plan, version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let config = format!("{GARDEN_CONFIG_DIR}/{GROWLIGHT_CONFIG_FILE}");
+        let text = match wt.exists(&config) {
+            true => Some(
+                wt.read_to_string(&config)
+                    .ok_or_else(|| (ErrorKind::Io, format!("{config}: unreadable")))?,
+            ),
+            false => None,
+        };
+        let switches = crate::growlight_unit::migrate_switches(text.as_deref()).map_err(|e| {
+            (ErrorKind::BadArgs, format!("{config}: {e}; the apply refuses under a config it cannot read"))
+        })?;
+        if switches.fleet_enabled {
+            return Err(apply_refusal(
+                ApplyRefusal::FleetArmed,
+                format!("{config} has `fleet_enabled = true`; disarm the fleet first"),
+            ));
+        }
+        if switches.queue_v2 {
+            return Err(apply_refusal(
+                ApplyRefusal::SwitchIsV2,
+                format!("{config} already says `queue = \"v2\"`; the migration runs before the flip"),
+            ));
+        }
+        let BacklogSnapshot { md: garden, v2_present } = migrate_snapshot(&wt, &inner.layer_b)?;
+        if !v2_present.is_empty() {
+            return Err(apply_refusal(ApplyRefusal::V2FilesPresent, v2_present.join(", ")));
+        }
+        if !garden.contains_key(BACKLOG_DOC) {
+            return Err((ErrorKind::NotFound, format!("no {BACKLOG_DOC}")));
+        }
+        let files = migrate::LegacyFiles { garden, batons: args.batons };
+        let version = files.digest();
+        if version != args.expect {
+            return Err(apply_refusal(
+                ApplyRefusal::LegacyChanged,
+                format!(
+                    "the snapshot ({} backlog files, {} batons) is version {version}, not --expect {}; \
+                     a file the plan reads changed since the dry run, so re-run it",
+                    files.garden.len(),
+                    files.batons.len(),
+                    args.expect
+                ),
+            ));
+        }
+        let legacy =
+            migrate::read_legacy(&files).map_err(|e| apply_refusal(ApplyRefusal::NotApplicable, e))?;
+        let plan = migrate::plan(&legacy, &args.answers, &conventions::now_rfc3339());
+        if !plan.applicable() {
+            return Err(apply_refusal(
+                ApplyRefusal::NotApplicable,
+                format!(
+                    "{} refusal(s), {} open call(s); re-run the dry run until none remain",
+                    plan.refusals.len(),
+                    plan.open_calls().count()
+                ),
+            ));
+        }
+        (plan, version)
+    };
+
+    let toml_err = |e: softfig_ipc::queue_v2::QueueV2Error| (ErrorKind::Internal, e.to_string());
+    let mut files = vec![
+        FileWrite {
+            rel: QUEUE_FILE.to_string(),
+            expected: None,
+            bytes: plan.queue.to_toml().map_err(toml_err)?.into_bytes(),
+        },
+        FileWrite {
+            rel: QUEUE_ARCHIVE_FILE.to_string(),
+            expected: None,
+            bytes: plan.archive.to_toml().map_err(toml_err)?.into_bytes(),
+        },
+    ];
+    let mut views = vec![ViewWrite {
+        host: queue_view_host(),
+        tag: QUEUE_V2_TAG,
+        body: Some(queue_view(&plan.queue)),
+    }];
+    for (milestone, slices) in &plan.slices {
+        files.push(FileWrite {
+            rel: slices_file(milestone),
+            expected: None,
+            bytes: slices.to_toml().map_err(toml_err)?.into_bytes(),
+        });
+        views.push(ViewWrite {
+            host: slices_view_host(milestone),
+            tag: SLICES_V2_TAG,
+            body: Some(slices_view(slices)),
+        });
+    }
+    let (entries, archived, slices) =
+        (plan.queue.entries.len(), plan.archive.entries.len(), plan.slices.len());
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_migrated",
+        serde_json::json!({
+            "version": version,
+            "entries": entries,
+            "archived": archived,
+            "slices": slices,
+        }),
+        &files,
+        &views,
+        &ExtraWrites::NONE,
+    )?;
+
+    Ok(serde_json::to_value(QueueV2MigrateApplyReply {
+        hash: hash.to_string(),
+        entries,
+        archived,
+        slices,
+        batons: plan.batons,
+    })
+    .unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::growlight::queue_verbs::{queue_add_entry, queue_add_project, queue_update_entry, slice_update};
+    use crate::actions::growlight::queue_verbs::{
+        queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_update,
+    };
     use crate::actions::growlight::v2::write::tests::unlocked;
     use crate::actions::managed;
     use softfig_ipc::queue_v2::{Lane, Project, QueueToml, SlicesToml};
@@ -1233,6 +1597,9 @@ mod tests {
             claimed: String::new(),
             follow_ups: 0,
             pending_status: None,
+            auto_restack: true,
+            fleet: true,
+            not_before: None,
         }
     }
 
@@ -1303,6 +1670,22 @@ mod tests {
 
     fn claim(daemon: &Daemon, entry: &str, unit: Option<&str>) -> Result<QueueV2ClaimReply, (ErrorKind, String)> {
         let v = queue_v2_claim(daemon, serde_json::json!({ "entry": entry, "unit": unit }))?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    /// A claim carrying the §8 first-claim `parent`/`base` (queue-v2-git slice
+    /// 002) — the shape growlightd sends for a never-claimed entry.
+    fn claim_first(
+        daemon: &Daemon,
+        entry: &str,
+        unit: Option<&str>,
+        parent: &str,
+        base: &str,
+    ) -> Result<QueueV2ClaimReply, (ErrorKind, String)> {
+        let v = queue_v2_claim(
+            daemon,
+            serde_json::json!({ "entry": entry, "unit": unit, "parent": parent, "base": base }),
+        )?;
         Ok(serde_json::from_value(v).unwrap())
     }
 
@@ -1406,6 +1789,100 @@ mod tests {
     }
 
     #[test]
+    fn first_claim_records_parent_base_and_claimed_and_resume_keeps_them() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        claim_first(&daemon, "m", Some("001"), "other", "deadbeef").expect("first claim");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent recorded at first claim");
+        assert_eq!(e.base, "deadbeef", "base recorded at first claim");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed stamped by keeperd: {}",
+            e.claimed
+        );
+
+        // A resume (pause → active) without parent/base must not overwrite the
+        // recorded base.
+        set_status(&daemon, "m", None, "paused").expect("pause");
+        claim(&daemon, "m", None).expect("resume");
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent unchanged by a resume");
+        assert_eq!(e.base, "deadbeef", "base unchanged by a resume");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed unchanged by a resume: {}",
+            e.claimed
+        );
+    }
+
+    /// Review 061 F1 (report 178): a first claim that resumed an existing
+    /// branch records `auto_restack = false` on the row; a fleet-cut claim, a
+    /// resume and a re-claim leave the flag alone. The flag is read back from
+    /// the committed `queue.toml`, so it survives a keeperd write/read round
+    /// trip. Fails on `1ad3a01`, where `existing` is never persisted.
+    #[test]
+    fn a_first_claim_that_resumed_a_branch_holds_it_out_of_the_auto_restack() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        // The fleet cut the branch (a second garden: one entry per repo starts):
+        // the default stands.
+        let other_garden = tempfile::tempdir().unwrap();
+        let other = unlocked(other_garden.path());
+        seed_queued_milestone(&other, "n");
+        claim_first(&other, "n", Some("001"), "", "cafe").expect("fleet-cut claim");
+        let (queue, _) = loaded_queue(&other);
+        assert!(queue.entries[0].auto_restack);
+
+        let v = queue_v2_claim(
+            &daemon,
+            serde_json::json!({ "entry": "m", "unit": "001", "parent": "", "base": "deadbeef", "existing": true }),
+        );
+        v.expect("resuming claim");
+        let (queue, _) = loaded_queue(&daemon);
+        let m = queue.entries.iter().find(|e| e.id == "m").unwrap();
+        assert!(!m.auto_restack, "a resumed branch is held out of the auto restack");
+        assert_eq!(m.base, "deadbeef");
+        let text = queue.to_toml().unwrap();
+        assert!(text.contains("auto_restack = false"), "{text}");
+        assert_eq!(QueueToml::parse(&text).unwrap(), queue, "round-trips");
+
+        // A resume of the same entry (no `existing`) does not re-enable it.
+        set_status(&daemon, "m", None, "paused").expect("pause");
+        claim(&daemon, "m", None).expect("resume");
+        let (queue, _) = loaded_queue(&daemon);
+        assert!(!queue.entries.iter().find(|e| e.id == "m").unwrap().auto_restack);
+    }
+
+    #[test]
+    fn a_first_claim_without_parent_or_base_stamps_claimed_and_leaves_them_empty() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        // A restack (or any branchless first claim) sends no parent/base —
+        // `claimed` is still stamped, parent/base stay empty.
+        claim(&daemon, "m", Some("001")).expect("first claim, no base");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "", "no parent without a base line");
+        assert_eq!(e.base, "", "no base without a base line");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed still stamped: {}",
+            e.claimed
+        );
+    }
+
+    #[test]
     fn claim_is_idempotent_and_resumes_a_paused_entry() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
@@ -1458,6 +1935,49 @@ mod tests {
             .expect("human block");
         let err = claim(&daemon, "b", Some("001")).unwrap_err();
         assert!(err.1.contains("is blocked"), "{err:?}");
+    }
+
+    /// F2 + V8: a drop does not refuse for an active child. It re-parents the
+    /// child in the same write, and its restack can't be claimed until the
+    /// child's session has handed off. Once the restack runs, the claim
+    /// refuses the other way round.
+    #[test]
+    fn the_restack_of_a_drop_waits_for_the_active_child() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut parent = entry("a", Lane::Normal, EntryStatus::Queued);
+        parent.branch = "feat/a".to_string();
+        parent.base = "main-commit".to_string();
+        parent.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut child = entry("b", Lane::Normal, EntryStatus::Active);
+        child.branch = "feat/b".to_string();
+        child.parent = "a".to_string();
+        child.base = "a-commit".to_string();
+        child.claimed = "2026-10-11T12:10:00Z".to_string();
+        seed_queue_rows(&daemon, vec![parent, child]);
+
+        queue_drop(&daemon, serde_json::json!({ "id": "a", "reason": "abandoned" }))
+            .expect("the drop proceeds over an active child");
+        let (queue, _) = loaded_queue(&daemon);
+        let restack = queue
+            .entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Restack)
+            .expect("the drop enqueued a restack")
+            .id
+            .clone();
+        let child = queue.entries.iter().find(|e| e.id == "b").unwrap();
+        assert_eq!(child.status, EntryStatus::Active, "the live session runs on");
+        assert_eq!((child.parent.as_str(), child.base.as_str()), ("", "a-commit"));
+
+        let err = claim(&daemon, &restack, None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
+
+        set_status(&daemon, "b", None, "paused").expect("the child hands off");
+        claim(&daemon, &restack, None).expect("no session holds a branch now");
+
+        let err = claim(&daemon, "b", None).unwrap_err();
+        assert!(err.1.contains("started"), "{err:?}");
     }
 
     #[test]
@@ -1544,6 +2064,26 @@ mod tests {
         assert_eq!(archive.entries[0].final_status, FinalStatus::Done);
         assert_eq!(archive.entries[0].row.id, "m");
         assert!(archive.entries[0].finished.starts_with("20"), "finished stamped");
+    }
+
+    /// §8: a restack's re-record is owed from the commit that archives it, so
+    /// a restart can't lose it. Only `done` owes one, and only a restack.
+    #[test]
+    fn set_status_done_marks_a_restack_row_due_and_nothing_else() {
+        // One row per garden: a repo holds one active entry at a time.
+        let run = |kind, status| {
+            let garden = tempfile::tempdir().unwrap();
+            let daemon = unlocked(garden.path());
+            let mut row = entry("r", Lane::Urgent, EntryStatus::Active);
+            row.kind = kind;
+            row.branch = String::new();
+            seed_queue_rows(&daemon, vec![row]);
+            set_status(&daemon, "r", None, status).expect("status");
+            loaded_queue(&daemon).1.entries.first().map(|a| a.re_record_due)
+        };
+        assert_eq!(run(EntryKind::Restack, "done"), Some(true));
+        assert_eq!(run(EntryKind::Task, "done"), Some(false));
+        assert_eq!(run(EntryKind::Restack, "deferred"), None, "the row stays live");
     }
 
     #[test]
@@ -1746,10 +2286,28 @@ mod tests {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         seed_running_milestone(&daemon, "m");
-        // Close-out: the milestone's own CLAUDE.md.
+        let claude = "growlight/backlog/milestones/m/CLAUDE.md";
+        let doc_before = {
+            let inner = daemon.inner.lock().unwrap();
+            WorkTree::new(&daemon, &inner).read_to_string(claude).unwrap()
+        };
+        // Close-out: the milestone's `sessions.md` (task 104), created by the
+        // first line and appended to by the next; the milestone doc is left
+        // alone.
         let reply = session_log(&daemon, "m", None, "deferred · reasoning · member oc · $0.02")
             .expect("close-out log");
-        assert_eq!(reply.path, "growlight/backlog/milestones/m/CLAUDE.md");
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/sessions.md");
+        session_log(&daemon, "m", None, "completed · reasoning · member oc · $0.03")
+            .expect("second close-out log");
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            let log = wt.read_to_string(&reply.path).unwrap();
+            assert!(log.starts_with(SESSIONS_DOC_STUB), "{log}");
+            assert_eq!(log.matches("## Sessions").count(), 1, "{log}");
+            assert!(log.contains("· deferred ·") && log.contains("· completed ·"), "{log}");
+            assert_eq!(wt.read_to_string(claude).unwrap(), doc_before);
+        }
 
         // Task: the numbered task doc.
         let id = seed_task(&daemon, "fix-x");
@@ -1964,10 +2522,63 @@ mod tests {
         let (queue, _) = loaded_queue(&daemon);
         assert_eq!(queue.entries[0].status, EntryStatus::Active, "the top-level row is active");
         assert_eq!(loaded_slices(&daemon, "m/sub-a").items[0].status, SliceStatus::Active);
-        // The sub's close-out session-log lands in the sub's own CLAUDE.md.
+        // The sub's close-out session-log lands in the sub's own sessions.md.
         let reply = session_log(&daemon, "m/sub-a", None, "completed · reasoning · member oc · $0.00")
             .expect("sub close-out log");
-        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/sub-a/CLAUDE.md");
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/sub-a/sessions.md");
+    }
+
+    // ---- view hosts (task 104) ---------------------------------------------
+
+    /// Every `.md` under the garden, garden-relative, skipping keeperd's state.
+    fn garden_docs(root: &std::path::Path) -> Vec<String> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                let path = e.path();
+                if e.file_name() == ".softfig" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if path.extension().is_some_and(|x| x == "md") {
+                    out.push(path.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[test]
+    fn no_v2_write_adds_a_region_to_any_claude_md() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // Project, milestone (with its generated views), task, claim, a sub,
+        // status and follow-up writes, and both kinds of session line.
+        seed_running_milestone(&daemon, "m");
+        let task = seed_task(&daemon, "fix-x");
+        add_sub(&daemon, sub_args("m", "001", "deeper", false)).expect("add_sub");
+        follow_ups(&daemon, "m", Some("002"), 1).expect("follow_ups");
+        session_log(&daemon, "m", None, "completed · reasoning · member oc · $0.01").expect("close-out");
+        session_log(&daemon, &task, None, "blocked · claude · member a · $0.00").expect("task log");
+
+        let docs = garden_docs(garden.path());
+        for rel in docs.iter().filter(|r| r.ends_with("CLAUDE.md")) {
+            let text = std::fs::read_to_string(garden.path().join(rel)).unwrap();
+            for tag in [QUEUE_V2_TAG, SLICES_V2_TAG] {
+                assert!(!managed::has_region(&text, tag), "{rel} carries softfig:{tag}:\n{text}");
+            }
+        }
+        // The views live in their own docs instead.
+        let has = |rel: &str, tag| {
+            let text = std::fs::read_to_string(garden.path().join(rel)).unwrap_or_default();
+            managed::has_region(&text, tag)
+        };
+        assert!(has("growlight/backlog/queue.md", QUEUE_V2_TAG), "{docs:?}");
+        assert!(has("growlight/backlog/milestones/m/slices.md", SLICES_V2_TAG), "{docs:?}");
+        assert!(has("growlight/backlog/milestones/m/subs/deeper/slices.md", SLICES_V2_TAG), "{docs:?}");
+        assert!(docs.iter().any(|r| r == "growlight/backlog/milestones/m/sessions.md"), "{docs:?}");
     }
 
     // ---- add_sub (slice 010) ----------------------------------------------
@@ -2040,7 +2651,9 @@ mod tests {
             None,
             "the generated doc declares no model, so the sub inherits the parent's chain",
         );
-        let region = managed::region_body(&doc, SLICES_V2_TAG).unwrap();
+        assert!(!managed::has_region(&doc, SLICES_V2_TAG), "the view is in slices.md: {doc}");
+        let view = wt.read_to_string(&slices_view_host("m/deeper")).unwrap();
+        let region = managed::region_body(&view, SLICES_V2_TAG).unwrap();
         assert!(region.contains("| slice | 001 | queued |"), "{region}");
         let parent = wt.read_to_string(&slices_view_host("m")).unwrap();
         let region = managed::region_body(&parent, SLICES_V2_TAG).unwrap();
@@ -2179,5 +2792,456 @@ mod tests {
                 _ => assert!(c.is_ascii_digit(), "digit at byte {i} in {ts:?}"),
             }
         }
+    }
+
+    // ---- slice 004: queue_v2_re_record_bases ----------------------------
+
+    fn re_record(
+        daemon: &Daemon,
+        entries: Vec<(&str, &str)>,
+    ) -> Result<QueueV2ReRecordBasesReply, (ErrorKind, String)> {
+        let v = queue_v2_re_record_bases(
+            daemon,
+            serde_json::json!({
+                "entries": entries
+                    .iter()
+                    .map(|(e, b)| serde_json::json!({ "entry": e, "base": b }))
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn re_record_replaces_each_named_entry_base_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "abc123".to_string();
+        let mut b = entry("b", Lane::Normal, EntryStatus::Queued);
+        b.claimed = "2026-10-11T12:10:00Z".to_string();
+        b.base = "def456".to_string();
+        b.parent = "a".to_string();
+        seed_queue_rows(&daemon, vec![a, b]);
+        let before = commit_count(&daemon);
+
+        let reply = re_record(&daemon, vec![("a", "111aaa"), ("b", "222bbb")]).expect("re-record");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit");
+        assert!(!reply.hash.is_empty());
+
+        let (queue, _) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].base, "111aaa");
+        assert_eq!(queue.entries[1].base, "222bbb");
+        // parent/claimed/status are untouched by a re-record.
+        assert_eq!(queue.entries[1].parent, "a");
+        assert_eq!(queue.entries[0].claimed, "2026-10-11T12:00:00Z");
+        assert_eq!(queue.entries[0].status, EntryStatus::Queued);
+    }
+
+    #[test]
+    fn re_record_refuses_an_unknown_entry_and_a_noop_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.base = "abc123".to_string();
+        seed_queue_rows(&daemon, vec![a]);
+        let before = commit_count(&daemon);
+
+        // An unknown entry is refused, nothing written.
+        let err = re_record(&daemon, vec![("ghost", "x")]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
+
+        // An all-no-op write (base already the given value) mints no commit.
+        re_record(&daemon, vec![("a", "abc123")]).expect("no-op re-record");
+        assert_eq!(commit_count(&daemon), before, "no commit for a no-op");
+    }
+
+    #[test]
+    fn re_record_refuses_an_empty_entries_list() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue_rows(&daemon, vec![entry("a", Lane::Normal, EntryStatus::Queued)]);
+        let err = re_record(&daemon, vec![]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+    }
+
+    // ---- queue_v2_migrate_apply ------------------------------------------
+
+    /// The converter's fixture (softfig-ipc `tests/fixtures/migrate/`): a
+    /// live-shaped legacy backlog, its runtime batons and the answers that
+    /// settle every call it raises.
+    fn migrate_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../softfig-ipc/tests/fixtures/migrate")
+    }
+
+    fn load_tree(root: &std::path::Path, dir: &std::path::Path, into: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                load_tree(root, &path, into);
+            } else {
+                let key = path.strip_prefix(root).unwrap().to_str().unwrap().to_string();
+                into.insert(key, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    /// The fixture's legacy files as the CLI's dry run reads them: the garden
+    /// half off disk, the batons the apply sends.
+    fn fixture_files() -> migrate::LegacyFiles {
+        let mut files = migrate::LegacyFiles::default();
+        let root = migrate_fixture();
+        load_tree(&root.join("garden"), &root.join("garden"), &mut files.garden);
+        load_tree(&root.join("batons"), &root.join("batons"), &mut files.batons);
+        files
+    }
+
+    /// Seed the fixture's legacy backlog into the garden as one commit; return
+    /// the snapshot's version as the dry run prints it (the `--expect`).
+    fn seed_legacy(daemon: &Daemon, garden: &std::path::Path) -> String {
+        let files = fixture_files();
+        for (rel, text) in &files.garden {
+            hand_write(garden, rel, text);
+        }
+        let mut inner = daemon.inner.lock().unwrap();
+        crate::actions::commit_now(&mut inner, softfig_vcs::Intent::init("seed legacy backlog")).unwrap();
+        files.digest()
+    }
+
+    fn migrate_args(expect: &str, answers: bool) -> serde_json::Value {
+        let batons = fixture_files().batons;
+        let answers: migrate::Answers = match answers {
+            true => toml::from_str(&std::fs::read_to_string(migrate_fixture().join("answers.toml")).unwrap())
+                .unwrap(),
+            false => migrate::Answers {
+                schema: migrate::ANSWERS_SCHEMA_VERSION,
+                class: Default::default(),
+                call: Default::default(),
+            },
+        };
+        serde_json::to_value(QueueV2MigrateApplyArgs { answers, expect: expect.to_string(), batons }).unwrap()
+    }
+
+    /// The version a dry run would print now: keeperd's own read of the garden
+    /// (the bytes the mount serves, report 128) plus the fixture's batons.
+    fn snapshot_version(daemon: &Daemon) -> String {
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(daemon, &inner);
+        let garden = migrate_snapshot(&wt, &inner.layer_b).map_err(|e| e.1).unwrap().md;
+        migrate::LegacyFiles { garden, batons: fixture_files().batons }.digest()
+    }
+
+    fn migrate_apply(daemon: &Daemon, args: serde_json::Value) -> Result<QueueV2MigrateApplyReply, (ErrorKind, String)> {
+        queue_v2_migrate_apply(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    fn backlog_doc(garden: &std::path::Path) -> String {
+        std::fs::read_to_string(garden.join(BACKLOG_DOC)).unwrap()
+    }
+
+    #[test]
+    fn migrate_apply_writes_every_v2_file_in_one_commit_and_leaves_the_legacy_tables() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let claude_docs = |root: &std::path::Path| -> Vec<(String, String)> {
+            let mut docs: Vec<_> = garden_docs(root)
+                .into_iter()
+                .filter(|r| r.ends_with("CLAUDE.md"))
+                .map(|r| {
+                    let text = std::fs::read_to_string(root.join(&r)).unwrap();
+                    (r, text)
+                })
+                .collect();
+            docs.sort();
+            docs
+        };
+        let before_claude = claude_docs(garden.path());
+
+        let before = commit_count(&daemon);
+
+        let reply = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1, "one commit");
+
+        // The commit is the new intent, carrying the CAS version + counts.
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            let tip = repo.tip_of(TIP_REF).unwrap().unwrap();
+            let head = &log::collect(repo.db(), tip).unwrap()[0];
+            assert_eq!(head.intent, "queue_v2_migrated");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&head.payload).unwrap(),
+                serde_json::json!({
+                    "version": expect,
+                    "entries": reply.entries,
+                    "archived": reply.archived,
+                    "slices": reply.slices,
+                })
+            );
+        }
+
+        // The written files are the plan the dry run computes.
+        let fixture = {
+            let files = fixture_files();
+            let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
+            migrate::plan(&migrate::read_legacy(&files).unwrap(), &args.answers, "2026-11-01T00:00:00Z")
+        };
+        let (queue, archive) = loaded_queue(&daemon);
+        let ids = |q: &QueueToml| q.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&queue), ids(&fixture.queue));
+        assert_eq!(archive.entries.len(), fixture.archive.entries.len());
+        assert_eq!((reply.entries, reply.archived), (fixture.queue.entries.len(), fixture.archive.entries.len()));
+        assert_eq!(reply.slices, fixture.slices.len());
+        assert!(reply.slices > 0, "the fixture has live milestones");
+        for (milestone, slices) in &fixture.slices {
+            assert_eq!(&loaded_slices(&daemon, milestone).items, &slices.items, "{milestone}");
+            let doc = std::fs::read_to_string(garden.path().join(slices_view_host(milestone))).unwrap();
+            assert!(managed::has_region(&doc, SLICES_V2_TAG), "{milestone}: slices view rendered");
+        }
+        assert_eq!(reply.batons, fixture.batons, "the caller's baton copies");
+
+        // Legacy untouched: no `CLAUDE.md` changed at all (task 104) — the
+        // views went to `queue.md` and each milestone's `slices.md`.
+        assert!(before_claude.iter().any(|(r, _)| r == "growlight/backlog/CLAUDE.md"));
+        assert_eq!(claude_docs(garden.path()), before_claude, "no CLAUDE.md changes");
+        let view = std::fs::read_to_string(garden.path().join(queue_view_host())).unwrap();
+        assert!(managed::has_region(&view, QUEUE_V2_TAG), "{view}");
+        assert!(!garden.path().join("config/growlight.toml").exists(), "the switch is never written");
+
+        // A second apply refuses: the v2 files exist now.
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::PathAlreadyExists);
+        assert!(msg.starts_with("v2_files_present: "), "{msg}");
+        assert_eq!(commit_count(&daemon), before + 1);
+    }
+
+    /// F12: a commit that fails leaves nothing staged, so the failure is
+    /// distinguishable from a landed apply and the same args retry cleanly.
+    /// The failure is real: the object store is read-only, so the commit
+    /// can't write its blobs.
+    #[test]
+    fn a_failed_migrate_commit_unstages_so_the_retry_applies() {
+        use std::os::unix::fs::PermissionsExt;
+        fn set_mode(dir: &std::path::Path, mode: u32) {
+            for entry in walkdir_dirs(dir) {
+                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        fn walkdir_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = vec![dir.to_path_buf()];
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    out.extend(walkdir_dirs(&path));
+                }
+            }
+            out
+        }
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let before_doc = backlog_doc(garden.path());
+        let before = commit_count(&daemon);
+        let objects = garden.path().join(".softfig/objects");
+
+        set_mode(&objects, 0o555);
+        let failed = migrate_apply(&daemon, migrate_args(&expect, true));
+        set_mode(&objects, 0o755);
+        let (_, msg) = failed.unwrap_err();
+        assert!(msg.ends_with("; nothing was committed and the staged files were put back"), "{msg}");
+        assert_eq!(commit_count(&daemon), before, "nothing landed");
+        assert!(!garden.path().join(QUEUE_FILE).exists(), "queue.toml unstaged");
+        assert!(!garden.path().join(QUEUE_ARCHIVE_FILE).exists(), "queue-archive.toml unstaged");
+        assert_eq!(backlog_doc(garden.path()), before_doc, "the backlog doc untouched");
+        assert!(!garden.path().join(queue_view_host()).exists(), "queue.md unstaged");
+        let fixture_slices = {
+            let files = fixture_files();
+            let args: QueueV2MigrateApplyArgs = serde_json::from_value(migrate_args(&expect, true)).unwrap();
+            migrate::plan(&migrate::read_legacy(&files).unwrap(), &args.answers, "2026-11-01T00:00:00Z").slices
+        };
+        for (milestone, _) in &fixture_slices {
+            assert!(!garden.path().join(slices_file(milestone)).exists(), "{milestone}: slices.toml unstaged");
+            let host = slices_view_host(milestone);
+            assert!(!garden.path().join(&host).exists(), "{host}: view unstaged");
+        }
+        assert_eq!(snapshot_version(&daemon), expect, "the tree is back at the dry run's snapshot");
+
+        // The same args now apply, and a landed apply is what refuses.
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+        assert_eq!(commit_count(&daemon), before + 1);
+        let (_, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert!(msg.starts_with("v2_files_present: "), "{msg}");
+    }
+
+    #[test]
+    fn migrate_apply_refuses_before_any_write() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let config = garden.path().join("config/growlight.toml");
+        let refused = |args: serde_json::Value, code: &str, want: ErrorKind| {
+            let at = commit_count(&daemon);
+            let (kind, msg) = migrate_apply(&daemon, args).unwrap_err();
+            assert_eq!(kind, want, "{code}: {msg}");
+            assert!(msg.starts_with(&format!("{code}: ")), "{msg}");
+            assert_eq!(commit_count(&daemon), at, "{code} mints no commit");
+            assert!(!garden.path().join(QUEUE_FILE).exists(), "{code} stages nothing");
+        };
+
+        hand_write(garden.path(), "config/growlight.toml", "fleet_enabled = true\nqueue = \"legacy\"\n");
+        refused(migrate_args(&expect, true), "fleet_armed", ErrorKind::BadArgs);
+        hand_write(garden.path(), "config/growlight.toml", "queue = \"v2\"\n");
+        refused(migrate_args(&expect, true), "switch_is_v2", ErrorKind::BadArgs);
+        // A config the apply cannot read is refused too, never defaulted.
+        hand_write(garden.path(), "config/growlight.toml", "queue = \"v3\"\n");
+        let (kind, _) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadArgs);
+        std::fs::remove_file(&config).unwrap();
+
+        refused(migrate_args("0000", true), "legacy_changed", ErrorKind::Conflict);
+        refused(migrate_args(&expect, false), "not_applicable", ErrorKind::BadArgs);
+
+        // Any one v2 file — here a lone sub-milestone's slices.toml.
+        let stray = "growlight/backlog/milestones/folder-grants/subs/x/slices.toml";
+        hand_write(garden.path(), stray, "schema = 1\n");
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::PathAlreadyExists);
+        assert_eq!(msg, format!("v2_files_present: {stray}"));
+        std::fs::remove_file(garden.path().join(stray)).unwrap();
+
+        // With every gate clear the same args apply.
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+    }
+
+    /// Report 132: `--expect` is a CAS over every file the plan reads, not the
+    /// backlog doc alone. An item doc edited, a slice doc added or a baton
+    /// moved between the dry run and the apply each refuse `legacy_changed`;
+    /// put back, the same `--expect` applies.
+    #[test]
+    fn migrate_apply_refuses_when_any_snapshot_file_moved_since_the_dry_run() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let expect = seed_legacy(&daemon, garden.path());
+        let at = commit_count(&daemon);
+        let refused = |args: serde_json::Value, what: &str| {
+            let (kind, msg) = migrate_apply(&daemon, args).unwrap_err();
+            assert_eq!(kind, ErrorKind::Conflict, "{what}: {msg}");
+            assert!(msg.starts_with("legacy_changed: the snapshot ("), "{what}: {msg}");
+            assert!(msg.contains(&format!("not --expect {expect}")), "{what}: {msg}");
+            assert_eq!(commit_count(&daemon), at, "{what} mints no commit");
+            assert!(!garden.path().join(QUEUE_FILE).exists(), "{what} stages nothing");
+        };
+
+        let item = "growlight/backlog/milestones/roadeye-m2-daemon-core/CLAUDE.md";
+        let doc = std::fs::read_to_string(garden.path().join(item)).unwrap();
+        hand_write(garden.path(), item, &format!("{doc}\n> Fleet: no\n"));
+        refused(migrate_args(&expect, true), "item doc edited");
+        hand_write(garden.path(), item, &doc);
+
+        let slice = "growlight/backlog/milestones/roadeye-m2-daemon-core/slices/999-late.md";
+        hand_write(garden.path(), slice, "# Added after the dry run\n");
+        refused(migrate_args(&expect, true), "slice doc added");
+        std::fs::remove_file(garden.path().join(slice)).unwrap();
+
+        let mut args = migrate_args(&expect, true);
+        args["batons"]["baton.md"] = serde_json::json!("moved since the dry run\n");
+        refused(args, "baton moved");
+
+        assert_eq!(snapshot_version(&daemon), expect, "put back, the snapshot is the dry run's");
+        migrate_apply(&daemon, migrate_args(&expect, true)).unwrap();
+    }
+
+    /// Report 128: the apply reads the backlog as the redacted view serves it,
+    /// so a `> Fleet: no` inside a sealed region refuses the plan instead of
+    /// migrating as `fleet = true` off the region's base64 ciphertext.
+    #[test]
+    fn migrate_apply_refuses_a_doc_whose_hold_sits_in_a_sealed_region() {
+        use base64::Engine as _;
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_legacy(&daemon, garden.path());
+        let rel = "growlight/backlog/milestones/roadeye-m2-daemon-core/CLAUDE.md";
+        let session = daemon.inner.lock().unwrap().layer_b.session().unwrap();
+        let ct = session.encrypt_layer_b_region(rel, "h", b"> Fleet: no").unwrap();
+        let region = base64::engine::general_purpose::STANDARD.encode(ct);
+        hand_write(garden.path(), rel, &format!("# roadeye\n\n<vault id=\"h\">{region}</vault>\n"));
+        let at = commit_count(&daemon);
+        let expect = snapshot_version(&daemon);
+
+        let (kind, msg) = migrate_apply(&daemon, migrate_args(&expect, true)).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadArgs, "{msg}");
+        assert!(msg.starts_with("not_applicable: 1 refusal(s)"), "{msg}");
+        assert_eq!(commit_count(&daemon), at);
+        assert!(!garden.path().join(QUEUE_FILE).exists());
+    }
+
+    /// A due restack `r` archived, with one live entry `a` left on the list.
+    fn seed_due_restack(daemon: &Daemon) {
+        let mut restack = entry("r", Lane::Urgent, EntryStatus::Active);
+        restack.kind = EntryKind::Restack;
+        restack.branch = String::new();
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.base = "abc123".to_string();
+        seed_queue_rows(daemon, vec![restack, a]);
+        set_status(daemon, "r", None, "done").expect("restack done");
+    }
+
+    fn settle(
+        daemon: &Daemon,
+        entries: serde_json::Value,
+        settled: &[&str],
+    ) -> Result<serde_json::Value, (ErrorKind, String)> {
+        queue_v2_re_record_bases(daemon, serde_json::json!({ "entries": entries, "settled": settled }))
+    }
+
+    #[test]
+    fn re_record_writes_the_bases_and_settles_the_row_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        settle(&daemon, serde_json::json!([{ "entry": "a", "base": "111aaa" }]), &["r"])
+            .expect("re-record");
+
+        assert_eq!(commit_count(&daemon), before + 1, "one commit for both files");
+        let (queue, archive) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].base, "111aaa");
+        assert!(!archive.entries[0].re_record_due);
+    }
+
+    /// A pass that found nothing to move still answers the row, or it would
+    /// retry forever; repeating that answer changes nothing.
+    #[test]
+    fn re_record_settles_with_no_bases_and_a_repeat_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        settle(&daemon, serde_json::json!([]), &["r"]).expect("settle");
+        assert_eq!(commit_count(&daemon), before + 1);
+        assert!(!loaded_queue(&daemon).1.entries[0].re_record_due);
+
+        settle(&daemon, serde_json::json!([]), &["r"]).expect("repeat");
+        assert_eq!(commit_count(&daemon), before + 1, "no commit for a no-op");
+    }
+
+    #[test]
+    fn re_record_refuses_an_unknown_settled_row_and_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_due_restack(&daemon);
+        let before = commit_count(&daemon);
+
+        let err = settle(&daemon, serde_json::json!([{ "entry": "a", "base": "111aaa" }]), &["ghost"])
+            .unwrap_err();
+
+        assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
+        assert_eq!(loaded_queue(&daemon).0.entries[0].base, "abc123");
     }
 }

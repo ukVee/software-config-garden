@@ -54,6 +54,7 @@ fn rides_out_a_restart_by_reconnecting() {
         budget: Duration::from_secs(3),
         initial_backoff: Duration::from_millis(20),
         max_backoff: Duration::from_millis(60),
+        ..RetryPolicy::default()
     };
     let req = Request::new("add_note", json!({}));
     let resp = call_reconnecting(&sock, &req, policy).expect("should reconnect and succeed");
@@ -105,6 +106,7 @@ fn post_send_drop_is_surfaced_not_blindly_retried() {
         budget: Duration::from_secs(2),
         initial_backoff: Duration::from_millis(20),
         max_backoff: Duration::from_millis(60),
+        ..RetryPolicy::default()
     };
     let req = Request::new("add_backlog_item", json!({}));
     let err = call_reconnecting(&sock, &req, policy)
@@ -128,6 +130,7 @@ fn unreachable_keeperd_yields_a_clear_bounded_error() {
         budget: Duration::from_millis(200),
         initial_backoff: Duration::from_millis(20),
         max_backoff: Duration::from_millis(50),
+        ..RetryPolicy::default()
     };
     let req = Request::new("set_item_status", json!({}));
 
@@ -150,4 +153,74 @@ fn unreachable_keeperd_yields_a_clear_bounded_error() {
     // Respects the ~200ms budget (ECONNREFUSED returns instantly, so the only
     // wall-clock is the backoff sleeps).
     assert!(elapsed < Duration::from_secs(2), "exceeded budget: {elapsed:?}");
+}
+
+/// Report 179: `budget` only bounds the reconnect loop; a peer that accepts
+/// and never replies is bounded by `call_timeout` and surfaces as an
+/// `Ambiguous` timeout, not a 30 s stall.
+#[test]
+fn a_peer_that_accepts_and_never_replies_times_out_at_call_timeout() {
+    let sock = unique_socket();
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_secs(3)); // hold it open, say nothing
+        drop(stream);
+    });
+
+    let policy = RetryPolicy {
+        budget: Duration::from_millis(600),
+        call_timeout: Duration::from_millis(300),
+        ..RetryPolicy::default()
+    };
+    let start = Instant::now();
+    let err = call_reconnecting(&sock, &Request::new("queue_live", json!(null)), policy)
+        .expect_err("a silent peer must not hang the caller");
+    let elapsed = start.elapsed();
+
+    match &err {
+        ReconnectError::Ambiguous { source, .. } => {
+            assert!(source.is_timeout(), "expected a timeout, got {source:?}")
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+    assert!(elapsed < Duration::from_secs(2), "held the caller {elapsed:?}");
+    server.join().unwrap();
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// A per-read timeout never fires on a peer that dribbles one byte at a time;
+/// the call deadline covers the whole reply line.
+#[test]
+fn a_peer_that_dribbles_a_reply_is_cut_off_at_the_call_deadline() {
+    let sock = unique_socket();
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request_line(&mut stream);
+        for _ in 0..40 {
+            if stream.write_all(b" ").and_then(|_| stream.flush()).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let policy = RetryPolicy {
+        budget: Duration::from_millis(600),
+        call_timeout: Duration::from_millis(300),
+        ..RetryPolicy::default()
+    };
+    let start = Instant::now();
+    let err = call_reconnecting(&sock, &Request::new("queue_live", json!(null)), policy)
+        .expect_err("a dribbling peer must hit the deadline");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(&err, ReconnectError::Ambiguous { source, .. } if source.is_timeout()),
+        "expected an Ambiguous timeout, got {err:?}"
+    );
+    assert!(elapsed < Duration::from_millis(1500), "held the caller {elapsed:?}");
+    server.join().unwrap();
+    let _ = std::fs::remove_file(&sock);
 }

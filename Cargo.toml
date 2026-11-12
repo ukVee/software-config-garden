@@ -19,6 +19,7 @@ members = [
     "crates/softfig-tui",
     "crates/softfig-deploy",
     "crates/softfig-net",
+    "crates/softfig-telemetry",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ softfig-growlight-gui = { path = "crates/softfig-growlight-gui" }
 softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }
 softfig-net     = { path = "crates/softfig-net" }
+softfig-telemetry = { path = "crates/softfig-telemetry" }
 
 # Crypto
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }

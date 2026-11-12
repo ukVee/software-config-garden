@@ -25,7 +25,7 @@ softfig-growlightd-client.workspace = true
 # a transitive bloom.
 softfig-growlightd.workspace = true
 softfig-onboard.workspace = true
-softfig-deploy.workspace = true
+softfig-telemetry.workspace = true
 clap.workspace = true
 hostname.workspace = true
 rpassword.workspace = true
@@ -45,3 +45,5 @@ softfig-keeperd.workspace = true
 # claude-login-switcher: isolate the HOME-rooted filesystem tests in a temp
 # directory. Dev-only — prod uses hand-rolled sibling tempfiles.
 tempfile.workspace = true
+# token-telemetry slice 005: the ingest test reads the rows back.
+rusqlite.workspace = true

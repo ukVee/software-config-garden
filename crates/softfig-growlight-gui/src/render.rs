@@ -179,6 +179,8 @@ mod tests {
             cargo_build_jobs: Some(2),
             memory_high: Some("3G".into()),
             cpu_weight: Some(50),
+            cpu_quota: None,
+            test_threads: None,
         };
         assert_eq!(build_caps_line(&caps), "caps: jobs 2 · mem 3G · cpu 50");
         assert_eq!(

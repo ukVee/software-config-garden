@@ -47,13 +47,14 @@ pub use member_verbs::{
 #[cfg(test)]
 pub(crate) use v2::write::tests::unlocked;
 pub use queue_verbs::{
-    queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_insert, slice_update,
+    queue_add_entry, queue_add_project, queue_drop, queue_set_project_repo, queue_update_entry, queue_v2_enqueue_restack,
+    slice_insert, slice_update,
 };
 pub use reports::{file_report, list_reports, update_report};
 pub use set_resources::growlight_set_resources;
 pub use v2::{
-    queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups, queue_v2_session_log,
-    queue_v2_set_status,
+    queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups,
+    queue_v2_migrate_apply, queue_v2_re_record_bases, queue_v2_session_log, queue_v2_set_status,
 };
 
 use softfig_vcs::Intent;

@@ -92,3 +92,17 @@ sessions.
 Every row also had `time_idle` set (`idle_outcome` `succeeded`, or `failed` for the error
 run) at most 20 ms after the run's last streamed line. That idle marker is what the ledger
 waits for before trusting the totals.
+
+## claude stream-json fixture (hand-built)
+
+`claude-assistant-usage-run.jsonl` lives in `crates/softfig-telemetry/tests/fixtures/`
+since slice 005 moved the claude fold there; growlightd's tests read it from that path. It
+is **not** a capture. It was built for
+token-telemetry-p1 slice 004 from the keys slice 001 verified against a live claude
+transcript, and nothing else: `session_id`, `parent_tool_use_id`,
+`message.{id, model, stop_reason, content[], usage}`, and `usage.{input_tokens,
+output_tokens, output_tokens_details.thinking_tokens, cache_read_input_tokens,
+cache_creation_input_tokens, cache_creation.{ephemeral_5m_input_tokens,
+ephemeral_1h_input_tokens}, speed}`. One response (`msg_01`) is split over two
+`assistant` events, the later one carrying the complete usage, so the capture must
+yield one row for it. Replace it with a real capture when one is taken.

@@ -11,6 +11,7 @@ mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_shared_subtree;
+mod cmd_telemetry;
 mod cmd_vault;
 mod growlight_backend;
 mod opencode_catalog;
@@ -91,6 +92,11 @@ enum Cmd {
     /// (`~/.local/share/softfig/claude-profiles/`); `home` is the default.
     #[command(name = "claude-login", subcommand)]
     ClaudeLogin(cmd_claude_login::ClaudeLoginCmd),
+
+    /// Token telemetry (spec-token-telemetry). `ingest-transcript` is the
+    /// semi-auto capture point, run from claude's `SessionEnd` hook.
+    #[command(subcommand)]
+    Telemetry(cmd_telemetry::TelemetryCmd),
 }
 
 #[derive(Args, Debug)]
@@ -122,5 +128,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
         Cmd::ClaudeLogin(cmd) => cmd_claude_login::run(cmd),
+        Cmd::Telemetry(cmd) => cmd_telemetry::run(cmd),
     }
 }

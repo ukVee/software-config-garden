@@ -16,6 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 # The session-context tests render against a real (temporary) garden + memory dir.

@@ -18,6 +18,7 @@ use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
+use crate::queue_v2_view::{HumanStatus, StatusTarget, V2Action, V2RowKind};
 use softfig_protocol_keeperd::{human_age_secs, DeployAction};
 
 /// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
@@ -156,6 +157,22 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ),
         Overlay::DeployForce { error } => {
             render_deploy_force(f, error.as_deref(), &mut hits, area)
+        }
+        Overlay::QueueConfirm {
+            action,
+            preview,
+            error,
+        } => render_queue_confirm(f, action, preview, error.as_deref(), &mut hits, area),
+        Overlay::QueueStatusPick {
+            target,
+            current,
+            selected,
+        } => render_queue_status_pick(f, target, current, *selected, &mut hits, area),
+        Overlay::QueueEditAfter { buf, entry, error } => {
+            render_queue_edit_after(f, entry, buf, error.as_deref(), &mut hits, area)
+        }
+        Overlay::QueueDrop { buf, entry, error } => {
+            render_queue_drop(f, entry, buf, error.as_deref(), &mut hits, area)
         }
         Overlay::AddShare { mount_path, error } => {
             render_add_share(f, mount_path, error.as_deref(), &mut hits, area)
@@ -422,8 +439,13 @@ fn render_body(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             render_shares_detail(f, app, cols[1]);
         }
         View::Growlight => {
-            render_growlight(f, app, hits, cols[0]);
-            render_growlight_detail(f, app, hits, cols[1]);
+            if app.growlight_v2_view {
+                render_growlight_v2(f, app, hits, cols[0]);
+                render_growlight_v2_detail(f, app, hits, cols[1]);
+            } else {
+                render_growlight(f, app, hits, cols[0]);
+                render_growlight_detail(f, app, hits, cols[1]);
+            }
         }
         View::Coordination => {
             render_coordination(f, app, hits, cols[0]);
@@ -1443,6 +1465,314 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, area
         &mut app.preview_total,
         hits,
     );
+}
+
+/// Left pane of the Growlight section's queue-v2 two-lane view (slice 007):
+/// the urgent lane first, then the normal lane, then the collapsed archive —
+/// each entry showing status + project + `after` links, milestones expanding to
+/// their slice list. `v` toggles back to the legacy backlog tree.
+fn render_growlight_v2(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
+    let Some(reply) = &app.growlight_queue_v2 else {
+        let list = List::new(vec![ListItem::new("(queue-v2 list not loaded)")])
+            .block(Block::default().borders(Borders::ALL).title("queue v2"));
+        f.render_widget(list, area);
+        return;
+    };
+    let rows = app.growlight_v2.rows(reply);
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new("(queue-v2 list is empty)")]
+    } else {
+        rows.iter()
+            .map(|r| {
+                let indent = "  ".repeat(r.depth);
+                let marker = if r.expandable {
+                    if r.expanded { "- " } else { "+ " }
+                } else {
+                    "  "
+                };
+                let lane = match r.kind {
+                    V2RowKind::Urgent => "U ",
+                    V2RowKind::Normal => "N ",
+                    _ => "  ",
+                };
+                let style = Style::default().fg(growlight_status_color(&r.status));
+                ListItem::new(Line::styled(
+                    format!("{indent}{lane}{marker}{:<14} {}", r.status, r.label),
+                    style,
+                ))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !rows.is_empty() {
+        st.select(Some(app.growlight_v2.selected.min(rows.len() - 1)));
+    }
+    *st.offset_mut() = hit::list_window(
+        rows.len(),
+        app.growlight_v2.selected,
+        pane_inner(area).height as usize,
+    );
+    let title = format!("queue v2 — {} row(s)  (v back to backlog)", rows.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::GrowlightV2,
+        rows.len(),
+        rows.len(),
+        app.growlight_v2.selected,
+    );
+}
+
+/// Right pane of the queue-v2 view: the fleet header strip above the selected
+/// row's detail (entry fields + session log, or a slice's status).
+fn render_growlight_v2_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(area);
+    render_growlight_header(f, app, rows[0]);
+    let (title, content) = app.v2_detail_view();
+    render_scroll_body(
+        f,
+        rows[1],
+        &content,
+        &title,
+        &mut app.preview_scroll,
+        &mut app.preview_viewport,
+        &mut app.preview_total,
+        hits,
+    );
+}
+
+/// Pick a human status for one entry or slice. Each option carries a line on
+/// what it does, because `done` on an entry archives it.
+fn render_queue_status_pick(
+    f: &mut Frame,
+    target: &StatusTarget,
+    current: &str,
+    selected: usize,
+    hits: &mut HitMap,
+    area: Rect,
+) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ", target.describe()),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(format!("(now: {current})")),
+        ]),
+        Line::raw(""),
+    ];
+    for (i, status) in HumanStatus::ALL.iter().enumerate() {
+        let style = if i == selected { sel_style() } else { Style::default() };
+        lines.push(Line::styled(
+            format!(
+                "{} {} {:<9} {}",
+                if i == selected { ">" } else { " " },
+                i + 1,
+                status.word(),
+                target.hint(*status)
+            ),
+            style,
+        ));
+    }
+    lines.push(Line::raw(""));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("1 queued", hit::key(KeyCode::Char('1'))),
+            ("2 blocked", hit::key(KeyCode::Char('2'))),
+            ("3 deferred", hit::key(KeyCode::Char('3'))),
+            ("4 done", hit::key(KeyCode::Char('4'))),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("set status"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// Confirm a §6.9 mutating action: show the dry-run `view` (capped) and ask y/n.
+fn render_queue_confirm(
+    f: &mut Frame,
+    action: &V2Action,
+    preview: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
+    let rect = centered_rect(80, 60, area);
+    f.render_widget(Clear, rect);
+    let mut preview_lines: Vec<&str> = preview.lines().collect();
+    let truncated = preview_lines.len() > 18;
+    if truncated {
+        preview_lines.truncate(18);
+    }
+    let mut lines: Vec<Line> = vec![
+        Line::raw("Apply this queue-v2 change?"),
+        Line::styled(
+            format!("{}  →  {}", action.op(), action.target()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(action.change()),
+        Line::raw(""),
+        Line::styled(
+            "dry-run result (the list as it would be):",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    for l in preview_lines {
+        lines.push(Line::raw(l.to_string()));
+    }
+    if truncated {
+        lines.push(Line::styled(
+            "… (preview truncated)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y apply", "n cancel"));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("queue v2 — confirm"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// Collect the comma-separated `after` link list (`a`).
+fn render_queue_edit_after(
+    f: &mut Frame,
+    entry: &str,
+    buf: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
+    let rect = centered_rect(75, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "entry: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(entry.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "after: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(buf.to_string()),
+        ]),
+        Line::styled(
+            "  (comma-separated ids; empty clears the links)",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Replace the entry's `after` links — a linked entry waits for every id to be archived `done`.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter edit", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("edit links"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// Collect the `--reason` for a `queue_drop` (`d`).
+fn render_queue_drop(
+    f: &mut Frame,
+    entry: &str,
+    buf: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
+    let rect = centered_rect(75, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "entry: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(entry.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "reason: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(buf.to_string()),
+        ]),
+        Line::styled(
+            "  (why the work is abandoned — recorded on the archived row)",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Drops the entry to the archive as `dropped`; a live `after` naming it refuses the drop.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter drop", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("drop entry"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
 }
 
 /// The always-visible fleet header strip. Slice 003 renders live growlightd
@@ -2921,7 +3251,7 @@ fn render_help(f: &mut Frame, hits: &mut HitMap, area: Rect) {
 soft-fig TUI — keys
 
   1-7          Browse / History / Vault / Peers / Backup / Deploy / Shares
-  8 9          growlight (read-only, when enabled) · coordination (turns · states · conflicts)
+  8 9          growlight (when enabled) · coordination (turns · states · conflicts)
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -2945,6 +3275,10 @@ soft-fig TUI — keys
   m            open the floating action menu (same as the ☰ button)
   ?            this help
   q            quit
+  v            growlight: switch to the v2 two-lane queue (when queue.toml exists)
+  K J          growlight v2: move the selected entry or slice up / down
+  s            growlight v2: status picker for the selected entry or slice
+  t a d        growlight v2: toggle lane · edit `after` links · drop an entry
 
 command palette runs actions: log_decision, log_incident,
 archive, add_project, refresh_snapshot, propose, seal, unseal,

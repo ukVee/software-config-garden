@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -13,12 +13,17 @@ use softfig_growlightd::baton_store::{runtime_entries_dir, FsEntryBatonStore};
 use softfig_growlightd::claim::KeeperdV2Keeper;
 use softfig_growlightd::fleet::garden_tag;
 use softfig_growlightd::member_handoff::HandoffSeams;
+use softfig_growlightd::singleton::InstanceLock;
+use softfig_growlightd::telemetry_capture::TelemetrySink;
 use softfig_growlightd::{
     garden_root_via_keeperd, load_fleet_config, reconcile_on_boot, spawn_bus_tailer, spawn_fleet,
     BusEmit, Daemon, GrowlightdConfig, KeeperdBusEmit, KeeperdBusSource, KeeperdItemResumer,
     KeeperdResourcePersister, NotifyEvent, Policy, BUS_POLL_MS,
 };
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
+use softfig_telemetry::{
+    default_db_path, FlushHandle, FlushPolicy, Flusher, NullRecorder, PriceTable, RingRecorder, Store,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,6 +53,13 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // One growlightd per socket, decided before anything else: `Daemon::start`
+    // unlinks and re-binds the socket and `reconcile_on_boot` requeues every
+    // `active` entry it sees no holder for, so a second instance must not get as
+    // far as either (review 061 F3). The kernel drops the lock on any exit.
+    let socket = cli.socket.unwrap_or_else(growlightd_runtime_socket_path);
+    let _instance_lock = InstanceLock::acquire(&socket)?;
+
     // Derive the garden root the same way `softfig growlight start` does — a
     // read-only keeperd `status`, never a literal path (spec §2/§12). An
     // explicit `--garden-root` short-circuits it.
@@ -58,7 +70,6 @@ fn main() -> Result<()> {
             .context("deriving garden root from keeperd")?,
     };
 
-    let socket = cli.socket.unwrap_or_else(growlightd_runtime_socket_path);
     let mut policy = Policy::default();
     if let Some(n) = cli.max_concurrent_agents {
         policy.max_concurrent_agents = n;
@@ -115,11 +126,24 @@ fn main() -> Result<()> {
     // synchronously here, so the reset always completes before the loop's first
     // `pick()`. Two steps: SIGKILL stray `growlight-agent-*.scope` units from a prior
     // generation, then reset every orphaned-`active` item (no live holder exists
-    // post-restart) to `queued` so the scheduler can re-pick it. Gate off ⇒ skipped,
+    // post-restart) to `queued` so the scheduler can re-pick it — under
+    // `queue = "v2"` that includes every `active` entry of `queue.toml` (report
+    // 172), which the legacy snapshot never held. Gate off ⇒ skipped,
     // so growlightd stays byte-identical to today when disarmed.
     if fleet_config.enabled {
-        reconcile_on_boot(&keeperd_socket);
+        reconcile_on_boot(&keeperd_socket, &garden_root, fleet_config.queue);
     }
+
+    // Token telemetry (token-telemetry-p1 slice 004): installed before
+    // `spawn_fleet`, because the backends take their sink at assembly. Armed
+    // fleet only, so a disarmed growlightd opens no db.
+    let telemetry_flush = if fleet_config.enabled {
+        let (sink, flush) = start_telemetry(&garden_root);
+        handle.daemon.set_telemetry(sink);
+        flush
+    } else {
+        None
+    };
 
     let drive_loop = spawn_fleet(&handle.daemon, &fleet_config, &keeperd_socket)
         .context("spawning the live fleet drive loop")?;
@@ -232,5 +256,48 @@ fn main() -> Result<()> {
     if let Some(drive) = drive_loop {
         let _ = drive.join();
     }
+    // After the drive loop, so the rows its last spawns recorded are flushed.
+    // The counts go to the journal: the one place a rotted db, an overflowed
+    // ring or a failed batch shows up without opening the db.
+    if let Some(flush) = telemetry_flush {
+        let s = flush.shutdown();
+        eprintln!(
+            "softfig-growlightd: telemetry: {} row(s) in {} batch(es), {} failed; {} dropped by the ring; {} rolled up in {} sweep(s)",
+            s.rows_written, s.batches, s.failed_batches, s.dropped, s.rolled, s.sweeps
+        );
+    }
     Ok(())
+}
+
+/// The fleet's telemetry sink and the thread flushing it into the Layer-1 db.
+/// Telemetry never stops the daemon: no db (no state dir, an open or spawn
+/// failure) logs once and records into a [`NullRecorder`], and a missing or
+/// bad `config/pricing.toml` logs once and leaves every row unpriced.
+fn start_telemetry(garden_root: &Path) -> (TelemetrySink, Option<FlushHandle>) {
+    let prices = match PriceTable::load(garden_root) {
+        Ok(table) => Some(Arc::new(table)),
+        Err(e) => {
+            eprintln!("softfig-growlightd: telemetry: no price table, rows stay unpriced: {e}");
+            None
+        }
+    };
+    let flushing = default_db_path()
+        .context("no state dir for the telemetry db")
+        .and_then(|path| Store::open(&path).with_context(|| format!("opening {}", path.display())))
+        .and_then(|store| {
+            let ring = RingRecorder::new();
+            let flush = Flusher::spawn(store, ring.clone(), FlushPolicy::default())
+                .context("spawning the telemetry flush thread")?;
+            Ok((ring, flush))
+        });
+    match flushing {
+        Ok((ring, flush)) => (
+            TelemetrySink { recorder: Arc::new(ring), prices },
+            Some(flush),
+        ),
+        Err(e) => {
+            eprintln!("softfig-growlightd: telemetry: recording nothing: {e:#}");
+            (TelemetrySink { recorder: Arc::new(NullRecorder), prices }, None)
+        }
+    }
 }
