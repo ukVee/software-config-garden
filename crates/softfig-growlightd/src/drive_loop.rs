@@ -1362,6 +1362,10 @@ pub struct TickReport {
     /// growlightd alerts once, so an item lands here on the tick its block is
     /// first seen, not every tick it persists.
     pub v2_walk_blocked: Vec<String>,
+    /// A v2 tick whose snapshot read gave nothing (absent, torn, unreadable).
+    /// The standing park and walk-block sets were not reconciled, so `dispatch`
+    /// keeps their identities but pages none of them (review 061 F5).
+    pub v2_read_failed: bool,
     /// Restacks withheld because a stack branch tracks an upstream (V1): the
     /// loop never rewrites a pushed branch, so the human is alerted instead.
     pub v2_restack_blocked: Vec<String>,
@@ -3427,6 +3431,11 @@ impl DriveLoop {
                         }
                     }
                 }
+            } else {
+                // No snapshot (absent, torn, unreadable): the standing park and
+                // walk-block sets below could not be reconciled this tick, so
+                // `dispatch` must not page from them (review 061 F5).
+                report.v2_read_failed = true;
             }
         } else {
         // Read this tick's queue snapshot ONCE, before the re-roll: BOTH the
@@ -4202,7 +4211,16 @@ impl DriveLoop {
         }
         // Every tick, like the legacy parked set: the dispatcher's ladder keeps a
         // standing park to one page per window, and a re-block pages afresh.
+        //
+        // A tick with no snapshot (F5) pages no STANDING identity: the sets were
+        // not reconciled, so a block the human resolved meanwhile would page on
+        // the ladder. Their identities stay in `reconcile_blocked` above, so a
+        // block that is still standing after the outage does not page afresh.
+        // A park made this tick (`v2_parked`) is new, not stale, and pages.
         for (entry, spin) in &self.v2_parks {
+            if report.v2_read_failed && !report.v2_parked.iter().any(|a| &a.entry == entry) {
+                continue;
+            }
             let event = match *spin {
                 Some((sessions, dirty)) => NotifyEvent::SpinGuardParked {
                     item: entry.clone(),
@@ -4221,6 +4239,9 @@ impl DriveLoop {
         // §2: a walk stopped at a human-`blocked` item (review R3), standing so
         // the ladder reminds and an un-block then re-block pages again.
         for at in self.v2_walk_blocked.values() {
+            if report.v2_read_failed {
+                break;
+            }
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: at.clone() }, now);
         }
@@ -10498,6 +10519,105 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(alert_lines(&probe).len(), 1, "once inside the 30-minute window");
         loop_.tick(1900);
         assert_eq!(alert_lines(&probe).len(), 2, "the first reminder lands at 30 minutes");
+    }
+
+    /// Review 061 F5 — a snapshot read that fails freezes the standing park set,
+    /// and dispatch used to keep paging it on the 071 ladder: a block the human
+    /// resolved during the outage re-paged at 30 minutes and 2 hours. Now the
+    /// outage is quiet, the resolved block is forgotten at the next good read,
+    /// and a re-block after recovery pages exactly once.
+    #[test]
+    fn a_v2_snapshot_outage_does_not_replay_a_resolved_park_page() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("f5-outage");
+        let human = "growlightd alert: `m1` is blocked on a human decision".to_string();
+        let snapshot = |status| v2_milestone("m1", status, "001", None);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(100).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        loop_.tick(101);
+        assert_eq!(alert_lines(&probe), vec![human.clone()]);
+
+        // queue.toml goes unparseable for over two hours. The ladder's 30-minute
+        // and 2-hour reminders must not fire from the frozen set.
+        source.failed.store(true, Ordering::SeqCst);
+        for now in [200, 1900, 3600, 7400] {
+            assert!(loop_.tick(now).v2_read_failed, "tick {now} read no snapshot");
+        }
+        assert_eq!(alert_lines(&probe), vec![human.clone()], "an outage pages nothing");
+
+        // The human resolved the block meanwhile; the next good read forgets it.
+        source.set(snapshot(EntryStatus::Queued));
+        let recovered = loop_.tick(7500);
+        assert!(!recovered.v2_read_failed);
+        assert!(loop_.v2_parks.is_empty(), "the resolved park left with the block");
+        assert_eq!(alert_lines(&probe).len(), 1, "recovery pages nothing either");
+
+        // A re-block after recovery is a new incident and pages once.
+        source.set(snapshot(EntryStatus::Active));
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(7600).v2_parked.len(), 1);
+        source.set(snapshot(EntryStatus::Blocked));
+        loop_.tick(7601);
+        assert_eq!(alert_lines(&probe), vec![human.clone(), human]);
+    }
+
+    /// Review 061 F5 — the same for a walk stopped at a blocked slice: the
+    /// standing `v2_walk_blocked` set does not page through an outage.
+    #[test]
+    fn a_v2_snapshot_outage_does_not_replay_a_walk_block_page() {
+        let blocked = || {
+            let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+            snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Blocked;
+            snapshot
+        };
+        let source = FakeV2Source::with(blocked());
+        let (mut loop_, _d, _backend, probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            v2_entries_dir("f5-walk"),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let walk = "growlightd alert: `m1:001` is blocked on a human decision".to_string();
+
+        loop_.tick(100);
+        assert_eq!(alert_lines(&probe), vec![walk.clone()]);
+        source.failed.store(true, Ordering::SeqCst);
+        for now in [1900, 7400] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "an outage pages nothing");
+
+        // Resolved during the outage, re-blocked after: one fresh page.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        loop_.tick(7500);
+        source.set(blocked());
+        loop_.tick(7600);
+        assert_eq!(alert_lines(&probe), vec![walk.clone(), walk]);
+    }
+
+    /// Review 061 F5 — a park made on a tick that read no snapshot is new, not
+    /// stale: it pages once, stays quiet through the outage, and does not
+    /// page again when the next good read confirms the entry `blocked`.
+    #[test]
+    fn a_park_made_during_a_snapshot_outage_pages_once() {
+        let (mut loop_, source, backend, probe, _repo) = v2_park_page_rig("f5-park-in-outage");
+        source.failed.store(true, Ordering::SeqCst);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        assert_eq!(loop_.tick(100).v2_parked.len(), 1);
+        for now in [200, 900] {
+            loop_.tick(now);
+        }
+        assert_eq!(alert_lines(&probe).len(), 1, "paged at the park, quiet after");
+        source.set(v2_milestone("m1", EntryStatus::Blocked, "001", None));
+        loop_.tick(1000); // still inside the ladder's first 30-minute window
+        assert_eq!(alert_lines(&probe).len(), 1, "the confirming read does not re-page");
+        assert_eq!(loop_.v2_parks.len(), 1, "the park stands");
     }
 
     /// Report 169 — the v2 fallback reservation, end to end: `a` is pinned to an
