@@ -33,7 +33,7 @@
 //! ## What gets resolved here (slice 002's snapshot contract)
 //!
 //! - **`> Model:` declarations** are resolved once at assembly, per unit, via
-//!   [`item_doc_candidates`] + [`resolve_item_models`]: a slice's own doc,
+//!   [`item_doc_candidates_listed`] + [`resolve_item_models`]: a slice's own doc,
 //!   then each enclosing sub-milestone's `CLAUDE.md` innermost-first, then the
 //!   milestone's `CLAUDE.md`; a task/restack's own doc for its unit. `None` =
 //!   undeclared → the member default (§6.4). **A malformed declaration is
@@ -54,29 +54,44 @@
 //!   nesting deeper than two levels is an invalid file, refused here rather
 //!   than walked past.
 //!
-//! ## Each file once per tick
+//! ## Each file and folder once per assembly
 //!
-//! One assembly reads each file at most once ([`Reads`]): a milestone's
-//! `CLAUDE.md` closes every undeclared slice's chain and the close-out's, so
-//! a per-unit read would fetch it once per slice through FUSE. Nothing is
-//! kept between calls. The mount stamps every `stat` with the current time
-//! (`softfig-fuse`'s `attr_for_path`), so an mtime key would never match
-//! there, and a cache held across ticks could only serve a stale file. The
-//! mount already keeps decrypted bytes per tip; what one tick saves is the
-//! repeated round-trips. The drive loop reads the source once per tick and
-//! shares the result between its passes.
+//! One assembly reads each file at most once and lists each folder at most
+//! once ([`Reads`]): a milestone's `CLAUDE.md` closes every undeclared slice's
+//! chain and the close-out's, and every slice of a milestone looks its doc up
+//! in the same `slices/` folder, so a per-unit read or listing would fetch the
+//! same thing once per slice through FUSE. Before listings were memoized too,
+//! a 50-milestone, 244-slice backlog listed ~285 folders a tick, and the
+//! mount's full-view `readdir` turned that into keeperd's FUSE thread at ~42 %
+//! of the only core (report 185).
+//!
+//! ## Reused while keeperd's tip stands still
+//!
+//! Across ticks, [`V2Source`] keeps its last good load and serves it again
+//! while keeperd reports the same garden tip ([`TipProbe`]). Every v2 file and
+//! doc is committed garden content, so an unchanged tip means unchanged
+//! input; an idle garden then costs one `status` round-trip a tick instead of
+//! a few hundred reads. A hand edit through the mount reaches the source once
+//! keeperd commits it (its 200 ms quiet window). Without a tip — keeperd
+//! unreachable, slow, or locked — the source assembles every tick as before.
+//! The tip is read *before* assembling, so a commit landing mid-assembly
+//! keys the result to the older tip and the next tick re-reads.
 //!
 //! ## What is deliberately not here
 //!
 //! No scheduling (slice 002), no keeperd socket, and no wiring into the drive
 //! loop — that is slice 006, behind the §11 switch. This module exists so
-//! slice 006 just plugs a `V2Source` in.
+//! slice 006 just plugs a `V2Source` in. The tip it reuses on comes through
+//! the [`TipProbe`] seam; the keeperd-backed probe lives with the other
+//! `status` query, in [`crate::handshake`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use softfig_ipc::model_choice::{item_doc_candidates, resolve_item_models, ModelList};
+use softfig_ipc::model_choice::{
+    item_doc_candidates_listed, read_dir_names, resolve_item_models, ModelList,
+};
 use softfig_ipc::queue_v2::{
     slices_file, sub_depth, EntryKind, FinalStatus, QueueArchiveToml, QueueRefusal, QueueToml,
     QueueV2Error, SliceKind, SlicesToml, QUEUE_ARCHIVE_FILE, QUEUE_FILE,
@@ -177,10 +192,17 @@ pub enum V2Load {
     Failed { error: V2SourceError, alert: bool },
 }
 
-/// The live v2 source: [`assemble`] the snapshot from the mount each tick,
-/// with the in-memory alert-once state. Constructed by the drive loop (slice
-/// 006) with the garden root; `load` takes `&mut self` because it owns the
-/// alert memory.
+/// Where [`V2Source`] learns whether the garden moved since its last load:
+/// the tip hash keeperd reports, or `None` when it cannot be had in time.
+pub trait TipProbe: Send + Sync + fmt::Debug {
+    fn tip(&self) -> Option<String>;
+}
+
+/// The live v2 source: [`assemble`] the snapshot from the mount, with the
+/// in-memory alert-once state, reusing the last good load while the garden
+/// tip stands still (module docs). Constructed by the drive loop (slice 006)
+/// with the garden root; `load` takes `&mut self` because it owns the alert
+/// memory and the kept load.
 #[derive(Debug)]
 pub struct V2Source {
     garden_root: PathBuf,
@@ -190,6 +212,11 @@ pub struct V2Source {
     /// `QueueV2Error` carries a `toml` error) — and the rendered form is the
     /// same deterministic identity two ticks of one broken file share.
     last_error: Option<String>,
+    /// `None` = no probe: assemble every tick.
+    tip: Option<Box<dyn TipProbe>>,
+    /// The last good load (`None` inside = `Absent`) and the tip it was read
+    /// at. A failed load keeps nothing, so a broken garden re-reads each tick.
+    kept: Option<(String, Option<V2Snapshot>)>,
 }
 
 impl V2Source {
@@ -198,20 +225,42 @@ impl V2Source {
         Self {
             garden_root,
             last_error: None,
+            tip: None,
+            kept: None,
         }
+    }
+
+    /// Reuse the last good load while `probe` reports the tip it was read at.
+    pub fn with_tip_probe(mut self, probe: Box<dyn TipProbe>) -> Self {
+        self.tip = Some(probe);
+        self
     }
 
     /// One tick's v2 read: assemble the snapshot, and apply the §3
     /// fail-closed + alert-once semantics. A `Snapshot` or `Absent` clears
     /// the error memory; a repeated `Failed` with the same error stays quiet.
     pub fn load(&mut self) -> V2Load {
+        // Before assembling: a commit that lands mid-assembly must key the
+        // result to the older tip (re-read next tick), never the newer one.
+        let tip = self.tip.as_ref().and_then(|probe| probe.tip());
+        if let (Some(tip), Some((kept_at, kept))) = (&tip, &self.kept)
+            && tip == kept_at
+        {
+            return match kept {
+                Some(snapshot) => V2Load::Snapshot(snapshot.clone()),
+                None => V2Load::Absent,
+            };
+        }
+        self.kept = None;
         match assemble(&self.garden_root) {
             Ok(Some(snapshot)) => {
                 self.last_error = None;
+                self.kept = tip.map(|tip| (tip, Some(snapshot.clone())));
                 V2Load::Snapshot(snapshot)
             }
             Ok(None) => {
                 self.last_error = None;
+                self.kept = tip.map(|tip| (tip, None));
                 V2Load::Absent
             }
             Err(error) => {
@@ -253,10 +302,11 @@ impl crate::drive_loop::V2QueueSource for V2Source {
 /// reports `NoUnit` for it (never a guessed close-out).
 pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError> {
     let mut read = |path: &Path| std::fs::read_to_string(path);
-    assemble_with(garden_root, &mut Reads::new(&mut read))
+    assemble_with(garden_root, &mut Reads::new(&mut read, &mut read_dir_names))
 }
 
-/// [`assemble`] over a given set of reads, so a test can count them.
+/// [`assemble`] over a given set of reads and listings, so a test can count
+/// them.
 fn assemble_with(
     garden_root: &Path,
     reads: &mut Reads<'_>,
@@ -442,7 +492,7 @@ fn load_tree(
 }
 
 /// Resolve a unit's chain-declared `> Model:` list (§6.4): the docs
-/// [`item_doc_candidates`] names, nearest first, read through the mount. A
+/// [`item_doc_candidates_listed`] names, nearest first, read through the mount. A
 /// candidate that cannot be read as text (e.g. a doc that does not exist) is
 /// skipped — the chain passes through it; a *malformed* declaration in a
 /// readable doc is fail-closed, because treating it as "undeclared" would
@@ -457,12 +507,12 @@ fn resolve_chain(
         Some(slice) => format!("milestone \"{item}\" slice \"{slice}\""),
         None => format!("entry \"{item}\""),
     };
-    let candidates = item_doc_candidates(garden_root, item, slice).map_err(|message| {
-        V2SourceError::InvalidModelDecl {
-            context: context.clone(),
-            message,
-        }
-    })?;
+    let candidates =
+        item_doc_candidates_listed(garden_root, item, slice, &mut |dir| reads.list(dir))
+            .map_err(|message| V2SourceError::InvalidModelDecl {
+                context: context.clone(),
+                message,
+            })?;
     let docs: Vec<(String, Option<String>)> = candidates
         .into_iter()
         .map(|path| {
@@ -514,20 +564,38 @@ struct ReadError {
     cause: String,
 }
 
-/// The reads of one [`assemble_with`] call: each path goes to `read` once,
-/// and a second ask gets the first answer, failures included, so one
-/// assembly never sees two versions of a file. Lives for one call only.
+/// The reads of one [`assemble_with`] call: each path goes to `read` once
+/// and each folder to `list` once, and a second ask gets the first answer,
+/// failures included, so one assembly never sees two versions of a file or
+/// folder. Lives for one call only.
 struct Reads<'r> {
     read: &'r mut dyn FnMut(&Path) -> std::io::Result<String>,
+    list: &'r mut dyn FnMut(&Path) -> Option<Vec<String>>,
     seen: BTreeMap<PathBuf, Result<String, ReadError>>,
+    listed: BTreeMap<PathBuf, Option<Vec<String>>>,
 }
 
 impl<'r> Reads<'r> {
-    fn new(read: &'r mut dyn FnMut(&Path) -> std::io::Result<String>) -> Self {
+    fn new(
+        read: &'r mut dyn FnMut(&Path) -> std::io::Result<String>,
+        list: &'r mut dyn FnMut(&Path) -> Option<Vec<String>>,
+    ) -> Self {
         Self {
             read,
+            list,
             seen: BTreeMap::new(),
+            listed: BTreeMap::new(),
         }
+    }
+
+    /// `dir`'s entry names, or `None` when it is not a readable folder.
+    fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
+        if let Some(answer) = self.listed.get(dir) {
+            return answer.clone();
+        }
+        let answer = (self.list)(dir);
+        self.listed.insert(dir.to_path_buf(), answer.clone());
+        answer
     }
 
     fn read(&mut self, path: &Path) -> Result<String, ReadError> {
@@ -1142,7 +1210,7 @@ mod tests {
             *asked.entry(path.to_path_buf()).or_default() += 1;
             std::fs::read_to_string(path)
         };
-        let snapshot = assemble_with(garden.root(), &mut Reads::new(&mut read))
+        let snapshot = assemble_with(garden.root(), &mut Reads::new(&mut read, &mut read_dir_names))
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.trees["m"].items[2].models, Some(list("claude")));
@@ -1173,5 +1241,104 @@ mod tests {
         };
         assert_eq!(after.trees["m"].items[0].status, SliceStatus::Active);
         assert_eq!(after.trees["m"].models, Some(list("flash")));
+    }
+
+    /// Report 185: every slice looks its doc up in the milestone's `slices/`
+    /// folder. Each folder must be listed once per assembly, not once per
+    /// slice — un-memoized, a 244-slice backlog listed ~285 folders a tick.
+    #[test]
+    fn one_assembly_lists_each_folder_once() {
+        let garden = TempGarden::new();
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+        for n in ["001-a", "002-b", "003-c"] {
+            garden.write(&format!("growlight/backlog/milestones/m/slices/{n}.md"), "# slice\n");
+        }
+
+        let mut read = |path: &Path| std::fs::read_to_string(path);
+        let mut listed: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        let mut lister = |dir: &Path| {
+            *listed.entry(dir.to_path_buf()).or_default() += 1;
+            read_dir_names(dir)
+        };
+        let snapshot = assemble_with(garden.root(), &mut Reads::new(&mut read, &mut lister))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.trees["m"].items[2].models, Some(list("claude")));
+
+        let slices = garden.root().join("growlight/backlog/milestones/m/slices");
+        assert_eq!(listed.get(&slices), Some(&1), "three slices, one listing: {listed:?}");
+        assert!(listed.values().all(|&n| n == 1), "every folder listed once: {listed:?}");
+    }
+
+    /// A tip the test moves by hand, standing in for keeperd's `status`.
+    #[derive(Debug, Clone, Default)]
+    struct FakeTip(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+    impl FakeTip {
+        fn set(&self, tip: Option<&str>) {
+            *self.0.lock().unwrap() = tip.map(str::to_string);
+        }
+    }
+    impl TipProbe for FakeTip {
+        fn tip(&self) -> Option<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn first_status(load: V2Load) -> SliceStatus {
+        match load {
+            V2Load::Snapshot(snapshot) => snapshot.trees["m"].items[0].status,
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unmoved_tip_serves_the_kept_load_and_a_moved_one_re_reads() {
+        let garden = TempGarden::new();
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+        let tip = FakeTip::default();
+        tip.set(Some("t1"));
+        let mut src = source(garden.root()).with_tip_probe(Box::new(tip.clone()));
+        assert_eq!(first_status(src.load()), SliceStatus::Queued);
+
+        // The files change but the tip does not: nothing is read, the kept
+        // load is served. (Only possible here by writing behind keeperd.)
+        three_undeclared_slices(&garden, "claude", SliceStatus::Active);
+        assert_eq!(first_status(src.load()), SliceStatus::Queued);
+
+        tip.set(Some("t2"));
+        assert_eq!(first_status(src.load()), SliceStatus::Active, "a moved tip re-reads");
+    }
+
+    #[test]
+    fn without_a_tip_every_load_re_reads() {
+        let garden = TempGarden::new();
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+        let tip = FakeTip::default();
+        tip.set(Some("t1"));
+        let mut src = source(garden.root()).with_tip_probe(Box::new(tip.clone()));
+        assert_eq!(first_status(src.load()), SliceStatus::Queued);
+
+        // keeperd unreachable or slow: no tip, so no reuse.
+        tip.set(None);
+        three_undeclared_slices(&garden, "claude", SliceStatus::Active);
+        assert_eq!(first_status(src.load()), SliceStatus::Active);
+    }
+
+    #[test]
+    fn a_failed_load_is_not_kept() {
+        let garden = TempGarden::new();
+        garden.write(QUEUE_FILE, "not toml {{{");
+        let tip = FakeTip::default();
+        tip.set(Some("t1"));
+        let mut src = source(garden.root()).with_tip_probe(Box::new(tip.clone()));
+        assert!(matches!(src.load(), V2Load::Failed { alert: true, .. }));
+        assert!(
+            matches!(src.load(), V2Load::Failed { alert: false, .. }),
+            "the alert-once memory still holds under a probe"
+        );
+
+        // Fixed behind an unmoved tip: a failure was never kept, so it re-reads.
+        three_undeclared_slices(&garden, "claude", SliceStatus::Queued);
+        assert_eq!(first_status(src.load()), SliceStatus::Queued);
     }
 }

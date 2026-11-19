@@ -104,6 +104,18 @@ decision record or crate that owns it, rather than at every internal change.
 
 ### Fixed
 
+- The garden mount's timestamps move only when content does. Every `stat` used
+  to report the current time as the mtime, so every file looked freshly modified
+  on every look and no tool could tell what changed. A write through the mount
+  now stamps the file, the commit that absorbs the write keeps that stamp, and an
+  untouched path reports the tip commit's time, which holds across daemon
+  restarts. `readdir` walks only the listed folder's subtree instead of the
+  whole garden (crate `softfig-fuse`).
+- growlightd no longer re-reads the v2 backlog every second. It keeps its last
+  good load while keeperd's tip stands still, at one `status` round-trip a tick,
+  and when it does read it lists each folder once instead of once per slice.
+  Before this, a 50-milestone, 244-slice backlog held keeperd's FUSE thread at
+  about 42 % of the core on an idle garden (growlight report 185).
 - keeperd no longer re-walks the whole commit and tree history on every 20 s
   replica sync. The served closure is built only when a host actually asks for
   an object and is kept across ticks, and so is the height the announce signs,

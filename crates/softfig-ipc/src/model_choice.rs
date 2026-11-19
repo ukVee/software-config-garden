@@ -541,13 +541,29 @@ pub fn item_doc_candidates(
     item: &str,
     slice: Option<&str>,
 ) -> Result<Vec<PathBuf>, String> {
+    item_doc_candidates_listed(garden_root, item, slice, &mut read_dir_names)
+}
+
+/// [`item_doc_candidates`] over a given directory lister: `list(dir)` names
+/// `dir`'s entries, or `None` when `dir` is not a readable directory. Every
+/// directory the lookup touches goes through it — the milestone-folder test
+/// and both numbered-doc searches — so a caller resolving many items in one
+/// pass can memoize it and list each directory once. growlightd's v2 source
+/// resolves every live slice's chain every tick; un-memoized, that listed the
+/// same `slices/` folders hundreds of times a second (report 185).
+pub fn item_doc_candidates_listed(
+    garden_root: &Path,
+    item: &str,
+    slice: Option<&str>,
+    list: &mut dyn FnMut(&Path) -> Option<Vec<String>>,
+) -> Result<Vec<PathBuf>, String> {
     let backlog = garden_root.join(BACKLOG_DIR);
     let top = item.split('/').next().unwrap_or(item);
-    if !backlog.join("milestones").join(top).is_dir() {
+    if list(&backlog.join("milestones").join(top)).is_none() {
         // A task (or restack) doc: the single file for the whole chain. A
         // restack's generated doc is numbered like a task, so the task
         // lookup covers both non-milestone shapes.
-        return Ok(find_by_number(&backlog.join("tasks"), item)?.into_iter().collect());
+        return Ok(find_by_number(list, &backlog.join("tasks"), item)?.into_iter().collect());
     }
 
     let mut candidates = Vec::new();
@@ -555,7 +571,7 @@ pub fn item_doc_candidates(
     if let Some(slice) = slice {
         let padded = format!("{:0>3}", slice.trim());
         let slices = garden_root.join(milestone_path(item)).join("slices");
-        if let Some(doc) = find_by_number(&slices, &padded)? {
+        if let Some(doc) = find_by_number(list, &slices, &padded)? {
             candidates.push(doc);
         }
     }
@@ -571,17 +587,29 @@ pub fn item_doc_candidates(
 /// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`:
 /// `Ok(None)` when there is none (or `dir` is absent), `Err` when more than one
 /// matches (see [`item_doc_candidates`]).
-fn find_by_number(dir: &Path, number: &str) -> Result<Option<PathBuf>, String> {
-    let Ok(listing) = std::fs::read_dir(dir) else {
+fn find_by_number(
+    list: &mut dyn FnMut(&Path) -> Option<Vec<String>>,
+    dir: &Path,
+    number: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(names) = list(dir) else {
         return Ok(None);
     };
-    let names: Vec<String> = listing
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
     Ok(unique_numbered(names.iter().map(String::as_str), number)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .map(|name| dir.join(name)))
+}
+
+/// The UTF-8 entry names in `dir`, or `None` when it is not a readable
+/// directory — the lister [`item_doc_candidates`] uses.
+pub fn read_dir_names(dir: &Path) -> Option<Vec<String>> {
+    let listing = std::fs::read_dir(dir).ok()?;
+    Some(
+        listing
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+    )
 }
 
 /// The one `<number>-*.md` name among `names`: `Ok(None)` when none matches,

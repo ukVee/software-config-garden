@@ -6,6 +6,7 @@
 //! referenced blob via the object store + vault session.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use softfig_store::{Db, Hash, TreeEntryKind, TreeEntryRow};
@@ -13,8 +14,10 @@ use softfig_vcs::ChainRegistry;
 
 use crate::Result;
 
-/// Materialized tree-at-tip entry.
-#[derive(Debug, Clone)]
+/// Materialized tree-at-tip entry. Two entries are equal when they name the
+/// same kind, mode and content hash — the mount's "did this path change"
+/// test across a rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub kind: EntryKind,
     pub mode: u32,
@@ -126,24 +129,31 @@ impl TreeView {
     }
 
     /// Iterate immediate children of a directory path.
+    ///
+    /// `Path` orders component-wise, so a directory's descendants sit in one
+    /// contiguous run directly after it in `by_path`. The scan walks that run
+    /// and stops at the first path outside it: a `readdir` costs the size of
+    /// the directory's subtree, not of the whole garden (it used to filter
+    /// every entry, which a client listing hundreds of directories a second
+    /// turned into a pegged FUSE thread — report 185).
     pub fn children<'a>(
         &'a self,
         dir: &'a Path,
     ) -> impl Iterator<Item = (&'a Path, &'a Entry)> + 'a {
-        self.by_path.iter().filter_map(move |(p, e)| {
-            if p == dir {
-                return None;
-            }
-            let parent = p.parent()?;
-            if parent != dir {
-                return None;
-            }
-            Some((p.as_path(), e))
-        })
+        self.by_path
+            .range::<Path, _>((Bound::Excluded(dir), Bound::Unbounded))
+            .take_while(move |(p, _)| p.starts_with(dir))
+            .filter(move |(p, _)| p.parent() == Some(dir))
+            .map(|(p, e)| (p.as_path(), e))
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &Path> + '_ {
         self.by_path.keys().map(|p| p.as_path())
+    }
+
+    /// Every `(path, entry)` in path order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Path, &Entry)> + '_ {
+        self.by_path.iter().map(|(p, e)| (p.as_path(), e))
     }
 }
 
@@ -281,5 +291,47 @@ mod tests {
         let view = TreeView::build_union(repo.db(), &ChainRegistry::device_only()).unwrap();
         assert!(view.get(Path::new("device.md")).is_some());
         assert!(view.get(Path::new("projects")).is_none());
+    }
+
+    /// The range scan answers exactly what the old full-view filter did, on
+    /// names that break a byte-order prefix scan (`a-b` and `a.txt` sort
+    /// around `a/…` bytewise, but not component-wise).
+    #[test]
+    fn children_matches_a_full_scan_on_tricky_names() {
+        let blob = |s: &str| Entry {
+            kind: EntryKind::Blob,
+            mode: 0o100644,
+            target: Hash::of(s.as_bytes()),
+        };
+        let dir = || Entry {
+            kind: EntryKind::Dir,
+            mode: 0o040755,
+            target: Hash::of(&[]),
+        };
+        let mut view = TreeView::empty();
+        for d in ["a", "a/b", "ab", "a-b", "z"] {
+            view.by_path.insert(PathBuf::from(d), dir());
+        }
+        for f in ["a/b.txt", "a/b/c.md", "a/c.md", "a.txt", "a-b/x.md", "ab/y.md", "z/a.md"] {
+            view.by_path.insert(PathBuf::from(f), blob(f));
+        }
+        let full_scan = |dir: &Path| -> Vec<PathBuf> {
+            view.by_path
+                .keys()
+                .filter(|p| p.as_path() != dir && p.parent() == Some(dir))
+                .cloned()
+                .collect()
+        };
+        for d in ["", "a", "a/b", "ab", "a-b", "z", "a/c.md", "missing"] {
+            let d = Path::new(d);
+            let got: Vec<PathBuf> = view.children(d).map(|(p, _)| p.to_path_buf()).collect();
+            assert_eq!(got, full_scan(d), "children of {d:?}");
+        }
+        let root: Vec<_> = view.children(Path::new("")).map(|(p, _)| p.to_path_buf()).collect();
+        assert_eq!(
+            root,
+            ["a", "a-b", "a.txt", "ab", "z"].map(PathBuf::from).to_vec(),
+            "component order, every top-level entry"
+        );
     }
 }

@@ -221,6 +221,14 @@ impl MountHandle {
         self.state.read_workfile(std::path::Path::new(rel))
     }
 
+    /// The mtime a `stat` of `rel` reports through the mount, or `None` when
+    /// `rel` does not resolve. It moves only when `rel`'s content does: a
+    /// staged write stamps it, the commit that absorbs the write keeps that
+    /// stamp, and an untouched path keeps its time across rotations.
+    pub fn modified_at(&self, rel: &str) -> Option<std::time::SystemTime> {
+        self.state.modified_at(std::path::Path::new(rel))
+    }
+
     /// Whether `rel` resolves to a live file or directory.
     pub fn path_exists(&self, rel: &str) -> bool {
         self.state.path_exists(std::path::Path::new(rel))

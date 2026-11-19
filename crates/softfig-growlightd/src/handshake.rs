@@ -9,9 +9,12 @@
 //! disagree on the path.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use softfig_ipc::{connect, op, ClientError, Request, StatusReply};
 use thiserror::Error;
+
+use crate::v2_source::TipProbe;
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -61,6 +64,36 @@ pub fn garden_root_via_keeperd(socket: &Path) -> Result<PathBuf, HandshakeError>
         return Err(HandshakeError::NotUnlocked { state: reply.state });
     }
     Ok(PathBuf::from(reply.garden_root))
+}
+
+/// How long a tick waits on keeperd for its tip before assembling anyway.
+/// keeperd answers `status` under the lock its commits hold, so a tick must not
+/// queue behind a slow commit (the drive-loop stall family, task 042).
+const TIP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The keeperd-backed [`TipProbe`]: one `status` round-trip per tick, bounded
+/// by [`TIP_PROBE_TIMEOUT`]. No daemon, a timeout, a garden with no tip, or a
+/// malformed reply is `None`, and the v2 source assembles as if unprobed.
+#[derive(Debug, Clone)]
+pub struct KeeperdTipProbe {
+    socket: PathBuf,
+}
+
+impl KeeperdTipProbe {
+    pub fn new(socket: PathBuf) -> Self {
+        Self { socket }
+    }
+}
+
+impl TipProbe for KeeperdTipProbe {
+    fn tip(&self) -> Option<String> {
+        let mut stream = connect(&self.socket).ok()?;
+        stream.set_read_timeout(Some(TIP_PROBE_TIMEOUT)).ok()?;
+        stream.set_write_timeout(Some(TIP_PROBE_TIMEOUT)).ok()?;
+        let req = Request::new(op::STATUS, serde_json::Value::Null);
+        let value = softfig_ipc::call(&mut stream, &req).ok()?.into_result().ok()?;
+        serde_json::from_value::<StatusReply>(value).ok()?.tip
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +167,41 @@ mod tests {
         let socket = dir.path().join("nonexistent.sock");
         let err = garden_root_via_keeperd(&socket).unwrap_err();
         assert!(matches!(err, HandshakeError::KeeperdAbsent { .. }));
+    }
+
+    #[test]
+    fn tip_probe_reads_the_tip_from_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let mut reply = status_reply("unlocked", "/g");
+        reply["tip"] = serde_json::json!("abc123");
+        let h = spawn_mock_keeperd(socket.clone(), reply);
+        assert_eq!(KeeperdTipProbe::new(socket).tip(), Some("abc123".to_string()));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn tip_probe_is_none_without_a_daemon_or_a_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(KeeperdTipProbe::new(dir.path().join("absent.sock")).tip(), None);
+
+        let socket = dir.path().join("keeperd.sock");
+        let h = spawn_mock_keeperd(socket.clone(), status_reply("unlocked", "/g"));
+        assert_eq!(KeeperdTipProbe::new(socket).tip(), None, "a garden with no tip yet");
+        h.join().unwrap();
+    }
+
+    /// A keeperd stuck behind a commit must cost the tick at most the timeout.
+    #[test]
+    fn tip_probe_gives_up_on_a_daemon_that_does_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(KeeperdTipProbe::new(socket).tip(), None);
+        let waited = started.elapsed();
+        assert!(waited >= TIP_PROBE_TIMEOUT, "it waited for an answer: {waited:?}");
+        assert!(waited < TIP_PROBE_TIMEOUT * 4, "and then gave up: {waited:?}");
+        drop(listener);
     }
 }

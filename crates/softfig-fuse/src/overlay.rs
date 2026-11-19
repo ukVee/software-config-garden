@@ -22,6 +22,12 @@
 //! absorbed the whole overlay; multi-ref rotations absorb one chain's
 //! carve-out (or, for a registry hot-swap, nothing at all).
 //!
+//! **Timestamps:** every mutation also records the wall-clock time it was
+//! staged ([`Overlay::staged_at`]). The mount reports it as the entry's
+//! mtime, and a rotation that absorbs the write carries it over to the
+//! committed path, so a file's mtime moves when it is written and not again
+//! when the commit lands.
+//!
 //! A note on `commit_workdir`'s reentrant walk: when the daemon
 //! commits, it walks `garden_root` (= the FUSE mount) which calls back
 //! into our `read` handler; we MUST serve overlay bytes there so the
@@ -30,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub enum OverlayEntry {
@@ -38,10 +45,12 @@ pub enum OverlayEntry {
     Removed,
 }
 
-/// One staged entry plus the generation of the mutation that staged it.
+/// One staged entry plus the generation and time of the mutation that staged
+/// it.
 #[derive(Debug)]
 struct Slot {
     generation: u64,
+    staged_at: SystemTime,
     entry: OverlayEntry,
 }
 
@@ -70,9 +79,22 @@ impl Overlay {
         self.by_path.get(path).map(|s| &s.entry)
     }
 
+    /// When the entry staged at `path` was last mutated, or `None` when
+    /// nothing is staged there.
+    pub fn staged_at(&self, path: &Path) -> Option<SystemTime> {
+        self.by_path.get(path).map(|s| s.staged_at)
+    }
+
     fn stage(&mut self, path: PathBuf, entry: OverlayEntry) {
         self.generation += 1;
-        self.by_path.insert(path, Slot { generation: self.generation, entry });
+        self.by_path.insert(
+            path,
+            Slot {
+                generation: self.generation,
+                staged_at: SystemTime::now(),
+                entry,
+            },
+        );
     }
 
     pub fn insert_file(&mut self, path: PathBuf, content: Vec<u8>, mode: u32) {

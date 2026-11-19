@@ -36,8 +36,9 @@ pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
     Backend, Declaration, DeclaredModels, ModelChoice, ModelList, ModelRuleError, ModelSpec,
-    item_doc_candidates, item_model_field, member_default, parse_declaration, parse_model_spec,
-    resolve_item_models, validate_declared_subset, validate_model_change,
+    item_doc_candidates, item_doc_candidates_listed, item_model_field, member_default,
+    parse_declaration, parse_model_spec, resolve_item_models, validate_declared_subset,
+    validate_model_change,
 };
 pub use proto::{ErrorKind, Request, Response};
 pub use slot_name::{validate_slot_name, SlotNameError};

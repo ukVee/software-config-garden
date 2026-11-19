@@ -78,6 +78,55 @@ pub(crate) struct Inner {
     pub(crate) tip: Option<Hash>,
     pub(crate) view: TreeView,
     pub(crate) overlay: Overlay,
+    /// When this mount last saw each committed path change — set by
+    /// [`Inner::restamp`] at every rotation. A path with no stamp has not
+    /// changed since the mount came up and reports [`Self::base_time`].
+    pub(crate) stamps: HashMap<PathBuf, SystemTime>,
+    /// The device tip's commit time when the mount came up (the mount time
+    /// when there is no tip yet): the mtime of everything not changed since.
+    pub(crate) base_time: SystemTime,
+}
+
+impl Inner {
+    /// The time the mount reports as `path`'s mtime (and atime/ctime): a
+    /// staged write's time while the overlay holds one, else when the
+    /// committed entry last changed.
+    ///
+    /// Report 185: these used to be `SystemTime::now()` on every `stat`, so
+    /// every file looked modified on every look. No mtime-keyed cache could
+    /// work against the mount, and growlightd re-read its whole backlog
+    /// every second because of it.
+    pub(crate) fn stamp(&self, path: &Path) -> SystemTime {
+        self.overlay
+            .staged_at(path)
+            .or_else(|| self.stamps.get(path).copied())
+            .unwrap_or(self.base_time)
+    }
+
+    /// Carry stamps across a rotation from `old` to the current view. A path
+    /// the overlay holds a write for takes that write's time, so the mtime a
+    /// reader saw while the write was staged stays put when the commit
+    /// absorbs it. Otherwise an unchanged entry keeps its stamp and a new or
+    /// changed one is stamped now. Paths that left the view drop theirs.
+    ///
+    /// A directory's entry carries its tree hash, so a change anywhere below
+    /// it moves its mtime too — coarser than POSIX, never stale.
+    fn restamp(&mut self, old: &TreeView) {
+        let now = SystemTime::now();
+        let mut stamps = HashMap::with_capacity(self.stamps.len());
+        for (path, entry) in self.view.iter() {
+            let stamp = match self.overlay.staged_at(path) {
+                Some(staged) => staged,
+                None if old.get(path) == Some(entry) => match self.stamps.get(path) {
+                    Some(&kept) => kept,
+                    None => continue,
+                },
+                None => now,
+            };
+            stamps.insert(path.to_path_buf(), stamp);
+        }
+        self.stamps = stamps;
+    }
 }
 
 impl SharedState {
@@ -130,7 +179,10 @@ impl SharedState {
         };
         let mut inner = self.inner.lock().unwrap();
         inner.tip = device_tip;
-        inner.view = view;
+        // Before the absorption below: a write this rotation absorbs lends
+        // its staged time to the committed path.
+        let old = std::mem::replace(&mut inner.view, view);
+        inner.restamp(&old);
         // Re-intern every path so freshly-introduced tip entries have
         // inodes ready for kernel lookups.
         for p in inner.view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
@@ -456,6 +508,14 @@ impl SharedState {
         let cipher = self.objects.get(&target)?;
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         Ok(Some(self.session.decrypt_tracked_blob(&rel_str, &cipher)?))
+    }
+
+    /// The mtime a `stat` of repo-relative `rel` reports ([`Inner::stamp`]),
+    /// or `None` when `rel` does not resolve.
+    pub(crate) fn modified_at(&self, rel: &Path) -> Option<SystemTime> {
+        let inner = self.inner.lock().unwrap();
+        entry_kind_of(&inner, rel)?;
+        Some(inner.stamp(rel))
     }
 
     /// Whether repo-relative `rel` resolves to a live file or directory.
@@ -927,6 +987,12 @@ impl FuseMount {
         for p in view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
             inodes.intern(&p);
         }
+        // The tip commit's own time: stable across daemon restarts, so a
+        // restart alone does not make every file look modified.
+        let base_time = tip
+            .and_then(|h| db.get_commit(&h).ok())
+            .map(|c| UNIX_EPOCH + Duration::from_secs(c.timestamp.max(0) as u64))
+            .unwrap_or_else(SystemTime::now);
 
         Ok(Arc::new(SharedState {
             db: Mutex::new(db),
@@ -937,6 +1003,8 @@ impl FuseMount {
                 tip,
                 view,
                 overlay: Overlay::new(),
+                stamps: HashMap::new(),
+                base_time,
             }),
             sink,
             sealed,
@@ -1189,10 +1257,10 @@ impl Filesystem for FuseFs {
         if self.refuses_unkeyed_shared_write(&path, "mkdir") {
             return reply.error(libc::EROFS);
         }
-        let ino = {
+        let (ino, at) = {
             let mut inner = self.state.inner.lock().unwrap();
             inner.overlay.insert_dir(path.clone(), mode);
-            inner.inodes.intern(&path)
+            (inner.inodes.intern(&path), inner.stamp(&path))
         };
         // mkdir alone doesn't create a commit-worthy event (empty dirs
         // aren't versioned without a `.keep` file); only nudge the
@@ -1202,10 +1270,10 @@ impl Filesystem for FuseFs {
             ino,
             size: 0,
             blocks: 0,
-            atime: now(),
-            mtime: now(),
-            ctime: now(),
-            crtime: now(),
+            atime: at,
+            mtime: at,
+            ctime: at,
+            crtime: at,
             kind: FileType::Directory,
             perm: 0o755,
             nlink: 2,
@@ -1476,7 +1544,8 @@ impl FuseFs {
 
     fn attr_for_inode(&self, ino: u64) -> Option<FileAttr> {
         if ino == ROOT_INODE {
-            return Some(self.dir_attr(ROOT_INODE, 0o755));
+            let at = self.state.inner.lock().unwrap().stamp(Path::new(""));
+            return Some(self.dir_attr(ROOT_INODE, 0o755, at));
         }
         let path = self.path_of(ino)?;
         self.attr_for_path(&path, ino)
@@ -1484,6 +1553,7 @@ impl FuseFs {
 
     fn attr_for_path(&self, path: &Path, ino: u64) -> Option<FileAttr> {
         let inner = self.state.inner.lock().unwrap();
+        let at = inner.stamp(path);
         // Overlay takes precedence.
         if let Some(entry) = inner.overlay.get(path) {
             return match entry {
@@ -1492,10 +1562,10 @@ impl FuseFs {
                     ino,
                     size: content.len() as u64,
                     blocks: (content.len() as u64).div_ceil(BLOCK_SIZE as u64),
-                    atime: now(),
-                    mtime: now(),
-                    ctime: now(),
-                    crtime: now(),
+                    atime: at,
+                    mtime: at,
+                    ctime: at,
+                    crtime: at,
                     kind: FileType::RegularFile,
                     perm: (mode & 0o7777) as u16,
                     nlink: 1,
@@ -1505,7 +1575,7 @@ impl FuseFs {
                     blksize: BLOCK_SIZE,
                     flags: 0,
                 }),
-                OverlayEntry::Dir { mode } => Some(self.dir_attr(ino, *mode)),
+                OverlayEntry::Dir { mode } => Some(self.dir_attr(ino, *mode, at)),
             };
         }
         // Fall back to tip view.
@@ -1520,10 +1590,10 @@ impl FuseFs {
                     ino,
                     size: bytes.len() as u64,
                     blocks: (bytes.len() as u64).div_ceil(BLOCK_SIZE as u64),
-                    atime: now(),
-                    mtime: now(),
-                    ctime: now(),
-                    crtime: now(),
+                    atime: at,
+                    mtime: at,
+                    ctime: at,
+                    crtime: at,
                     kind: FileType::RegularFile,
                     perm: (entry.mode & 0o7777) as u16,
                     nlink: 1,
@@ -1534,19 +1604,19 @@ impl FuseFs {
                     flags: 0,
                 }
             }
-            EntryKind::Dir => self.dir_attr(ino, entry.mode),
+            EntryKind::Dir => self.dir_attr(ino, entry.mode, at),
         })
     }
 
-    fn dir_attr(&self, ino: u64, mode: u32) -> FileAttr {
+    fn dir_attr(&self, ino: u64, mode: u32, at: SystemTime) -> FileAttr {
         FileAttr {
             ino,
             size: 0,
             blocks: 0,
-            atime: now(),
-            mtime: now(),
-            ctime: now(),
-            crtime: now(),
+            atime: at,
+            mtime: at,
+            ctime: at,
+            crtime: at,
             kind: FileType::Directory,
             perm: (mode & 0o7777) as u16,
             nlink: 2,
@@ -1705,10 +1775,6 @@ impl FuseFs {
         }
         out
     }
-}
-
-fn now() -> SystemTime {
-    SystemTime::now()
 }
 
 fn path_to_repo_rel(path: &Path) -> String {

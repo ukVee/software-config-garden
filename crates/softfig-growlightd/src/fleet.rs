@@ -63,6 +63,7 @@ use crate::drive_loop::{
     spawn_drive_loop, DriveLoop, FleetMember, LiveRate, ProfileResolver, RateMeter,
     RouteConnectivity, SystemExeProbe, V2Seams, DRIVE_POLL_MS,
 };
+use crate::handshake::KeeperdTipProbe;
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
 use crate::opencode_backend::ModelSelection;
@@ -1025,7 +1026,13 @@ pub fn assemble_fleet(
         // reads) and the SAME keeperd socket the legacy claimer rides.
         let baton_writer = FsBatonStore::new(agents_dir.clone(), garden_name.clone());
         drive.with_v2(V2Seams {
-            source: Box::new(V2Source::new(garden_root.clone())),
+            // Reuse the last load while keeperd's tip stands still (report 185:
+            // re-reading the whole backlog every second pegged keeperd's FUSE
+            // thread on an idle garden).
+            source: Box::new(
+                V2Source::new(garden_root.clone())
+                    .with_tip_probe(Box::new(KeeperdTipProbe::new(keeperd_socket.to_path_buf()))),
+            ),
             entries: FsEntryBatonStore::new(runtime_entries_dir(), garden_name),
             member_writer: Box::new(baton_writer),
             claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
