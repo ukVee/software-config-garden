@@ -46,8 +46,13 @@ fn err_kind(resp: Response) -> ErrorKind {
 
 /// Start a daemon on `garden`/`socket` and wait for the socket to bind.
 fn boot(garden: &Path, socket: &Path, allow_relock: bool) -> DaemonHandle {
+    // The relock artifacts go to a per-test runtime dir beside the socket, not
+    // the real `$XDG_RUNTIME_DIR` (and not refused where it is unset). Both
+    // boots of one test share it, as two daemons share the real one.
+    let runtime_dir = socket.parent().expect("socket has a parent").join("run");
     let config = KeeperConfig::new(garden)
         .with_socket(socket)
+        .with_runtime_dir(&runtime_dir)
         .without_watcher()
         .without_net()
         .allow_relock(allow_relock);

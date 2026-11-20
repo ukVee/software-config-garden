@@ -96,7 +96,7 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     let garden = resolve_existing(args.garden)?;
 
     // Bridge fast path: try the daemon first.
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_ipc::runtime_socket_path()?;
     let req_args = serde_json::to_value(IpcCommitArgs {
         intent: intent_name.clone(),
         payload: payload.clone(),
@@ -146,7 +146,7 @@ fn print_commit_result(hash: &str, committed: bool) {
 pub fn log(args: LogArgs) -> Result<()> {
     let garden = resolve_existing(args.garden)?;
 
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_ipc::runtime_socket_path()?;
     let req_args = serde_json::to_value(IpcLogArgs { limit: args.limit })?;
     if let Some(reply) =
         try_daemon_call(&socket, op::LOG, req_args).map_err(|e| anyhow!("daemon: {e}"))?
@@ -198,7 +198,7 @@ pub fn log(args: LogArgs) -> Result<()> {
 pub fn show(args: ShowArgs) -> Result<()> {
     let garden = resolve_existing(args.garden)?;
 
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_ipc::runtime_socket_path()?;
     let req_args = serde_json::to_value(IpcShowArgs {
         hash: args.commit.clone(),
     })?;
@@ -274,7 +274,7 @@ pub fn show(args: ShowArgs) -> Result<()> {
 pub fn fsck(args: FsckArgs) -> Result<()> {
     let garden = resolve_existing(args.garden)?;
 
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_ipc::runtime_socket_path()?;
     if let Some(reply) = try_daemon_call(&socket, op::FSCK, serde_json::Value::Null)
         .map_err(|e| anyhow!("daemon: {e}"))?
     {

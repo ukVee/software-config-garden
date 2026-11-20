@@ -67,7 +67,7 @@ pub struct UnpairArgs {
 }
 
 pub fn pair(args: PairArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
 
     // No fingerprint → LAN pick-list: surface discovered devices by name, let
     // the user choose, and thread its cached endpoint into the initiate path.
@@ -214,7 +214,7 @@ fn confirm_flow(
 }
 
 pub fn peers(args: PeersArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let reply: PairListReply = serde_json::from_value(daemon_call(
         &socket,
         op::PAIR_LIST,
@@ -252,7 +252,7 @@ fn print_pending(p: &PendingPairing) {
 }
 
 pub fn unpair(args: UnpairArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let remove_args = serde_json::to_value(PairRemoveArgs {
         fingerprint: args.fingerprint.clone(),
     })?;

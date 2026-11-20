@@ -275,7 +275,7 @@ pub fn run(cmd: VaultCmd) -> Result<()> {
 }
 
 fn seal(pattern: String, socket: Option<PathBuf>) -> Result<()> {
-    let socket = socket.unwrap_or_else(runtime_socket_path);
+    let socket = socket.map_or_else(runtime_socket_path, Ok)?;
     let args = serde_json::to_value(VaultSealArgs { pattern })?;
     let reply = try_daemon_call(&socket, op::VAULT_SEAL, args)
         .map_err(|e| anyhow!("{e}"))?
@@ -295,7 +295,7 @@ fn seal(pattern: String, socket: Option<PathBuf>) -> Result<()> {
 }
 
 fn unseal(pattern: String, socket: Option<PathBuf>) -> Result<()> {
-    let socket = socket.unwrap_or_else(runtime_socket_path);
+    let socket = socket.map_or_else(runtime_socket_path, Ok)?;
     let args = serde_json::to_value(VaultUnsealArgs { pattern })?;
     let reply = try_daemon_call(&socket, op::VAULT_UNSEAL, args)
         .map_err(|e| anyhow!("{e}"))?
@@ -311,7 +311,7 @@ fn unseal(pattern: String, socket: Option<PathBuf>) -> Result<()> {
 }
 
 fn list_sealed(socket: Option<PathBuf>) -> Result<()> {
-    let socket = socket.unwrap_or_else(runtime_socket_path);
+    let socket = socket.map_or_else(runtime_socket_path, Ok)?;
     let reply = try_daemon_call(&socket, op::VAULT_LIST_SEALED, serde_json::Value::Null)
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| anyhow!("daemon not running"))?;

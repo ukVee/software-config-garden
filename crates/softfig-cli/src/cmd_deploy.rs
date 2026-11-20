@@ -38,7 +38,7 @@ pub struct DeployArgs {
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
 
     let plan: DeployPlanReply = serde_json::from_value(daemon_call(
         &socket,

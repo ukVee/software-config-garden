@@ -60,7 +60,7 @@ pub fn run(cmd: ReplicaCmd) -> Result<()> {
 }
 
 fn grant(args: GrantArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(ReplicaGrantArgs {
         fingerprint: args.fingerprint,
     })?;
@@ -78,7 +78,7 @@ fn grant(args: GrantArgs) -> Result<()> {
 }
 
 fn revoke(args: GrantArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(ReplicaRevokeArgs {
         fingerprint: args.fingerprint,
     })?;
@@ -96,7 +96,7 @@ fn revoke(args: GrantArgs) -> Result<()> {
 }
 
 fn status(args: StatusArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let reply: ReplicaStatusReply = serde_json::from_value(daemon_call(
         &socket,
         op::REPLICA_STATUS,

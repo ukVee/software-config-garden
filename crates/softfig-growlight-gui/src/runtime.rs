@@ -333,11 +333,20 @@ impl Drop for StopOnDrop {
 /// reuses the tested driver verbatim — no decode/reconnect logic lives here. The
 /// socket is always growlightd's, resolved here so no captured data is needed.
 fn subscribe_stream() -> impl Stream<Item = GuiMessage> {
+    // No usable `$XDG_RUNTIME_DIR` means no socket to tail (report 174): say
+    // so once and end the stream; the console stays in its `Connecting` state.
     let socket = socket_for(Daemon::Growlightd);
     iced::stream::channel(
         STREAM_BUFFER,
         // The explicit `output` type pins the stream item to `GuiMessage`.
         move |mut output: iced::futures::channel::mpsc::Sender<GuiMessage>| async move {
+            let socket = match socket {
+                Ok(socket) => socket,
+                Err(e) => {
+                    eprintln!("softfig-growlight-gui: {e}");
+                    return;
+                }
+            };
             let stop = Arc::new(AtomicBool::new(false));
             // Drops with the future on teardown → tells the worker to stop.
             let _guard = StopOnDrop(stop.clone());

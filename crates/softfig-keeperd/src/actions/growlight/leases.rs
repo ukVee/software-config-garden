@@ -37,7 +37,7 @@ pub fn request_lease(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
         growlightd::op::REQUEST_LEASE,
         serde_json::to_value(args).unwrap(),
     );
-    forward_to_growlightd(&daemon.growlightd_socket(), &req)
+    forward_to_growlightd(&daemon.growlightd_socket().map_err(no_growlightd_socket)?, &req)
 }
 
 /// `release_lease` (spec §4c/§14): forward a lease release to growlightd. A
@@ -50,7 +50,7 @@ pub fn release_lease(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
         growlightd::op::RELEASE_LEASE,
         serde_json::to_value(args).unwrap(),
     );
-    forward_to_growlightd(&daemon.growlightd_socket(), &req)
+    forward_to_growlightd(&daemon.growlightd_socket().map_err(no_growlightd_socket)?, &req)
 }
 
 /// The keeperd→growlightd hop: send one one-shot request to growlightd at
@@ -59,6 +59,11 @@ pub fn release_lease(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
 /// `BadArgs`); a transport failure (growlightd down / unreachable / an
 /// ambiguous post-send drop) surfaces as `Io` with a clear message rather than
 /// being blindly retried into a possible double-apply.
+/// No growlightd socket to dial (report 174), as a handler error.
+pub(crate) fn no_growlightd_socket(e: softfig_ipc::NoRuntimeDir) -> (ErrorKind, String) {
+    (ErrorKind::Io, format!("growlightd unreachable: {e}"))
+}
+
 pub(crate) fn forward_to_growlightd(socket: &Path, req: &Request) -> HandlerResult {
     match softfig_ipc::call_reconnecting(socket, req, RetryPolicy::default()) {
         Ok(Response::Ok { data, .. }) => Ok(data),

@@ -34,7 +34,9 @@ pub fn start(daemon: Daemon) -> Result<DaemonHandle> {
         .unwrap()
         .config
         .socket_path
-        .clone();
+        .clone()
+        .map_or_else(softfig_ipc::runtime_socket_path, Ok)
+        .map_err(std::io::Error::from)?;
 
     // Stale socket from a previous unclean exit.
     if socket_path.exists() {
@@ -55,7 +57,7 @@ pub fn start(daemon: Daemon) -> Result<DaemonHandle> {
     // be redeemed; tmpfs already wiped it on a reboot.
     {
         let inner = daemon.inner.lock().unwrap();
-        crate::relock::prune_expired(inner.config.state_dir(), now_secs());
+        crate::relock::prune_expired(&inner.config, now_secs());
     }
 
     let daemon_for_thread = daemon.clone();

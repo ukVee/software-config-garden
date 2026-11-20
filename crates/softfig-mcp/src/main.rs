@@ -1708,7 +1708,7 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
     // A member session's every request carries its identity, so keeperd holds
     // its writes to §6.7 (the `> Model:` guard) and relays its slice verbs to
     // growlightd; a human's carries none and is served as before.
-    let socket = softfig_client::runtime_socket_path();
+    let socket = softfig_client::runtime_socket_path()?;
     let req = Request::new(op_name, ipc_args).with_member(caller.member());
     let resp = softfig_client::call_reconnecting(&socket, &req, softfig_client::RetryPolicy::default())?;
     match resp {

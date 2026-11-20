@@ -112,7 +112,7 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     // baked repo's newest release newer than this binary (report 076). Never
     // silently build the current dir, and never re-clone the installed tag.
     let recorded = source::recorded_source(&prefix);
-    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.clone().map_or_else(runtime_socket_path, Ok)?;
 
     // --dry-run prints the plan and stops before any clone, pull or build
     // (report 081 item 6).
@@ -540,7 +540,7 @@ fn no_cycle_reason(supervisor: Supervisor, daemon: &DaemonState) -> &'static str
 /// pre-upgrade build until it is restarted. `upgrade` detects the orchestrator
 /// socket and warns rather than silently stranding a stale loop.
 fn warn_if_growlight_live() {
-    if growlightd_runtime_socket_path().exists() {
+    if growlightd_runtime_socket_path().is_ok_and(|socket| socket.exists()) {
         println!(
             "WARNING: a growlight orchestrator appears to be running. It was started \
              with the pre-upgrade binary and will keep executing it until restarted — \

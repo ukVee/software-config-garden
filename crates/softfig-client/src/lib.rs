@@ -13,6 +13,6 @@ pub mod socket;
 pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
-pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
+pub use socket::{growlightd_runtime_socket_path, runtime_dir, runtime_socket_path, NoRuntimeDir};
 
 use softfig_protocol_keeperd::proto;

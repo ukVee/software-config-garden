@@ -265,15 +265,16 @@ impl Daemon {
 
     /// growlightd's socket path for the keeperd→growlightd lease hop (spec §4c):
     /// the configured override, else the default
-    /// [`softfig_ipc::growlightd_runtime_socket_path`].
-    pub fn growlightd_socket(&self) -> PathBuf {
+    /// [`softfig_ipc::growlightd_runtime_socket_path`], which refuses rather
+    /// than guess when `XDG_RUNTIME_DIR` is unusable (report 174).
+    pub fn growlightd_socket(&self) -> std::result::Result<PathBuf, softfig_ipc::NoRuntimeDir> {
         self.inner
             .lock()
             .unwrap()
             .config
             .growlightd_socket
             .clone()
-            .unwrap_or_else(softfig_ipc::growlightd_runtime_socket_path)
+            .map_or_else(softfig_ipc::growlightd_runtime_socket_path, Ok)
     }
 
     /// The graceful teardown shared by every shutdown trigger — the IPC
@@ -323,14 +324,14 @@ impl Daemon {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            crate::relock::prune_expired(inner.config.state_dir(), now);
+            crate::relock::prune_expired(&inner.config, now);
             // A still-armed (unexpired) blob after pruning means a `daemon cycle`/
             // `relock` is pending — a *resume*, not a terminal lock. That decides
             // whether the growlightd unit is stopped below (config-in-garden
             // slice 2 / locked-decision 5): a resume leaves the fleet running to
             // ride the bounce via its reconnecting IPC; a terminal lock stops it.
             let resume_pending =
-                crate::relock::pending_expires_at(inner.config.state_dir(), now).is_some();
+                crate::relock::pending_expires_at(&inner.config, now).is_some();
             let supervise = inner.config.enable_growlight_supervision;
             let fuse = inner.fuse.take();
             let net = inner.net.take();

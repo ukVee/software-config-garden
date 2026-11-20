@@ -65,7 +65,7 @@ pub use softfig_client::{client, compat, socket};
 pub use softfig_client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
-pub use softfig_client::{growlightd_runtime_socket_path, runtime_socket_path};
+pub use softfig_client::{growlightd_runtime_socket_path, runtime_dir, runtime_socket_path, NoRuntimeDir};
 pub use softfig_protocol_growlightd::growlightd;
 pub use softfig_protocol_keeperd::{proto, verbs, PROTOCOL_VERSION};
 pub use softfig_protocol_keeperd::proto::{ErrorKind, Request, Response};

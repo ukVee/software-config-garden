@@ -187,7 +187,10 @@ fn transcript_files(transcript: &Path) -> Vec<PathBuf> {
 fn price(rows: &mut [RequestRow], garden_root: Option<PathBuf>) {
     let garden = match garden_root {
         Some(g) => g,
-        None => match cmd_growlight::resolve_garden_root(&runtime_socket_path(), None) {
+        None => match runtime_socket_path()
+            .map_err(anyhow::Error::from)
+            .and_then(|socket| cmd_growlight::resolve_garden_root(&socket, None))
+        {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("telemetry: rows stored unpriced (no garden: {e})");

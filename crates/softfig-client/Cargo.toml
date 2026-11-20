@@ -11,7 +11,6 @@ description = "soft-fig IPC client: Unix-socket connect, call and reconnect, the
 softfig-protocol-keeperd.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-libc.workspace = true
 semver.workspace = true
 memchr.workspace = true
 

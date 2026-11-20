@@ -198,7 +198,7 @@ pub fn queue_set_project_repo(daemon: &Daemon, args: serde_json::Value) -> Handl
         .filter(|e| e.project == args.name && e.status == EntryStatus::Active)
         .collect();
     if !active.is_empty() {
-        let holders = Holders::ask(&growlightd_socket_of(&inner));
+        let holders = holders_of(&inner);
         if let Some(refusal) = active.iter().find_map(|e| holders.running_refusal(&e.id)) {
             return Err(refusal);
         }
@@ -1448,7 +1448,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         let idx = idx_of(&queue, &args.id);
         if queue.entries[idx].status == EntryStatus::Active
             && let Some(refusal) = holders
-                .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                .get_or_insert_with(|| holders_of(&inner))
                 .running_refusal(&args.id)
         {
             return Err(refusal);
@@ -1507,7 +1507,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 // human override stands.
                 if queue.entries[idx].status == EntryStatus::Active
                     && let Some(refusal) = holders
-                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .get_or_insert_with(|| holders_of(&inner))
                         .running_refusal(&args.id)
                 {
                     return Err(refusal);
@@ -1547,7 +1547,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 // entry. Unknown liveness records it, as a held row does.
                 let holder_less = queue.entries[idx].status == EntryStatus::Active
                     && !holders
-                        .get_or_insert_with(|| Holders::ask(&growlightd_socket_of(&inner)))
+                        .get_or_insert_with(|| holders_of(&inner))
                         .holds(&args.id);
                 let row = &mut queue.entries[idx];
                 if row.status == EntryStatus::Active && !holder_less {
@@ -1994,7 +1994,7 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     }
     let idx = idx_of(&queue, &args.id);
     if queue.entries[idx].status == EntryStatus::Active
-        && let Some(refusal) = Holders::ask(&growlightd_socket_of(&inner)).running_refusal(&args.id)
+        && let Some(refusal) = holders_of(&inner).running_refusal(&args.id)
     {
         return Err(refusal);
     }
@@ -2284,12 +2284,23 @@ impl Holders {
 
 /// growlightd's socket, read off the locked daemon state (`Daemon::growlightd_socket`
 /// would take the lock again).
-fn growlightd_socket_of(inner: &DaemonInner) -> std::path::PathBuf {
+fn growlightd_socket_of(
+    inner: &DaemonInner,
+) -> Result<std::path::PathBuf, softfig_ipc::NoRuntimeDir> {
     inner
         .config
         .growlightd_socket
         .clone()
-        .unwrap_or_else(softfig_ipc::growlightd_runtime_socket_path)
+        .map_or_else(softfig_ipc::growlightd_runtime_socket_path, Ok)
+}
+
+/// [`Holders::ask`] at growlightd's socket. No socket to dial (report 174) is
+/// an answer growlightd could not give, so the refusals fail closed on it.
+fn holders_of(inner: &DaemonInner) -> Holders {
+    match growlightd_socket_of(inner) {
+        Ok(socket) => Holders::ask(&socket),
+        Err(e) => Holders::Unknown(e.to_string()),
+    }
 }
 
 /// The untouched tip hash — a dry run's reply `hash` (no commit is minted).

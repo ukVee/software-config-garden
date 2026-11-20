@@ -57,13 +57,13 @@ fn main() -> Result<()> {
     // unlinks and re-binds the socket and `reconcile_on_boot` requeues every
     // `active` entry it sees no holder for, so a second instance must not get as
     // far as either (review 061 F3). The kernel drops the lock on any exit.
-    let socket = cli.socket.unwrap_or_else(growlightd_runtime_socket_path);
+    let socket = cli.socket.map_or_else(growlightd_runtime_socket_path, Ok)?;
     let _instance_lock = InstanceLock::acquire(&socket)?;
 
     // Derive the garden root the same way `softfig growlight start` does — a
     // read-only keeperd `status`, never a literal path (spec §2/§12). An
     // explicit `--garden-root` short-circuits it.
-    let keeperd_socket = cli.keeperd_socket.unwrap_or_else(runtime_socket_path);
+    let keeperd_socket = cli.keeperd_socket.map_or_else(runtime_socket_path, Ok)?;
     let garden_root = match cli.garden_root {
         Some(p) => p,
         None => garden_root_via_keeperd(&keeperd_socket)

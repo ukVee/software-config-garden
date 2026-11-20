@@ -13,7 +13,10 @@ pub struct KeeperConfig {
     /// is the FUSE mount path. When `None`, the daemon runs in
     /// M1c-compat mode: `.softfig/` lives at `garden_root/.softfig/`.
     pub state_root: Option<PathBuf>,
-    pub socket_path: PathBuf,
+    /// The socket keeperd binds. `None` is the default,
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`, resolved when the daemon starts;
+    /// without a usable `XDG_RUNTIME_DIR` the start is refused (report 174).
+    pub socket_path: Option<PathBuf>,
     /// When true, the watcher thread is started after `unlock`. Tests
     /// disable this to keep the runtime predictable.
     pub enable_watcher: bool,
@@ -52,6 +55,10 @@ pub struct KeeperConfig {
     /// M4 deploy: the persistent plaintext deploy-cache root. `None` → the XDG
     /// default `~/.local/share/softfig/deployed/`. Overridable for tests.
     pub deploy_cache_root: Option<PathBuf>,
+    /// The tmpfs for runtime secrets (the relock token, `reveal`'s plaintext).
+    /// `None` → `$XDG_RUNTIME_DIR`, refused when unusable (report 174).
+    /// Overridable so tests keep them out of the real runtime dir.
+    pub runtime_dir: Option<PathBuf>,
     /// Growlight loop policy from `[growlight]` — currently the relock opt-in.
     pub growlight: GrowlightConfig,
     /// growlightd's listen socket, for the keeperd→growlightd hop the lease
@@ -166,7 +173,7 @@ impl KeeperConfig {
         Self {
             garden_root: garden_root.as_ref().to_path_buf(),
             state_root: None,
-            socket_path: softfig_ipc::runtime_socket_path(),
+            socket_path: None,
             enable_watcher: true,
             enable_fuse: true,
             fuse_attach_unmounted: false,
@@ -177,6 +184,7 @@ impl KeeperConfig {
             replica: ReplicaConfig::default(),
             replica_root: None,
             deploy_home: None,
+            runtime_dir: None,
             deploy_cache_root: None,
             growlight: GrowlightConfig::default(),
             growlightd_socket: None,
@@ -200,7 +208,7 @@ impl KeeperConfig {
         Ok(Self {
             garden_root,
             state_root: cfg.state_root,
-            socket_path: softfig_ipc::runtime_socket_path(),
+            socket_path: None,
             enable_watcher: true,
             enable_fuse: true,
             fuse_attach_unmounted: false,
@@ -213,6 +221,7 @@ impl KeeperConfig {
             replica: cfg.replica.into(),
             replica_root: None,
             deploy_home: None,
+            runtime_dir: None,
             deploy_cache_root: None,
             growlight: cfg.growlight.into(),
             growlightd_socket: None,
@@ -240,7 +249,7 @@ impl KeeperConfig {
     }
 
     pub fn with_socket(mut self, path: impl AsRef<Path>) -> Self {
-        self.socket_path = path.as_ref().to_path_buf();
+        self.socket_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -295,6 +304,21 @@ impl KeeperConfig {
     pub fn with_replica_root(mut self, root: impl AsRef<Path>) -> Self {
         self.replica_root = Some(root.as_ref().to_path_buf());
         self
+    }
+
+    /// Override the runtime-secret dir (tests keep relock and reveal files in
+    /// a tempdir instead of the real `$XDG_RUNTIME_DIR`).
+    pub fn with_runtime_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.runtime_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Where runtime secrets go: the override, else `$XDG_RUNTIME_DIR`, never
+    /// a `/tmp` guess (report 174). `purpose` names the caller in the refusal.
+    pub fn runtime_dir(&self, purpose: &'static str) -> Result<PathBuf, softfig_ipc::NoRuntimeDir> {
+        self.runtime_dir
+            .clone()
+            .map_or_else(|| softfig_ipc::runtime_dir(purpose), Ok)
     }
 
     /// M4 deploy: override the `$HOME` boundary the deploy verbs resolve targets
@@ -436,7 +460,7 @@ mod tests {
 
         // Bootstrap/local fields untouched by the overlay.
         assert_eq!(cfg.state_root.as_deref(), Some(Path::new("/state")));
-        assert_eq!(cfg.socket_path, Path::new("/run/sock"));
+        assert_eq!(cfg.socket_path.as_deref(), Some(Path::new("/run/sock")));
         assert!(cfg.growlight.allow_relock, "allow_relock stays from pointer");
         assert_eq!(cfg.replica_root.as_deref(), Some(Path::new("/peers")));
     }

@@ -57,7 +57,7 @@ pub struct UninstallArgs {
 
 pub fn run(args: UninstallArgs) -> Result<()> {
     let prefix = args.prefix.clone().unwrap_or_else(default_prefix);
-    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.clone().map_or_else(runtime_socket_path, Ok)?;
 
     // Refuse a package-owned prefix before removing anything: those files
     // belong to the package manager (an AUR install), not to us.

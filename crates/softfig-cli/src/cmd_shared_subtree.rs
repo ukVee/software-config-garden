@@ -120,7 +120,7 @@ pub fn run(cmd: SharedSubtreeCmd) -> Result<()> {
 }
 
 fn add(args: AddArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(SharedSubtreeAddArgs {
         mount_path: args.mount_path,
         id: args.id,
@@ -135,7 +135,7 @@ fn add(args: AddArgs) -> Result<()> {
 }
 
 fn remove(args: IdArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(SharedSubtreeRemoveArgs { id: args.id })?;
     let reply: SharedSubtreeRemoveReply =
         serde_json::from_value(daemon_call(&socket, op::SHARED_SUBTREE_REMOVE, call)?)?;
@@ -148,7 +148,7 @@ fn remove(args: IdArgs) -> Result<()> {
 }
 
 fn toggle(args: IdArgs, enable: bool) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let op_name = if enable {
         op::SHARED_SUBTREE_ENABLE
     } else {
@@ -166,7 +166,7 @@ fn toggle(args: IdArgs, enable: bool) -> Result<()> {
 }
 
 fn accept(args: AcceptArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(SharedSubtreeAcceptArgs {
         id: args.id,
         mount_path: args.mount_path,
@@ -189,7 +189,7 @@ fn accept(args: AcceptArgs) -> Result<()> {
 }
 
 fn migrate_into_share(args: MigrateArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let call = serde_json::to_value(MigrateIntoShareArgs {
         id: args.id,
         from: args.from,
@@ -204,7 +204,7 @@ fn migrate_into_share(args: MigrateArgs) -> Result<()> {
 }
 
 fn list(args: ListArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let reply: SharedSubtreeListReply = serde_json::from_value(daemon_call(
         &socket,
         op::SHARED_SUBTREE_LIST,

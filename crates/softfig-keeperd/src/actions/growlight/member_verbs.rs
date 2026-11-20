@@ -28,7 +28,7 @@ use softfig_ipc::growlightd::{
 use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
 use softfig_ipc::{op, ErrorKind, Request};
 
-use super::leases::forward_to_growlightd;
+use super::leases::{forward_to_growlightd, no_growlightd_socket};
 use crate::daemon::Daemon;
 use crate::handlers::HandlerResult;
 
@@ -39,7 +39,7 @@ fn forward<A: DeserializeOwned + Serialize>(
     verb: &'static str,
     args: serde_json::Value,
 ) -> HandlerResult {
-    forward_at::<A>(&daemon.growlightd_socket(), verb, args)
+    forward_at::<A>(&daemon.growlightd_socket().map_err(no_growlightd_socket)?, verb, args)
 }
 
 /// [`forward`] against an explicit growlightd socket (the testable seam).
@@ -104,7 +104,7 @@ pub fn member_slice_insert(
 ) -> HandlerResult {
     let call = member_envelope::<SliceInsertArgs>(op::SLICE_INSERT, member, args)?;
     let req = Request::new(growlightd::op::MEMBER_SLICE_INSERT, call);
-    forward_to_growlightd(&daemon.growlightd_socket(), &req)
+    forward_to_growlightd(&daemon.growlightd_socket().map_err(no_growlightd_socket)?, &req)
 }
 
 /// A member's `slice_update` (§6.7, `move` only), relayed to growlightd.
@@ -115,7 +115,7 @@ pub fn member_slice_update(
 ) -> HandlerResult {
     let call = member_envelope::<SliceUpdateArgs>(op::SLICE_UPDATE, member, args)?;
     let req = Request::new(growlightd::op::MEMBER_SLICE_UPDATE, call);
-    forward_to_growlightd(&daemon.growlightd_socket(), &req)
+    forward_to_growlightd(&daemon.growlightd_socket().map_err(no_growlightd_socket)?, &req)
 }
 
 #[cfg(test)]

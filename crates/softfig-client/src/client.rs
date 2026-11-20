@@ -227,6 +227,10 @@ pub enum ReconnectError {
     /// The request could not be serialized — a programmer error, never retried.
     #[error("could not encode request: {0}")]
     Encode(#[source] serde_json::Error),
+    /// The default socket couldn't be resolved, so nothing was dialed
+    /// (report 174: no `/tmp` fallback).
+    #[error(transparent)]
+    NoRuntimeDir(#[from] crate::socket::NoRuntimeDir),
 }
 
 /// Outcome of a single connect→send→receive attempt, tagged with where it

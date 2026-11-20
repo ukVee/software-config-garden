@@ -111,7 +111,7 @@ fn start(args: StartArgs) -> Result<()> {
 }
 
 fn stop(args: BasicArgs) -> Result<()> {
-    let path = args.socket.unwrap_or_else(runtime_socket_path);
+    let path = args.socket.map_or_else(runtime_socket_path, Ok)?;
     stop_daemon(&path)
 }
 
@@ -171,7 +171,7 @@ fn is_connection_drop(e: &ClientError) -> bool {
 }
 
 fn status(args: BasicArgs) -> Result<()> {
-    let path = args.socket.unwrap_or_else(runtime_socket_path);
+    let path = args.socket.map_or_else(runtime_socket_path, Ok)?;
     report_status(&path, SetReport::scan_own_dir())
 }
 
@@ -283,7 +283,7 @@ fn report_status(socket: &Path, set: std::io::Result<SetReport>) -> Result<()> {
 }
 
 fn unlock(args: BasicArgs) -> Result<()> {
-    let path = args.socket.unwrap_or_else(runtime_socket_path);
+    let path = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let passphrase = rpassword::prompt_password("Vault passphrase: ")
         .context("could not read passphrase from tty")?;
     let req_args = serde_json::to_value(UnlockArgs { passphrase })?;
@@ -302,7 +302,7 @@ fn unlock(args: BasicArgs) -> Result<()> {
 /// redeem, and tmpfs-only (wiped on reboot); the token bytes never enter this
 /// process or the model's context (the daemon reads its own token file).
 pub(crate) fn cycle(args: CycleArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
 
     // 1. Arm a relock token, PERSISTED to the 0600 tmpfs path. Arming before the
     //    stop is what makes a cycle abort recoverable: if any later step fails,
@@ -383,7 +383,7 @@ pub(crate) fn cycle(args: CycleArgs) -> Result<()> {
 /// tmpfs for an out-of-band restart, then print the paths. This command never
 /// sees the token bytes — the daemon writes them and we only relay the path.
 fn relock_arm(args: BasicArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let mint: RelockMintReply = match try_daemon_call(&socket, op::RELOCK_MINT, json!({ "persist": true })) {
         Ok(Some(v)) => serde_json::from_value(v)?,
         Ok(None) => bail!("no running daemon at {} to arm", socket.display()),
@@ -408,7 +408,7 @@ fn relock_arm(args: BasicArgs) -> Result<()> {
 /// Growlight `relock`: redeem the armed token after the daemon restarted.
 /// Sends no token — the daemon reads its own persisted token file.
 fn relock(args: BasicArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let data = match try_daemon_call(&socket, op::RELOCK_REDEEM, json!({})) {
         Ok(Some(v)) => v,
         Ok(None) => bail!("no running daemon at {} to relock", socket.display()),

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
-    ClientError, ErrorKind, Request, growlightd_runtime_socket_path, runtime_socket_path,
+    ClientError, ErrorKind, NoRuntimeDir, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::parse_baton,
     claude_profiles,
     growlightd::{
@@ -384,7 +384,7 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
 // ---- init (Phase 2a) ---------------------------------------------------
 
 fn init(args: InitArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req_args = serde_json::to_value(GrowlightInitArgs::default())?;
     match try_daemon_call(&socket, op::GROWLIGHT_INIT, req_args) {
         Ok(Some(value)) => {
@@ -444,7 +444,7 @@ fn short_hash(hash: &str) -> &str {
 // ---- start (Phase 2b): runtime + launcher ------------------------------
 
 fn start(args: StartArgs) -> Result<()> {
-    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.clone().map_or_else(runtime_socket_path, Ok)?;
     let garden_root = resolve_garden_root(&socket, args.garden_root.clone())?;
 
     // The hook injects this on every (re)start; its absence means the durable
@@ -1624,8 +1624,9 @@ fn today_iso() -> String {
 
 /// Resolve growlightd's socket: the `--socket` override, else
 /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock` (distinct from keeperd's).
-fn growlight_socket(override_: Option<PathBuf>) -> PathBuf {
-    override_.unwrap_or_else(growlightd_runtime_socket_path)
+/// Without either there is no socket to dial (report 174).
+fn growlight_socket(override_: Option<PathBuf>) -> Result<PathBuf, NoRuntimeDir> {
+    override_.map_or_else(growlightd_runtime_socket_path, Ok)
 }
 
 /// One-shot growlightd client call: connect → `call` → decode the typed reply
@@ -1650,7 +1651,7 @@ fn growlight_call<T: serde::de::DeserializeOwned>(
 }
 
 fn client_status(args: ClientArgs) -> Result<()> {
-    let socket = growlight_socket(args.socket);
+    let socket = growlight_socket(args.socket)?;
     let reply: FleetStatusReply =
         growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
     print_fleet_status(&reply);
@@ -1814,7 +1815,7 @@ fn agent_accounting(a: &growlightd::AgentSummary) -> String {
 }
 
 fn client_pause(args: ClientArgs) -> Result<()> {
-    let socket = growlight_socket(args.socket);
+    let socket = growlight_socket(args.socket)?;
     let reply: PausedReply =
         growlight_call(&socket, growlightd::op::PAUSE, serde_json::Value::Null)?;
     println!("fleet {}", gate_label(reply.paused));
@@ -1822,7 +1823,7 @@ fn client_pause(args: ClientArgs) -> Result<()> {
 }
 
 fn client_resume(args: ResumeArgs) -> Result<()> {
-    let socket = growlight_socket(args.socket);
+    let socket = growlight_socket(args.socket)?;
     match args.item {
         // `growlight resume <item>` — un-block one parked backlog item. A distinct
         // growlightd verb (`resume_item`) from the gate `resume` below; the guard
@@ -1866,7 +1867,7 @@ fn client_resources(args: ResourcesArgs) -> Result<()> {
         // unit name carry a per-spawn generation. (Per-scope LIVE values via
         // `systemctl show` are an on-device read deferred to the §7b verify.)
         ResourcesCmd::Show(a) => {
-            let socket = growlight_socket(a.socket);
+            let socket = growlight_socket(a.socket)?;
             let reply: FleetStatusReply =
                 growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
             print!("{}", render_resources_show(&reply));
@@ -1875,7 +1876,7 @@ fn client_resources(args: ResourcesArgs) -> Result<()> {
         // `resources set` — adjust the caps live. The all-empty case is refused
         // here (a no-op `set` is almost certainly a mistake) before any daemon call.
         ResourcesCmd::Set(a) => {
-            let socket = growlight_socket(a.socket);
+            let socket = growlight_socket(a.socket)?;
             let set_args = build_set_resources_args(a.build_jobs, a.memory_high, a.cpu_weight)?;
             let reply: SetResourcesReply = growlight_call(
                 &socket,
@@ -2047,7 +2048,7 @@ fn render_set_resources_reply(r: &SetResourcesReply) -> String {
 }
 
 fn client_stop(args: StopArgs) -> Result<()> {
-    let socket = growlight_socket(args.socket);
+    let socket = growlight_socket(args.socket)?;
     let force = ForceStopArgs {
         agent: args.agent,
         level: args.level.into(),
@@ -2088,7 +2089,7 @@ fn stop_level_label(level: StopLevel) -> &'static str {
 /// `Event` JSON, NOT `Response` envelopes) mirrors growlightd's
 /// `tests/subscribe_stream.rs`.
 fn client_watch(args: ClientArgs) -> Result<()> {
-    let socket = growlight_socket(args.socket);
+    let socket = growlight_socket(args.socket)?;
     // `subscribe` is a long-lived stream: connect WITHOUT a read timeout so an
     // idle daemon (no events) blocks for the next frame instead of the read
     // timing out into a fatal EAGAIN (os error 11). Ctrl-C / EOF are the only
@@ -2201,7 +2202,7 @@ fn render_event(e: &Event) -> String {
 /// half of the bus's async turn-boundary model: agents read it in their inbox at
 /// their next boot (spec §4a). The GUI input box is the same seam later.
 fn client_say(args: SayArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let post = human_say_args(&args.to, &args.kind, &args.body);
     match try_daemon_call(&socket, op::POST_MESSAGE, serde_json::to_value(post)?) {
         Ok(Some(value)) => {
@@ -2227,7 +2228,7 @@ fn client_say(args: SayArgs) -> Result<()> {
 }
 
 fn client_reports(args: ReportsArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req = ListReportsArgs { tags: args.tags.clone() };
     match try_daemon_call(&socket, op::LIST_REPORTS, serde_json::to_value(req)?) {
         Ok(Some(value)) => {
@@ -2758,11 +2759,18 @@ pub struct SliceStatusArgs {
 }
 
 fn client_queue(args: QueueArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
-    let growlightd_socket = growlight_socket(args.growlightd_socket);
-    match args.cmd.unwrap_or(QueueSub::Show) {
+    let growlightd_socket = growlight_socket(args.growlightd_socket)?;
+    let cmd = args.cmd.unwrap_or(QueueSub::Show);
+    // `pick` asks growlightd only, so it must not need keeperd's default
+    // socket (an explicit `--growlightd-socket` works without
+    // `XDG_RUNTIME_DIR`).
+    if let QueueSub::Pick { member } = cmd {
+        return queue_pick(&growlightd_socket, member.as_deref());
+    }
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
+    match cmd {
         QueueSub::Show => queue_show(&socket, &growlightd_socket),
-        QueueSub::Pick { member } => queue_pick(&growlightd_socket, member.as_deref()),
+        QueueSub::Pick { .. } => unreachable!("answered above"),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
             QueueProjectSub::SetRepo(a) => queue_project_set_repo(&socket, a),
@@ -2782,7 +2790,7 @@ fn client_queue(args: QueueArgs) -> Result<()> {
 }
 
 fn client_slice(args: SliceArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     match args.cmd {
         SliceSub::Insert(a) => slice_insert(&socket, a),
         SliceSub::Move(a) => slice_move(&socket, a),

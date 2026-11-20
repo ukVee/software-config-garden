@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         println!("softfig-tui {}", softfig_client::compat::binary_version());
         return Ok(());
     }
-    let socket = softfig_client::runtime_socket_path();
+    let socket = softfig_client::runtime_socket_path()?;
     // release-pipeline slice 002: refuse to start against a daemon of another
     // build, before the terminal is taken over, so the message stays readable.
     // A daemon that is absent or unreachable is not a refusal: the TUI starts
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     // reads on purpose: process-state is the one permanent growlightd read and
     // never migrates to the future garden mount. Its worker idles until the
     // Growlight tab is active; an unreachable socket soft-fails in the header.
-    let growlightd_socket = softfig_client::growlightd_runtime_socket_path();
+    let growlightd_socket = softfig_client::growlightd_runtime_socket_path()?;
     let mut growlightd = IpcClient::spawn(growlightd_socket);
     let mut app = App::new();
     // Interface preferences (menu-button position, last editor view) are

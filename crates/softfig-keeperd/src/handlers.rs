@@ -60,7 +60,7 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         // Growlight: surface an armed relock token (lazily prunes an expired
         // one). The state dir is real disk (never the mount), safe under `inner`.
         let relock_expires_at =
-            crate::relock::pending_expires_at(inner.config.state_dir(), unix_now());
+            crate::relock::pending_expires_at(&inner.config, unix_now());
         (
             inner.state.label().to_string(),
             tip_hex,
@@ -338,14 +338,15 @@ pub fn relock_mint(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         ));
     }
 
-    let state_dir = inner.config.state_dir().to_path_buf();
+    let relock_config = inner.config.clone();
     let session = inner.session.as_ref().expect("unlocked").clone();
     let now = unix_now();
     let (token, blob) = session
         .mint_relock(now, RELOCK_TTL_SECS)
         .map_err(|e| (ErrorKind::Internal, format!("mint relock: {e}")))?;
 
-    let blob_path = crate::relock::blob_path(&state_dir)
+    let blob_path = crate::relock::blob_path(&relock_config)
+        .map_err(|e| (ErrorKind::Io, e.to_string()))?
         .ok_or((ErrorKind::Internal, "vault not initialized".into()))?;
     crate::relock::write_secret_file(&blob_path, &blob.encode())
         .map_err(|e| (ErrorKind::Io, format!("write relock blob: {e}")))?;
@@ -358,7 +359,8 @@ pub fn relock_mint(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         token_path: None,
     };
     if args.persist {
-        let token_path = crate::relock::token_path(&state_dir)
+        let token_path = crate::relock::token_path(&relock_config)
+            .map_err(|e| (ErrorKind::Io, e.to_string()))?
             .ok_or((ErrorKind::Internal, "vault not initialized".into()))?;
         crate::relock::write_secret_file(&token_path, token.to_hex().as_bytes())
             .map_err(|e| (ErrorKind::Io, format!("write relock token: {e}")))?;
@@ -398,7 +400,9 @@ pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
     }
 
     let state_dir = inner.config.state_dir().to_path_buf();
-    let blob_path = crate::relock::blob_path(&state_dir)
+    let relock_config = inner.config.clone();
+    let blob_path = crate::relock::blob_path(&relock_config)
+        .map_err(|e| (ErrorKind::Io, e.to_string()))?
         .ok_or((ErrorKind::NotFound, "vault not initialized".into()))?;
     let blob_bytes = std::fs::read(&blob_path).map_err(|_| {
         (
@@ -414,7 +418,8 @@ pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
         Some(hex) => RelockToken::from_hex(hex)
             .map_err(|e| (ErrorKind::BadArgs, format!("relock token: {e}")))?,
         None => {
-            let token_path = crate::relock::token_path(&state_dir)
+            let token_path = crate::relock::token_path(&relock_config)
+                .map_err(|e| (ErrorKind::Io, e.to_string()))?
                 .ok_or((ErrorKind::NotFound, "vault not initialized".into()))?;
             let hex = std::fs::read_to_string(&token_path).map_err(|_| {
                 (
@@ -447,7 +452,7 @@ pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
     crate::growlight_unit::apply_fleet_gate(daemon);
 
     // Single-use: remove the blob + any persisted token now that it redeemed.
-    crate::relock::remove_artifacts(&state_dir);
+    crate::relock::remove_artifacts(&relock_config);
     eprintln!("keeperd: relock token redeemed; session resumed");
 
     Ok(serde_json::to_value(RelockRedeemReply {
@@ -886,6 +891,12 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // any path that has an inline `<vault id="…">` tag with the
     // matching id.
     let garden_root = inner.config.garden_root.clone();
+    // Refuse before decrypting anything: plaintext never goes to a `/tmp`
+    // guess (report 174).
+    let reveal_dir = inner
+        .config
+        .runtime_dir("the revealed plaintext")
+        .map_err(|e| (ErrorKind::Io, e.to_string()))?;
     let rel = validate_repo_path(&garden_root, &args.path)
         .map_err(|m| (ErrorKind::BadArgs, m))?;
     let rel_string = path_to_repo_rel_string(&garden_root, &rel)
@@ -1027,7 +1038,7 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     };
 
     // Write 0600 temp file in XDG_RUNTIME_DIR. Caller `open()`s it.
-    let temp_path = write_reveal_temp_file(&rel_string, args.id.as_deref(), &plaintext)
+    let temp_path = write_reveal_temp_file(&reveal_dir, &rel_string, args.id.as_deref(), &plaintext)
         .map_err(|e| (ErrorKind::Io, e))?;
 
     // Commit a `vault_reveal` audit intent. Failure to commit is fatal
@@ -2831,15 +2842,13 @@ pub(crate) fn resolve_path_in_tree(
 }
 
 fn write_reveal_temp_file(
+    runtime_dir: &Path,
     rel: &str,
     id: Option<&str>,
     plaintext: &[u8],
 ) -> std::result::Result<PathBuf, String> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
     if !runtime_dir.exists() {
-        std::fs::create_dir_all(&runtime_dir)
+        std::fs::create_dir_all(runtime_dir)
             .map_err(|e| format!("create runtime dir: {e}"))?;
     }
     // Crude random suffix from nanos — sufficient for collision

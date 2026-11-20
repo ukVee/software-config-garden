@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 
 use softfig_client::{
-    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, ReconnectError,
-    RetryPolicy,
+    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, NoRuntimeDir,
+    ReconnectError, RetryPolicy,
 };
 use softfig_protocol_growlightd::{op as gop, FleetStatusReply};
 use softfig_protocol_keeperd::{ErrorKind, Request, Response};
@@ -32,8 +32,9 @@ use crate::update::Message;
 
 /// The socket a [`Daemon`] is dialed at. Pure over `$XDG_RUNTIME_DIR`
 /// resolution: keeperd and growlightd are separate processes binding distinct
-/// sockets beside each other under the same per-user runtime dir.
-pub fn socket_for(daemon: Daemon) -> PathBuf {
+/// sockets beside each other under the same per-user runtime dir. Without a
+/// usable `$XDG_RUNTIME_DIR` there is no socket to dial (report 174).
+pub fn socket_for(daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
     match daemon {
         Daemon::Keeperd => runtime_socket_path(),
         Daemon::Growlightd => growlightd_runtime_socket_path(),
@@ -51,6 +52,13 @@ pub trait Transport {
     /// [`call_reconnecting`]: a pre-send failure is retried, a post-send drop is
     /// surfaced as [`ReconnectError::Ambiguous`] rather than blindly re-applied.
     fn send(&mut self, socket: &Path, req: &Request) -> Result<Response, ReconnectError>;
+
+    /// The socket [`dispatch`] dials for `daemon`. The default is the live
+    /// [`socket_for`]; a test transport pins its own, so routing is provable
+    /// without `$XDG_RUNTIME_DIR`.
+    fn socket(&self, daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
+        socket_for(daemon)
+    }
 }
 
 /// The live transport: the already-tested reconnecting client. **No new client**
@@ -77,7 +85,7 @@ pub fn dispatch(
     transport: &mut impl Transport,
     req: &WireRequest,
 ) -> Result<Response, ReconnectError> {
-    let socket = socket_for(req.daemon);
+    let socket = transport.socket(req.daemon)?;
     let request = Request::new(req.op, req.args.clone());
     transport.send(&socket, &request)
 }
@@ -155,6 +163,15 @@ mod tests {
     use crate::command::Command;
     use softfig_protocol_growlightd::{PolicySummary, StopLevel};
 
+    /// The sockets every test transport pins, so routing is asserted without
+    /// reading `$XDG_RUNTIME_DIR`.
+    fn pinned(daemon: Daemon) -> PathBuf {
+        match daemon {
+            Daemon::Keeperd => PathBuf::from("/run/test/softfig-keeperd.sock"),
+            Daemon::Growlightd => PathBuf::from("/run/test/softfig-growlightd.sock"),
+        }
+    }
+
     /// A recording fake [`Transport`]: captures every `(socket, request)` it is
     /// handed and answers with a canned `Ok` so [`dispatch`]'s routing can be
     /// asserted with no daemon running.
@@ -164,6 +181,9 @@ mod tests {
     }
 
     impl Transport for RecordingTransport {
+        fn socket(&self, daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
+            Ok(pinned(daemon))
+        }
         fn send(&mut self, socket: &Path, req: &Request) -> Result<Response, ReconnectError> {
             self.calls.push((socket.to_path_buf(), req.clone()));
             Ok(Response::ok(serde_json::json!({"acked": true})))
@@ -180,13 +200,16 @@ mod tests {
 
     #[test]
     fn socket_for_picks_the_distinct_per_daemon_sockets() {
+        // Holds with or without `$XDG_RUNTIME_DIR`: each daemon resolves
+        // through its own client resolver, and without the variable both
+        // refuse (no `/tmp` guess, report 174).
         assert_eq!(socket_for(Daemon::Keeperd), runtime_socket_path());
         assert_eq!(socket_for(Daemon::Growlightd), growlightd_runtime_socket_path());
-        assert_ne!(
-            socket_for(Daemon::Keeperd),
-            socket_for(Daemon::Growlightd),
-            "keeperd and growlightd bind separate sockets"
-        );
+        match (socket_for(Daemon::Keeperd), socket_for(Daemon::Growlightd)) {
+            (Ok(k), Ok(g)) => assert_ne!(k, g, "keeperd and growlightd bind separate sockets"),
+            (Err(_), Err(_)) => {}
+            other => panic!("one runtime dir rule for both daemons: {other:?}"),
+        }
     }
 
     #[test]
@@ -196,7 +219,7 @@ mod tests {
             kind: "info".into(),
             body: "hi".into(),
         });
-        assert_eq!(socket, runtime_socket_path(), "human post → keeperd socket");
+        assert_eq!(socket, pinned(Daemon::Keeperd), "human post → keeperd socket");
         assert_eq!(req.op, "post_message");
         assert_eq!(req.args["from"], "@human", "sender forced to the human");
         assert_eq!(req.args["to"], "@all");
@@ -209,7 +232,7 @@ mod tests {
             let (socket, req) = dispatched(cmd);
             assert_eq!(
                 socket,
-                growlightd_runtime_socket_path(),
+                pinned(Daemon::Growlightd),
                 "control verb → growlightd socket"
             );
             assert_eq!(req.op, op);
@@ -222,7 +245,7 @@ mod tests {
             agent: "loop-1".into(),
             level: StopLevel::HardKill,
         });
-        assert_eq!(socket, growlightd_runtime_socket_path());
+        assert_eq!(socket, pinned(Daemon::Growlightd));
         assert_eq!(req.op, "force_stop");
         assert_eq!(req.args["agent"], "loop-1");
         assert_eq!(req.args["level"], "hard_kill");
@@ -238,7 +261,7 @@ mod tests {
             session_7d_halt_pct: 90,
         };
         let (socket, req) = dispatched(Command::SetPolicy { policy });
-        assert_eq!(socket, growlightd_runtime_socket_path());
+        assert_eq!(socket, pinned(Daemon::Growlightd));
         assert_eq!(req.op, "set_policy");
         assert_eq!(req.args["policy"]["max_concurrent_agents"], 3);
     }
@@ -250,7 +273,7 @@ mod tests {
             memory_high: Some("3G".into()),
             cpu_weight: None,
         });
-        assert_eq!(socket, growlightd_runtime_socket_path());
+        assert_eq!(socket, pinned(Daemon::Growlightd));
         assert_eq!(req.op, "set_resources");
         assert_eq!(req.args["build_jobs"], 1);
         assert_eq!(req.args["memory_high"], "3G");
@@ -296,8 +319,11 @@ mod tests {
         /// reply, asserting it was dialed at growlightd's socket.
         struct Replying(serde_json::Value);
         impl Transport for Replying {
+            fn socket(&self, daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
+                Ok(pinned(daemon))
+            }
             fn send(&mut self, socket: &Path, req: &Request) -> Result<Response, ReconnectError> {
-                assert_eq!(socket, growlightd_runtime_socket_path(), "status → growlightd");
+                assert_eq!(socket, pinned(Daemon::Growlightd), "status → growlightd");
                 assert_eq!(req.op, "status");
                 Ok(Response::ok(self.0.clone()))
             }
@@ -319,6 +345,9 @@ mod tests {
     fn load_status_surfaces_a_daemon_error_rather_than_a_status() {
         struct Rejecting;
         impl Transport for Rejecting {
+            fn socket(&self, daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
+                Ok(pinned(daemon))
+            }
             fn send(&mut self, _: &Path, _: &Request) -> Result<Response, ReconnectError> {
                 Ok(Response::err(ErrorKind::Io, "boom"))
             }
@@ -338,6 +367,9 @@ mod tests {
     fn a_daemon_side_error_is_relayed_not_swallowed() {
         struct Rejecting;
         impl Transport for Rejecting {
+            fn socket(&self, daemon: Daemon) -> Result<PathBuf, NoRuntimeDir> {
+                Ok(pinned(daemon))
+            }
             fn send(&mut self, _: &Path, _: &Request) -> Result<Response, ReconnectError> {
                 Ok(Response::err(softfig_protocol_keeperd::ErrorKind::BadArgs, "nope"))
             }

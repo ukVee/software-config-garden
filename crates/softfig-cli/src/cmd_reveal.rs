@@ -32,7 +32,7 @@ pub struct RevealArgs {
 }
 
 pub fn run(args: RevealArgs) -> Result<()> {
-    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.clone().map_or_else(runtime_socket_path, Ok)?;
 
     // Client-side `--id` charset / length validation — fails fast so the
     // daemon doesn't have to round-trip a `BadArgs` for the obvious

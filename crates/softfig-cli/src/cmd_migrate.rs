@@ -149,7 +149,7 @@ fn prepare(args: PrepareArgs) -> Result<()> {
 
     // Refuse if a daemon socket is reachable. Half-finished prepare
     // against a running daemon would corrupt the running session.
-    let socket = runtime_socket_path();
+    let socket = runtime_socket_path()?;
     if socket.exists() {
         return Err(anyhow!(
             "daemon socket present at {} — stop the daemon (`softfig daemon stop`) before prepare",
@@ -210,7 +210,7 @@ fn prepare(args: PrepareArgs) -> Result<()> {
 }
 
 fn finalize(args: FinalizeArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req_args = serde_json::to_value(MigrateFinalizeArgs::default())?;
     match try_daemon_call(&socket, op::MIGRATE_FINALIZE, req_args) {
         Ok(Some(value)) => {
@@ -248,7 +248,7 @@ fn finalize(args: FinalizeArgs) -> Result<()> {
 }
 
 fn split(args: SplitArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req_args = serde_json::to_value(MigrateSplitArgs { apply: args.apply })?;
     match try_daemon_call(&socket, op::MIGRATE_SPLIT, req_args) {
         Ok(Some(value)) => {
@@ -292,7 +292,7 @@ fn split(args: SplitArgs) -> Result<()> {
 }
 
 fn reindex(args: ReindexArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req_args = serde_json::to_value(MigrateReindexArgs { apply: args.apply })?;
     match try_daemon_call(&socket, op::MIGRATE_REINDEX, req_args) {
         Ok(Some(value)) => {
@@ -331,7 +331,7 @@ fn reindex(args: ReindexArgs) -> Result<()> {
 }
 
 fn config(args: ConfigArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let socket = args.socket.map_or_else(runtime_socket_path, Ok)?;
     let req_args = serde_json::to_value(MigrateConfigArgs { apply: args.apply })?;
     match try_daemon_call(&socket, op::MIGRATE_CONFIG, req_args) {
         Ok(Some(value)) => {
