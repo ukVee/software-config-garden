@@ -6,6 +6,9 @@ members = [
     "crates/softfig-vcs",
     "crates/softfig-cli",
     "crates/softfig-ipc",
+    "crates/softfig-protocol-keeperd",
+    "crates/softfig-protocol-growlightd",
+    "crates/softfig-client",
     "crates/softfig-keeperd",
     "crates/softfig-growlightd",
     "crates/softfig-growlightd-client",
@@ -31,6 +34,9 @@ softfig-vault   = { path = "crates/softfig-vault" }
 softfig-store   = { path = "crates/softfig-store" }
 softfig-vcs    = { path = "crates/softfig-vcs" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
+softfig-protocol-keeperd = { path = "crates/softfig-protocol-keeperd" }
+softfig-protocol-growlightd = { path = "crates/softfig-protocol-growlightd" }
+softfig-client  = { path = "crates/softfig-client" }
 softfig-keeperd = { path = "crates/softfig-keeperd" }
 softfig-growlightd = { path = "crates/softfig-growlightd" }
 softfig-growlightd-client = { path = "crates/softfig-growlightd-client" }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use softfig_growlight_gui::{
     drive_messages, update, App, ConnState, Connector, Message, ReconnectPolicy, Sleeper,
 };
-use softfig_ipc::growlightd::{AgentDeltaKind, Event};
+use softfig_protocol_growlightd::{AgentDeltaKind, Event};
 
 /// A scripted connector: each entry is one connection's worth of lines (then EOF)
 /// or a connect failure. Mirrors the client crate's own test seam.

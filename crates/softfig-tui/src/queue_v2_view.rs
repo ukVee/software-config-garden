@@ -8,10 +8,11 @@
 
 use std::collections::HashSet;
 
-use softfig_ipc::growlightd::{QueueShowReply, QueueShowTree};
-use softfig_ipc::queue_v2::{Lane, SliceStatus};
-use softfig_ipc::verbs::{
-    op, QueueDropArgs, QueueMoveSpec, QueueStatusArg, QueueUpdateEntryArgs, SliceUpdateArgs,
+use softfig_protocol_growlightd::{QueueShowEntry, QueueShowReply, QueueShowTree};
+use softfig_protocol_keeperd::queue_v2::{Lane, SliceStatus};
+use softfig_protocol_keeperd::verbs::{
+    op, QueueDropArgs, QueueDropReply, QueueMoveSpec, QueueStatusArg, QueueUpdateEntryArgs,
+    QueueUpdateEntryReply, SliceUpdateArgs, SliceUpdateReply,
 };
 
 /// The §6.9 action set — the CLI verbs minus `add` (which stays CLI/MCP). Each
@@ -103,20 +104,16 @@ impl V2Action {
     pub fn view_from(&self, value: &serde_json::Value) -> Option<String> {
         match self {
             V2Action::EntryUpdate(_) => {
-                serde_json::from_value::<softfig_ipc::verbs::QueueUpdateEntryReply>(value.clone())
+                serde_json::from_value::<QueueUpdateEntryReply>(value.clone())
                     .ok()
                     .map(|r| r.view)
             }
-            V2Action::Drop(_) => serde_json::from_value::<softfig_ipc::verbs::QueueDropReply>(
-                value.clone(),
-            )
-            .ok()
-            .map(|r| r.view),
-            V2Action::SliceUpdate(_) => serde_json::from_value::<softfig_ipc::verbs::SliceUpdateReply>(
-                value.clone(),
-            )
-            .ok()
-            .map(|r| r.view),
+            V2Action::Drop(_) => serde_json::from_value::<QueueDropReply>(value.clone())
+                .ok()
+                .map(|r| r.view),
+            V2Action::SliceUpdate(_) => serde_json::from_value::<SliceUpdateReply>(value.clone())
+                .ok()
+                .map(|r| r.view),
         }
     }
 }
@@ -324,7 +321,7 @@ fn push_entry(
     out: &mut Vec<V2Row>,
     reply: &QueueShowReply,
     expanded: &HashSet<String>,
-    e: &softfig_ipc::growlightd::QueueShowEntry,
+    e: &softfig_protocol_growlightd::QueueShowEntry,
     kind: V2RowKind,
 ) {
     let is_milestone = tree_for(reply, &e.id).is_some();
@@ -412,7 +409,7 @@ pub fn entry_move(reply: &QueueShowReply, view: &QueueV2View, up: bool) -> Optio
         return None;
     }
     let lane = if row.kind == V2RowKind::Urgent { "urgent" } else { "normal" };
-    let siblings: Vec<&softfig_ipc::growlightd::QueueShowEntry> =
+    let siblings: Vec<&softfig_protocol_growlightd::QueueShowEntry> =
         reply.entries.iter().filter(|e| e.lane == lane).collect();
     let pos = siblings.iter().position(|e| e.id == row.entry_id)?;
     let (to, ref_id) = if up {
@@ -583,7 +580,7 @@ pub fn status_action(target: &StatusTarget, status: HumanStatus) -> V2Action {
 /// list. The overlay-driven actions (`after`, `drop`) address the id they
 /// captured when the overlay opened, never the cursor row at submit time — a
 /// reload while the overlay is open moves the rows under the cursor.
-fn live_entry<'a>(reply: &'a QueueShowReply, id: &str) -> Option<&'a softfig_ipc::growlightd::QueueShowEntry> {
+fn live_entry<'a>(reply: &'a QueueShowReply, id: &str) -> Option<&'a QueueShowEntry> {
     reply.entries.iter().find(|e| e.id == id)
 }
 
@@ -686,7 +683,7 @@ pub fn move_selected(reply: &QueueShowReply, view: &QueueV2View, up: bool) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use softfig_ipc::growlightd::{QueueShowEntry, QueueShowSlice, QueueShowTree};
+    use softfig_protocol_growlightd::{QueueShowEntry, QueueShowSlice, QueueShowTree};
 
     fn entry(id: &str, lane: &str, status: &str, after: &[&str], open: bool) -> QueueShowEntry {
         QueueShowEntry {

@@ -21,8 +21,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use softfig_ipc::growlightd::{op, Event};
-use softfig_ipc::Request;
+use softfig_protocol_growlightd::{op, Event};
+use softfig_protocol_keeperd::Request;
 
 // ---------------------------------------------------------------------------
 // Frame decoding (pure). Tolerant by design: a frame this build can't decode is
@@ -304,7 +304,7 @@ impl Connector for UnixConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use softfig_ipc::growlightd::AgentDeltaKind;
+    use softfig_protocol_growlightd::AgentDeltaKind;
     use std::collections::VecDeque;
     use std::io::Cursor;
 

@@ -28,14 +28,14 @@ use softfig_tui::ui;
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn main() -> Result<()> {
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_client::runtime_socket_path();
     let mut ipc = IpcClient::spawn(socket);
     // A SECOND, independent IPC channel — growlightd's own socket — for the live
     // fleet header (its `status` poll). Kept distinct from the keeperd garden
     // reads on purpose: process-state is the one permanent growlightd read and
     // never migrates to the future garden mount. Its worker idles until the
     // Growlight tab is active; an unreachable socket soft-fails in the header.
-    let growlightd_socket = softfig_ipc::growlightd_runtime_socket_path();
+    let growlightd_socket = softfig_client::growlightd_runtime_socket_path();
     let mut growlightd = IpcClient::spawn(growlightd_socket);
     let mut app = App::new();
     // Interface preferences (menu-button position, last editor view) are

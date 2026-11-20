@@ -21,14 +21,13 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use softfig_ipc::{
-    self,
-    growlightd::{
-        AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
-        CompleteSliceArgs, MemberCall, MemberVerbReply, RefusalCode, ReleaseLeaseArgs,
-        RequestLeaseArgs, MEMBER_VERB_OK, MEMBER_VERB_REFUSED, NOT_A_MEMBER_MESSAGE,
-    },
-    MemberIdentity,
+use softfig_ipc::MemberIdentity;
+use softfig_protocol_growlightd::{
+    AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
+    CompleteSliceArgs, MemberCall, MemberVerbReply, RefusalCode, ReleaseLeaseArgs,
+    RequestLeaseArgs, MEMBER_VERB_OK, MEMBER_VERB_REFUSED, NOT_A_MEMBER_MESSAGE,
+};
+use softfig_protocol_keeperd::{
     verbs::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
@@ -1126,7 +1125,7 @@ fn route_member_verb(
             args,
         })?)
     }
-    let Some(&op_name) = softfig_ipc::growlightd::op::MEMBER_VERBS
+    let Some(&op_name) = softfig_protocol_growlightd::op::MEMBER_VERBS
         .iter()
         .find(|&&v| v == name)
     else {
@@ -1175,12 +1174,12 @@ fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> 
         "queue_add_entry" => {
             let a: QueueAddEntryArgs = serde_json::from_value(args.clone()).ok()?;
             let urgent = "urgent work goes to the human instead: post_message to @human";
-            if a.kind == softfig_ipc::queue_v2::EntryKind::Restack {
+            if a.kind == softfig_protocol_keeperd::queue_v2::EntryKind::Restack {
                 Some(refused(
                     "queue_add_entry kind=restack",
                     &format!("a restack is always urgent, and {urgent}"),
                 ))
-            } else if a.lane == Some(softfig_ipc::queue_v2::Lane::Urgent) {
+            } else if a.lane == Some(softfig_protocol_keeperd::queue_v2::Lane::Urgent) {
                 Some(refused(
                     "queue_add_entry lane=urgent",
                     &format!("a member's found work joins the normal lane, and {urgent}"),
@@ -1539,7 +1538,7 @@ fn summarize(name: &str, data: &Value) -> String {
         }
         return format!("read_versions {path}: {version}{flag}\n{}", sec_lines.join("\n"));
     }
-    if softfig_ipc::growlightd::op::MEMBER_VERBS.contains(&name) {
+    if softfig_protocol_growlightd::op::MEMBER_VERBS.contains(&name) {
         return summarize_member_verb(data);
     }
     if name == "request_lease" || name == "release_lease" {
@@ -1705,9 +1704,9 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
     // A member session's every request carries its identity, so keeperd holds
     // its writes to §6.7 (the `> Model:` guard) and relays its slice verbs to
     // growlightd; a human's carries none and is served as before.
-    let socket = softfig_ipc::runtime_socket_path();
+    let socket = softfig_client::runtime_socket_path();
     let req = Request::new(op_name, ipc_args).with_member(caller.member());
-    let resp = softfig_ipc::call_reconnecting(&socket, &req, softfig_ipc::RetryPolicy::default())?;
+    let resp = softfig_client::call_reconnecting(&socket, &req, softfig_client::RetryPolicy::default())?;
     match resp {
         Response::Ok { data, .. } => Ok(json!({
             "content": [{ "type": "text", "text": summarize(name, &data) }],
@@ -1803,7 +1802,7 @@ mod tests {
     /// agent reads — the session isn't errored out. One test per verb name.
     #[test]
     fn a_non_member_is_refused_every_member_verb_before_any_socket() {
-        for verb in softfig_ipc::growlightd::op::MEMBER_VERBS {
+        for verb in softfig_protocol_growlightd::op::MEMBER_VERBS {
             let line = json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": { "name": verb, "arguments": {} },
@@ -1943,7 +1942,7 @@ mod tests {
             "growlight_complete_slice",
             "m",
             "003",
-            Some(softfig_ipc::growlightd::NextUnit {
+            Some(softfig_protocol_growlightd::NextUnit {
                 entry: "m".into(),
                 unit: "004".into(),
             }),

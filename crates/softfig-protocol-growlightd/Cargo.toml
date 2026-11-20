@@ -1,0 +1,20 @@
+[package]
+name = "softfig-protocol-growlightd"
+# Its own 0.x, not `version.workspace`: this crate makes no stability promise
+# (spec-softfig-tui-frontend-split §3.2).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig growlightd wire protocol, unstable: any version bump may break. No IO."
+
+[dependencies]
+softfig-protocol-keeperd.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# Only the `mod tests` block builds JSON values; the wire types are serde
+# only, so a keeperd-only client of this unstable crate does not pull it
+# (review 060 F7).
+serde_json.workspace = true

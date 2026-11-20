@@ -94,7 +94,7 @@ pub fn fleet_status_rows(app: &App) -> Vec<&AgentRow> {
 mod tests {
     use super::*;
     use crate::state::ThoughtLine;
-    use softfig_ipc::growlightd::AgentDeltaKind;
+    use softfig_protocol_growlightd::AgentDeltaKind;
 
     fn thought(agent: &str, text: &str) -> ThoughtLine {
         ThoughtLine {

@@ -79,8 +79,15 @@ software-config_garden/
     │   └── src/{lib,db,objects,paths,hash,error}.rs
     ├── softfig-vcs/                   # VCS operations
     │   └── src/{lib,repo,walk,tree,commit,intent,log,fsck,error}.rs
-    ├── softfig-ipc/                    # JSON-Lines protocol + client
-    │   └── src/{lib,proto,verbs,socket,client}.rs
+    ├── softfig-protocol-keeperd/       # keeperd wire types + envelope, no IO, 0.x
+    │   └── src/{lib,proto,verbs,queue_v2}.rs
+    ├── softfig-protocol-growlightd/    # growlightd wire types, no IO, unstable 0.x
+    │   └── src/{lib,growlightd}.rs
+    ├── softfig-client/                 # connect, call, reconnect, socket paths
+    │   └── src/{lib,client,socket}.rs
+    ├── softfig-ipc/                    # facade over the three above + daemon-shared code
+    │   └── src/{lib,backlog_doc,baton,claude_profiles,fleet,item_meta,item_repo,member,
+    │            model_choice,opencode,slot_name,testing,usage}.rs + src/queue_v2/
     ├── softfig-keeperd/                # daemon binary
     │   ├── src/{lib,main,config,daemon,server,handlers,reads,peer,classify,watcher,state,
     │   │        keeper_toml,migrate,fuse_sink,net,deploy,replica_health}.rs
@@ -233,7 +240,17 @@ falls back to direct mode **only** when the socket is absent
 `vault_locked`) is surfaced verbatim — never bypassed — so the
 "daemon, when present, is the sole writer" invariant holds.
 
-## IPC surface (softfig-ipc)
+## IPC surface (softfig-protocol-keeperd, softfig-protocol-growlightd, softfig-client)
+
+The wire types live in `softfig-protocol-keeperd` (the envelope and keeperd
+verbs) and `softfig-protocol-growlightd`, which depends on it one way. Neither
+does IO. `softfig-client` holds connect, call, reconnect and the socket paths.
+`softfig-ipc` re-exports all three, so every `softfig_ipc::…` path still
+compiles. keeperd, growlightd and the CLI stay on that facade until the unmerged
+branches land. `softfig-tui`, `softfig-growlight-gui` and
+`softfig-growlightd-client` no longer depend on it, and `softfig-mcp` keeps it
+for `MemberIdentity` and `queue_v2::QueueRefusal`. Nothing here is stable yet:
+see `docs/protocol-stability.md`.
 
 JSON-Lines on a Unix socket. Verbs: `status`, `unlock`, `commit`,
 `log`, `show`, `fsck`, `propose_doc_update`, `migrate_finalize`,

@@ -19,7 +19,7 @@ use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
 use crate::queue_v2_view::{HumanStatus, StatusTarget, V2Action, V2RowKind};
-use softfig_ipc::{human_age_secs, DeployAction};
+use softfig_protocol_keeperd::{human_age_secs, DeployAction};
 
 /// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
 /// backend serving it, and — only when that backend is metered — its model and
@@ -34,7 +34,7 @@ use softfig_ipc::{human_age_secs, DeployAction};
 /// Deliberately terser than `growlight status`: no step count, no "this session".
 /// This is a one-line panel on a small screen, and the dollar figure is the part
 /// the operator scans for.
-fn fleet_agent_cell(a: &softfig_ipc::growlightd::AgentSummary) -> String {
+fn fleet_agent_cell(a: &softfig_protocol_growlightd::AgentSummary) -> String {
     let mut cell = format!("{}:{} · {}", a.id, a.status, a.backend);
     if let Some(model) = &a.model {
         cell.push_str(" · ");
@@ -3331,7 +3331,7 @@ mod tests {
 
     #[test]
     fn a_fleet_agent_cell_shows_metered_spend_and_no_reserve_column() {
-        use softfig_ipc::growlightd::{AgentSpendSummary, AgentSummary};
+        use softfig_protocol_growlightd::{AgentSpendSummary, AgentSummary};
 
         // The fleet panel's half of slice 006: a metered member carries its model
         // and dollar figure, so it no longer sits against an empty Anthropic
@@ -3360,7 +3360,7 @@ mod tests {
 
     #[test]
     fn a_fleet_agent_cell_shows_the_claude_login_profile_slot_when_pinned() {
-        use softfig_ipc::growlightd::AgentSummary;
+        use softfig_protocol_growlightd::AgentSummary;
 
         // claude-login-switcher slice 003 finish-check 5: the active profile
         // slot shows between the backend and the spend column (opencode has

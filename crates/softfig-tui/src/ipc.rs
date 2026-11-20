@@ -1,6 +1,6 @@
 //! Worker-thread IPC client.
 //!
-//! The sync `softfig-ipc` client runs on a dedicated thread so the UI loop
+//! The sync `softfig-client` client runs on a dedicated thread so the UI loop
 //! never blocks on a daemon round-trip. The UI sends `(id, op, args, tag)`
 //! commands and drains replies non-blockingly each tick. The daemon serves
 //! one request per connection, so the worker connects fresh per call.
@@ -10,7 +10,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
 use serde_json::Value;
-use softfig_ipc::{call, connect, ErrorKind, Request};
+use softfig_client::{call, connect};
+use softfig_protocol_keeperd::{ErrorKind, Request};
 
 pub type ReqId = u64;
 
@@ -94,7 +95,7 @@ pub enum Tag {
     /// (slice 003). Rides the SECOND, growlightd-only [`IpcClient`] channel, not
     /// the keeperd one — process-state is the one permanent growlightd read and
     /// never migrates to the garden mount. `Ok` carries a
-    /// `softfig_ipc::growlightd::FleetStatusReply`; ANY `Err` (growlightd down /
+    /// `softfig_protocol_growlightd::FleetStatusReply`; ANY `Err` (growlightd down /
     /// fleet disarmed / a version-skew malformed reply) soft-fails to the
     /// header's dim "unreachable" line — never a status splat, never blanking the
     /// garden-only tree/body.
@@ -102,7 +103,7 @@ pub enum Tag {
     /// growlight: the LIVE runtime baton, polled on the SECOND (growlightd-only)
     /// [`IpcClient`] channel via the `baton` verb (slice 004) — the loop's carried
     /// state, which lives OUTSIDE the garden today. `Ok` carries a
-    /// `softfig_ipc::growlightd::BatonReply`; ANY `Err` (growlightd down / disarmed
+    /// `softfig_protocol_growlightd::BatonReply`; ANY `Err` (growlightd down / disarmed
     /// / a malformed reply) soft-fails to `None` — the header then falls back to the
     /// garden baton-LOG headline — never a status splat, never blanking the page.
     /// Transitional: retires when the runtime is a mounted garden chain, when the
@@ -113,7 +114,7 @@ pub enum Tag {
     /// state, like `GrowlightNodeFile`, NOT the growlightd channel (contrast
     /// `FleetStatus`/`GrowlightRuntimeBaton`). Eagerly loaded on tab entry (and on
     /// the stale-refresh path), not per-select. `Ok` carries a
-    /// `softfig_ipc::TailBusReply` (messages ascending); the app parses it into
+    /// `softfig_protocol_keeperd::TailBusReply` (messages ascending); the app parses it into
     /// newest-first rows. An `Err` surfaces on `self.status` like the other garden
     /// reads — the page keeps working with growlightd down (keeper-sourced).
     GrowlightBus,
@@ -121,7 +122,7 @@ pub enum Tag {
     /// (growlightd-only) channel — the stack annotation needs growlightd's
     /// read-only git surface. Fired once when the tab is active and the snapshot
     /// is marked stale (entry / refresh / a confirmed action), NOT polled. `Ok`
-    /// carries a `softfig_ipc::growlightd::QueueShowReply`; an `Err` (growlightd
+    /// carries a `softfig_protocol_growlightd::QueueShowReply`; an `Err` (growlightd
     /// down) soft-fails to `None` — the legacy tree still renders (slice 007).
     GrowlightQueueShow,
     /// growlight: one §6.9 mutating action (`queue_update_entry` / `queue_drop` /

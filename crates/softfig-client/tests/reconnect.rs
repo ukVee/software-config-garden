@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
+use softfig_client::{call_reconnecting, ReconnectError, RetryPolicy};
+use softfig_protocol_keeperd::{Request, Response};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 

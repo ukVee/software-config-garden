@@ -30,6 +30,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+// Re-exported: the four wire types live in `softfig-protocol-keeperd`, but this
+// module is their documented path for the converter's callers (tests included).
+pub use super::{Answers, BatonMove, CallClass};
+
 use super::{
     ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project, QueueArchiveToml,
     QueueToml, RepoLocality, SliceItem, SliceKind, SliceStatus, SlicesToml,
@@ -396,61 +400,6 @@ fn orphan_tables(doc: &str, registry: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
-/// The owner's settlements, read from the answers file (`--answers <toml>`).
-/// A class-wide answer settles every call of that class; a per-key answer
-/// overrides it for one call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Answers {
-    pub schema: u32,
-    /// Class → the answer for every call of that class.
-    #[serde(default)]
-    pub class: BTreeMap<CallClass, String>,
-    /// [`CallKey`] (rendered) → the answer for that one call.
-    #[serde(default)]
-    pub call: BTreeMap<String, String>,
-}
-
-/// The closed list of judgment-call classes (the milestone doc's `## Mapping`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CallClass {
-    /// How the per-queue orders interleave into the one global list.
-    ListOrder,
-    /// A project's `repo`: no registry cell (`default`), trailing prose, or a
-    /// value `RepoLocality` calls ambiguous.
-    ProjectRepo,
-    /// A project's `main` branch (legacy records none).
-    ProjectMain,
-    /// Two projects naming one repository under different spellings.
-    SameRepo,
-    /// A `type` or `status` cell outside the legacy vocabulary.
-    UnknownCell,
-    /// An item id that appears in more than one queue table.
-    DuplicateId,
-    /// A live item with no item doc, or more than one. Acknowledgment only:
-    /// v2 finds the doc by its path, so the answer is never read.
-    ItemDoc,
-    /// A `[blocked on X]` tag whose X names no known item.
-    BlockedOn,
-    /// `## Branch policy` prose that names no single branch, or a branch other
-    /// than the v2 default (`feat/<id>` / `fix/<id>`).
-    Branch,
-    /// A started item's `parent` / `base` the prose does not state.
-    StackBase,
-    /// A started milestone's per-slice progress (legacy records none); a
-    /// milestone with no slices raises none.
-    SliceProgress,
-    /// A `> Not before:` value that does not parse.
-    NotBefore,
-    /// A `> Model:` line the v2 resolver refuses (a comma list before the flip).
-    Model,
-    /// More than one `active` normal-lane entry for one repo (§3.1 invariant).
-    ActivePerRepo,
-    /// A baton naming an item that is not live, or two batons naming one item.
-    Baton,
-}
-
 /// A judgment call's stable key: class + subject (`<class>:<subject>`), the
 /// key the answers file's `call` table uses.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -458,29 +407,6 @@ pub struct CallKey {
     pub class: CallClass,
     /// The entry id, project name, or baton path the call is about.
     pub subject: String,
-}
-
-impl CallClass {
-    /// The class's answers-file name — its serde wire name.
-    pub fn name(self) -> &'static str {
-        match self {
-            CallClass::ListOrder => "list_order",
-            CallClass::ProjectRepo => "project_repo",
-            CallClass::ProjectMain => "project_main",
-            CallClass::SameRepo => "same_repo",
-            CallClass::UnknownCell => "unknown_cell",
-            CallClass::DuplicateId => "duplicate_id",
-            CallClass::ItemDoc => "item_doc",
-            CallClass::BlockedOn => "blocked_on",
-            CallClass::Branch => "branch",
-            CallClass::StackBase => "stack_base",
-            CallClass::SliceProgress => "slice_progress",
-            CallClass::NotBefore => "not_before",
-            CallClass::Model => "model",
-            CallClass::ActivePerRepo => "active_per_repo",
-            CallClass::Baton => "baton",
-        }
-    }
 }
 
 impl fmt::Display for CallKey {
@@ -507,14 +433,6 @@ pub struct JudgmentCall {
 pub struct Refusal {
     pub subject: String,
     pub reason: String,
-}
-
-/// A runtime baton copy: `from` (runtime-relative) → `entries/<entry>/baton.md`.
-/// A copy, never a move: the legacy baton stays where it is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatonMove {
-    pub from: String,
-    pub entry: String,
 }
 
 /// The whole conversion: the v2 files, the baton copies, every judgment call

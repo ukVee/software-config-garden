@@ -1,5 +1,27 @@
-//! soft-fig IPC: JSON-Lines protocol shared by the daemon, the CLI's
-//! daemon-bridge code path, and the MCP bridge.
+//! soft-fig IPC: a **facade** for in-repo consumers, not a public surface,
+//! and no longer the protocol itself (`docs/protocol-stability.md`).
+//!
+//! `feat/tui-split-protocol` moved the wire out; every moved item is
+//! re-exported here unchanged, so every pre-split `softfig_ipc::...` path
+//! still compiles. A frontend depends on the concrete crate; this facade is
+//! what keeps the daemons and the CLI unedited (the mergeability argument in
+//! `meta/spec-softfig-tui-frontend-split.md` §3).
+//!
+//! - `softfig-protocol-keeperd` — the JSON-Lines envelope (`Request`,
+//!   `Response`, `ErrorKind`), the keeperd verb types, `PROTOCOL_VERSION`, and
+//!   the pure value rules the wire surface reads:
+//!   `fleet::{holds, parse_not_before, days_from_civil}` and
+//!   `queue_v2::{EntryKind, Lane, SliceStatus, RestackBranch,
+//!   hold_annotation}` with the IO-free `queue_v2::migrate::{Answers,
+//!   BatonMove, CallClass}`.
+//! - `softfig-protocol-growlightd` — the growlightd wire types (`growlightd`).
+//! - `softfig-client` — `client`, `socket`, and the reconnecting call.
+//!
+//! What is left here is the daemon-shared garden code: `backlog_doc`, `baton`,
+//! `claude_profiles`, `item_meta`, `item_repo`, `member`, `model_choice`,
+//! `opencode`, `slot_name`, `testing`, `tz`, `usage`, the `queue_v2` state-file
+//! half (`validate`, and the IO-bound `migrate` plan) and the `fleet` item-doc
+//! scanner.
 //!
 //! Wire format: one JSON object per line, `\n`-terminated. Both directions
 //! identical. See `meta/spec-keeper.md` "IPC protocol" in the soft-fig
@@ -11,27 +33,19 @@
 pub mod backlog_doc;
 pub mod baton;
 pub mod claude_profiles;
-pub mod client;
 pub mod fleet;
-pub mod growlightd;
 pub mod item_meta;
 pub mod item_repo;
 pub mod member;
 pub mod model_choice;
 pub mod opencode;
-pub mod proto;
 pub mod queue_v2;
 pub mod slot_name;
-pub mod socket;
 pub mod testing;
 pub mod tz;
 pub mod usage;
-pub mod verbs;
 
 pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
-pub use client::{
-    call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
-};
 pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
@@ -40,18 +54,21 @@ pub use model_choice::{
     parse_declaration, parse_model_spec, resolve_item_models, validate_declared_subset,
     validate_model_change,
 };
-pub use proto::{ErrorKind, Request, Response};
 pub use slot_name::{validate_slot_name, SlotNameError};
 pub use queue_v2::{
     sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
     QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,
     SlicesToml,
 };
-pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
-pub use verbs::*;
-
-/// Bumped on incompatible wire-format changes. M1c ships v1.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub use softfig_client::{client, socket};
+pub use softfig_client::{
+    call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
+};
+pub use softfig_client::{growlightd_runtime_socket_path, runtime_socket_path};
+pub use softfig_protocol_growlightd::growlightd;
+pub use softfig_protocol_keeperd::{proto, verbs, PROTOCOL_VERSION};
+pub use softfig_protocol_keeperd::proto::{ErrorKind, Request, Response};
+pub use softfig_protocol_keeperd::verbs::*;
 
 /// The in-garden config directory (`<garden_root>/config/`) holding the
 /// encrypted, versioned, M5b-backed daemon config files.

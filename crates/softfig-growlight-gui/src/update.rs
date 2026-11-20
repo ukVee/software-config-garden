@@ -4,7 +4,7 @@
 //! the reducer + the decoder/reconnect that produced the events).
 
 use softfig_growlightd_client::ClientEvent;
-use softfig_ipc::growlightd::{Event, FleetStatusReply, SetResourcesReply};
+use softfig_protocol_growlightd::{Event, FleetStatusReply, SetResourcesReply};
 
 use crate::state::{App, ConnState, ThoughtLine};
 
@@ -118,7 +118,7 @@ fn apply_event(app: &mut App, e: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use softfig_ipc::growlightd::AgentDeltaKind;
+    use softfig_protocol_growlightd::AgentDeltaKind;
 
     fn fold(app: &mut App, ev: ClientEvent) {
         update(app, Message::from(ev));
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn resources_applied_folds_the_caps_and_outcome_into_the_model() {
-        use softfig_ipc::growlightd::BuildCapsSummary;
+        use softfig_protocol_growlightd::BuildCapsSummary;
         let mut app = App::default();
         update(
             &mut app,

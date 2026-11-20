@@ -4,7 +4,7 @@
 //! was already decided in [`command`](crate::command); this module only honors
 //! [`WireRequest::daemon`] by dialing the matching socket and delegating the
 //! whole connect→send→receive (with its reconnect/idempotency rules) to the
-//! already-tested [`softfig_ipc::call_reconnecting`]. There is **no new client**.
+//! already-tested [`softfig_client::call_reconnecting`]. There is **no new client**.
 //!
 //! This is the *write* mirror of [`crate::drive_messages`] (the reconnecting
 //! *read* binding over `subscribe`): both are the thin live edges of the
@@ -20,11 +20,12 @@
 
 use std::path::{Path, PathBuf};
 
-use softfig_ipc::growlightd::{op as gop, FleetStatusReply};
-use softfig_ipc::{
-    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, ErrorKind,
-    ReconnectError, Request, Response, RetryPolicy,
+use softfig_client::{
+    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, ReconnectError,
+    RetryPolicy,
 };
+use softfig_protocol_growlightd::{op as gop, FleetStatusReply};
+use softfig_protocol_keeperd::{ErrorKind, Request, Response};
 
 use crate::command::{Daemon, WireRequest};
 use crate::update::Message;
@@ -41,7 +42,7 @@ pub fn socket_for(daemon: Daemon) -> PathBuf {
 
 /// One round-trip against a daemon socket. The seam that keeps [`dispatch`]
 /// provable without a live daemon: production is [`ReconnectingTransport`]
-/// (delegating verbatim to [`softfig_ipc::call_reconnecting`]); a test injects a
+/// (delegating verbatim to [`softfig_client::call_reconnecting`]); a test injects a
 /// fake that records the `(socket, request)` it was handed and returns a canned
 /// [`Response`].
 pub trait Transport {
@@ -152,7 +153,7 @@ pub fn load_status(transport: &mut impl Transport) -> Result<Message, StatusErro
 mod tests {
     use super::*;
     use crate::command::Command;
-    use softfig_ipc::growlightd::{PolicySummary, StopLevel};
+    use softfig_protocol_growlightd::{PolicySummary, StopLevel};
 
     /// A recording fake [`Transport`]: captures every `(socket, request)` it is
     /// handed and answers with a canned `Ok` so [`dispatch`]'s routing can be
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     fn load_status_decodes_the_fleet_reply_into_a_status_loaded_message() {
-        use softfig_ipc::growlightd::{AgentSummary, FleetStatusReply, PolicySummary};
+        use softfig_protocol_growlightd::{AgentSummary, FleetStatusReply, PolicySummary};
 
         let reply = FleetStatusReply {
             state: "running".into(),
@@ -337,13 +338,13 @@ mod tests {
         struct Rejecting;
         impl Transport for Rejecting {
             fn send(&mut self, _: &Path, _: &Request) -> Result<Response, ReconnectError> {
-                Ok(Response::err(softfig_ipc::ErrorKind::BadArgs, "nope"))
+                Ok(Response::err(softfig_protocol_keeperd::ErrorKind::BadArgs, "nope"))
             }
         }
         let req = Command::Pause.to_request().unwrap();
         match dispatch(&mut Rejecting, &req).unwrap() {
             Response::Err { kind, error, .. } => {
-                assert_eq!(kind, softfig_ipc::ErrorKind::BadArgs);
+                assert_eq!(kind, softfig_protocol_keeperd::ErrorKind::BadArgs);
                 assert_eq!(error, "nope");
             }
             Response::Ok { .. } => panic!("expected the relayed daemon error"),

@@ -3679,6 +3679,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-client"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "libc",
+ "serde_json",
+ "softfig-protocol-keeperd",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "softfig-deploy"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -3708,8 +3718,10 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "iced",
  "serde_json",
+ "softfig-client",
  "softfig-growlightd-client",
- "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]
@@ -3735,7 +3747,8 @@ name = "softfig-growlightd-client"
 version = "1.0.0-alpha.1"
 dependencies = [
  "serde_json",
- "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
  "thiserror 2.0.18",
 ]
 
@@ -3745,9 +3758,11 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "blake3",
- "libc",
  "serde",
  "serde_json",
+ "softfig-client",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3794,7 +3809,10 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "softfig-client",
  "softfig-ipc",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]
@@ -3833,6 +3851,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-protocol-growlightd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "softfig-protocol-keeperd",
+]
+
+[[package]]
+name = "softfig-protocol-keeperd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "softfig-store"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -3867,7 +3902,9 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "softfig-ipc",
+ "softfig-client",
+ "softfig-protocol-growlightd",
+ "softfig-protocol-keeperd",
 ]
 
 [[package]]

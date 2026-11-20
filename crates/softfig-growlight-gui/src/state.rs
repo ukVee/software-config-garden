@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use softfig_ipc::growlightd::{
+use softfig_protocol_growlightd::{
     AgentDeltaKind, AgentSummary, BuildCapsSummary, FleetStatusReply, PolicySummary,
     SetResourcesReply,
 };
@@ -57,7 +57,7 @@ pub struct ThoughtLine {
 
 /// The sender form a human post shows as **on the bus** — the `@` sigil stripped
 /// from [`crate::command::HUMAN_SENDER`] (`@human`). The echoed
-/// [`softfig_ipc::growlightd::Event::BusMessage`] carries this form, so the
+/// [`softfig_protocol_growlightd::Event::BusMessage`] carries this form, so the
 /// optimistic chat line uses it to match the echo.
 pub const HUMAN_FROM: &str = "human";
 
@@ -150,7 +150,7 @@ pub struct Budgets {
 /// slice 003): which scope properties were applied LIVE to running scopes, which
 /// caps wait for the NEXT spawn, and the running agent scopes the live
 /// `set-property` targeted. The non-cap fields of a wire
-/// [`SetResourcesReply`](softfig_ipc::growlightd::SetResourcesReply), kept so the
+/// [`SetResourcesReply`](softfig_protocol_growlightd::SetResourcesReply), kept so the
 /// resources panel can render "what just happened" without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourcesOutcome {
