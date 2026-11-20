@@ -1,0 +1,128 @@
+# AUR — `soft-fig` (source) + `soft-fig-bin`
+
+The first channel: two AUR packages that make V1 gate #1 (`pacman -S soft-fig`
+works cold on a fresh box) literally true. Channels package what the release
+pipeline produces; they never fork behavior (`meta/spec-release.md` → Channels):
+each PKGBUILD **sets paths** (binaries to `/usr/bin`, units to
+`/usr/lib/systemd/user/`, the desktop entry to `/usr/share/applications/`) and
+**declares dependencies** (`fuse3`, `systemd`, `foot`), and never patches a
+default — the garden location, config parsing, and feature set are exactly the
+shipped binaries.
+
+| Package | Builds from | `check()` | arch |
+|---|---|---|---|
+| `soft-fig` | the tagged source tarball (`git` tag archive) | none — omitted on purpose: the daemon integration tests flake under load (report 045), and CI's gate runs the full suite on every push | `x86_64` |
+| `soft-fig-bin` | the tier-1 program tarball from GitHub Releases | verifies the `SHA256SUMS` minisign signature, then the tarball's `SHA256SUMS` entry | `x86_64` |
+
+Both install the **installed set** — the five binaries
+(`softfig`, `softfig-keeperd`, `softfig-growlightd`, `softfig-mcp`,
+`softfig-tui`), the two systemd **user** units, the `softfig-tui` desktop
+entry, and the AGPL license text. `growlight-gui` is deliberately absent
+(opt-in, never installed or published — see `meta/spec-release.md` → Binary
+set). `arch` is `x86_64` for both: tier-1 is the only *tested* target.
+`aarch64` (tier 2) is built but untested, so it is not offered here — add it to
+`soft-fig`'s `arch` once it is verified on hardware (a channel must not imply a
+tier it does not have).
+
+## Verifying a release before you install
+
+Release artifacts are signed two ways (see `meta/spec-release.md` → "Signing
+and the trust root"):
+
+- **Build provenance (sigstore).** Every artifact is attested in CI; verify
+  before executing, using tooling independent of the artifact itself:
+
+  ```
+  gh attestation verify <tarball> --repo ukVee/software-config-garden
+  ```
+
+- **A signed checksum manifest** for consumers without `gh`. `SHA256SUMS` is
+  signed with the maintainer's minisign key, and the public key is published
+  next to it as `minisign.pub` on the release page:
+
+  ```
+  minisign -Vm SHA256SUMS -p minisign.pub
+  ```
+
+`soft-fig-bin`'s `check()` runs that same `minisign` verification before
+installing anything — against its **own** copy of the public key, a local file
+in the AUR package repo pinned from the committed
+`packaging/signing/minisign.pub`. It never uses the `minisign.pub` published on
+the release page: a key from the release under test would vouch for whoever
+controls that release.
+
+## Install order (fresh box)
+
+Scaffold the garden **first**, then start the daemon against it, then unlock.
+The keeperd unit points `--garden %h/soft-fig_garden`, so enabling it before
+the garden exists boots the daemon against a path it cannot use:
+
+```
+softfig onboard                                  # scaffold a garden (interactive, needs a TTY)
+systemctl --user enable --now softfig-keeperd   # the keeper daemon (boots Locked)
+softfig daemon unlock                            # once per session
+```
+
+## Maintenance
+
+> **STATUS: PROPOSED — pending the owner's H9 answer.** This statement records
+> the recommended default from `meta/spec-release.md` → Open questions → "AUR
+> owner and update latency"; it is **not** the owner's decision until H9 is
+> answered. Fill in the `# Maintainer:` line and this section from that answer
+> before uploading.
+
+- **Maintainer:** the owner as **sole maintainer** (recommended; see below).
+- **Update-latency promise:** within **7 days of a tagged release**.
+
+The three options weighed (owner's call, H9):
+
+- **(a) Sole owner** — zero coordination, a single point of failure, but honest:
+  an AUR package with an absentee co-maintainer is worse than one with a slow
+  owner. *Recommended to start.*
+- **(b) A second maintainer** — spreads load but shares the owner's private
+  account surface; premature before H5 (CLA/legal) is settled.
+- **(c) An automation bot as co-maintainer** — updates fast, but is its own
+  supply-chain surface.
+
+**Flagging a stale package:** open an issue at
+https://github.com/ukVee/software-config-garden (title the issue with the
+package name), or comment on the AUR page. If a release has shipped and the AUR
+package has not updated within the promised latency window, that is a bug in
+this statement's promise — flag it the same way.
+
+## What the loop did, and what the owner must do
+
+The release-pipeline slices wrote these PKGBUILDs + this statement and
+committed them on `feat/release-pipeline` (unmerged). The loop never
+pushes/tags/publishes. Before `soft-fig`/`soft-fig-bin` go live, the owner:
+
+1. Answers **H9** and finalizes the `# Maintainer:` line + this section.
+2. **Creates the minisign signing keypair** — commit the public key as
+   `packaging/signing/minisign.pub`, store the secret key as the
+   `MINISIGN_SECRET_KEY` repository secret. See `packaging/signing/README.md`.
+3. Moves the `## [Unreleased]` entries in `CHANGELOG.md` into the tag's own
+   `## [X.Y.Z] - <date>` section and commits that to `main`. The release
+   workflow's `gate` refuses a tag whose section is missing or empty, or that
+   leaves entries under `[Unreleased]` (`scripts/release-notes.sh`). Decide the
+   version first: `CHANGELOG.md` already has a pre-pipeline
+   `## [1.0.0-alpha.1] - 2026-10-17`, so the first pipeline release either
+   folds the new entries into that section and reuses `v1.0.0-alpha.1`, or
+   bumps the workspace version (say `1.0.0-alpha.2`) and both PKGBUILDs'
+   `pkgver`/`_tag` with it.
+4. Cuts the tag (`v1.0.0-alpha.1`, or the version step 3 bumped to) and lets the release workflow build the
+   artifacts (the tarball, `SHA256SUMS` and `SHA256SUMS.minisig` that this
+   `-bin` package downloads).
+5. Copies the committed `packaging/signing/minisign.pub` into
+   `packaging/aur/soft-fig-bin/minisign.pub` and pins its sha256 **from that
+   committed copy** — never from the release download, which is what the pin
+   protects against.
+6. Fills the real `sha256sums=` into both PKGBUILDs — they are **all-zero
+   placeholders that fail closed** until the tag exists — and regenerates
+   `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`).
+7. Uploads each package directory to the AUR as its own git repo
+   (`soft-fig-bin`'s includes `minisign.pub`).
+
+`soft-fig-bin` `provides` and `conflicts` `soft-fig`; `soft-fig` only
+`conflicts` `soft-fig-bin` (it does not provide it). The two install the same
+files, so install one or the other, never both — but only `-bin` satisfies a
+dependency on `soft-fig`.

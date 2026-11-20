@@ -3,7 +3,8 @@
 //! `start` is foreground/dev-mode — systemd's user unit handles boot in
 //! the long run. `unlock` reads the passphrase via `rpassword` and
 //! forwards it to a running daemon over the IPC socket. `stop` sends
-//! `shutdown`. `status` queries `state`.
+//! `shutdown`. `status` queries `state`, every version axis, and checks that
+//! this `softfig`, the running daemon, and the installed set are one build.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,13 +13,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use softfig_ipc::{
+    compat::{binary_version, SetReport, SWAP_IN_PROGRESS_MARKER},
     runtime_socket_path,
     verbs::{op, RelockMintReply, StatusReply, UnlockArgs, UnlockReply},
     ClientError, ErrorKind, Request,
 };
 
 /// How long `cycle` waits for systemd to respawn the daemon Locked.
-const CYCLE_RESTART_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CYCLE_RESTART_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCmd {
@@ -110,7 +112,17 @@ fn start(args: StartArgs) -> Result<()> {
 
 fn stop(args: BasicArgs) -> Result<()> {
     let path = args.socket.unwrap_or_else(runtime_socket_path);
-    match send_shutdown_tolerating_close(&path)? {
+    stop_daemon(&path)
+}
+
+/// Send `shutdown` to a running daemon, tolerating a connection drop around
+/// the stop as the stop itself (incident 20260622). Prints the outcome and
+/// returns `Ok(())` whether the daemon was running or not — stopping an absent
+/// daemon is not an error. Shared by the `stop` command and `upgrade`'s
+/// non-cycle path (which stops the daemon so it is not left running the old
+/// binary against a newly-swapped set).
+pub(crate) fn stop_daemon(socket: &Path) -> Result<()> {
+    match send_shutdown_tolerating_close(socket)? {
         StopOutcome::Stopped => {
             println!("daemon: stopping");
             Ok(())
@@ -160,7 +172,30 @@ fn is_connection_drop(e: &ClientError) -> bool {
 
 fn status(args: BasicArgs) -> Result<()> {
     let path = args.socket.unwrap_or_else(runtime_socket_path);
-    match call_simple(&path, op::STATUS, serde_json::Value::Null) {
+    report_status(&path, SetReport::scan_own_dir())
+}
+
+/// Print the daemon's state and the version report, then fail if anything in
+/// it means the install is not one build (release-pipeline slice 002):
+///
+/// - the handshake: this `softfig` against the running daemon;
+/// - the daemon's executable replaced on disk since it started, which is the
+///   same-version rebuild the handshake alone can't see;
+/// - the installed set: every binary in this one's directory at one version,
+///   so a partial install is named even when the daemon isn't running.
+///
+/// The report always prints in full first, so the failure has its evidence.
+fn report_status(socket: &Path, set: std::io::Result<SetReport>) -> Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+    // slice 004: the daemon's executable directory, compared to this binary's
+    // own directory after the installed set is read, so two installs at one
+    // version are named (the version handshake alone can't see them).
+    let mut daemon_exe_dir: Option<PathBuf> = None;
+    // Whether the version handshake passed. The install-dir comparison is only
+    // meaningful when the daemon is this same build; a version mismatch is
+    // already named by the handshake.
+    let mut handshake_ok = false;
+    match call_simple(socket, op::STATUS, serde_json::Value::Null) {
         Ok(data) => {
             let reply: StatusReply = serde_json::from_value(data)?;
             println!("state           {}", reply.state);
@@ -176,13 +211,74 @@ fn status(args: BasicArgs) -> Result<()> {
                     None => println!("relock          armed"),
                 }
             }
-            Ok(())
+            match &reply.axes {
+                Some(axes) => println!("versions        {axes}"),
+                None => println!("versions        (not reported: the daemon predates version stamping)"),
+            }
+            if let Some(exe) = &reply.exe {
+                let exe_path = match exe.strip_suffix(" (deleted)") {
+                    Some(replaced) => {
+                        println!("daemon exe      {replaced} (replaced on disk since it started)");
+                        problems.push(format!(
+                            "the running daemon's binary {replaced} was replaced on disk after it \
+                             started — cycle the daemon (`softfig daemon cycle`)"
+                        ));
+                        replaced
+                    }
+                    None => {
+                        println!("daemon exe      {exe}");
+                        exe.as_str()
+                    }
+                };
+                daemon_exe_dir = Path::new(exe_path).parent().map(Path::to_path_buf);
+            }
+            handshake_ok = match softfig_ipc::compat::version_check(&reply) {
+                Ok(()) => {
+                    println!("handshake       ok ({} on both sides)", binary_version());
+                    true
+                }
+                Err(mismatch) => {
+                    println!("handshake       REFUSED");
+                    problems.push(mismatch.to_string());
+                    false
+                }
+            };
         }
-        Err(e) if e.is_daemon_absent() => {
-            println!("daemon: not running");
-            Ok(())
+        Err(e) if e.is_daemon_absent() => println!("daemon: not running"),
+        Err(e) => return Err(anyhow!("{e}")),
+    }
+    match set {
+        Ok(set) => {
+            println!("installed set   {set}");
+            if set.swap_in_progress {
+                problems.push(format!(
+                    "an interrupted swap left {SWAP_IN_PROGRESS_MARKER} in {} — \
+                     re-run the install/upgrade to converge",
+                    set.dir.display()
+                ));
+            } else if set.consistent_identity().is_none() {
+                // Identity, not version: a same-version mix of two builds is
+                // as partial as two versions (report 073).
+                problems.push(format!("partial install: {set}"));
+            }
+            if handshake_ok
+                && let Some(daemon_dir) = &daemon_exe_dir
+                && daemon_dir != &set.dir
+            {
+                problems.push(format!(
+                    "two installs at one version: the daemon runs from {} but this \
+                     `softfig` is in {}",
+                    daemon_dir.display(),
+                    set.dir.display(),
+                ));
+            }
         }
-        Err(e) => Err(anyhow!("{e}")),
+        Err(e) => println!("installed set   (could not find this binary's directory: {e})"),
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", problems.join("\n"))
     }
 }
 
@@ -205,7 +301,7 @@ fn unlock(args: BasicArgs) -> Result<()> {
 /// (incident 20260622). Both artifacts are single-use, deleted on a clean
 /// redeem, and tmpfs-only (wiped on reboot); the token bytes never enter this
 /// process or the model's context (the daemon reads its own token file).
-fn cycle(args: CycleArgs) -> Result<()> {
+pub(crate) fn cycle(args: CycleArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
 
     // 1. Arm a relock token, PERSISTED to the 0600 tmpfs path. Arming before the
@@ -451,6 +547,180 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A one-connection mock keeperd answering `status` with `reply`.
+    fn spawn_status_daemon(socket: PathBuf, reply: serde_json::Value) -> JoinHandle<()> {
+        let listener = UnixListener::bind(&socket).expect("bind mock socket");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Request = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(req.op, op::STATUS);
+            let mut bytes = serde_json::to_vec(&Response::ok(reply)).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+        })
+    }
+
+    fn status_of_build(binary: &str) -> serde_json::Value {
+        status_of_build_with_exe(binary, "/usr/bin/softfig-keeperd")
+    }
+
+    /// `status_of_build` with the daemon's `exe` path set explicitly, so a test
+    /// can place the daemon in this binary's own directory (one install) or
+    /// elsewhere (a second install at the same version).
+    fn status_of_build_with_exe(binary: &str, exe: &str) -> serde_json::Value {
+        let mut axes = softfig_ipc::compat::this_build_axes(1, 1);
+        axes.binary = binary.to_string();
+        json!({
+            "state": "unlocked",
+            "tip": null,
+            "garden_root": "/mock-garden",
+            "protocol_version": PROTOCOL_VERSION,
+            "axes": axes,
+            "exe": exe,
+        })
+    }
+
+    /// An installed set in a tempdir: every binary stamped `version`, except
+    /// the overrides (`None` = an unstamped, pre-stamp build).
+    fn fake_set(versions: &[(&str, Option<&str>)], version: &str) -> (tempfile::TempDir, SetReport) {
+        let dir = tempfile::tempdir().unwrap();
+        for name in softfig_ipc::compat::INSTALLED_SET {
+            let stamp = versions.iter().find(|(n, _)| *n == name).map_or(Some(version), |(_, v)| *v);
+            let bytes = stamp.map_or_else(|| b"old build".to_vec(), softfig_ipc::compat::stamp_for);
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let set = SetReport::scan(dir.path());
+        (dir, set)
+    }
+
+    /// release-pipeline slice 002: a CLI and a daemon of different builds — the
+    /// daemon's reply carries the wrong version — are refused with the
+    /// handshake's message, even when the installed set itself is consistent.
+    #[test]
+    fn status_refuses_a_daemon_of_another_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let mock = spawn_status_daemon(socket.clone(), status_of_build("0.0.1"));
+        let (_set_dir, set) = fake_set(&[], binary_version());
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        mock.join().unwrap();
+        assert_eq!(
+            err,
+            format!(
+                "your `softfig` ({}) is newer than the running daemon (0.0.1) — cycle the daemon \
+                 (`softfig daemon cycle`) so it runs the installed build",
+                binary_version()
+            )
+        );
+    }
+
+    /// Three of five binaries replaced: the daemon matches this CLI, but the
+    /// set doesn't, and `status` names every binary.
+    #[test]
+    fn status_names_a_partial_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let (_set_dir, set) =
+            fake_set(&[("softfig-tui", Some("0.0.1")), ("softfig-growlightd", None)], binary_version());
+        let exe = set.dir.join("softfig-keeperd");
+        let mock = spawn_status_daemon(
+            socket.clone(),
+            status_of_build_with_exe(binary_version(), &exe.to_string_lossy()),
+        );
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        mock.join().unwrap();
+        assert!(err.starts_with("partial install: PARTIAL in "), "{err}");
+        assert!(
+            err.contains(&format!("3 at {} (softfig, softfig-keeperd, softfig-mcp)", binary_version()))
+                && err.contains("1 at 0.0.1 (softfig-tui)")
+                && err.contains("1 unstamped, older than version stamping (softfig-growlightd)"),
+            "{err}"
+        );
+    }
+
+    /// The set is checked with no daemon at all: a partial install needs no
+    /// running daemon to be one.
+    #[test]
+    fn status_checks_the_set_when_the_daemon_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        let (_set_dir, set) = fake_set(&[("softfig-mcp", Some("0.0.1"))], binary_version());
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        assert!(err.contains("1 at 0.0.1 (softfig-mcp)"), "{err}");
+        let (_set_dir, set) = fake_set(&[], binary_version());
+        report_status(&socket, Ok(set)).expect("a consistent set and no daemon is fine");
+    }
+
+    /// Report 073: one version at two build ids is a partial install, and
+    /// the report names the builds. `consistent_version()` passed this.
+    #[test]
+    fn status_flags_a_same_version_mix_of_two_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        let set_dir = tempfile::tempdir().unwrap();
+        for (i, name) in softfig_ipc::compat::INSTALLED_SET.iter().enumerate() {
+            let id = if i == 0 { "aaa" } else { "bbb" };
+            let bytes = softfig_ipc::compat::stamp_with_identity(binary_version(), id);
+            std::fs::write(set_dir.path().join(name), bytes).unwrap();
+        }
+        let set = SetReport::scan(set_dir.path());
+        assert_eq!(set.consistent_version(), Some(binary_version()));
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        assert!(err.starts_with("partial install: PARTIAL in "), "{err}");
+        assert!(err.contains(&format!("at {} build aaa", binary_version())), "{err}");
+        assert!(err.contains(&format!("at {} build bbb", binary_version())), "{err}");
+    }
+
+    #[test]
+    fn status_passes_one_build_and_flags_a_replaced_daemon_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let (_set_dir, set) = fake_set(&[], binary_version());
+        let exe = set.dir.join("softfig-keeperd");
+        let mock = spawn_status_daemon(
+            socket.clone(),
+            status_of_build_with_exe(binary_version(), &exe.to_string_lossy()),
+        );
+        report_status(&socket, Ok(set)).expect("one build everywhere");
+        mock.join().unwrap();
+
+        // A fresh socket path: the first mock's socket file is still bound.
+        let socket = dir.path().join("keeperd-replaced.sock");
+        let (_set_dir, set) = fake_set(&[], binary_version());
+        let exe = set.dir.join("softfig-keeperd (deleted)");
+        let mock = spawn_status_daemon(
+            socket.clone(),
+            status_of_build_with_exe(binary_version(), &exe.to_string_lossy()),
+        );
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        mock.join().unwrap();
+        assert!(err.contains("was replaced on disk"), "{err}");
+    }
+
+    /// slice 004: a daemon at the same version but running from a different
+    /// directory than this binary is named — two installs at one version.
+    #[test]
+    fn status_names_a_daemon_in_another_install_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let (_set_dir, set) = fake_set(&[], binary_version());
+        let own_dir = set.dir.display().to_string();
+        let mock = spawn_status_daemon(
+            socket.clone(),
+            status_of_build_with_exe(binary_version(), "/usr/local/bin/softfig-keeperd"),
+        );
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        mock.join().unwrap();
+        assert!(
+            err.contains("/usr/local/bin")
+                && err.contains(&own_dir)
+                && err.contains("two installs at one version"),
+            "{err}"
+        );
     }
 
     /// criterion 4: a stop that closes the socket without an ack must not strand

@@ -13,12 +13,14 @@ members = [
     "crates/softfig-growlightd",
     "crates/softfig-growlightd-client",
     "crates/softfig-growlight-gui",
+    "crates/softfig-install",
     "crates/softfig-mcp",
     "crates/softfig-fuse",
     "crates/softfig-onboard",
     "crates/softfig-tui",
     "crates/softfig-deploy",
     "crates/softfig-net",
+    "crates/softfig-rescue",
     "crates/softfig-telemetry",
 ]
 
@@ -41,6 +43,7 @@ softfig-keeperd = { path = "crates/softfig-keeperd" }
 softfig-growlightd = { path = "crates/softfig-growlightd" }
 softfig-growlightd-client = { path = "crates/softfig-growlightd-client" }
 softfig-growlight-gui = { path = "crates/softfig-growlight-gui" }
+softfig-install = { path = "crates/softfig-install" }
 softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }
 softfig-net     = { path = "crates/softfig-net" }
@@ -67,6 +70,11 @@ serde_jcs = "0.1"
 toml = "0.8"
 hex = "0.4"
 
+# Version handshake (softfig-ipc `compat`): ordering builds, and finding the
+# build stamp inside a binary on disk
+semver = "1"
+memchr = "2"
+
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 
@@ -75,6 +83,7 @@ walkdir = "2"
 hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
 
 # M-onboard — embedded default-garden skeleton template
 include_dir = "0.7"

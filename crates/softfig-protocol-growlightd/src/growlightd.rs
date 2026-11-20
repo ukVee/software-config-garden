@@ -31,6 +31,10 @@ pub mod op {
     /// `shutdown() -> {}`. Orderly daemon teardown. The ack is flushed before
     /// the accept loop winds down (ack-before-teardown, mirroring keeperd).
     pub const SHUTDOWN: &str = "shutdown";
+    /// release-pipeline slice 002: the ops growlightd serves whatever the
+    /// caller's build, so a client of another build can still see the fleet's
+    /// state and stop it.
+    pub const LIFECYCLE: &[&str] = &[STATUS, SHUTDOWN];
     /// `subscribe() -> stream<`[`Event`]`>`. The one *streaming* verb (spec §13
     /// Observe): instead of a single [`Response`](softfig_protocol_keeperd::Response), the daemon holds the
     /// connection open and writes newline-framed [`Event`] JSON objects as they
@@ -224,6 +228,11 @@ pub struct FleetStatusReply {
     pub garden_root: String,
     /// growlightd's own IPC protocol version (the shared [`PROTOCOL_VERSION`](softfig_protocol_keeperd::PROTOCOL_VERSION)).
     pub protocol_version: u8,
+    /// release-pipeline slice 002: growlightd's build
+    /// (`softfig_client::compat::binary_version`). `None` from a growlightd that
+    /// predates the stamp; `#[serde(default)]` keeps its replies parseable.
+    #[serde(default)]
+    pub binary_version: Option<String>,
     /// The active per-device policy (budget thresholds + concurrency cap).
     pub policy: PolicySummary,
     /// The GENTLE per-agent build-resource caps the next spawned agent's scope is
@@ -2208,6 +2217,7 @@ mod tests {
             state: "running".into(),
             garden_root: "/g".into(),
             protocol_version: 1,
+            binary_version: None,
             policy: PolicySummary {
                 max_concurrent_agents: 2,
                 ctx_roll_pct: 50,

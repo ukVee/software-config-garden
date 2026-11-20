@@ -54,15 +54,22 @@ been independently audited). What ships:
 - **Growlight** — an autonomous work loop (a curated *baton* carried across
   agent sessions), run interactively with `softfig growlight start` or
   unattended by the supervised `growlightd` fleet.
+- **Release pipeline (built in this release, not yet published)** — the
+  version handshake, a tag-driven release workflow with provenance
+  attestation, a signed checksum manifest, `softfig upgrade` + `softfig
+  uninstall`, the `softfig-install` helper and `softfig-rescue` profile, and
+  the first channel as two AUR packages (`soft-fig` source + `soft-fig-bin`
+  prebuilt).
 
 Not built yet: template rendering (profile-scoped vars + render-time secrets),
-a general desktop GUI, prebuilt packages (AUR, `.deb`, …) and a
-`softfig upgrade` command. Linux + systemd + FUSE only. Full, dated detail:
+a general desktop GUI, and non-AUR prebuilt packages (`.deb`, …). Linux +
+systemd + FUSE only. Full, dated detail:
 [the docs status page](https://ukvee.github.io/software-config-docs/internals/status/).
 
 ## Quickstart
 
-There are no prebuilt packages yet, so build from source. This produces **one
+The AUR channel ships in this release but is not yet published, so build
+from source for now. This produces **one
 standalone garden that documents the machine it runs on** — cloning this repo
 to a new device moves the *program* (the schema), never another device's
 *content*. The full runbook is in the

@@ -19,6 +19,15 @@ pub struct Request {
     /// send and accept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// The sender's build (`softfig_client::compat::binary_version`). A
+    /// daemon refuses a request from another build before running the verb
+    /// (`softfig_client::compat::check_request`). Absent means a client that
+    /// predates the stamp, or a script. Such a request is served. Older
+    /// daemons ignore the field. [`Request::new`] leaves it unset: this crate
+    /// has no build identity, so `softfig-client`'s send path stamps it
+    /// (`compat::stamped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<String>,
 }
 
 impl Request {
@@ -28,6 +37,7 @@ impl Request {
             op: op.into(),
             args,
             member: None,
+            binary_version: None,
         }
     }
 
@@ -185,6 +195,11 @@ pub enum ErrorKind {
     /// so the daemon refuses until the share is keyed (run/accept the
     /// ceremony, or `migrate-into-share` for existing content).
     SharedChainUnkeyed,
+    /// release-pipeline slice 002: the request came from another build than
+    /// the daemon's ([`crate::compat::check_request`]). The message is the
+    /// refusal to show, worded from the client's side. Only a stamped request
+    /// can draw it, so a client older than the stamp never has to parse it.
+    VersionMismatch,
     /// Unknown / unhandled internal error.
     Internal,
 }

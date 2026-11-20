@@ -17,6 +17,10 @@ set -euo pipefail
 
 BIN_DIR="${HOME}/.local/bin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The INSTALLED set: exactly what the default `cargo build --release` produces.
+# The authoritative list is "Binary set" in the garden's meta/spec-release.md.
+# The feature-gated `growlight-gui` is deliberately left out. The workspace
+# declares it, but it is opt-in only (see packaging/desktop/README.md).
 BINARIES=(softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd)
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

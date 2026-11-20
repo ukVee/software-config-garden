@@ -14,55 +14,143 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every job builds with the rust-toolchain.toml pin, stated explicitly and
+  # asserted below; the msrv job overrides it with the declared MSRV. Without
+  # RUSTUP_TOOLCHAIN the rust-toolchain.toml directory override beats
+  # `rustup default`, so the msrv job silently compiled on 1.95.0 and MSRV
+  # 1.88 was proven nowhere (report 077).
+  RUSTUP_TOOLCHAIN: 1.95.0
 
 # No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
-# red on arrival. `cargo clippy --all-targets -- -D warnings` (the clippy job
+# red on arrival. `cargo clippy --all-targets --locked -- -D warnings` (the clippy job
 # below) is this repo's style gate, per CLAUDE.md's build/test/run section.
+#
+# Every action is pinned to a full commit SHA, never a floating tag — a mutable
+# `@v4` can be repointed by a compromised action repo (meta/spec-install.md →
+# "CI pipeline" → "hardening"). The `# <tag>` comment names the ref the SHA was
+# taken from.
 jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.95.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo test --workspace --no-fail-fast
+      - run: cargo test --workspace --no-fail-fast --locked
 
   build:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo build --workspace --release
+      - run: cargo build --workspace --release --locked
+
+  # The rescue artifact must build without the FUSE stack (meta/spec-release.md
+  # → "What CI must prove"): this job deliberately installs no protoc and no
+  # libfuse3-dev, so a stray FUSE link or protoc dependency in the rescue crate
+  # fails here. It builds the static-musl target the release ships, and the
+  # readelf check proves the binary has no NEEDED entries at all (report 081
+  # item 5) — the same check as release.yml's rescue and helper jobs.
+  rescue:
+    name: rescue (no-FUSE, static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Build the rescue artifact (static musl, no system deps)
+        run: cargo build -p softfig-rescue --release --locked --target x86_64-unknown-linux-musl
+      - name: Prove the rescue binary is statically linked
+        run: |
+          set -euo pipefail
+          dyn="$(readelf -d target/x86_64-unknown-linux-musl/release/softfig-rescue)"
+          if printf '%s\n' "$dyn" | grep -q '(NEEDED)'; then
+            printf '%s\n' "$dyn" | grep '(NEEDED)' >&2
+            echo "softfig-rescue has dynamic NEEDED entries — the rescue artifact must be statically linked" >&2
+            exit 1
+          fi
+          echo "rescue binary is statically linked"
 
   msrv:
     name: msrv
     runs-on: ubuntu-latest
+    env:
+      # The declared MSRV (Cargo.toml `rust-version`), overriding both the
+      # workflow-level pin and the rust-toolchain.toml directory override.
+      RUSTUP_TOOLCHAIN: "1.88"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.88"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the MSRV toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.88\.'
+          cargo --version | grep -q '^cargo 1\.88\.'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
+
+  deny:
+    name: deny (advisories + licenses + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check

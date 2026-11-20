@@ -1,0 +1,82 @@
+# Maintainer: <owner name> <owner email>   # PROPOSED — pending the owner's H9 answer; see ../README.md
+# Maintenance: sole owner; update-latency promise = within 7 days of a tagged
+# release (also PROPOSED pending H9 — see the AUR README's Maintenance section).
+
+pkgname=soft-fig
+pkgver=1.0.0alpha.1
+pkgrel=1
+pkgdesc="Encrypted local-first knowledge base: FUSE garden view + growlight fleet"
+arch=('x86_64')
+url="https://github.com/ukVee/software-config-garden"
+license=('AGPL-3.0-or-later')
+depends=('fuse3' 'systemd' 'foot')
+makedepends=('cargo' 'protobuf' 'fuse3')
+conflicts=('soft-fig-bin')
+
+# `_tag` is the real git tag (`v`-prefixed, prerelease segment intact); `pkgver`
+# is its AUR-safe form (pkgver may contain neither `-` nor `_`). `1.0.0alpha.1`
+# is used over `1.0.0_alpha.1` on purpose: alpm treats `_` as a version
+# separator, so `vercmp 1.0.0_alpha.1 1.0.0` -> `1` (the alpha reads NEWER, and
+# `pacman -Syu` would refuse the eventual `1.0.0` as a downgrade), while the
+# no-separator form sorts below it: `vercmp 1.0.0alpha.1 1.0.0` -> `-1`.
+#
+# The tag does not exist yet — the owner cuts it and fills in the real sha256
+# at publish time (see ../README.md). Until then the checksum is an all-zero
+# placeholder that FAILS makepkg's verification instead of skipping it, so the
+# package refuses to build before the real sum lands.
+_tag="v1.0.0-alpha.1"
+source=("https://github.com/ukVee/software-config-garden/archive/refs/tags/${_tag}.tar.gz")
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+build() {
+  cd "$srcdir/software-config-garden-"*
+  # The installed set (five binaries) exactly as the default-features release
+  # build produces it; growlight-gui stays out (opt-in `gui` feature).
+  # --locked: build against the committed Cargo.lock (reproducible-builds
+  # groundwork, meta/spec-release.md → "Reproducible builds").
+  cargo build --workspace --release --locked
+}
+
+# check() is intentionally omitted. The full workspace suite includes the
+# keeperd spawned-daemon integration tests (crates/softfig-keeperd/tests/
+# daemon.rs), which poll with fixed 2–3 s wall-clock budgets and flake under
+# load on a user's machine (growlight report 045) — a spurious `makepkg`
+# failure for a package that is already compiled and whose full suite the CI
+# gate runs on every push. Restore check() with `cargo test --workspace
+# --no-fail-fast --locked` once report 045 is fixed (readiness-signal wait
+# instead of a wall-clock budget).
+
+package() {
+  cd "$srcdir/software-config-garden-"*
+
+  # --- binaries (the installed set) -> /usr/bin ---
+  for bin in softfig softfig-keeperd softfig-growlightd softfig-mcp softfig-tui; do
+    install -Dm755 "target/release/${bin}" "$pkgdir/usr/bin/${bin}"
+  done
+
+  # --- license ---
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/soft-fig/LICENSE"
+
+  # --- systemd USER units -> /usr/lib/systemd/user ---
+  # "Set paths, never patch defaults" (meta/spec-release.md → Channels). The
+  # shipped units point ExecStart at the ~/.local/bin source install; this
+  # package installs to /usr/bin, so substitute the *path only*. The garden
+  # default (--garden %h/soft-fig_garden) and every other behavior default are
+  # left exactly as shipped — no distro divergence.
+  install -Dm644 packaging/systemd/softfig-keeperd.service \
+    "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service"
+  install -Dm644 packaging/systemd/softfig-growlightd.service \
+    "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
+  sed -i 's|%h/.local/bin/|/usr/bin/|g' \
+    "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service" \
+    "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
+
+  # --- desktop entry (softfig-tui only; growlight-gui is not installed) ---
+  # The repo draft keeps a bare binary name (packaging/desktop/README.md); this
+  # package installs to /usr/bin, so pin the command to the absolute path. The
+  # `--app-id=softfig-tui` token is the window class, left untouched.
+  install -Dm644 packaging/desktop/softfig-tui.desktop \
+    "$pkgdir/usr/share/applications/softfig-tui.desktop"
+  sed -i 's| softfig-tui$| /usr/bin/softfig-tui|' \
+    "$pkgdir/usr/share/applications/softfig-tui.desktop"
+}

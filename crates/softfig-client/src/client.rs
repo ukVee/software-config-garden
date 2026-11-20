@@ -94,9 +94,10 @@ pub fn connect_stream(path: &Path) -> Result<UnixStream, ClientError> {
 }
 
 /// Send one request, read one response. JSON-Lines framing: one JSON
-/// object terminated by `\n` in each direction.
+/// object terminated by `\n` in each direction. The request goes out
+/// stamped with this build ([`crate::compat::stamped`]).
 pub fn call(stream: &mut UnixStream, req: &Request) -> Result<Response, ClientError> {
-    let mut bytes = serde_json::to_vec(req)?;
+    let mut bytes = serde_json::to_vec(&crate::compat::stamped(req))?;
     bytes.push(b'\n');
     stream.write_all(&bytes)?;
     stream.flush()?;
@@ -270,7 +271,8 @@ pub fn call_reconnecting(
     req: &Request,
     policy: RetryPolicy,
 ) -> Result<Response, ReconnectError> {
-    let mut framed = serde_json::to_vec(req).map_err(ReconnectError::Encode)?;
+    let mut framed =
+        serde_json::to_vec(&crate::compat::stamped(req)).map_err(ReconnectError::Encode)?;
     framed.push(b'\n');
 
     let start = Instant::now();

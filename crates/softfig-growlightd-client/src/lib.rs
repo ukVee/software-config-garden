@@ -292,7 +292,11 @@ impl Connector for UnixConnector {
 
     fn connect(&mut self) -> io::Result<Self::Source> {
         let mut stream = UnixStream::connect(&self.socket)?;
-        let mut framed = serde_json::to_vec(&Request::new(op::SUBSCRIBE, serde_json::Value::Null))
+        // Stamped like every softfig-client send, so a growlightd of another
+        // build refuses the subscription instead of streaming to a client it
+        // may not decode (release-pipeline slice 002).
+        let req = Request::new(op::SUBSCRIBE, serde_json::Value::Null);
+        let mut framed = serde_json::to_vec(&softfig_client::compat::stamped(&req))
             .map_err(io::Error::other)?;
         framed.push(b'\n');
         stream.write_all(&framed)?;

@@ -167,9 +167,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "argon2"
@@ -3662,10 +3662,12 @@ dependencies = [
  "hostname",
  "rpassword",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "softfig-growlightd",
  "softfig-growlightd-client",
+ "softfig-install",
  "softfig-ipc",
  "softfig-keeperd",
  "softfig-onboard",
@@ -3683,8 +3685,11 @@ name = "softfig-client"
 version = "1.0.0-alpha.1"
 dependencies = [
  "libc",
+ "memchr",
+ "semver",
  "serde_json",
  "softfig-protocol-keeperd",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -3747,9 +3752,24 @@ name = "softfig-growlightd-client"
 version = "1.0.0-alpha.1"
 dependencies = [
  "serde_json",
+ "softfig-client",
  "softfig-protocol-growlightd",
  "softfig-protocol-keeperd",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "softfig-install"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rustix 1.1.4",
+ "semver",
+ "softfig-ipc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -3868,6 +3888,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-rescue"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "clap",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "softfig-store"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -3953,9 +3984,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]

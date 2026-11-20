@@ -1,0 +1,449 @@
+name: Release
+
+# The producer side of meta/spec-release.md: on a `v*` tag push, build the
+# per-artifact target matrix, verify the build stamp survived thin LTO, attest
+# provenance, and publish. The privileged publish job runs only through a
+# GitHub Environment with a required reviewer, and only on a tag push to the
+# upstream repo — this workflow has no `pull_request` trigger, so it never runs
+# on a fork PR (meta/spec-install.md → "CI pipeline" → "release gate").
+#
+# The loop never tags or pushes; the human cuts the tag.
+#
+# What the `release` Environment does and does NOT guarantee (report 053):
+#
+#   * DOES gate the publish job behind a human approval, but ONLY if the
+#     Environment actually has a `required_reviewers` protection rule
+#     configured. GitHub auto-creates a referenced environment with NO rules,
+#     so the mere `environment: release` line proves nothing — the publish
+#     job's preflight step fails closed unless the rule exists and has at
+#     least one reviewer.
+#
+#   * DOES NOT verify the tagged commit is on green main. That is the `gate`
+#     job's responsibility: it re-runs `cargo test --workspace` and clippy
+#     `-D warnings` against the tagged commit and asserts the tag is an
+#     ancestor of `origin/main`. `publish` needs `gate`, so a tag on an
+#     unmerged or failing commit publishes nothing.
+#
+#   * DOES NOT attest the bytes. Attestation is minted in-job by
+#     actions/attest-build-provenance over whatever the build jobs produced,
+#     so the build jobs must not let an untrusted tag steer a shell: the tag
+#     is validated against `^v[0-9A-Za-z._-]+$` and every ref-derived string
+#     flows through `env:`/`$GITHUB_OUTPUT`, never into a `run:` template
+#     (GitHub's script-injection hardening; report 053).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# One in-flight release per tag. cancel-in-progress is deliberately false: a
+# re-run of the same tag (e.g. after a flake) queues behind the first rather
+# than killing a publish that is mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The single pinned toolchain every release build uses. rust-toolchain.toml
+  # carries the same 1.95.0; asserting it here and in each job's version-assert
+  # step means a drift between this pin and the 1.88 MSRV declared in
+  # Cargo.toml / ci.yml cannot go silently unnoticed.
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  # --- gate: re-prove green main at the tag commit ---------------------------
+  # The trust gate. Every other job `needs` it, so nothing builds or publishes
+  # until the tagged commit has (a) a tag name matching the allow-list regex,
+  # (b) passed the same test + clippy gates CI runs on main, and (c) is proven
+  # to be an ancestor of origin/main.
+  gate:
+    name: gate (tag regex + test + clippy + on-main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate the tag name
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "tag: $TAG_NAME"
+          echo "$TAG_NAME" | grep -Eq '^v[0-9A-Za-z._-]+$' || {
+            echo "tag name does not match ^v[0-9A-Za-z._-]+$ — refusing to build" >&2
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full history so `merge-base --is-ancestor` has the graph to walk.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - name: Assert the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Assert the tag commit is an ancestor of origin/main
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo "the tagged commit is not an ancestor of origin/main" >&2
+            exit 1
+          }
+      - name: Check the tag's release notes
+        # Blank or stale notes fail here, before any build or approval
+        # (report 080); `publish` extracts them with the same script.
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "${TAG_NAME#v}" CHANGELOG.md > /dev/null
+      - name: Test (locked)
+        run: cargo test --workspace --no-fail-fast --locked
+      - name: Clippy (locked, -D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # --- Build matrix: the program tarball, per target -------------------------
+  # Tier 1 x86_64-unknown-linux-gnu is built and tested (by CI's test gate on
+  # main, the commit a tag must point at); tier 2 aarch64-unknown-linux-gnu is
+  # built, untested on hardware, and labeled as such in the artifact name. The
+  # rescue artifact (static musl ×2, slice 006) and the helper (softfig-install,
+  # static musl ×2, slice 005) build in their own jobs below (report 050).
+  program:
+    name: program (${{ matrix.target }})
+    needs: [gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            tier: tier1
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            tier: tier2
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - name: Assert the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Build (release, locked)
+        run: cargo build --workspace --release --locked
+      - name: Compute the release version (validated tag without the leading v)
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$TAG_NAME" | grep -Eq '^v[0-9A-Za-z._-]+$' || {
+            echo "tag name does not match ^v[0-9A-Za-z._-]+$" >&2
+            exit 1
+          }
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Verify the release binaries carry the tag's build stamp
+        env:
+          EXPECTED_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo test --release -p softfig-ipc --lib --locked -- release_binaries_carry_the_build_stamp
+      - name: Stage the program tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          TIER: ${{ matrix.tier }}
+        run: |
+          set -euo pipefail
+          stage="softfig-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${stage}"
+          for bin in softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd; do
+            cp "target/release/${bin}" "dist/${stage}/${bin}"
+          done
+          # Ship the units, the desktop entry and the license INSIDE the tarball
+          # so the -bin channel has nothing to fetch from a mutable tag (report
+          # 052). The source package reads the same files from the git archive.
+          cp packaging/systemd/softfig-keeperd.service    "dist/${stage}/softfig-keeperd.service"
+          cp packaging/systemd/softfig-growlightd.service "dist/${stage}/softfig-growlightd.service"
+          cp packaging/desktop/softfig-tui.desktop        "dist/${stage}/softfig-tui.desktop"
+          cp LICENSE                                      "dist/${stage}/LICENSE"
+          # Per-file checksums, generated inside the stage so they travel with
+          # the tarball (spec-release.md -> Artifacts: "one tarball plus
+          # per-file checksums").
+          (cd "dist/${stage}" && sha256sum \
+            softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd \
+            softfig-keeperd.service softfig-growlightd.service \
+            softfig-tui.desktop LICENSE > SHA256SUMS)
+          tar -C dist -czf "dist/${stage}-${TIER}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: program-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Rescue artifact: static musl, no FUSE, no daemon (slice 006) ---------
+  # tier 1 x86_64-unknown-linux-musl + tier 2 aarch64-unknown-linux-musl, both
+  # static and minimal (meta/spec-release.md → "Artifacts" → "Target matrix").
+  # Built with NO system deps on purpose: the rescue binary must not link
+  # libfuse3 or anything else a live-USB/chroot lacks, so a stray FUSE
+  # dependency in the rescue crate fails this build (no libfuse3-dev is
+  # installed here).
+  rescue:
+    name: rescue (${{ matrix.target }})
+    needs: [gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Build the rescue artifact (static musl, no system deps)
+        run: cargo build -p softfig-rescue --release --locked --target ${{ matrix.target }}
+      - name: Prove the rescue binary is statically linked
+        # No NEEDED entries at all, not just no libfuse: a live USB or chroot
+        # may lack any shared library (report 081 item 5). readelf must read
+        # the file, so a missing binary fails instead of passing vacuously.
+        run: |
+          set -euo pipefail
+          dyn="$(readelf -d "target/${{ matrix.target }}/release/softfig-rescue")"
+          if printf '%s\n' "$dyn" | grep -q '(NEEDED)'; then
+            printf '%s\n' "$dyn" | grep '(NEEDED)' >&2
+            echo "softfig-rescue has dynamic NEEDED entries — the rescue artifact must be statically linked" >&2
+            exit 1
+          fi
+          echo "rescue binary is statically linked"
+      - name: Compute the release version (validated tag without the leading v)
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$TAG_NAME" | grep -Eq '^v[0-9A-Za-z._-]+$' || {
+            echo "tag name does not match ^v[0-9A-Za-z._-]+$" >&2
+            exit 1
+          }
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Stage the rescue artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="softfig-rescue-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${stage}"
+          cp "target/${TARGET}/release/softfig-rescue" "dist/${stage}/softfig-rescue"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rescue-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Helper artifact: the softfig-install front door, static musl (slice 005)
+  # tier 1 x86_64-unknown-linux-musl + tier 2 aarch64-unknown-linux-musl, both
+  # static (meta/spec-release.md → "Target matrix" → helper). The downloaded
+  # front door must run on a cold box with no toolchain, so like the rescue job
+  # it builds with NO system deps and NO C cross-compiler: the softfig-install
+  # crate is pure Rust (clap/toml/rustix/semver/tempfile/softfig-ipc), so a stray
+  # C/openssl/ring/git2 dependency fails this build instead of silently shipping
+  # a helper that needs a linker (report 050).
+  helper:
+    name: helper (${{ matrix.target }})
+    needs: [gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Build the helper artifact (static musl, no system deps)
+        run: cargo build -p softfig-install --release --locked --target ${{ matrix.target }}
+      - name: Prove the helper binary is statically linked
+        run: |
+          set -euo pipefail
+          dyn="$(readelf -d "target/${{ matrix.target }}/release/softfig-install")"
+          if printf '%s\n' "$dyn" | grep -q '(NEEDED)'; then
+            printf '%s\n' "$dyn" | grep '(NEEDED)' >&2
+            echo "softfig-install has dynamic NEEDED entries — the helper must be statically linked" >&2
+            exit 1
+          fi
+          echo "helper binary is statically linked"
+      - name: Compute the release version (validated tag without the leading v)
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$TAG_NAME" | grep -Eq '^v[0-9A-Za-z._-]+$' || {
+            echo "tag name does not match ^v[0-9A-Za-z._-]+$" >&2
+            exit 1
+          }
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Stage the helper artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="softfig-install-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${stage}"
+          cp "target/${TARGET}/release/softfig-install" "dist/${stage}/softfig-install"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Privileged: attest provenance + publish ------------------------------
+  # Mints the sigstore build-provenance attestation for every artifact and
+  # uploads the release. Runs only through the `release` Environment (required
+  # reviewer) and only on a tag push to the upstream repo. Least-privilege
+  # token: the workflow default is contents: read; this job alone gains
+  # id-token + attestations + contents write. Published draft-then-flip: the
+  # release and its assets land as a draft (never briefly visible as "latest"
+  # with a partial asset set), then the flip step publishes it after the
+  # checksum + attestation steps have succeeded.
+  publish:
+    name: publish (Environment-gated)
+    needs: [gate, program, rescue, helper]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    environment: release
+    steps:
+      # Fail closed on the Environment gate: the `release` Environment gates
+      # this job behind a required reviewer, but only if the rule exists.
+      # GitHub auto-creates a referenced environment with no protection rules,
+      # so assert the rule is real before any artifact is published. Any error
+      # here (missing permission, renamed environment, ...) fails the step and
+      # nothing publishes.
+      - name: Verify the release Environment requires a reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(gh api "repos/$GITHUB_REPOSITORY/environments/release" \
+            --jq '.protection_rules // []
+                | map(select(.type == "required_reviewers") | ((.reviewers // []) | length))
+                | any(. > 0)')"
+          [ "$result" = "true" ] || {
+            echo "the 'release' Environment has no required_reviewers rule with at least one reviewer" >&2
+            echo "configure it under repo Settings -> Environments -> release, then re-run" >&2
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums (every tarball)
+        run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Install minisign
+        # Not in the ubuntu-latest image: without this the signing step below
+        # fails `command not found` on every tag, after the Environment
+        # approval (report 078). Ubuntu universe package.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          minisign -v
+      - name: Sign the checksum manifest (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # The secret is the base64 of the owner's passwordless minisign
+          # secret-key file (setup in packaging/signing/README.md). Decode to a
+          # temp file, sign SHA256SUMS, publish the committed public key beside
+          # it, then delete the key.
+          keyfile="$(mktemp)"
+          printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > "$keyfile"
+          chmod 600 "$keyfile"
+          (cd dist && minisign -S -s "$keyfile" -m SHA256SUMS -x SHA256SUMS.minisig)
+          rm -f "$keyfile"
+          cp packaging/signing/minisign.pub dist/minisign.pub
+      - name: Attest build provenance (every artifact)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          scripts/release-notes.sh "${GITHUB_REF_NAME#v}" CHANGELOG.md > release-notes.md
+      - name: Publish the GitHub release (as a draft)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+            dist/minisign.pub
+      - name: Flip the draft release to published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG_NAME" --draft=false

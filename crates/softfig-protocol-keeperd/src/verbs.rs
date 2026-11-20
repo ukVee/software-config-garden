@@ -474,6 +474,14 @@ pub mod op {
     /// lock, so Require Unlocked. v1 exposes the turn HOLDER only (queue depth
     /// deferred). Device ids are hex; names are resolved frontend-side via the ring.
     pub const COORDINATION_STATUS: &str = "coordination_status";
+
+    /// release-pipeline slice 002: the ops keeperd serves whatever the
+    /// caller's build. The version handshake's own remedy runs through them:
+    /// `daemon status` to see the mismatch, and `daemon cycle` (relock mint →
+    /// shutdown → relock redeem) or unlock to bring the daemon onto the
+    /// installed build. Refusing any of them could strand the daemon locked
+    /// (incident 20260622).
+    pub const LIFECYCLE: &[&str] = &[STATUS, UNLOCK, SHUTDOWN, RELOCK_MINT, RELOCK_REDEEM];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +500,13 @@ pub struct StatusReply {
     /// Unix seconds at which the armed relock token expires, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relock_expires_at: Option<i64>,
+    /// Whether the daemon will mint a relock token (`[growlight] allow_relock`).
+    /// Surfaced so a client can preflight a `cycle` — `upgrade` reads it before
+    /// the swap to decide cycle-vs-shutdown instead of attempting the mint and
+    /// bailing mid-flight. `#[serde(default)]` keeps older daemons/clients
+    /// wire-compatible (an absent field ⇒ `false`, the fail-closed default).
+    #[serde(default)]
+    pub relock_enabled: bool,
     /// Daemon-owned growlight gate: the fail-closed `fleet_enabled()` value the
     /// keeperd already owns, surfaced so a client never re-derives it from
     /// file-presence and disagrees. Refreshes on every status tick.
@@ -507,6 +522,65 @@ pub struct StatusReply {
     /// stderr-only. `#[serde(default)]` keeps older daemons/clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_key_divergence: Option<String>,
+    /// release-pipeline slice 002: every compatibility axis this daemon speaks,
+    /// its own build included. `None` means the daemon predates the report, and
+    /// `softfig_client::compat::version_check` treats that as an older build.
+    /// `#[serde(default)]` keeps older daemons' replies parseable.
+    #[serde(default)]
+    pub axes: Option<VersionAxes>,
+    /// The daemon's executable as the kernel reports it (`/proc/self/exe`).
+    /// It ends in ` (deleted)` once the file was replaced on disk after the
+    /// daemon started: a same-version rebuild that the version check alone
+    /// can't see (the stale-inode class of tasks 007/039).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+}
+
+/// Every compatibility axis a daemon speaks, reported by keeperd's `status`
+/// ([`StatusReply::axes`]). `softfig_client::compat::this_build_axes` fills it
+/// for the running build.
+///
+/// An axis this build doesn't have is `None`. It is written as an explicit
+/// `null`, not left out, so a reader can see that the axis is known and empty.
+/// A reply from a daemon that predates an axis also parses to `None`. For
+/// compatibility those mean the same thing: neither daemon can serve that axis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionAxes {
+    /// The daemon's build (`softfig_client::compat::binary_version`).
+    pub binary: String,
+    /// IPC protocol ([`crate::PROTOCOL_VERSION`]).
+    pub ipc_protocol: u8,
+    /// On-disk store schema (`softfig_store::db::SCHEMA_VERSION`).
+    pub store_schema: u32,
+    /// Replication wire protocol (`softfig_net::PROTOCOL_VERSION`).
+    pub wire_protocol: u32,
+    /// Queue-v2 TOML schema ([`crate::queue_v2::SCHEMA_VERSION`]).
+    pub queue_v2_schema: u32,
+    /// The pack format (`softfig_client::compat::PACK_FORMAT_VERSION`).
+    #[serde(default)]
+    pub pack_format: Option<u32>,
+    /// The garden convention
+    /// (`softfig_client::compat::GARDEN_CONVENTION_VERSION`).
+    #[serde(default)]
+    pub garden_convention: Option<u32>,
+}
+
+impl std::fmt::Display for VersionAxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opt = |v: Option<u32>| v.map_or_else(|| "none".to_string(), |v| v.to_string());
+        write!(
+            f,
+            "binary {} · ipc v{} · store schema {} · wire v{} · queue-v2 schema {} · \
+             pack format {} · garden convention {}",
+            self.binary,
+            self.ipc_protocol,
+            self.store_schema,
+            self.wire_protocol,
+            self.queue_v2_schema,
+            opt(self.pack_format),
+            opt(self.garden_convention),
+        )
+    }
 }
 
 // ---- growlight relock token -------------------------------------------

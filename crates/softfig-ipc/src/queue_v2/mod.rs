@@ -55,10 +55,7 @@ pub use softfig_protocol_keeperd::queue_v2::{
     hold_annotation, EntryKind, Lane, RestackBranch, SliceStatus,
 };
 
-/// The schema version every file writes and the only version parsing accepts.
-/// Bump only with a migration: a reader of the old build refuses the new file
-/// fail-closed rather than misreading it.
-pub const SCHEMA_VERSION: u32 = 1;
+pub use softfig_protocol_keeperd::queue_v2::SCHEMA_VERSION;
 
 /// `<garden>/growlight/backlog/queue.toml` — the live v2 list (§3.1).
 pub const QUEUE_FILE: &str = "growlight/backlog/queue.toml";

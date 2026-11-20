@@ -15,7 +15,8 @@
 //!   hold_annotation}` with the IO-free `queue_v2::migrate::{Answers,
 //!   BatonMove, CallClass}`.
 //! - `softfig-protocol-growlightd` — the growlightd wire types (`growlightd`).
-//! - `softfig-client` — `client`, `socket`, and the reconnecting call.
+//! - `softfig-client` — `client`, `socket`, the reconnecting call, and
+//!   `compat` (the build stamp and version handshake, release-pipeline).
 //!
 //! What is left here is the daemon-shared garden code: `backlog_doc`, `baton`,
 //! `claude_profiles`, `item_meta`, `item_repo`, `member`, `model_choice`,
@@ -60,7 +61,7 @@ pub use queue_v2::{
     QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,
     SlicesToml,
 };
-pub use softfig_client::{client, socket};
+pub use softfig_client::{client, compat, socket};
 pub use softfig_client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };

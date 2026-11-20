@@ -149,7 +149,8 @@ pub enum FleetHeader {
     /// Not polled yet (before the first `status` reply after entering the tab).
     #[default]
     Unknown,
-    /// A decoded live growlightd `status` reply.
+    /// A decoded live growlightd `status` reply. Boxed: the reply dwarfs the
+    /// other variants.
     Live(Box<FleetStatusReply>),
     /// The last poll couldn't reach growlightd — render one dim line, keep the
     /// garden-only page fully functional.
@@ -6315,8 +6316,11 @@ mod tests {
                 protocol_version: softfig_protocol_keeperd::PROTOCOL_VERSION,
                 relock_pending: false,
                 relock_expires_at: None,
+                relock_enabled: false,
                 growlight_enabled,
                 shared_key_divergence: None,
+                axes: None,
+                exe: None,
             })
             .unwrap()),
         }

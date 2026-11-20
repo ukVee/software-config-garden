@@ -1716,6 +1716,10 @@ fn print_fleet_status(r: &FleetStatusReply) {
     println!("state         {}", r.state);
     println!("garden        {}", r.garden_root);
     println!("protocol      v{}", r.protocol_version);
+    println!(
+        "binary        {}",
+        r.binary_version.as_deref().unwrap_or("(not reported: predates version stamping)")
+    );
     // The config-level arm/disarm gate (`config/growlight.toml fleet_enabled`),
     // distinct from `paused` (the runtime admission gate over an armed fleet).
     println!("fleet         {}", if r.fleet_enabled { "enabled" } else { "disabled" });
@@ -4467,6 +4471,7 @@ mod tests {
             state: "running".into(),
             garden_root: "/g".into(),
             protocol_version: 1,
+            binary_version: None,
             policy: growlightd::PolicySummary {
                 max_concurrent_agents: 2,
                 ctx_roll_pct: 50,

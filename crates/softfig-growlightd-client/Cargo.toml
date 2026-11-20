@@ -10,6 +10,9 @@ description = "soft-fig growlightd client: a thin, reconnecting `subscribe` clie
 [dependencies]
 softfig-protocol-keeperd.workspace = true
 softfig-protocol-growlightd.workspace = true
+# Only `compat::stamped`: this crate hand-rolls its stream, so it stamps the
+# subscribe request itself (tui-split-protocol D6).
+softfig-client.workspace = true
 
 serde_json.workspace = true
 thiserror.workspace = true

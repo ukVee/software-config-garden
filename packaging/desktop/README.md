@@ -31,6 +31,13 @@ never compiles the heavy iced dependency:
 cargo install --path crates/softfig-growlight-gui --features gui --root ~/.local --force
 ```
 
+**Opt-in, outside the installed set.** The workspace declares `growlight-gui`,
+but it is not in the installed set that `scripts/onboard-device.sh` installs,
+and releases do not publish it. Its live window has never been checked on a
+device. It also sits outside the atomic install/upgrade swap, so nothing
+refreshes it for you. Rebuild it with the command above after every upgrade, or
+it falls behind the daemon it talks to.
+
 ## softfig-tui.desktop
 
 `softfig-tui` is a ratatui TUI, so the launcher runs it inside `foot` and tags

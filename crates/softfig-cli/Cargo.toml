@@ -25,6 +25,7 @@ softfig-growlightd-client.workspace = true
 # a transitive bloom.
 softfig-growlightd.workspace = true
 softfig-onboard.workspace = true
+softfig-install.workspace = true
 softfig-telemetry.workspace = true
 clap.workspace = true
 hostname.workspace = true
@@ -34,6 +35,7 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+semver.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -42,8 +44,9 @@ zeroize.workspace = true
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
-# claude-login-switcher: isolate the HOME-rooted filesystem tests in a temp
-# directory. Dev-only — prod uses hand-rolled sibling tempfiles.
+# release-pipeline slice 002: `daemon status` tests fake an installed set in a
+# temp dir. claude-login-switcher: isolate the HOME-rooted filesystem tests in
+# a temp directory. Dev-only — prod uses hand-rolled sibling tempfiles.
 tempfile.workspace = true
 # token-telemetry slice 005: the ingest test reads the rows back.
 rusqlite.workspace = true

@@ -9,6 +9,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// The schema version every queue-v2 file writes and the only version parsing
+/// accepts. Bump only with a migration: a reader of the old build refuses the
+/// new file fail-closed rather than misreading it. Here and not in
+/// `softfig-ipc::queue_v2`, so `VersionAxes` can name it.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// An entry's `kind` (§1, §3.1): one milestone, task or restack in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

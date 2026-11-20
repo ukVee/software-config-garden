@@ -11,6 +11,51 @@ decision record or crate that owns it, rather than at every internal change.
 
 ### Added
 
+- **Version handshake.** `softfig daemon status` reports every compatibility axis:
+  binary, IPC protocol, store schema, wire protocol and queue-v2 schema. Pack format
+  and garden convention read `none` until they exist. It also checks that this
+  `softfig` and the running daemon are the same build, reads the build stamp out of
+  each installed binary to name a partial install, and exits non-zero if any check
+  fails. keeperd and growlightd refuse a request from a client of another build with
+  "your `softfig` is newer/older than the running daemon …". The lifecycle verbs
+  that `daemon status` and `daemon cycle` need are exempt. The TUI refuses to start,
+  and growlightd to boot, against a daemon of another build. `softfig-tui` and
+  `softfig-mcp` accept `--version`. (`softfig_ipc::compat`, release-pipeline slice 002)
+- **Release pipeline.** A tag-driven workflow (`.github/workflows/release.yml`)
+  turns a `v*` tag into the artifact set: program tarballs per target (tier 1
+  `x86_64-unknown-linux-gnu` built + tested, tier 2 `aarch64` built + untested,
+  macOS tier 3 source-only), a `SHA256SUMS` manifest, and sigstore provenance
+  attestation gated behind a required-reviewer Environment; a minisign-signed
+  checksum manifest serves consumers without `gh` (release-pipeline slice 004,
+  `meta/spec-release.md`).
+- **The AUR channel.** Two packages — `soft-fig` (source) and `soft-fig-bin`
+  (repackages the tier-1 artifact) — each installing the five-binary installed
+  set, the systemd user units, and the `softfig-tui` desktop entry; `-bin`
+  verifies the signed manifest in `check()` before installing (release-pipeline
+  slice 008). Not yet published.
+- **`softfig-install`.** The downloaded front door: OS/supervisor detection, a
+  toolchain gate, a from-source `--release --locked` build, and the atomic
+  installed-set swap, all behind consented, reversible offers (release-pipeline
+  slice 005).
+- **`softfig-rescue`.** The recovery-wedge artifact — no FUSE, no daemon, no
+  network, minimally linked — that writes the phase-1 carry-file and declares
+  the packs seam (release-pipeline slice 006).
+- **`softfig upgrade` and `softfig uninstall`.** With no source named, `upgrade`
+  builds the newest release tag newer than the running binary (or says it is
+  already current); otherwise it builds the given checkout or tag. It refuses a
+  release that changes the store schema before building. It pulls, builds, swaps
+  the installed set atomically, cycles the daemon on the relock-token path (or
+  stops it honestly where no supervisor respawns), runs pending migrations, and
+  confirms the handshake; `uninstall` removes the installed set, the unit and
+  the MCP registration, refusing to touch the store without a separate
+  `--yes-remove-data` confirmation (release-pipeline slice 007).
+- **Build identity, rollback and re-install.** Every binary's build stamp carries
+  the git commit it was built from (`-dirty` for an uncommitted tree), so a
+  same-version rebuild swaps instead of no-oping and `softfig daemon status` names
+  a set mixing two builds. Each swap keeps the replaced set in `<prefix>/.previous`;
+  `softfig upgrade --rollback` restores it (then cycle the daemon), and
+  `--force` re-installs even an identical build. `uninstall` removes the kept set
+  and the install lock too.
 - keeperd refuses a write that grows a routing `CLAUDE.md` past 8 KB of hand-written
   text. Managed regions don't count, and an over-limit doc may always shrink.
   `growlight/backlog/` is exempt for now. See `decision-claude-md-lazy-pointers`.
@@ -137,6 +182,13 @@ decision record or crate that owns it, rather than at every internal change.
 - A v2 spin park pages as `SpinGuardParked` rather than `BlockedOnHuman`, parks and
   walk-blocks ride the 30-minute and 2-hour page ladder, and a failed `queue.toml`
   read stops replaying the standing pages (sweep-fixes 005, 012, report 170).
+
+### Protocol
+
+- IPC requests gain an optional `binary_version` field, and errors gain a
+  `version_mismatch` kind. Both are additive and the IPC protocol stays v1: daemons
+  from 1.0.0-alpha.1 ignore the field, and only a client that sends the field can
+  draw the new kind.
 
 ## [1.0.0-alpha.1] - 2026-10-17
 

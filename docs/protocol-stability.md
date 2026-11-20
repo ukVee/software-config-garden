@@ -35,6 +35,8 @@ that now defines it.
 | `fleet::{holds, parse_not_before, days_from_civil}` (the pure item-doc value rules) | `softfig-protocol-keeperd::fleet` |
 | `growlightd::*`, including the five member-verb `op` aliases | `softfig-protocol-growlightd` |
 | `client`, `socket`, `call`, `call_reconnecting`, `connect`, `RetryPolicy`, the runtime socket paths | `softfig-client` |
+| `verbs::VersionAxes` (named by `StatusReply.axes`) and `queue_v2::SCHEMA_VERSION` | `softfig-protocol-keeperd` |
+| `compat` (the build stamp, `stamped`, `check_request`, `version_check`, `this_build_axes`, the installed-set scan) | `softfig-client` |
 
 **`queue_v2` and `fleet` are split on purpose, and the split is the stability
 line.** What a wire type needs is in the protocol crate, IO-free: the three
@@ -46,6 +48,16 @@ plan/apply half of `queue_v2::migrate` (it reads `$HOME` and imports
 `backlog_doc`, `model_choice`, `baton` and `fleet`), and the `> Fleet:` /
 `> Not before:` item-doc scanner in `fleet`. A third party that wants the wire
 types does not get a filesystem reader with them.
+
+**The build stamp is the client's, not the protocol's.** `Request.binary_version`
+is a wire field in `softfig-protocol-keeperd`, but `Request::new` leaves it
+unset: that crate has no build identity. `softfig-client` stamps every request
+it sends (`call`, `call_reconnecting`, via `compat::stamped`), and
+`softfig-growlightd-client`, which hand-rolls its stream, stamps its subscribe
+request the same way. A third-party client that sends no stamp is served; one
+that stamps a different build is refused with `ErrorKind::VersionMismatch`,
+except for each daemon's `op::LIFECYCLE`. Whether a third-party client should
+ever be refused by build is still directord ruling 7.
 
 ## Already pinned by tests
 

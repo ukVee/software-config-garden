@@ -5,10 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "soft-fig IPC client: Unix-socket connect, call and reconnect, plus the runtime socket paths."
+description = "soft-fig IPC client: Unix-socket connect, call and reconnect, the runtime socket paths, and the build stamp every request carries."
 
 [dependencies]
 softfig-protocol-keeperd.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 libc.workspace = true
+semver.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
