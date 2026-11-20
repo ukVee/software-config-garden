@@ -20,7 +20,7 @@ decision record or crate that owns it, rather than at every internal change.
   "your `softfig` is newer/older than the running daemon …". The lifecycle verbs
   that `daemon status` and `daemon cycle` need are exempt. The TUI refuses to start,
   and growlightd to boot, against a daemon of another build. `softfig-tui` and
-  `softfig-mcp` accept `--version`. (`softfig_ipc::compat`, release-pipeline slice 002)
+  `softfig-mcp` accept `--version`. (`softfig_client::compat`, re-exported as `softfig_ipc::compat`; release-pipeline slice 002)
 - **Release pipeline.** A tag-driven workflow (`.github/workflows/release.yml`)
   turns a `v*` tag into the artifact set: program tarballs per target (tier 1
   `x86_64-unknown-linux-gnu` built + tested, tier 2 `aarch64` built + untested,

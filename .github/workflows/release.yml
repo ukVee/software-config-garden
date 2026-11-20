@@ -164,7 +164,7 @@ jobs:
       - name: Verify the release binaries carry the tag's build stamp
         env:
           EXPECTED_RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: cargo test --release -p softfig-ipc --lib --locked -- release_binaries_carry_the_build_stamp
+        run: cargo test --release -p softfig-client --lib --locked -- --exact compat::tests::release_binaries_carry_the_build_stamp
       - name: Stage the program tarball
         env:
           VERSION: ${{ steps.version.outputs.version }}
