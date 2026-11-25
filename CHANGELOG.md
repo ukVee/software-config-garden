@@ -9,6 +9,8 @@ decision record or crate that owns it, rather than at every internal change.
 
 ## [Unreleased]
 
+## [1.0.0-alpha.3] - 2026-11-24
+
 ### Added
 
 - **Version handshake.** `softfig daemon status` reports every compatibility axis:
@@ -304,5 +306,6 @@ install is build-from-source (no prebuilt packages yet).
   cryptography, and the project is maintained by one person on a best-effort
   basis.
 
-[Unreleased]: https://github.com/ukVee/software-config-garden/compare/v1.0.0-alpha.1...HEAD
+[Unreleased]: https://github.com/ukVee/software-config-garden/compare/v1.0.0-alpha.3...HEAD
+[1.0.0-alpha.3]: https://github.com/ukVee/software-config-garden/releases/tag/v1.0.0-alpha.3
 [1.0.0-alpha.1]: https://github.com/ukVee/software-config-garden/releases/tag/v1.0.0-alpha.1

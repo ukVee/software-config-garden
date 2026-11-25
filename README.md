@@ -29,7 +29,7 @@ reference, plus a codebase tour. This README is just the front door.
 
 ## Status
 
-**1.0.0-alpha.1 — the first public alpha.** Built and used daily on one device
+**1.0.0-alpha.3 — the first public alpha.** Built and used daily on one device
 by one author: expect rough edges, and read [SECURITY.md](SECURITY.md) before
 trusting it with anything you can't afford to lose (the cryptography has not
 been independently audited). What ships:

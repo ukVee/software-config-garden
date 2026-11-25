@@ -3654,7 +3654,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-cli"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-client"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "memchr",
  "semver",
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-deploy"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-fuse"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "fuser",
  "libc",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlight-gui"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "iced",
  "serde_json",
@@ -3730,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlightd"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlightd-client"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "serde_json",
  "softfig-client",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-install"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3773,7 +3773,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-ipc"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3789,7 +3789,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-keeperd"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-mcp"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -3836,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-net"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3857,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-onboard"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "include_dir",
  "serde",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-rescue"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "clap",
  "serde",
@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-store"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "blake3",
  "hex",
@@ -3913,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-telemetry"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3925,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-tui"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-vault"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "argon2",
  "base64",
@@ -3963,7 +3963,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-vcs"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "blake3",
  "ed25519-dalek",

@@ -31,7 +31,7 @@ theory with a clear reasoning trail is still worth sending.
 
 **Latest release only.**
 
-The current release is **1.0.0-alpha.1**, a source release: every install is
+The current release is **1.0.0-alpha.3**, a source release: every install is
 built from source at a tag or commit, so include the commit you built in a
 report. Fixes land on the latest release.
 

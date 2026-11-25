@@ -3,7 +3,7 @@
 # release (also PROPOSED pending H9 — see the AUR README's Maintenance section).
 
 pkgname=soft-fig-bin
-pkgver=1.0.0alpha.1
+pkgver=1.0.0alpha.3
 pkgrel=1
 pkgdesc="Encrypted local-first knowledge base: FUSE garden view + growlight fleet (bin)"
 arch=('x86_64')
@@ -14,12 +14,12 @@ makedepends=('minisign')
 provides=('soft-fig')
 conflicts=('soft-fig')
 
-# `_tag` is the real git tag; `pkgver` its AUR-safe form. `1.0.0alpha.1` is
+# `_tag` is the real git tag; `pkgver` its AUR-safe form. `1.0.0alpha.3` is
 # used over `1.0.0_alpha.1` on purpose: alpm treats `_` as a version separator,
 # so `vercmp 1.0.0_alpha.1 1.0.0` -> `1` (the alpha reads NEWER, and
 # `pacman -Syu` would refuse the eventual `1.0.0` as a downgrade), while the
-# no-separator form sorts below it: `vercmp 1.0.0alpha.1 1.0.0` -> `-1`.
-_tag="v1.0.0-alpha.1"
+# no-separator form sorts below it: `vercmp 1.0.0alpha.3 1.0.0` -> `-1`.
+_tag="v1.0.0-alpha.3"
 _target="x86_64-unknown-linux-gnu"
 _tarball="softfig-${_tag}-${_target}-tier1.tar.gz"
 
@@ -47,7 +47,7 @@ sha256sums=(
   '0000000000000000000000000000000000000000000000000000000000000000'
   '0000000000000000000000000000000000000000000000000000000000000000'
   '0000000000000000000000000000000000000000000000000000000000000000'
-  '0000000000000000000000000000000000000000000000000000000000000000'
+  'ced3363e77a57917cb5a08642c2220acc4d93f62d521e41ff1c26108ba70e9c2'
 )
 
 check() {
